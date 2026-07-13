@@ -192,18 +192,15 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 
 	maxFiles, maxLSPs, maxMCPs, maxSkills := getDynamicHeightLimits(remainingHeight, filesCount, lspsCount, mcpsCount, skillsCount)
 
-	// When focused, show all items so scroll can reveal truncated content.
-	if focused {
-		maxFiles = max(maxFiles, filesCount)
-		maxLSPs = max(maxLSPs, lspsCount)
-		maxMCPs = max(maxMCPs, mcpsCount)
-		maxSkills = max(maxSkills, skillsCount)
-	}
-
 	lspSection := m.lspInfo(width, maxLSPs, true)
 	mcpSection := m.mcpInfo(width, maxMCPs, true)
 	skillsSection := m.skillsInfo(width, maxSkills, true)
 	filesSection := m.filesInfo(m.com.Workspace.WorkingDir(), width, maxFiles, true)
+
+	var borderStyle lipgloss.Border = lipgloss.NormalBorder()
+	if focused {
+		borderStyle = lipgloss.ThickBorder()
+	}
 
 	fullContent := lipgloss.JoinVertical(
 		lipgloss.Left,
@@ -217,23 +214,22 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 		skillsSection,
 	)
 
-	// Apply scroll offset when focused. Clamp against real content height.
+	// Apply scroll offset when focused.
 	contentLines := strings.Split(fullContent, "\n")
-	maxScroll := max(0, len(contentLines)-height)
-	m.sidebarScroll = min(m.sidebarScroll, maxScroll)
-	scroll := min(m.sidebarScroll, maxScroll)
-	if scroll > 0 && scroll < len(contentLines) {
-		contentLines = contentLines[scroll:]
+	if m.sidebarScroll > 0 && m.sidebarScroll < len(contentLines) {
+		contentLines = contentLines[m.sidebarScroll:]
+	} else if m.sidebarScroll >= len(contentLines) {
+		contentLines = contentLines[max(0, len(contentLines)-1):]
 	}
+	m.sidebarScroll = min(m.sidebarScroll, max(0, len(contentLines)-1))
 	scrolledContent := strings.Join(contentLines, "\n")
 
-	renderStyle := lipgloss.NewStyle().
-		MaxWidth(width).
-		MaxHeight(height)
-	if focused {
-		renderStyle = renderStyle.BorderLeft(true).BorderStyle(lipgloss.ThickBorder())
-	}
 	uv.NewStyledString(
-		renderStyle.Render(scrolledContent),
+		lipgloss.NewStyle().
+			MaxWidth(width).
+			MaxHeight(height).
+			BorderLeft(true).
+			BorderStyle(borderStyle).
+			Render(scrolledContent),
 	).Draw(scr, area)
 }
