@@ -2,6 +2,7 @@ package dialog
 
 import (
 	"fmt"
+	"sort"
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
@@ -173,11 +174,19 @@ func NewMCPServers(com *common.Common, ws workspace.Workspace) *MCPServers {
 	return d
 }
 
-// serverItems builds the list items from current MCP server states.
+// serverItems builds the list items from current MCP server states, sorted by
+// name so the list order is stable across dialog opens (map iteration order is
+// otherwise random).
 func (d *MCPServers) serverItems() []list.FilterableItem {
 	states := d.ws.MCPGetStates()
+	names := make([]string, 0, len(states))
+	for name := range states {
+		names = append(names, name)
+	}
+	sort.Strings(names)
 	items := make([]list.FilterableItem, 0, len(states))
-	for name, info := range states {
+	for _, name := range names {
+		info := states[name]
 		info.Name = name
 		items = append(items, NewMCPServerItem(d.com.Styles, info))
 	}

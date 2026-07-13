@@ -115,6 +115,25 @@ func TestMCPServers_FilterNarrowsList(t *testing.T) {
 	require.Equal(t, "cairn", item.info.Name)
 }
 
+func TestMCPServers_ServersSortedByName(t *testing.T) {
+	t.Parallel()
+
+	d := newTestMCPServers(t, map[string]mcp.ClientInfo{
+		"zeta":  {Name: "zeta", State: mcp.StateConnected},
+		"alpha": {Name: "alpha", State: mcp.StateConnected},
+		"mid":   {Name: "mid", State: mcp.StateConnected},
+	})
+
+	items := d.list.FilteredItems()
+	require.Len(t, items, 3)
+	names := make([]string, 0, len(items))
+	for _, it := range items {
+		names = append(names, it.(*MCPServerItem).info.Name)
+	}
+	require.Equal(t, []string{"alpha", "mid", "zeta"}, names,
+		"servers should be listed in a stable alphabetical order")
+}
+
 func TestMCPServers_NavigationWraps(t *testing.T) {
 	t.Parallel()
 
