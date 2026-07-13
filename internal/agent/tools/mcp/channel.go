@@ -181,6 +181,7 @@ func publishChannelMessage(name string, raw json.RawMessage) {
 	broker.Publish(pubsub.CreatedEvent, Event{
 		Type:           EventChannelMessage,
 		Name:           name,
+		ChannelMeta:    p.Meta,
 		ChannelMessage: renderChannel(name, p),
 	})
 }

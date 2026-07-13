@@ -110,6 +110,7 @@ type Event struct {
 	// ChannelMessage is set only for EventChannelMessage: the fully rendered
 	// and escaped <channel>...</channel> element to inject into the session.
 	ChannelMessage string
+	ChannelMeta    map[string]string
 }
 
 // Counts number of available tools, prompts, etc.
@@ -126,6 +127,7 @@ type ClientInfo struct {
 	Error       error
 	Client      *ClientSession
 	Counts      Counts
+	Channel     bool
 	ConnectedAt time.Time
 }
 
@@ -338,6 +340,9 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 		Client: client,
 		Counts: counts,
 	}
+	if previous, ok := states.Get(name); ok {
+		info.Channel = previous.Channel
+	}
 	switch state {
 	case StateConnected:
 		info.ConnectedAt = time.Now()
@@ -427,6 +432,10 @@ func createSession(ctx context.Context, name string, m config.MCPConfig, resolve
 	// config is not enough; this enforces the "listed is not enabled" model.
 	if channelOptIn && hasChannelCapability(session.InitializeResult()) {
 		channelGate.Store(true)
+		if info, ok := states.Get(name); ok {
+			info.Channel = true
+			states.Set(name, info)
+		}
 		slog.Info("MCP channel enabled", "name", name)
 	}
 
