@@ -139,6 +139,8 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 	width := area.Dx()
 	height := area.Dy()
 
+	focused := m.focus == uiFocusSidebar
+
 	title := t.Sidebar.SessionTitle.Width(width).MaxHeight(2).Render(m.session.Title)
 	cwd := common.PrettyPath(t, m.com.Workspace.WorkingDir(), width)
 	sidebarLogo := m.sidebarLogo
@@ -194,22 +196,25 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 	skillsSection := m.skillsInfo(width, maxSkills, true)
 	filesSection := m.filesInfo(m.com.Workspace.WorkingDir(), width, maxFiles, true)
 
+	style := lipgloss.NewStyle().
+		MaxWidth(width).
+		MaxHeight(height)
+	if focused {
+		style = style.BorderLeft(true).BorderStyle(lipgloss.ThickBorder())
+	}
 	uv.NewStyledString(
-		lipgloss.NewStyle().
-			MaxWidth(width).
-			MaxHeight(height).
-			Render(
-				lipgloss.JoinVertical(
-					lipgloss.Left,
-					sidebarHeader,
-					filesSection,
-					"",
-					lspSection,
-					"",
-					mcpSection,
-					"",
-					skillsSection,
-				),
+		style.Render(
+			lipgloss.JoinVertical(
+				lipgloss.Left,
+				sidebarHeader,
+				filesSection,
+				"",
+				lspSection,
+				"",
+				mcpSection,
+				"",
+				skillsSection,
 			),
+		),
 	).Draw(scr, area)
 }
