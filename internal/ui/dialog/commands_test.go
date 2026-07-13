@@ -187,6 +187,35 @@ func TestCommands_BreadcrumbDraw(t *testing.T) {
 
 // setupMenuHierarchy creates a Commands dialog with a parent item that has
 // children, where one child is itself a parent with a nested leaf.
+func TestCommands_PopRestoresFullParentList(t *testing.T) {
+	t.Parallel()
+
+	c := newTestCommands(t)
+
+	leaf := NewCommandItem(c.com.Styles, "leaf", "Leaf", "", ActionNewSession{})
+	parent := NewCommandItem(c.com.Styles, "parent", "Alpha", "", nil).WithChildren(leaf)
+	sibling := NewCommandItem(c.com.Styles, "sibling", "Zulu", "", ActionNewSession{})
+
+	items := []list.FilterableItem{parent, sibling}
+	c.list.SetItems(items...)
+	c.list.SetSelected(0)
+
+	// Filter so only the parent ("Alpha") matches, leaving the sibling hidden.
+	c.HandleMsg(keyMsg('a'))
+	require.Len(t, c.list.FilteredItems(), 1, "filter should narrow to the parent")
+
+	// Enter the parent's sub-menu, then pop back to the top level.
+	c.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.True(t, c.inSubMenu())
+	c.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEscape})
+	require.False(t, c.inSubMenu())
+
+	// Both top-level items must be restored — not just the previously-filtered
+	// subset. Regression guard for pushMenu snapshotting FilteredItems() while a
+	// filter was active.
+	require.Len(t, c.list.FilteredItems(), 2, "popping should restore the full parent list")
+}
+
 func setupMenuHierarchy(t *testing.T) *Commands {
 	t.Helper()
 	c := newTestCommands(t)

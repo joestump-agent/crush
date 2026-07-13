@@ -420,6 +420,13 @@ func (c *Commands) inSubMenu() bool {
 
 // pushMenu saves the current list state and navigates into a sub-menu.
 func (c *Commands) pushMenu(parent *CommandItem) {
+	// Clear any active filter before snapshotting so we save the FULL parent
+	// list, not just the currently-matched subset. Otherwise popping back would
+	// drop every top-level item that didn't match the filter that was active
+	// when the user entered the sub-menu.
+	c.input.SetValue("")
+	c.list.SetFilter("")
+
 	// Save current visible items (includes FilterableItem interface).
 	c.menuStack = append(c.menuStack, menuLevel{
 		items: c.list.FilteredItems(),
