@@ -2170,14 +2170,10 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				}
 			case key.Matches(msg, m.keyMap.Tab):
 				if m.state != uiLanding {
-					if m.isCompact {
-						m.setState(m.state, uiFocusMain)
-						m.textarea.Blur()
-						m.chat.Focus()
-						m.chat.SetSelected(m.chat.Len() - 1)
-					} else {
-						m.focusSidebar()
-					}
+					m.setState(m.state, uiFocusMain)
+					m.textarea.Blur()
+					m.chat.Focus()
+					m.chat.SetSelected(m.chat.Len() - 1)
 				}
 			case key.Matches(msg, m.keyMap.Editor.OpenEditor):
 				if m.isAgentBusy() {
@@ -2311,18 +2307,13 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			}
 		case uiFocusSidebar:
 			switch {
-			case key.Matches(msg, m.keyMap.Tab):
+			case key.Matches(msg, m.keyMap.Tab), key.Matches(msg, m.keyMap.Editor.Escape):
 				m.focus = uiFocusEditor
 				cmds = append(cmds, m.textarea.Focus())
-				m.sidebarScroll = 0
 			case key.Matches(msg, m.keyMap.Chat.Up):
 				m.sidebarScroll = max(0, m.sidebarScroll-1)
 			case key.Matches(msg, m.keyMap.Chat.Down):
 				m.sidebarScroll++
-			case msg.Code == 'g' && msg.Text == "g":
-				m.sidebarScroll = 0
-			case msg.Code == 'G':
-				m.sidebarScroll = 9999
 			}
 		case uiFocusMain:
 			switch {
@@ -3417,6 +3408,7 @@ func (m *UI) focusSidebar() {
 	m.focus = uiFocusSidebar
 	m.textarea.Blur()
 	m.chat.Blur()
+	m.updateLayoutAndSize()
 }
 
 // mimeOf detects the MIME type of the given content.

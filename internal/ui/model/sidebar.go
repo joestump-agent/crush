@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"image"
+	"strings"
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/ui/common"
@@ -196,25 +197,39 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 	skillsSection := m.skillsInfo(width, maxSkills, true)
 	filesSection := m.filesInfo(m.com.Workspace.WorkingDir(), width, maxFiles, true)
 
-	style := lipgloss.NewStyle().
-		MaxWidth(width).
-		MaxHeight(height)
+	var borderStyle lipgloss.Border = lipgloss.NormalBorder()
 	if focused {
-		style = style.BorderLeft(true).BorderStyle(lipgloss.ThickBorder())
+		borderStyle = lipgloss.ThickBorder()
 	}
+
+	fullContent := lipgloss.JoinVertical(
+		lipgloss.Left,
+		sidebarHeader,
+		filesSection,
+		"",
+		lspSection,
+		"",
+		mcpSection,
+		"",
+		skillsSection,
+	)
+
+	// Apply scroll offset when focused.
+	contentLines := strings.Split(fullContent, "\n")
+	if m.sidebarScroll > 0 && m.sidebarScroll < len(contentLines) {
+		contentLines = contentLines[m.sidebarScroll:]
+	} else if m.sidebarScroll >= len(contentLines) {
+		contentLines = contentLines[max(0, len(contentLines)-1):]
+	}
+	m.sidebarScroll = min(m.sidebarScroll, max(0, len(contentLines)-1))
+	scrolledContent := strings.Join(contentLines, "\n")
+
 	uv.NewStyledString(
-		style.Render(
-			lipgloss.JoinVertical(
-				lipgloss.Left,
-				sidebarHeader,
-				filesSection,
-				"",
-				lspSection,
-				"",
-				mcpSection,
-				"",
-				skillsSection,
-			),
-		),
+		lipgloss.NewStyle().
+			MaxWidth(width).
+			MaxHeight(height).
+			BorderLeft(true).
+			BorderStyle(borderStyle).
+			Render(scrolledContent),
 	).Draw(scr, area)
 }
