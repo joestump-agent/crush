@@ -23,7 +23,6 @@ const CommandsID = "commands"
 // menuLevel captures the parent state when navigating into a sub-menu.
 type menuLevel struct {
 	items []list.Item
-	title string
 }
 
 // CommandType represents the type of commands being displayed.
@@ -430,7 +429,6 @@ func (c *Commands) pushMenu(parent *CommandItem) {
 	// Save current visible items (includes FilterableItem interface).
 	c.menuStack = append(c.menuStack, menuLevel{
 		items: c.list.FilteredItems(),
-		title: parent.title,
 	})
 	c.breadcrumb = append(c.breadcrumb, parent.title)
 
@@ -461,9 +459,7 @@ func (c *Commands) popMenu() {
 			fitems = append(fitems, fi)
 		}
 	}
-	if len(fitems) > 0 {
-		c.list.SetItems(fitems...)
-	}
+	c.list.SetItems(fitems...)
 	c.list.SetFilter("")
 	c.list.ScrollToTop()
 	c.list.SetSelected(0)
