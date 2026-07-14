@@ -217,9 +217,10 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 		skillsSection,
 	)
 
-	// Apply scroll offset when focused. Clamp against real content height.
+	// Apply scroll offset. Clamp against real content height.
 	contentLines := strings.Split(fullContent, "\n")
-	maxScroll := max(0, len(contentLines)-height)
+	contentHeight := len(contentLines)
+	maxScroll := max(0, contentHeight-height)
 	m.sidebarScroll = min(m.sidebarScroll, maxScroll)
 	scroll := min(m.sidebarScroll, maxScroll)
 	if scroll > 0 && scroll < len(contentLines) {
@@ -227,13 +228,22 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 	}
 	scrolledContent := strings.Join(contentLines, "\n")
 
-	renderStyle := lipgloss.NewStyle().
-		MaxWidth(width).
-		MaxHeight(height)
-	if focused {
-		renderStyle = renderStyle.BorderLeft(true).BorderStyle(lipgloss.ThickBorder())
+	// Reserve 1 column for scrollbar when focused (same pattern as chat panel).
+	contentWidth := width
+	var scrollbar string
+	if focused && contentHeight > height {
+		contentWidth = width - 1
+		scrollbar = common.Scrollbar(t, height, contentHeight, height, scroll)
 	}
-	uv.NewStyledString(
-		renderStyle.Render(scrolledContent),
-	).Draw(scr, area)
+
+	contentStyle := lipgloss.NewStyle().
+		MaxWidth(contentWidth).
+		MaxHeight(height)
+	rendered := contentStyle.Render(scrolledContent)
+
+	if scrollbar != "" {
+		rendered = lipgloss.JoinHorizontal(lipgloss.Top, rendered, scrollbar)
+	}
+
+	uv.NewStyledString(rendered).Draw(scr, area)
 }
