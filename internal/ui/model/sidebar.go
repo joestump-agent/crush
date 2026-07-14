@@ -127,6 +127,21 @@ func getDynamicHeightLimits(availableHeight, fileCount, lspCount, mcpCount, skil
 	return maxFiles, maxLSPs, maxMCPs, maxSkills
 }
 
+// scrollSidebarOnWheel scrolls the sidebar when a wheel event lands over it,
+// returning true if it handled the event. DeltaY>0 is a scroll-down (matching
+// list.ScrollBy and the chat wheel handler), and a higher sidebarScroll shows
+// lower content, so the delta is added — keeping the wheel consistent with the
+// chat panel and the Down key. The upper bound is clamped at draw time.
+func (m *UI) scrollSidebarOnWheel(msg common.CoalescedWheelMsg) bool {
+	if msg.Mouse.X < m.layout.sidebar.Min.X || msg.Mouse.X >= m.layout.sidebar.Max.X {
+		return false
+	}
+	if lines := int(msg.DeltaY); lines != 0 {
+		m.sidebarScroll = max(0, m.sidebarScroll+lines)
+	}
+	return true
+}
+
 // sidebar renders the chat sidebar containing session title, working
 // directory, model info, file list, LSP status, and MCP status.
 func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {

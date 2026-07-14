@@ -936,11 +936,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.state {
 		case uiChat:
 			// Route wheel events to the sidebar if the cursor is over it.
-			if msg.Mouse.X >= m.layout.sidebar.Min.X && msg.Mouse.X < m.layout.sidebar.Max.X {
-				lines := int(msg.DeltaY)
-				if lines != 0 {
-					m.sidebarScroll = max(0, m.sidebarScroll-lines)
-				}
+			if m.scrollSidebarOnWheel(msg) {
 				break
 			}
 			if msg.DeltaX != 0 {
