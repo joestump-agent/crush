@@ -50,7 +50,8 @@ func newTestSkillsDialog(t *testing.T, entries []skills.CatalogEntry, states []*
 func TestSkillsDialog_EscCloses(t *testing.T) {
 	t.Parallel()
 
-	d := newTestSkillsDialog(t,
+	d := newTestSkillsDialog(
+		t,
 		[]skills.CatalogEntry{{ID: "a", Name: "Alpha", Source: skills.SourceSystem}},
 		nil,
 		nil,
@@ -64,7 +65,8 @@ func TestSkillsDialog_EscCloses(t *testing.T) {
 func TestSkillsDialog_ReloadAction(t *testing.T) {
 	t.Parallel()
 
-	d := newTestSkillsDialog(t,
+	d := newTestSkillsDialog(
+		t,
 		[]skills.CatalogEntry{{ID: "a", Name: "Alpha", Source: skills.SourceSystem}},
 		nil,
 		nil,
@@ -78,7 +80,8 @@ func TestSkillsDialog_ReloadAction(t *testing.T) {
 func TestSkillsDialog_ToggleAction(t *testing.T) {
 	t.Parallel()
 
-	d := newTestSkillsDialog(t,
+	d := newTestSkillsDialog(
+		t,
 		[]skills.CatalogEntry{{ID: "alpha", Name: "Alpha", Source: skills.SourceSystem}},
 		nil,
 		nil,
@@ -93,7 +96,8 @@ func TestSkillsDialog_ToggleAction(t *testing.T) {
 func TestSkillsDialog_NavigationWraps(t *testing.T) {
 	t.Parallel()
 
-	d := newTestSkillsDialog(t,
+	d := newTestSkillsDialog(
+		t,
 		[]skills.CatalogEntry{
 			{ID: "a", Name: "Alpha", Source: skills.SourceSystem},
 			{ID: "b", Name: "Beta", Source: skills.SourceUser},
@@ -124,7 +128,8 @@ func TestSkillsDialog_NavigationWraps(t *testing.T) {
 func TestSkillsDialog_FilterNarrowsList(t *testing.T) {
 	t.Parallel()
 
-	d := newTestSkillsDialog(t,
+	d := newTestSkillsDialog(
+		t,
 		[]skills.CatalogEntry{
 			{ID: "alpha", Name: "Alpha", Source: skills.SourceSystem},
 			{ID: "beta", Name: "Beta", Source: skills.SourceUser},
@@ -202,7 +207,8 @@ func TestSkillsDialog_ShowsDisabledSkillsFromStates(t *testing.T) {
 
 	// Catalog returns only active skills. A disabled skill should still
 	// appear via the states list.
-	d := newTestSkillsDialog(t,
+	d := newTestSkillsDialog(
+		t,
 		[]skills.CatalogEntry{{ID: "active", Name: "Active", Source: skills.SourceSystem}},
 		[]*skills.SkillState{
 			{Name: "Active", State: skills.StateNormal},
@@ -223,4 +229,29 @@ func TestSkillsDialog_ShowsDisabledSkillsFromStates(t *testing.T) {
 	}
 	require.True(t, names["Active"])
 	require.True(t, names["DisabledOne"])
+}
+
+func TestSkillsDialog_ActiveSkillNotDuplicatedByState(t *testing.T) {
+	t.Parallel()
+
+	// In production CatalogEntry.ID is the skill's file path (not its name),
+	// while SkillState.Name is the name, and the states list includes active
+	// skills. The dedup must key on name, or an active skill present in both
+	// the catalog and the states list gets listed twice (once "on", once
+	// "off").
+	d := newTestSkillsDialog(
+		t,
+		[]skills.CatalogEntry{
+			{ID: "/skills/alpha/SKILL.md", Name: "Alpha", Source: skills.SourceUser},
+		},
+		[]*skills.SkillState{
+			{Name: "Alpha", State: skills.StateNormal},
+		},
+		nil,
+	)
+
+	items := d.list.FilteredItems()
+	require.Len(t, items, 1, "an active skill must not be duplicated by its states entry")
+	require.Equal(t, "Alpha", items[0].(*SkillItem).entry.Name)
+	require.False(t, items[0].(*SkillItem).disabled, "the single entry should be the active one")
 }

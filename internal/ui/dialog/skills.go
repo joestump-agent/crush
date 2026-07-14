@@ -1,7 +1,7 @@
 package dialog
 
 import (
-	"fmt"
+	"context"
 	"strings"
 
 	"charm.land/bubbles/v2/help"
@@ -181,7 +181,7 @@ func NewSkills(com *common.Common, ws workspace.Workspace) *Skills {
 
 // skillItems builds the list items from current skill catalog entries and states.
 func (d *Skills) skillItems() []list.FilterableItem {
-	entries, err := d.ws.ListSkills(nil)
+	entries, err := d.ws.ListSkills(context.Background())
 	if err != nil || len(entries) == 0 {
 		return nil
 	}
@@ -203,17 +203,21 @@ func (d *Skills) skillItems() []list.FilterableItem {
 	// Also include disabled skills from all skills, not just active catalog.
 	// The catalog only returns active skills, so we also need to include
 	// disabled ones from the states list.
-	seenIDs := make(map[string]bool, len(entries))
+	// Track which skills are already listed by NAME. CatalogEntry.ID is the
+	// skill's file path, not its name, whereas SkillState.Name is the name —
+	// so the disabled-skill dedup below must key on name, or every active
+	// skill would be re-appended as "off".
+	seenNames := make(map[string]bool, len(entries))
 	items := make([]list.FilterableItem, 0, len(entries))
 	for _, entry := range entries {
-		seenIDs[entry.ID] = true
+		seenNames[entry.Name] = true
 		state := stateMap[entry.Name]
 		items = append(items, NewSkillItem(d.com.Styles, entry, state, disabledSet[entry.Name]))
 	}
 
 	// Add skills that are discovered but disabled (not in the active catalog).
 	for _, st := range states {
-		if seenIDs[st.Name] {
+		if seenNames[st.Name] {
 			continue
 		}
 		entry := skills.CatalogEntry{
@@ -351,21 +355,4 @@ func (d *Skills) Refresh() {
 	d.list.ScrollToTop()
 	d.list.SetSelected(0)
 	d.input.SetValue("")
-}
-
-// skillCount returns a formatted string with skill statistics.
-func skillCount(items []list.FilterableItem) string {
-	active, errored, disabled := 0, 0, 0
-	for _, item := range items {
-		if si, ok := item.(*SkillItem); ok {
-			if si.disabled {
-				disabled++
-			} else if si.state != nil && si.state.State == skills.StateError {
-				errored++
-			} else {
-				active++
-			}
-		}
-	}
-	return fmt.Sprintf("%d active · %d disabled · %d errors", active, disabled, errored)
 }
