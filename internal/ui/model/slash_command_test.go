@@ -124,6 +124,10 @@ func TestSlashCompactTriggersSummarize(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("expected a command to be returned")
 	}
+	cmd()
+	if ws.summCall != "s1" {
+		t.Fatalf("expected AgentSummarize called with s1, got %q", ws.summCall)
+	}
 }
 
 // TestSlashCompactNoSession verifies /compact is a no-op without a session.
@@ -138,7 +142,8 @@ func TestSlashCompactNoSession(t *testing.T) {
 	}
 }
 
-// TestSlashCompactBlockedWhenAgentBusy verifies /compact warns when busy.
+// TestSlashCompactBlockedWhenAgentBusy verifies /compact warns when busy and
+// does not call AgentSummarize even if the returned cmd is executed.
 func TestSlashCompactBlockedWhenAgentBusy(t *testing.T) {
 	t.Parallel()
 
@@ -146,9 +151,12 @@ func TestSlashCompactBlockedWhenAgentBusy(t *testing.T) {
 	m := newSlashCommandUI(ws)
 	m.session = &session.Session{ID: "s1"}
 
-	_, ok := m.handleSlashCommand("/compact")
+	cmd, ok := m.handleSlashCommand("/compact")
 	if !ok {
 		t.Fatal("handleSlashCommand(/compact) should still match when busy")
+	}
+	if cmd != nil {
+		cmd()
 	}
 	if ws.summCall != "" {
 		t.Fatal("AgentSummarize should not be called when agent is busy")

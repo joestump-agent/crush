@@ -4133,8 +4133,8 @@ func (m *UI) handleSlashCommand(value string) (tea.Cmd, bool) {
 	switch value {
 	case "/clear":
 		m.randomizePlaceholders()
-		m.historyReset()
 		if m.isAgentBusy() {
+			m.historyReset()
 			return util.ReportWarn("Agent is busy, please wait before starting a new session..."), true
 		}
 		return m.newSession(), true
