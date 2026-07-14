@@ -93,12 +93,15 @@ func TestSlashClearStartsNewSession(t *testing.T) {
 	}
 }
 
-// TestSlashClearBlockedWhenAgentBusy verifies /clear warns when busy.
+// TestSlashClearBlockedWhenAgentBusy verifies /clear warns when busy, keeps
+// the session, and still resets the prompt history.
 func TestSlashClearBlockedWhenAgentBusy(t *testing.T) {
 	t.Parallel()
 
 	m := newSlashCommandUI(&slashCommandWorkspace{ready: true, busy: map[string]bool{"s1": true}})
 	m.session = &session.Session{ID: "s1"}
+	m.promptHistory.index = 3
+	m.promptHistory.draft = "wip"
 
 	_, ok := m.handleSlashCommand("/clear")
 	if !ok {
@@ -106,6 +109,31 @@ func TestSlashClearBlockedWhenAgentBusy(t *testing.T) {
 	}
 	if m.session == nil {
 		t.Fatal("session should not be cleared when agent is busy")
+	}
+	if m.promptHistory.index != -1 || m.promptHistory.draft != "" {
+		t.Fatalf("prompt history not reset on busy /clear: index=%d draft=%q", m.promptHistory.index, m.promptHistory.draft)
+	}
+}
+
+// TestSlashClearNoSessionResetsHistory verifies /clear with no active session
+// is a no-op for session state but still resets the prompt history/draft —
+// newSession early-returns without resetting, so /clear handles it directly.
+func TestSlashClearNoSessionResetsHistory(t *testing.T) {
+	t.Parallel()
+
+	m := newSlashCommandUI(&slashCommandWorkspace{ready: true})
+	m.promptHistory.index = 3
+	m.promptHistory.draft = "wip"
+
+	cmd, ok := m.handleSlashCommand("/clear")
+	if !ok {
+		t.Fatal("handleSlashCommand(/clear) should match without a session")
+	}
+	if cmd != nil {
+		t.Fatal("expected no command when there is no session to clear")
+	}
+	if m.promptHistory.index != -1 || m.promptHistory.draft != "" {
+		t.Fatalf("prompt history not reset on no-session /clear: index=%d draft=%q", m.promptHistory.index, m.promptHistory.draft)
 	}
 }
 
