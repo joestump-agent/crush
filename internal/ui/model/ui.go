@@ -3440,6 +3440,9 @@ func (m *UI) isAgentBusy() bool {
 	if m.bangCancel != nil {
 		return true
 	}
+	if m.com == nil || m.com.Workspace == nil {
+		return false
+	}
 	return m.com.Workspace.AgentIsReady() &&
 		m.com.Workspace.AgentIsBusy()
 }
