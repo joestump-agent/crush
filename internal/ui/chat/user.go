@@ -191,8 +191,13 @@ func (m *UserMessageItem) renderChannelMessage(raw string, width int) string {
 		metaParts = append(metaParts, m.sty.Messages.ChannelInfoTimestamp.Render(fmt.Sprintf("at %s", ts)))
 	}
 
-	metaLine := common.Section(m.sty, strings.Join(metaParts, " "), width)
+	// With no metadata attributes at all, render the body alone rather than a
+	// lone separator line under it.
+	if len(metaParts) == 0 {
+		return bodyRendered
+	}
 
+	metaLine := common.Section(m.sty, strings.Join(metaParts, " "), width)
 	if bodyRendered == "" {
 		return metaLine
 	}

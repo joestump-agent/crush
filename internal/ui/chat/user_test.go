@@ -199,6 +199,8 @@ func TestRawRender_ChannelMessageNoMetadata(t *testing.T) {
 	require.NotContains(t, out, "via")
 	require.NotContains(t, out, "at ")
 	require.NotContains(t, out, "<channel")
+	// With no metadata, there must be no lone Section separator line under the body.
+	require.NotContains(t, out, styles.SectionSeparator, "no separator line when there is no metadata")
 }
 
 // TestRawRender_ChannelMessageMetadataFormat verifies the exact format of the
