@@ -2,6 +2,7 @@ package dialog
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -18,10 +19,11 @@ type stubSkillsWorkspace struct {
 	entries []skills.CatalogEntry
 	states  []*skills.SkillState
 	cfg     *config.Config
+	listErr error
 }
 
 func (w *stubSkillsWorkspace) ListSkills(_ context.Context) ([]skills.CatalogEntry, error) {
-	return w.entries, nil
+	return w.entries, w.listErr
 }
 
 func (w *stubSkillsWorkspace) GetSkillStates() []*skills.SkillState {
@@ -229,6 +231,31 @@ func TestSkillsDialog_ShowsDisabledSkillsFromStates(t *testing.T) {
 	}
 	require.True(t, names["Active"])
 	require.True(t, names["DisabledOne"])
+}
+
+func TestSkillsDialog_ListSkillsErrorRendersEmpty(t *testing.T) {
+	t.Parallel()
+
+	// When ListSkills fails, the dialog should render empty rather than
+	// panicking or showing stale data, and key actions must be safe no-ops.
+	s := styles.CharmtonePantera()
+	com := &common.Common{
+		Workspace: &stubSkillsWorkspace{
+			listErr: errors.New("boom"),
+			cfg:     &config.Config{Options: &config.Options{}},
+		},
+		Styles: &s,
+	}
+	d := NewSkills(com, com.Workspace)
+
+	require.Empty(t, d.list.FilteredItems(), "no items when ListSkills errors")
+	require.Nil(t, d.selectedSkill(), "no selection when the list is empty")
+
+	// Enter (toggle) and Ctrl+R (reload) must not panic with no selection.
+	require.Nil(t, d.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter}), "toggle is a no-op with no selection")
+	reload := d.HandleMsg(tea.KeyPressMsg{Code: 'r', Mod: tea.ModCtrl})
+	_, ok := reload.(ActionSkillsReload)
+	require.True(t, ok, "reload should still fire even when the list is empty")
 }
 
 func TestSkillsDialog_ActiveSkillNotDuplicatedByState(t *testing.T) {
