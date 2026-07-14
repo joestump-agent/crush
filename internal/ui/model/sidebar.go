@@ -250,12 +250,11 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 	}
 	scrolledContent := strings.Join(contentLines, "\n")
 
-	// Reserve 1 column for scrollbar when focused (same pattern as chat panel).
+	const scrollbarWidth = 1
+	scrollbarNeeded := contentHeight > height
 	contentWidth := width
-	var scrollbar string
-	if focused && contentHeight > height {
-		contentWidth = width - 1
-		scrollbar = common.Scrollbar(t, height, contentHeight, height, scroll)
+	if scrollbarNeeded {
+		contentWidth = max(width-scrollbarWidth, 0)
 	}
 
 	contentStyle := lipgloss.NewStyle().
@@ -263,7 +262,21 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 		MaxHeight(height)
 	rendered := contentStyle.Render(scrolledContent)
 
-	if scrollbar != "" {
+	if scrollbarNeeded {
+		var scrollbar string
+		if focused {
+			scrollbar = common.Scrollbar(t, height, contentHeight, height, scroll)
+		} else {
+			var sb strings.Builder
+			for i := 0; i < height; i++ {
+				if i > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(" ")
+			}
+			scrollbar = sb.String()
+		}
+
 		rendered = lipgloss.JoinHorizontal(lipgloss.Top, rendered, scrollbar)
 	}
 
