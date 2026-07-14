@@ -71,8 +71,9 @@ func TestChannelStatusItems_StateVariants(t *testing.T) {
 		"starting":  {Name: "starting", State: mcp.StateStarting, Channel: true},
 		"disabled":  {Name: "disabled", State: mcp.StateDisabled, Channel: true},
 		"errorless": {Name: "errorless", State: mcp.StateError, Channel: true}, // error state, nil Error
+		"unknown":   {Name: "unknown", State: mcp.State(99), Channel: true},    // out-of-range → offline
 	}
-	m := newChannelsTestUI(t, []string{"starting", "disabled", "errorless"}, states)
+	m := newChannelsTestUI(t, []string{"starting", "disabled", "errorless", "unknown"}, states)
 
 	got := map[string]string{}
 	for _, it := range m.channelStatusItems() {
@@ -81,6 +82,7 @@ func TestChannelStatusItems_StateVariants(t *testing.T) {
 	require.Contains(t, got["starting"], "starting")
 	require.Contains(t, got["disabled"], "disabled")
 	require.Equal(t, "error", got["errorless"], "error state with no Error shows bare 'error'")
+	require.Contains(t, got["unknown"], "offline", "unknown state falls back to offline")
 }
 
 // TestChannelsInfo_EmptyShowsNone verifies the empty state renders the section
