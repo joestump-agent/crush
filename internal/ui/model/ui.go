@@ -2800,8 +2800,12 @@ func (m *UI) FullHelp() [][]key.Binding {
 				k.Editor.MentionFile,
 				k.Editor.OpenEditor,
 			}
+			// AddImage (ctrl+f) opens the file picker, which now accepts text
+			// files on any model, so its hint always shows. Only the clipboard
+			// image paste stays gated to image-capable models.
+			editorBinds = append(editorBinds, k.Editor.AddImage)
 			if m.currentModelSupportsImages() {
-				editorBinds = append(editorBinds, k.Editor.AddImage, k.Editor.PasteImage)
+				editorBinds = append(editorBinds, k.Editor.PasteImage)
 			}
 			binds = append(binds, editorBinds)
 			if hasAttachments {
@@ -2855,8 +2859,12 @@ func (m *UI) FullHelp() [][]key.Binding {
 				k.Editor.MentionFile,
 				k.Editor.OpenEditor,
 			}
+			// AddImage (ctrl+f) opens the file picker, which now accepts text
+			// files on any model, so its hint always shows. Only the clipboard
+			// image paste stays gated to image-capable models.
+			editorBinds = append(editorBinds, k.Editor.AddImage)
 			if m.currentModelSupportsImages() {
-				editorBinds = append(editorBinds, k.Editor.AddImage, k.Editor.PasteImage)
+				editorBinds = append(editorBinds, k.Editor.PasteImage)
 			}
 			binds = append(binds, editorBinds)
 			if hasAttachments {
