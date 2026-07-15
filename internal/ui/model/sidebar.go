@@ -145,21 +145,27 @@ func (m *UI) scrollSidebarOnWheel(msg common.CoalescedWheelMsg) bool {
 }
 
 // sidebarScrollbarWidth is the fixed 1-column gutter the sidebar reserves for
-// its scroll indicator.
+// its scroll indicator (flush to the terminal's rightmost column).
 const sidebarScrollbarWidth = 1
 
+// sidebarRightPadWidth is a fixed 1-column blank spacer between the sidebar
+// content and the scrollbar gutter, so the scrollbar never sits flush against
+// the content.
+const sidebarRightPadWidth = 1
+
 // sidebarContentWidth returns the width available for sidebar content after
-// reserving the scrollbar gutter. The gutter is reserved unconditionally (not
-// only when content overflows) so the content — including the fixed-width logo,
-// which is cached at this same width — is always rendered at its final width
-// and never clipped when the scrollbar is drawn. Keeping it focus- and
-// overflow-independent also stops the content from shifting on focus changes.
+// reserving the right pad and the scrollbar gutter. Both are reserved
+// unconditionally (not only when content overflows) so the content — including
+// the fixed-width logo, which is cached at this same width — is always rendered
+// at its final width and never clipped when the scrollbar is drawn. Keeping it
+// focus- and overflow-independent also stops the content from shifting on focus
+// changes.
 func sidebarContentWidth(sidebarWidth int) int {
-	return max(sidebarWidth-sidebarScrollbarWidth, 0)
+	return max(sidebarWidth-sidebarScrollbarWidth-sidebarRightPadWidth, 0)
 }
 
-// blankSidebarColumn renders an empty gutter column height rows tall, used when
-// the sidebar reserves scrollbar space but has no scrollbar to draw.
+// blankSidebarColumn renders an empty column height rows tall, used for the
+// right pad and for the scrollbar gutter when there is no scrollbar to draw.
 func blankSidebarColumn(height int) string {
 	if height <= 0 {
 		return ""
@@ -290,11 +296,13 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 		MaxHeight(height)
 	rendered := contentStyle.Render(scrolledContent)
 
-	// The gutter column is always reserved (see sidebarContentWidth). Draw a
-	// real scrollbar when the sidebar is focused and its content overflows;
-	// otherwise fill the gutter with a blank spacer so nothing shifts and the
-	// scrollbar never overlaps content. Scrollbar returns "" when the content
-	// fits, so an unfocused or non-overflowing sidebar gets the blank spacer.
+	// The right pad and gutter columns are always reserved (see
+	// sidebarContentWidth). Draw a real scrollbar in the gutter when the sidebar
+	// is focused and its content overflows; otherwise fill it with a blank
+	// spacer so nothing shifts and the scrollbar never overlaps content.
+	// Scrollbar returns "" when the content fits, so an unfocused or
+	// non-overflowing sidebar gets the blank spacer. The pad is always blank,
+	// keeping the scrollbar off the content.
 	var gutter string
 	if focused {
 		gutter = common.Scrollbar(t, height, contentHeight, height, scroll)
@@ -302,7 +310,8 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 	if gutter == "" {
 		gutter = blankSidebarColumn(height)
 	}
-	rendered = lipgloss.JoinHorizontal(lipgloss.Top, rendered, gutter)
+	pad := blankSidebarColumn(height)
+	rendered = lipgloss.JoinHorizontal(lipgloss.Top, rendered, pad, gutter)
 
 	uv.NewStyledString(rendered).Draw(scr, area)
 }

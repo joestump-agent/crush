@@ -2975,11 +2975,12 @@ func (m *UI) generateLayout(w, h int) uiLayout {
 	helpHeight := 1
 	// The editor height: textarea height + margin for attachments and bottom spacing.
 	editorHeight := m.textarea.Height() + editorHeightMargin
-	// The sidebar width, budgeted right-to-left: the rightmost column is
-	// the scrollbar gutter (flush to the terminal edge), sidebarContentWidth
-	// is sidebarWidth-1, and 1 column of left padding separates sidebar from
+	// The sidebar width, budgeted right-to-left: the rightmost column is the
+	// scrollbar gutter (flush to the terminal edge), then a 1-column right pad
+	// keeps the scrollbar off the content, then sidebarContentWidth
+	// (sidebarWidth-2), and 1 column of left padding separates the sidebar from
 	// the main pane.
-	sidebarWidth := 30
+	sidebarWidth := 32
 	// The header height
 	const landingHeaderHeight = 4
 
