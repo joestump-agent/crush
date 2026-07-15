@@ -2663,12 +2663,13 @@ func (m *UI) ShortHelp() []key.Binding {
 			binds = append(binds, cancelBinding)
 		}
 
-		binds = append(
-			binds,
-			tab,
-			commands,
-			k.Models,
-		)
+		isSidebar := m.focus == uiFocusSidebar
+
+		commonBinds := []key.Binding{tab}
+		if !isSidebar {
+			commonBinds = append(commonBinds, commands, k.Models)
+		}
+		binds = append(binds, commonBinds...)
 
 		switch m.focus {
 		case uiFocusEditor:
@@ -2711,10 +2712,14 @@ func (m *UI) ShortHelp() []key.Binding {
 		)
 	}
 
+	isSidebar := m.focus == uiFocusSidebar
+	footerBinds := []key.Binding{k.Quit}
+	if !isSidebar {
+		footerBinds = append(footerBinds, k.Help)
+	}
 	binds = append(
 		binds,
-		k.Quit,
-		k.Help,
+		footerBinds...,
 	)
 
 	return binds
@@ -2754,11 +2759,16 @@ func (m *UI) FullHelp() [][]key.Binding {
 		mainBinds := []key.Binding{}
 		tab := k.Tab
 
+		isSidebar := m.focus == uiFocusSidebar
+
 		mainBinds = append(
 			mainBinds,
 			tab,
-			commands,
-			k.Models,
+		)
+		if !isSidebar {
+			mainBinds = append(mainBinds, commands, k.Models)
+		}
+		mainBinds = append(mainBinds,
 			k.Sessions,
 			k.ToggleYolo,
 		)
@@ -2847,12 +2857,14 @@ func (m *UI) FullHelp() [][]key.Binding {
 		}
 	}
 
+	isSidebar := m.focus == uiFocusSidebar
+	footerBinds := []key.Binding{k.Quit}
+	if !isSidebar {
+		footerBinds = append([]key.Binding{help}, footerBinds...)
+	}
 	binds = append(
 		binds,
-		[]key.Binding{
-			help,
-			k.Quit,
-		},
+		footerBinds,
 	)
 
 	return binds
