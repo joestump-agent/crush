@@ -495,6 +495,7 @@ func ExtractMessageItems(sty *styles.Styles, msg *message.Message, toolResults m
 			sty.Attachments.Image,
 			sty.Attachments.Text,
 			sty.Attachments.Skill,
+			sty.Attachments.Remove,
 		)
 		items = []MessageItem{NewUserMessageItem(sty, msg, r)}
 		if IsChannelMessage(msg) {

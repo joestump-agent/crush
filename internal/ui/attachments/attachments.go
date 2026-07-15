@@ -74,6 +74,22 @@ func (m *Attachments) Update(msg tea.Msg) bool {
 	return false
 }
 
+// HandleClick processes a mouse click at the given x offset within the
+// attachment row. If the click lands on a remove button, the
+// corresponding attachment is removed. It returns true if the click was
+// handled.
+func (m *Attachments) HandleClick(x int) bool {
+	if m.deleting || len(m.list) == 0 {
+		return false
+	}
+	idx := m.renderer.HitTestRemove(m.list, x)
+	if idx >= 0 && idx < len(m.list) {
+		m.list = slices.Delete(m.list, idx, idx+1)
+		return true
+	}
+	return false
+}
+
 func (m *Attachments) Render(width int) string {
 	return m.renderer.Render(m.list, m.deleting, width)
 }
@@ -82,35 +98,52 @@ func (m *Attachments) Render(width int) string {
 // styles in place.
 func (m *Attachments) Renderer() *Renderer { return m.renderer }
 
-func NewRenderer(normalStyle, deletingStyle, imageStyle, textStyle, skillStyle lipgloss.Style) *Renderer {
+func NewRenderer(normalStyle, deletingStyle, imageStyle, textStyle, skillStyle, removeStyle lipgloss.Style) *Renderer {
 	return &Renderer{
 		normalStyle:   normalStyle,
 		textStyle:     textStyle,
 		imageStyle:    imageStyle,
 		skillStyle:    skillStyle,
+		removeStyle:   removeStyle,
 		deletingStyle: deletingStyle,
 	}
 }
 
 // SetStyles updates the renderer styles in place.
-func (r *Renderer) SetStyles(normalStyle, deletingStyle, imageStyle, textStyle, skillStyle lipgloss.Style) {
+func (r *Renderer) SetStyles(normalStyle, deletingStyle, imageStyle, textStyle, skillStyle, removeStyle lipgloss.Style) {
 	r.normalStyle = normalStyle
 	r.textStyle = textStyle
 	r.imageStyle = imageStyle
 	r.skillStyle = skillStyle
+	r.removeStyle = removeStyle
 	r.deletingStyle = deletingStyle
 }
 
 type Renderer struct {
-	normalStyle, textStyle, imageStyle, skillStyle, deletingStyle lipgloss.Style
+	normalStyle, textStyle, imageStyle, skillStyle, removeStyle, deletingStyle lipgloss.Style
+	// bounds stores the X-coordinate ranges of each chip's remove
+	// button from the most recent Render call, for mouse hit-testing.
+	bounds []chipBounds
 }
 
+// chipBounds holds the rendered strings and the X-coordinate range of
+// each chip's remove button for hit-testing.
+type chipBounds struct {
+	startX    int
+	removeEnd int // exclusive end X of the remove button (0 if none)
+}
+
+// Render renders the attachment chips. When not in deleting mode, each
+// chip shows an icon, filename, and a remove button (✕) on the right.
 func (r *Renderer) Render(attachments []message.Attachment, deleting bool, width int) string {
 	var chips []string
+	r.bounds = r.bounds[:0]
 
-	maxItemWidth := lipgloss.Width(r.imageStyle.String() + r.normalStyle.Render(strings.Repeat("x", maxFilename)))
+	removeStr := r.removeStyle.String()
+	maxItemWidth := lipgloss.Width(r.imageStyle.String() + r.normalStyle.Render(strings.Repeat("x", maxFilename)) + removeStr)
 	fits := int(math.Floor(float64(width)/float64(maxItemWidth))) - 1
 
+	var offset int
 	for i, att := range attachments {
 		filename := filepath.Base(att.FileName)
 		// Truncate if needed.
@@ -124,12 +157,26 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting bool, width
 				r.deletingStyle.Render(fmt.Sprintf("%d", i)),
 				r.normalStyle.Render(filename),
 			)
+			offset += lipgloss.Width(r.deletingStyle.Render(fmt.Sprintf("%d", i))) + lipgloss.Width(r.normalStyle.Render(filename))
 		} else {
+			iconStr := r.icon(att).String()
+			nameStr := r.normalStyle.Render(filename)
+
 			chips = append(
 				chips,
-				r.icon(att).String(),
-				r.normalStyle.Render(filename),
+				iconStr,
+				nameStr,
+				removeStr,
 			)
+
+			chipW := lipgloss.Width(iconStr) + lipgloss.Width(nameStr)
+			removeStart := offset + chipW
+			removeW := lipgloss.Width(removeStr)
+			r.bounds = append(r.bounds, chipBounds{
+				startX:    removeStart,
+				removeEnd: removeStart + removeW,
+			})
+			offset = removeStart + removeW
 		}
 
 		if i == fits && len(attachments) > i {
@@ -139,6 +186,17 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting bool, width
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Left, chips...)
+}
+
+// HitTestRemove returns the index of the attachment whose remove button
+// contains the given x coordinate, or -1 if none.
+func (r *Renderer) HitTestRemove(_ []message.Attachment, x int) int {
+	for i, b := range r.bounds {
+		if x >= b.startX && x < b.removeEnd {
+			return i
+		}
+	}
+	return -1
 }
 
 func (r *Renderer) icon(a message.Attachment) lipgloss.Style {
