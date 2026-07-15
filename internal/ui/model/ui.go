@@ -2975,7 +2975,10 @@ func (m *UI) generateLayout(w, h int) uiLayout {
 	helpHeight := 1
 	// The editor height: textarea height + margin for attachments and bottom spacing.
 	editorHeight := m.textarea.Height() + editorHeightMargin
-	// The sidebar width
+	// The sidebar width, budgeted right-to-left: the rightmost column is
+	// the scrollbar gutter (flush to the terminal edge), sidebarContentWidth
+	// is sidebarWidth-1, and 1 column of left padding separates sidebar from
+	// the main pane.
 	sidebarWidth := 30
 	// The header height
 	const landingHeaderHeight = 4
@@ -3121,8 +3124,13 @@ func (m *UI) generateLayout(w, h int) uiLayout {
 				layout.Len(appRect.Dx()-sidebarWidth),
 				layout.Fill(1),
 			).Split(appRect).Assign(&mainRect, &sideRect)
-			// Add padding left
+			// Add padding left (gap between main pane and sidebar)
 			sideRect.Min.X += 1
+			// The sidebar extends to the terminal's rightmost column so its
+			// reserved scrollbar gutter is flush to the edge and content is
+			// never clipped. The app-level right margin (appRect.Max.X -= 1)
+			// applies to the main pane; the sidebar claims that column back.
+			sideRect.Max.X = area.Max.X
 			var editorRect image.Rectangle
 			layout.Vertical(
 				layout.Len(mainRect.Dy()-editorHeight),
