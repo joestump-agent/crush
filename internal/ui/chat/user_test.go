@@ -25,6 +25,7 @@ func newTestUserItem(text string, createdAt int64) *UserMessageItem {
 		sty.Attachments.Image,
 		sty.Attachments.Text,
 		sty.Attachments.Skill,
+		sty.Attachments.Remove,
 	)
 	return NewUserMessageItem(&sty, msg, r).(*UserMessageItem)
 }
