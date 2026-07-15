@@ -174,7 +174,7 @@ func (h *mcpOAuthHandler) buildInner() (*auth.AuthorizationCodeHandler, error) {
 		},
 		RedirectURL: redirectURL,
 		AuthorizationCodeFetcher: func(fetchCtx context.Context, args *auth.AuthorizationArgs) (*auth.AuthorizationResult, error) {
-			return openBrowserAndCapture(fetchCtx, args.URL, port)
+			return openBrowserAndCapture(fetchCtx, args.URL, port, h.serverURL)
 		},
 	}
 	return auth.NewAuthorizationCodeHandler(cfg)
@@ -240,7 +240,7 @@ func (h *mcpOAuthHandler) discoverEndpoints(ctx context.Context, serverURL strin
 
 // openBrowserAndCapture opens the authorization URL in the user's
 // browser and listens on the given port for the OAuth callback redirect.
-func openBrowserAndCapture(ctx context.Context, authURL string, port int) (*auth.AuthorizationResult, error) {
+func openBrowserAndCapture(ctx context.Context, authURL string, port int, serverName string) (*auth.AuthorizationResult, error) {
 	resultCh := make(chan auth.AuthorizationResult, 1)
 	errCh := make(chan error, 1)
 
@@ -277,9 +277,14 @@ func openBrowserAndCapture(ctx context.Context, authURL string, port int) (*auth
 
 	slog.Info("Opening browser for MCP server authorization", "url", authURL)
 	if err := browser.OpenURL(authURL); err != nil {
-		// If the browser can't be opened (headless, etc.), log the
-		// URL so the user can open it manually.
-		slog.Warn("Failed to open browser for MCP OAuth. Please open this URL manually", "url", authURL, "error", err)
+		// If the browser can't be opened (headless, remote SSH, etc.), return
+		// a user-facing error containing the exact URL so the TUI can show it.
+		return nil, fmt.Errorf(
+			"could not open browser for MCP OAuth (%s): %w\nopen this URL manually to continue:\n%s",
+			serverName,
+			err,
+			authURL,
+		)
 	}
 
 	select {
