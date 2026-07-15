@@ -7,9 +7,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSidebarContentWidth verifies the sidebar always reserves exactly one
-// column for the scrollbar gutter (so the cached full-width logo, rendered at
-// this same width, is never clipped) and clamps at zero for tiny widths.
+// TestSidebarContentWidth verifies the sidebar always reserves two columns —
+// the right pad plus the scrollbar gutter (so the cached full-width logo,
+// rendered at this same width, is never clipped and the scrollbar never sits
+// flush against content) — and clamps at zero for tiny widths.
 func TestSidebarContentWidth(t *testing.T) {
 	t.Parallel()
 
@@ -17,8 +18,9 @@ func TestSidebarContentWidth(t *testing.T) {
 		sidebarWidth int
 		want         int
 	}{
-		{30, 29},
-		{2, 1},
+		{32, 30},
+		{3, 1},
+		{2, 0},
 		{1, 0},
 		{0, 0},
 	}

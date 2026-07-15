@@ -8,7 +8,7 @@ import (
 
 // TestSidebarLayoutFlushToEdge verifies that in the non-compact chat view the
 // sidebar rectangle extends to the terminal's rightmost column and is the full
-// sidebarWidth (30). This pins the scrollbar gutter flush to the edge so
+// sidebarWidth (32). This pins the scrollbar gutter flush to the edge so
 // content is never clipped and the rightmost terminal column is not wasted.
 //
 // See: https://github.com/joestump-agent/crush/issues/112
@@ -20,7 +20,7 @@ func TestSidebarLayoutFlushToEdge(t *testing.T) {
 	// branch we need to exercise.
 	layout := m.generateLayout(m.width, 50)
 
-	const sidebarWidth = 30
+	const sidebarWidth = 32
 
 	require.Equal(t, sidebarWidth, layout.sidebar.Dx(),
 		"sidebar should be the full sidebarWidth (%d), got %d",
