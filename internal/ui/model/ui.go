@@ -2019,17 +2019,27 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 	var cmds []tea.Cmd
 
 	handleGlobalKeys := func(msg tea.KeyPressMsg) bool {
+		// Commands, models, and help/more are not meaningful from the sidebar,
+		// so they are hidden from its help (see ShortHelp/FullHelp, #114) and
+		// gated off here. The sidebar case in the focus switch below does not
+		// currently route through this handler, so today this only matters as a
+		// guarantee: when the interactive secondary-agent sidebar lands and
+		// starts routing unhandled keys through handleGlobalKeys (like the
+		// editor/main cases already do), these three stay inert unless the help
+		// is deliberately updated to advertise them. Keep this in lockstep with
+		// the sidebar help and TestSidebarSuppressesGlobalKeys.
+		notSidebar := m.focus != uiFocusSidebar
 		switch {
-		case key.Matches(msg, m.keyMap.Help):
+		case notSidebar && key.Matches(msg, m.keyMap.Help):
 			m.status.ToggleHelp()
 			m.updateLayoutAndSize()
 			return true
-		case key.Matches(msg, m.keyMap.Commands):
+		case notSidebar && key.Matches(msg, m.keyMap.Commands):
 			if cmd := m.openCommandsDialog(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
 			return true
-		case key.Matches(msg, m.keyMap.Models):
+		case notSidebar && key.Matches(msg, m.keyMap.Models):
 			if cmd := m.openModelsDialog(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
@@ -2353,6 +2363,14 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				}
 			}
 		case uiFocusSidebar:
+			// The sidebar is currently a read-only status panel, so it only
+			// handles focus/scroll keys and intentionally does NOT fall through
+			// to handleGlobalKeys — every other key is inert while it's focused.
+			// When the interactive secondary-agent sidebar lands, route its keys
+			// here (and add `default: handleGlobalKeys(msg)` to keep global keys
+			// working, mirroring the editor/main cases). handleGlobalKeys already
+			// gates commands/models/help for sidebar focus, so those stay inert
+			// unless you also un-hide them from the sidebar help (#114).
 			switch {
 			case key.Matches(msg, m.keyMap.Tab), key.Matches(msg, m.keyMap.Editor.Escape):
 				m.focus = uiFocusEditor
