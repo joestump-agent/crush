@@ -44,7 +44,11 @@ type tokenStore struct {
 }
 
 func newTokenStore() *tokenStore {
-	dir := filepath.Dir(globalConfigPath())
+	// globalConfigPath already returns the crush config directory, so the
+	// token file sits alongside crush.json (e.g. ~/.config/crush/). Do not
+	// take filepath.Dir again — that would drop the file a level too high
+	// (e.g. ~/.config/).
+	dir := globalConfigPath()
 	return &tokenStore{
 		path: filepath.Join(dir, tokenFileName),
 		data: make(map[string]mcptoken),

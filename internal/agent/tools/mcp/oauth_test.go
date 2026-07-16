@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 )
@@ -102,4 +103,68 @@ func TestMCPOAuthHandler_TokenSourceEmptyByDefault(t *testing.T) {
 	ts, err := h.TokenSource(t.Context())
 	require.NoError(t, err)
 	require.Nil(t, ts)
+}
+
+func TestTokenStore_GetUnknownServer(t *testing.T) {
+	t.Parallel()
+	store := &tokenStore{
+		path: filepath.Join(t.TempDir(), "tokens.json"),
+		data: make(map[string]mcptoken),
+	}
+	_, ok := store.get("https://never-saved.example.com")
+	require.False(t, ok, "get should report ok=false for an unknown server")
+}
+
+func TestTokenStore_LoadMissingFile(t *testing.T) {
+	t.Parallel()
+	// Pointing at a non-existent file must not panic and must leave the
+	// store empty (first-run / no-tokens-yet case).
+	store := &tokenStore{
+		path: filepath.Join(t.TempDir(), "does-not-exist.json"),
+		data: make(map[string]mcptoken),
+	}
+	store.load()
+	require.Empty(t, store.data, "load of a missing file should leave the store empty")
+	_, ok := store.get("https://x.example.com")
+	require.False(t, ok)
+}
+
+func TestTokenStore_LoadCorruptFile(t *testing.T) {
+	t.Parallel()
+	// A corrupt token file must be ignored gracefully rather than crashing
+	// Crush on startup.
+	path := filepath.Join(t.TempDir(), "tokens.json")
+	require.NoError(t, os.WriteFile(path, []byte("{ not valid json"), 0o600))
+	store := &tokenStore{path: path, data: make(map[string]mcptoken)}
+	require.NotPanics(t, func() { store.load() })
+	require.Empty(t, store.data, "a corrupt token file should be ignored, leaving the store empty")
+}
+
+func TestMCPOAuthHandler_RestoresSavedToken(t *testing.T) {
+	// With a token already persisted for the server, a new handler should
+	// restore a non-nil token source so the browser flow is skipped.
+	globalDir := t.TempDir()
+	t.Setenv("CRUSH_GLOBAL_CONFIG", globalDir)
+
+	serverURL := "https://mcp.example.com/mcp"
+	seed := &tokenStore{
+		path: filepath.Join(filepath.Dir(config.GlobalConfig()), tokenFileName),
+		data: make(map[string]mcptoken),
+	}
+	saved := mcptoken{
+		Token:    &oauth2.Token{AccessToken: "abc123", RefreshToken: "refresh456", TokenType: "Bearer"},
+		ClientID: "test-client",
+	}
+	saved.Endpoints.AuthURL = "https://auth.example.com/authorize"
+	saved.Endpoints.TokenURL = "https://auth.example.com/token"
+	seed.save(serverURL, saved)
+
+	h := newMCPOAuthHandler(serverURL)
+	ts, err := h.TokenSource(t.Context())
+	require.NoError(t, err)
+	require.NotNil(t, ts, "a saved token should produce a non-nil token source")
+
+	tok, err := ts.Token()
+	require.NoError(t, err)
+	require.Equal(t, "abc123", tok.AccessToken, "restored token source should yield the saved (unexpired) token")
 }
