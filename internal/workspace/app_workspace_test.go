@@ -21,29 +21,62 @@ func newTestAppWorkspace(t *testing.T, workingDir string, cfg *config.Config) *A
 	return &AppWorkspace{store: store}
 }
 
+// newLoadedAppWorkspace loads a real ConfigStore from workingDir (so
+// MCPReconnect's ReloadFromDisk reads the on-disk crush.json) and isolates
+// the global config from the host/CI so only test-provided config is visible.
+// The app field is nil because MCPReconnect only touches w.store.
+func newLoadedAppWorkspace(t *testing.T, workingDir string) *AppWorkspace {
+	t.Helper()
+	globalDir := t.TempDir()
+	t.Setenv("CRUSH_GLOBAL_CONFIG", globalDir)
+	t.Setenv("CRUSH_GLOBAL_DATA", globalDir)
+	store, err := config.Load(workingDir, workingDir, false)
+	require.NoError(t, err)
+	return &AppWorkspace{store: store}
+}
+
+// writeCrushConfig writes a crush.json containing a valid provider and model
+// selection (so ReloadFromDisk's provider/model setup succeeds) plus the given
+// MCP section. A nil mcp writes a config with no MCP servers.
+func writeCrushConfig(t *testing.T, path string, mcp map[string]any) {
+	t.Helper()
+	cfg := map[string]any{
+		"providers": map[string]any{
+			"openai": map[string]any{
+				"api_key": "test-key",
+				"models":  []any{map[string]any{"id": "gpt-4", "name": "GPT-4"}},
+			},
+		},
+		"models": map[string]any{
+			"large": map[string]any{"provider": "openai", "model": "gpt-4"},
+		},
+	}
+	if mcp != nil {
+		cfg["mcp"] = mcp
+	}
+	writeJSON(t, path, cfg)
+}
+
+// disabledStdioMCP is a minimal disabled stdio MCP entry — disabled so
+// InitializeSingle marks it StateDisabled without spawning a process.
+func disabledStdioMCP() map[string]any {
+	return map[string]any{"type": "stdio", "command": "echo", "disabled": true}
+}
+
 // TestMCPReconnect_HappyPath verifies that MCPReconnect reloads the
 // config from disk before re-initialising the MCP server. We write a
 // config with a disabled MCP, then confirm the reloaded config is used.
+// Not parallel: uses t.Setenv to isolate the global config.
 func TestMCPReconnect_HappyPath(t *testing.T) {
-	t.Parallel()
-
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "crush.json")
 
-	writeJSON(t, configPath, map[string]any{
-		"mcp": map[string]any{
-			"test-server": map[string]any{
-				"type":     "stdio",
-				"command":  "echo",
-				"disabled": true,
-			},
-		},
+	writeCrushConfig(t, configPath, map[string]any{
+		"test-server": disabledStdioMCP(),
 	})
 
-	// Seed the store with an empty config; the on-disk version will be
-	// loaded during MCPReconnect via ReloadFromDisk.
-	cfg := &config.Config{MCP: map[string]config.MCPConfig{}}
-	w := newTestAppWorkspace(t, tmpDir, cfg)
+	// Load a real store from disk; MCPReconnect reloads the same crush.json.
+	w := newLoadedAppWorkspace(t, tmpDir)
 
 	err := w.MCPReconnect(t.Context(), "test-server")
 	require.NoError(t, err, "MCPReconnect should succeed when config reloads from disk")
@@ -68,27 +101,22 @@ func TestMCPReconnect_HappyPath(t *testing.T) {
 // TestMCPReconnect_ConfigChangedOnDisk verifies that changes to the
 // config file made AFTER the store was initialised are picked up by
 // MCPReconnect — the core behaviour this feature adds.
+// Not parallel: uses t.Setenv to isolate the global config.
 func TestMCPReconnect_ConfigChangedOnDisk(t *testing.T) {
-	t.Parallel()
-
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "crush.json")
 
-	// Write config with no MCP servers.
-	writeJSON(t, configPath, map[string]any{})
+	// Load a store from a config that has no MCP servers yet.
+	writeCrushConfig(t, configPath, nil)
+	w := newLoadedAppWorkspace(t, tmpDir)
 
-	cfg := &config.Config{MCP: map[string]config.MCPConfig{}}
-	w := newTestAppWorkspace(t, tmpDir, cfg)
+	// The added server must not be visible until the reload picks it up.
+	require.NotContains(t, w.store.Config().MCP, "added-server",
+		"added-server should not be in the initially-loaded config")
 
 	// Now write a new config that adds a disabled MCP server.
-	writeJSON(t, configPath, map[string]any{
-		"mcp": map[string]any{
-			"added-server": map[string]any{
-				"type":     "stdio",
-				"command":  "echo",
-				"disabled": true,
-			},
-		},
+	writeCrushConfig(t, configPath, map[string]any{
+		"added-server": disabledStdioMCP(),
 	})
 
 	// Reconnect should pick up the newly-added server from disk.
