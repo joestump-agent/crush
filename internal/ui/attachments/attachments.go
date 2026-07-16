@@ -168,7 +168,16 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting, showRemove
 			offset += lipgloss.Width(r.deletingStyle.Render(fmt.Sprintf("%d", i))) + lipgloss.Width(r.normalStyle.Render(filename))
 		} else {
 			iconStr := r.icon(att).String()
-			nameStr := r.normalStyle.Render(filename)
+			nameStyle := r.normalStyle
+			if !showRemove {
+				// Without a remove button there is nothing to carry the
+				// trailing margin that separates adjacent chips (the ✕'s
+				// MarginRight does this on the editor path), so put it on the
+				// filename instead. Otherwise posted messages with multiple
+				// attachments render with their chip backgrounds touching.
+				nameStyle = nameStyle.MarginRight(1)
+			}
+			nameStr := nameStyle.Render(filename)
 
 			chips = append(chips, iconStr, nameStr)
 			chipW := lipgloss.Width(iconStr) + lipgloss.Width(nameStr)

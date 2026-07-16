@@ -3,6 +3,7 @@ package attachments
 import (
 	"testing"
 
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/stretchr/testify/require"
@@ -55,6 +56,34 @@ func TestRender_ShowRemoveFalseOmitsRemoveButton(t *testing.T) {
 	require.Empty(t, r.bounds,
 		"no remove bounds should be recorded when the button is hidden")
 	require.Equal(t, -1, r.HitTestRemove(atts, 0))
+}
+
+func TestRender_ShowRemoveFalseKeepsGapBetweenChips(t *testing.T) {
+	t.Parallel()
+
+	// Regression for the #134 + #135 interaction: #134 moved the trailing
+	// margin onto the remove button, and #135 hides that button on posted
+	// messages. Together, posted messages with multiple attachments lost the
+	// margin that separated adjacent chips, so their backgrounds touched. The
+	// filename must carry the margin when the remove button is hidden.
+	//
+	// White-box width check: the visible width of the two chips without any
+	// separator is icon+filename per chip. With the fix each posted chip adds
+	// a 1-column trailing margin, so the rendered row is exactly two columns
+	// wider. Stripping ANSI can't detect this (a margin space and a
+	// background-colored padding space are both just spaces), so we measure
+	// width instead.
+	r := newTestRenderer()
+	atts := []message.Attachment{
+		{FileName: "alpha.txt"},
+		{FileName: "beta.txt"},
+	}
+	bare := lipgloss.Width(r.textStyle.String()+r.normalStyle.Render("alpha.txt")) +
+		lipgloss.Width(r.textStyle.String()+r.normalStyle.Render("beta.txt"))
+
+	got := lipgloss.Width(r.Render(atts, false, false, 200))
+	require.Equal(t, bare+2, got,
+		"each posted chip must carry a 1-col trailing margin so adjacent chip backgrounds don't touch")
 }
 
 func TestRender_MultipleChipsEachHaveRemoveButton(t *testing.T) {
