@@ -91,7 +91,8 @@ func (m *Attachments) HandleClick(x int) bool {
 }
 
 func (m *Attachments) Render(width int) string {
-	return m.renderer.Render(m.list, m.deleting, width)
+	// The editor is interactive, so the remove button is shown.
+	return m.renderer.Render(m.list, m.deleting, true, width)
 }
 
 // Renderer returns the attachment renderer so callers can update its
@@ -133,14 +134,21 @@ type chipBounds struct {
 	removeEnd int // exclusive end X of the remove button (0 if none)
 }
 
-// Render renders the attachment chips. When not in deleting mode, each
-// chip shows an icon, filename, and a remove button (✕) on the right.
-func (r *Renderer) Render(attachments []message.Attachment, deleting bool, width int) string {
+// Render renders the attachment chips. When not in deleting mode and
+// showRemove is true, each chip shows an icon, filename, and a remove
+// button (✕) on the right. showRemove should be false for attachments on
+// already-posted messages, where removal is not possible.
+func (r *Renderer) Render(attachments []message.Attachment, deleting, showRemove bool, width int) string {
 	var chips []string
 	r.bounds = r.bounds[:0]
 
 	removeStr := r.removeStyle.String()
-	maxItemWidth := lipgloss.Width(r.imageStyle.String() + r.normalStyle.Render(strings.Repeat("x", maxFilename)) + removeStr)
+	// Only reserve width for the remove button when it will be drawn.
+	removeReserve := ""
+	if showRemove {
+		removeReserve = removeStr
+	}
+	maxItemWidth := lipgloss.Width(r.imageStyle.String() + r.normalStyle.Render(strings.Repeat("x", maxFilename)) + removeReserve)
 	fits := int(math.Floor(float64(width)/float64(maxItemWidth))) - 1
 
 	var offset int
@@ -162,21 +170,21 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting bool, width
 			iconStr := r.icon(att).String()
 			nameStr := r.normalStyle.Render(filename)
 
-			chips = append(
-				chips,
-				iconStr,
-				nameStr,
-				removeStr,
-			)
-
+			chips = append(chips, iconStr, nameStr)
 			chipW := lipgloss.Width(iconStr) + lipgloss.Width(nameStr)
-			removeStart := offset + chipW
-			removeW := lipgloss.Width(removeStr)
-			r.bounds = append(r.bounds, chipBounds{
-				startX:    removeStart,
-				removeEnd: removeStart + removeW,
-			})
-			offset = removeStart + removeW
+
+			if showRemove {
+				chips = append(chips, removeStr)
+				removeStart := offset + chipW
+				removeW := lipgloss.Width(removeStr)
+				r.bounds = append(r.bounds, chipBounds{
+					startX:    removeStart,
+					removeEnd: removeStart + removeW,
+				})
+				offset = removeStart + removeW
+			} else {
+				offset += chipW
+			}
 		}
 
 		if i == fits && len(attachments) > i {

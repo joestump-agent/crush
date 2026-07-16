@@ -27,7 +27,7 @@ func TestRender_IncludesRemoveButton(t *testing.T) {
 	atts := []message.Attachment{
 		{FileName: "test.txt"},
 	}
-	out := r.Render(atts, false, 80)
+	out := r.Render(atts, false, true, 80)
 	require.Contains(t, out, styles.RemoveIcon)
 }
 
@@ -38,8 +38,23 @@ func TestRender_DeletingModeNoRemoveButton(t *testing.T) {
 	atts := []message.Attachment{
 		{FileName: "test.txt"},
 	}
-	out := r.Render(atts, true, 80)
+	out := r.Render(atts, true, true, 80)
 	require.NotContains(t, out, styles.RemoveIcon)
+}
+
+func TestRender_ShowRemoveFalseOmitsRemoveButton(t *testing.T) {
+	t.Parallel()
+
+	r := newTestRenderer()
+	atts := []message.Attachment{
+		{FileName: "no-change.png"},
+	}
+	out := r.Render(atts, false, false, 80)
+	require.NotContains(t, out, styles.RemoveIcon,
+		"posted-message attachments must not show a remove button")
+	require.Empty(t, r.bounds,
+		"no remove bounds should be recorded when the button is hidden")
+	require.Equal(t, -1, r.HitTestRemove(atts, 0))
 }
 
 func TestRender_MultipleChipsEachHaveRemoveButton(t *testing.T) {
@@ -51,7 +66,7 @@ func TestRender_MultipleChipsEachHaveRemoveButton(t *testing.T) {
 		{FileName: "b.txt"},
 		{FileName: "c.txt"},
 	}
-	out := r.Render(atts, false, 120)
+	out := r.Render(atts, false, true, 120)
 	// Count occurrences of the remove glyph.
 	count := 0
 	for _, c := range out {
@@ -70,7 +85,7 @@ func TestHitTestRemove_ClickOnFirstChipRemove(t *testing.T) {
 		{FileName: "first.txt"},
 		{FileName: "second.txt"},
 	}
-	_ = r.Render(atts, false, 120)
+	_ = r.Render(atts, false, true, 120)
 
 	// The remove button of the first chip should be hit-testable.
 	// Click at various X positions to verify we hit the right chip.
@@ -87,7 +102,7 @@ func TestHitTestRemove_ReturnsCorrectIndex(t *testing.T) {
 		{FileName: "first.txt"},
 		{FileName: "second.txt"},
 	}
-	_ = r.Render(atts, false, 120)
+	_ = r.Render(atts, false, true, 120)
 
 	// Each chip bounds are stored after render. Verify there are two.
 	require.Len(t, r.bounds, 2)
@@ -110,7 +125,7 @@ func TestHitTestRemove_OutsideAnyRemoveReturnsMinusOne(t *testing.T) {
 	atts := []message.Attachment{
 		{FileName: "test.txt"},
 	}
-	_ = r.Render(atts, false, 80)
+	_ = r.Render(atts, false, true, 80)
 
 	// Click far past the remove button.
 	idx := r.HitTestRemove(atts, 999)
