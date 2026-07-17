@@ -5,10 +5,13 @@ import (
 	"testing"
 
 	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/session"
+	"github.com/charmbracelet/crush/internal/ui/attachments"
 	"github.com/charmbracelet/crush/internal/ui/common"
+	"github.com/charmbracelet/crush/internal/ui/dialog"
 	"github.com/charmbracelet/crush/internal/workspace"
 )
 
@@ -41,6 +44,12 @@ func (w *slashCommandWorkspace) Config() *config.Config { return nil }
 func (w *slashCommandWorkspace) AgentSummarize(_ context.Context, sessionID string) error {
 	w.summCall = sessionID
 	return w.summErr
+}
+
+func (w *slashCommandWorkspace) PermissionSkipRequests() bool { return false }
+
+func (w *slashCommandWorkspace) CreateSession(context.Context, string) (session.Session, error) {
+	return session.Session{}, nil
 }
 
 func newSlashCommandUI(ws *slashCommandWorkspace) *UI {
@@ -100,9 +109,9 @@ func TestSlashClearBlockedWhenAgentBusy(t *testing.T) {
 
 	m := newSlashCommandUI(&slashCommandWorkspace{ready: true, busy: map[string]bool{"s1": true}})
 	m.session = &session.Session{ID: "s1"}
-	// isAgentBusy is a pure cache read (workspace probes happen off-thread);
-	// seed the memoized busy state the way a refresh would.
-	m.agentBusyCache.set(true)
+	// The gate is a pure cache read of the session-scoped busy state
+	// (workspace probes happen off-thread); seed it the way a refresh would.
+	m.sessionBusyCache.setForSession(true, "s1")
 	m.promptHistory.index = 3
 	m.promptHistory.draft = "wip"
 
@@ -115,6 +124,29 @@ func TestSlashClearBlockedWhenAgentBusy(t *testing.T) {
 	}
 	if m.promptHistory.index != -1 || m.promptHistory.draft != "" {
 		t.Fatalf("prompt history not reset on busy /clear: index=%d draft=%q", m.promptHistory.index, m.promptHistory.draft)
+	}
+}
+
+// TestSlashClearNotBlockedByOtherSessionBusy verifies the busy gate is
+// session-scoped: agent activity in a different session must not block
+// /clear for the session the user is viewing.
+func TestSlashClearNotBlockedByOtherSessionBusy(t *testing.T) {
+	t.Parallel()
+
+	m := newSlashCommandUI(&slashCommandWorkspace{ready: true, busy: map[string]bool{"other": true}})
+	m.session = &session.Session{ID: "s1"}
+	// A busy value cached for a DIFFERENT session must not gate this one.
+	m.sessionBusyCache.setForSession(true, "other")
+
+	_, ok := m.handleSlashCommand("/clear")
+	if !ok {
+		t.Fatal("handleSlashCommand(/clear) should match")
+	}
+	if m.session != nil {
+		t.Fatal("busy state of another session must not block /clear")
+	}
+	if m.state != uiLanding {
+		t.Fatal("expected state to be uiLanding after /clear")
 	}
 }
 
@@ -173,6 +205,54 @@ func TestSlashCompactNoSession(t *testing.T) {
 	}
 }
 
+// TestSlashCompactNotBlockedByOtherSessionBusy verifies the busy gate is
+// session-scoped: agent activity in a different session must not block
+// /compact for the session the user is viewing.
+func TestSlashCompactNotBlockedByOtherSessionBusy(t *testing.T) {
+	t.Parallel()
+
+	ws := &slashCommandWorkspace{ready: true, busy: map[string]bool{"other": true}}
+	m := newSlashCommandUI(ws)
+	m.session = &session.Session{ID: "s1"}
+	// A busy value cached for a DIFFERENT session must not gate this one.
+	m.sessionBusyCache.setForSession(true, "other")
+
+	cmd, ok := m.handleSlashCommand("/compact")
+	if !ok {
+		t.Fatal("handleSlashCommand(/compact) should match")
+	}
+	if cmd == nil {
+		t.Fatal("expected a summarize command despite another session being busy")
+	}
+	cmd()
+	if ws.summCall != "s1" {
+		t.Fatalf("expected AgentSummarize called with s1, got %q", ws.summCall)
+	}
+}
+
+// TestBangModeWinsOverSlashCommands verifies that in bang (!) shell mode a
+// command that is literally "/clear" is executed in the shell instead of
+// being hijacked by the slash-command handler.
+func TestBangModeWinsOverSlashCommands(t *testing.T) {
+	t.Parallel()
+
+	m := newSlashCommandUI(&slashCommandWorkspace{ready: true})
+	m.keyMap = DefaultKeyMap()
+	m.dialog = dialog.NewOverlay()
+	m.attachments = attachments.New(nil, attachments.Keymap{})
+	m.bangMode = true
+	m.textarea.SetValue("/clear")
+
+	m.handleKeyPressMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	if m.bangMode {
+		t.Fatal("bang mode should be consumed by Enter")
+	}
+	if m.pendingBangCommand != "/clear" {
+		t.Fatalf("bang-mode input should run as a shell command, got pending %q", m.pendingBangCommand)
+	}
+}
+
 // TestSlashCompactBlockedWhenAgentBusy verifies /compact warns when busy and
 // does not call AgentSummarize even if the returned cmd is executed.
 func TestSlashCompactBlockedWhenAgentBusy(t *testing.T) {
@@ -181,9 +261,9 @@ func TestSlashCompactBlockedWhenAgentBusy(t *testing.T) {
 	ws := &slashCommandWorkspace{ready: true, busy: map[string]bool{"s1": true}}
 	m := newSlashCommandUI(ws)
 	m.session = &session.Session{ID: "s1"}
-	// isAgentBusy is a pure cache read (workspace probes happen off-thread);
-	// seed the memoized busy state the way a refresh would.
-	m.agentBusyCache.set(true)
+	// The gate is a pure cache read of the session-scoped busy state
+	// (workspace probes happen off-thread); seed it the way a refresh would.
+	m.sessionBusyCache.setForSession(true, "s1")
 
 	cmd, ok := m.handleSlashCommand("/compact")
 	if !ok {

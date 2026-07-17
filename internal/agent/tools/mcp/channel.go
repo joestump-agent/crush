@@ -162,7 +162,7 @@ func hasChannelCapability(res *mcp.InitializeResult) bool {
 func ChannelEnabled(enabled []string, name string) bool {
 	for _, e := range enabled {
 		e = strings.TrimSpace(e)
-		if e == name {
+		if strings.EqualFold(e, name) {
 			return true
 		}
 		if strings.EqualFold(e, "server:"+name) {

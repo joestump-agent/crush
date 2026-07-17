@@ -37,12 +37,13 @@ func TestMCPServers_EnterReconnectsSelectedServer(t *testing.T) {
 	}
 	d := newTestMCPServers(t, states)
 
-	// Select the first server and press Enter — should fire reconnect for that server.
+	// Select the first server and press Enter — should fire reconnect for
+	// that server. serverItems sorts by name, so index 0 is "cairn".
 	action := d.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	reconnect, ok := action.(ActionMCPReconnect)
 	require.True(t, ok, "expected ActionMCPReconnect")
-	require.Contains(t, []string{"signal", "cairn"}, reconnect.ServerName)
+	require.Equal(t, "cairn", reconnect.ServerName)
 }
 
 func TestMCPServers_EscClosesDialog(t *testing.T) {

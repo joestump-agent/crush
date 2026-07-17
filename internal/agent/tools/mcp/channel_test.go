@@ -300,6 +300,9 @@ func TestChannelEnabled(t *testing.T) {
 		{[]string{"other"}, "webhook", false},
 		{nil, "webhook", false},
 		{[]string{"SERVER:webhook"}, "webhook", true},
+		{[]string{"Webhook"}, "webhook", true},
+		{[]string{"WEBHOOK"}, "webhook", true},
+		{[]string{"  Webhook  "}, "webhook", true},
 	}
 	for _, tt := range tests {
 		if got := ChannelEnabled(tt.enabled, tt.name); got != tt.want {
