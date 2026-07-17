@@ -1,12 +1,15 @@
 package mcp
 
 import (
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 )
@@ -167,4 +170,126 @@ func TestMCPOAuthHandler_RestoresSavedToken(t *testing.T) {
 	tok, err := ts.Token()
 	require.NoError(t, err)
 	require.Equal(t, "abc123", tok.AccessToken, "restored token source should yield the saved (unexpired) token")
+}
+
+// TestTokenStore_SaveMergesWithDisk pins the multi-server persistence fix:
+// each HTTP MCP server gets its own handler with its own store snapshot, and
+// a save used to rewrite the whole file from that snapshot — server B's save
+// erased server A's token. Save now merges with what's on disk.
+func TestTokenStore_SaveMergesWithDisk(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "tokens.json")
+
+	// Handler A's store saves server A.
+	storeA := &tokenStore{path: path, data: make(map[string]mcptoken)}
+	storeA.load()
+	storeA.save("https://a.example.com/mcp", mcptoken{Token: &oauth2.Token{AccessToken: "tok-a"}})
+
+	// Handler B's store loaded before/without A's save (its own snapshot).
+	storeB := &tokenStore{path: path, data: make(map[string]mcptoken)}
+	storeB.save("https://b.example.com/mcp", mcptoken{Token: &oauth2.Token{AccessToken: "tok-b"}})
+
+	// Both tokens must survive on disk.
+	check := &tokenStore{path: path, data: make(map[string]mcptoken)}
+	check.load()
+	gotA, okA := check.get("https://a.example.com/mcp")
+	require.True(t, okA, "server A's token was erased by server B's save")
+	require.Equal(t, "tok-a", gotA.Token.AccessToken)
+	gotB, okB := check.get("https://b.example.com/mcp")
+	require.True(t, okB)
+	require.Equal(t, "tok-b", gotB.Token.AccessToken)
+}
+
+// TestPersistingTokenSource_RepersistsRotatedToken pins the refresh fix:
+// OAuth 2.1 public clients rotate the refresh token on use; a refresh that
+// stayed only in memory invalidated the copy on disk, so the NEXT restart
+// fell back to the browser flow. The wrapping source re-persists on change.
+func TestPersistingTokenSource_RepersistsRotatedToken(t *testing.T) {
+	globalDir := t.TempDir()
+	t.Setenv("CRUSH_GLOBAL_CONFIG", globalDir)
+
+	serverURL := "https://rotate.example.com/mcp"
+	h := newMCPOAuthHandler(serverURL)
+	h.clientID = "client-1"
+	h.endpoints = oauthEndpoints{AuthURL: "https://as.example.com/auth", TokenURL: "https://as.example.com/token"}
+
+	rotated := &oauth2.Token{AccessToken: "new-access", RefreshToken: "new-refresh"}
+	src := &persistingTokenSource{
+		h:    h,
+		src:  oauth2.StaticTokenSource(rotated),
+		last: &oauth2.Token{AccessToken: "old-access", RefreshToken: "old-refresh"},
+	}
+
+	tok, err := src.Token()
+	require.NoError(t, err)
+	require.Equal(t, "new-access", tok.AccessToken)
+
+	// The rotated token must be on disk, with the client ID and endpoints.
+	check := newTokenStore()
+	check.load()
+	got, ok := check.get(serverURL)
+	require.True(t, ok, "rotated token was not re-persisted")
+	require.Equal(t, "new-access", got.Token.AccessToken)
+	require.Equal(t, "new-refresh", got.Token.RefreshToken)
+	require.Equal(t, "client-1", got.ClientID)
+	require.Equal(t, "https://as.example.com/token", got.Endpoints.TokenURL)
+}
+
+// TestCaptureFromAuthURL pins the client-ID persistence fix: the SDK never
+// exposes the dynamically registered client ID, but it necessarily appears
+// as client_id in the authorization URL handed to the code fetcher. Before
+// the fix, ClientID was persisted as "" on every path, so refresh after
+// restart could never work (a public client must send client_id).
+func TestCaptureFromAuthURL(t *testing.T) {
+	t.Setenv("CRUSH_GLOBAL_CONFIG", t.TempDir())
+	h := newMCPOAuthHandler("https://cap.example.com/mcp")
+
+	h.captureFromAuthURL("https://as.example.com/authorize?client_id=dyn-client-42&response_type=code&state=xyz")
+
+	require.Equal(t, "dyn-client-42", h.clientID)
+	require.Equal(t, "https://as.example.com/authorize", h.endpoints.AuthURL)
+
+	// persistToken must write the captured ID (TokenURL pre-set so the
+	// test performs no network discovery).
+	h.endpoints.TokenURL = "https://as.example.com/token"
+	h.persistToken(&oauth2.Token{AccessToken: "t"})
+	check := newTokenStore()
+	check.load()
+	got, ok := check.get("https://cap.example.com/mcp")
+	require.True(t, ok)
+	require.Equal(t, "dyn-client-42", got.ClientID, "registered client ID must be persisted")
+}
+
+// TestCallbackHandler_DuplicateHitDoesNotBlock pins the wedge fix: a second
+// /callback request (browser refresh, prefetcher, AS retry) used to block
+// its handler goroutine forever on the full capacity-1 channel; the deferred
+// srv.Shutdown then waited for that handler indefinitely and the whole
+// authorization flow leaked.
+func TestCallbackHandler_DuplicateHitDoesNotBlock(t *testing.T) {
+	t.Parallel()
+	resultCh := make(chan auth.AuthorizationResult, 1)
+	errCh := make(chan error, 1)
+	handler := callbackHandler(resultCh, errCh)
+
+	hit := func() {
+		req := httptest.NewRequest("GET", "/callback?code=abc&state=s1", nil)
+		handler(httptest.NewRecorder(), req)
+	}
+
+	hit() // first delivery fills the channel
+
+	done := make(chan struct{})
+	go func() {
+		hit() // duplicate — must not block
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("duplicate callback hit blocked (would wedge srv.Shutdown and leak the auth flow)")
+	}
+
+	require.Len(t, resultCh, 1, "exactly one result delivered")
+	got := <-resultCh
+	require.Equal(t, "abc", got.Code)
 }
