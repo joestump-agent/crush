@@ -298,6 +298,17 @@ type UI struct {
 	pillsAutoExpanded  bool
 	focusedPillSection pillSection
 	promptQueue        int
+	// busyCached memoizes isCurrentSessionBusy briefly (see busyCacheTTL):
+	// in client/server mode each probe is a synchronous HTTP round-trip.
+	busyCached         bool
+	busyCheckedAt      time.Time
+	busyCheckedSession string
+	// agentBusyCached / yoloCached mirror busyCached for the global busy and
+	// permission-skip probes made by the per-message placeholder path.
+	agentBusyCached    bool
+	agentBusyCheckedAt time.Time
+	yoloCached         bool
+	yoloCheckedAt      time.Time
 	sidebarScroll      int
 	pillsView          string
 
@@ -596,16 +607,26 @@ func (m *UI) loadMCPrompts() tea.Msg {
 	return mcpPromptsLoadedMsg{Prompts: prompts}
 }
 
+// refreshPromptQueue re-reads the queued-prompt count and re-layouts when it
+// changed. In client/server mode the count is a synchronous HTTP round-trip,
+// so this must only run when the queue can actually have changed — message
+// events (the agent dequeueing), local queue mutations, and session switches.
+// Polling it unconditionally at the top of Update put a network call on
+// every keystroke and froze typing on a slow server.
+func (m *UI) refreshPromptQueue() {
+	queueSize := 0
+	if m.hasSession() {
+		queueSize = m.com.Workspace.AgentQueuedPrompts(m.session.ID)
+	}
+	if queueSize != m.promptQueue {
+		m.promptQueue = queueSize
+		m.updateLayoutAndSize()
+	}
+}
+
 // Update handles updates to the UI model.
 func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
-	if m.hasSession() {
-		queueSize := m.com.Workspace.AgentQueuedPrompts(m.session.ID)
-		if queueSize != m.promptQueue {
-			m.promptQueue = queueSize
-			m.updateLayoutAndSize()
-		}
-	}
 	// Update terminal capabilities
 	m.caps.Update(msg)
 	switch msg := msg.(type) {
@@ -723,6 +744,8 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			prevHasInProgress := hasInProgressTodo(m.session.Todos)
 			prevPillsHeight := m.pillsAreaHeight()
 			m.session = &msg.Payload
+			m.invalidateBusyCache()
+			m.refreshPromptQueue()
 			if !prevHasInProgress && hasInProgressTodo(m.session.Todos) {
 				m.todoIsSpinning = true
 				cmds = append(cmds, m.todoSpinner.Tick)
@@ -761,6 +784,11 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case pubsub.DeletedEvent:
 			m.chat.RemoveMessage(msg.Payload.ID)
 		}
+		// A message event means agent state may have changed: re-probe busy
+		// and the prompt queue now (both are otherwise memoized/event-driven
+		// to keep synchronous HTTP off the per-keystroke path).
+		m.invalidateBusyCache()
+		m.refreshPromptQueue()
 		// start the spinner if there is a new message
 		if hasInProgressTodo(m.session.Todos) && m.isCurrentSessionBusy() && !m.todoIsSpinning {
 			m.todoIsSpinning = true
@@ -1126,7 +1154,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.textarea.Placeholder = m.readyPlaceholder
 		}
-		if !m.bangMode && m.com.Workspace.PermissionSkipRequests() {
+		if !m.bangMode && m.yoloModeCached() {
 			m.textarea.Placeholder = "Yolo mode!"
 		}
 	}
@@ -1564,6 +1592,7 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 
 	// Command dialog messages.
 	case dialog.ActionToggleYoloMode:
+		m.yoloCheckedAt = time.Time{}
 		yolo := !m.com.Workspace.PermissionSkipRequests()
 		m.com.Workspace.PermissionSetSkipRequests(yolo)
 		m.setEditorPrompt(yolo)
@@ -2683,7 +2712,7 @@ func (m *UI) ShortHelp() []key.Binding {
 			cancelBinding := k.Chat.Cancel
 			if m.isCanceling {
 				cancelBinding.SetHelp("esc", "press again to cancel")
-			} else if m.com.Workspace.AgentQueuedPrompts(m.session.ID) > 0 {
+			} else if m.promptQueue > 0 {
 				cancelBinding.SetHelp("esc", "clear queue")
 			}
 			binds = append(binds, cancelBinding)
@@ -2776,7 +2805,7 @@ func (m *UI) FullHelp() [][]key.Binding {
 			cancelBinding := k.Chat.Cancel
 			if m.isCanceling {
 				cancelBinding.SetHelp("esc", "press again to cancel")
-			} else if m.com.Workspace.AgentQueuedPrompts(m.session.ID) > 0 {
+			} else if m.promptQueue > 0 {
 				cancelBinding.SetHelp("esc", "clear queue")
 			}
 			binds = append(binds, []key.Binding{cancelBinding})
@@ -3490,7 +3519,9 @@ func isWhitespace(b byte) bool {
 }
 
 // isAgentBusy returns true if the agent coordinator exists and is currently
-// busy processing a request.
+// busy processing a request. Memoized like isCurrentSessionBusy: it runs in
+// the per-message textarea-placeholder path, which in client/server mode
+// would otherwise issue HTTP probes on every keystroke.
 func (m *UI) isAgentBusy() bool {
 	if m.bangCancel != nil {
 		return true
@@ -3498,14 +3529,31 @@ func (m *UI) isAgentBusy() bool {
 	if m.com == nil || m.com.Workspace == nil {
 		return false
 	}
-	return m.com.Workspace.AgentIsReady() &&
+	if time.Since(m.agentBusyCheckedAt) < busyCacheTTL {
+		return m.agentBusyCached
+	}
+	busy := m.com.Workspace.AgentIsReady() &&
 		m.com.Workspace.AgentIsBusy()
+	m.agentBusyCached = busy
+	m.agentBusyCheckedAt = time.Now()
+	return busy
 }
+
+// busyCacheTTL bounds how long isCurrentSessionBusy may reuse its last
+// workspace probe. Event handlers that change agent state invalidate the
+// cache explicitly, so the TTL only limits staleness for probes triggered by
+// unrelated churn (resize storms, typing re-renders).
+const busyCacheTTL = 500 * time.Millisecond
 
 // isCurrentSessionBusy reports whether the agent is actively processing a
 // request for the session the user is currently viewing. Unlike
 // isAgentBusy, activity in another session does not make the current
 // session appear busy.
+//
+// In client/server mode each workspace probe is a synchronous HTTP
+// round-trip and this is called from hot paths (renderPills via resize, the
+// message-event handler), so the result is memoized briefly; paths that know
+// the state changed call invalidateBusyCache first.
 func (m *UI) isCurrentSessionBusy() bool {
 	if m.bangCancel != nil {
 		return true
@@ -3513,8 +3561,34 @@ func (m *UI) isCurrentSessionBusy() bool {
 	if !m.hasSession() || m.com == nil || m.com.Workspace == nil {
 		return false
 	}
-	return m.com.Workspace.AgentIsReady() &&
+	if m.busyCheckedSession == m.session.ID && time.Since(m.busyCheckedAt) < busyCacheTTL {
+		return m.busyCached
+	}
+	busy := m.com.Workspace.AgentIsReady() &&
 		m.com.Workspace.AgentIsSessionBusy(m.session.ID)
+	m.busyCached = busy
+	m.busyCheckedAt = time.Now()
+	m.busyCheckedSession = m.session.ID
+	return busy
+}
+
+// invalidateBusyCache forces the next isCurrentSessionBusy / isAgentBusy to
+// re-probe the workspace. Called by event handlers that indicate agent state
+// changed.
+func (m *UI) invalidateBusyCache() {
+	m.busyCheckedAt = time.Time{}
+	m.agentBusyCheckedAt = time.Time{}
+}
+
+// yoloModeCached memoizes PermissionSkipRequests for the per-message
+// placeholder path; the yolo toggle invalidates it.
+func (m *UI) yoloModeCached() bool {
+	if time.Since(m.yoloCheckedAt) < busyCacheTTL {
+		return m.yoloCached
+	}
+	m.yoloCached = m.com.Workspace.PermissionSkipRequests()
+	m.yoloCheckedAt = time.Now()
+	return m.yoloCached
 }
 
 // hasSession returns true if there is an active session with a valid ID.
@@ -3898,6 +3972,7 @@ func (m *UI) cancelAgent() tea.Cmd {
 	// Check if there are queued prompts - if so, clear the queue.
 	if m.com.Workspace.AgentQueuedPrompts(m.session.ID) > 0 {
 		m.com.Workspace.AgentClearQueue(m.session.ID)
+		m.refreshPromptQueue()
 		return nil
 	}
 
