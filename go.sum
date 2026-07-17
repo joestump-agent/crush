@@ -106,8 +106,6 @@ github.com/charmbracelet/anthropic-sdk-go v0.0.0-20260223140439-63879b0b8dab h1:
 github.com/charmbracelet/anthropic-sdk-go v0.0.0-20260223140439-63879b0b8dab/go.mod h1:hqlYqR7uPKOKfnNeicUbZp0Ps0GeYFlKYtwh5HGDCx8=
 github.com/charmbracelet/colorprofile v0.4.3 h1:QPa1IWkYI+AOB+fE+mg/5/4HRMZcaXex9t5KX76i20Q=
 github.com/charmbracelet/colorprofile v0.4.3/go.mod h1:/zT4BhpD5aGFpqQQqw7a+VtHCzu+zrQtt1zhMt9mR4Q=
-github.com/charmbracelet/harmonica v0.2.0 h1:8NxJWRWg/bzKqqEaaeFNipOu77YR5t8aSwG4pgaUBiQ=
-github.com/charmbracelet/harmonica v0.2.0/go.mod h1:KSri/1RMQOZLbw7AHqgcBycp8pgJnQMYYT8QZRqZ1Ao=
 github.com/charmbracelet/openai-go v0.0.0-20260617131321-5e4b9c18c4be h1:pg+OWlIkk9HOe/8P5J95aKe2wGDzFUiiyFOUpwR30B4=
 github.com/charmbracelet/openai-go v0.0.0-20260617131321-5e4b9c18c4be/go.mod h1:1DahUaExbUZx/jD+FNT2PKP4L9rLE5+ZBRuI8mZjd/E=
 github.com/charmbracelet/ultraviolet v0.0.0-20260525132238-948f4557a654 h1:FpSYhY28ucg9ZRr+2wj67FAQ0Ey5yiK0072PmRDJNek=
@@ -258,8 +256,8 @@ github.com/jackmordaunt/icns/v3 v3.0.1 h1:xxot6aNuGrU+lNgxz5I5H0qSeCjNKp8uTXB1j8
 github.com/jackmordaunt/icns/v3 v3.0.1/go.mod h1:5sHL59nqTd2ynTnowxB/MDQFhKNqkK8X687uKNygaSQ=
 github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 h1:BQSFePA1RWJOlocH6Fxy8MmwDt+yVQYULKfN0RoTN8A=
 github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99/go.mod h1:1lJo3i6rXxKeerYnT8Nvf0QmHCRC1n8sfWVwXF2Frvo=
-github.com/joestump-agent/a2tea v0.0.0-20260714164616-8ab435ba4295 h1:mTAaheRGU2m+vMYKpF2L764sFPTxlRgGf1iycISF0fc=
-github.com/joestump-agent/a2tea v0.0.0-20260714164616-8ab435ba4295/go.mod h1:0RW8D3zFSWsc5UlVFepecQzFABXQMqX/xtFXqIe0Va0=
+github.com/joestump-agent/a2tea v0.0.0-20260717194424-347a52e05f08 h1:bB5h3QxxxnqYGJQoA8K5i7PjP7idMdzFBqD6MFgjuFI=
+github.com/joestump-agent/a2tea v0.0.0-20260717194424-347a52e05f08/go.mod h1:pg6ATa4oTrJfhPmfQ9a/Y/5xU9DTXZ8rGVvLj3NpEaE=
 github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
 github.com/joho/godotenv v1.5.1/go.mod h1:f4LDr5Voq0i2e/R5DDNOoa2zzDfwtkZa6DnEwAbqwq4=
 github.com/jordanella/go-ansi-paintbrush v0.0.0-20240728195301-b7ad996ecf3d h1:on25kP+Sx7sxUMRQiA8gdcToAGet4DK/EIA30mXre+4=
