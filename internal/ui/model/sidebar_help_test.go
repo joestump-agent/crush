@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/ui/attachments"
 	"github.com/stretchr/testify/require"
 )
@@ -77,6 +79,43 @@ func TestFullHelpSidebarHidesCommandOptions(t *testing.T) {
 
 	for _, key := range []string{"ctrl+p", "ctrl+l", "ctrl+m", "ctrl+g", "/ or ctrl+p"} {
 		require.False(t, helpKeys[key], "key %q should NOT appear in FullHelp when sidebar is focused", key)
+	}
+}
+
+// TestFullHelpSidebarHidesUnroutedKeys verifies that FullHelp under sidebar
+// focus does not advertise sessions (ctrl+s), yolo (ctrl+y), or new session
+// (ctrl+n) — the sidebar key handler never routes them, so they are dead keys
+// while it has focus.
+func TestFullHelpSidebarHidesUnroutedKeys(t *testing.T) {
+	t.Parallel()
+
+	collectKeys := func(m *UI) map[string]bool {
+		out := make(map[string]bool)
+		for _, row := range m.FullHelp() {
+			for _, b := range row {
+				out[b.Help().Key] = true
+			}
+		}
+		return out
+	}
+
+	m := newSidebarTestUI()
+	m.attachments = attachments.New(nil, attachments.Keymap{})
+	// The editor-focus branch consults the model config and agent state, so
+	// give the UI a workspace stub with an empty config.
+	m.com.Workspace = &sidebarHeightTestWorkspace{cfg: &config.Config{}}
+	m.session = &session.Session{ID: "s1"} // so NewSession would otherwise be listed
+	m.focus = uiFocusSidebar
+	keys := collectKeys(m)
+	for _, key := range []string{"ctrl+s", "ctrl+y", "ctrl+n"} {
+		require.False(t, keys[key], "key %q should NOT appear in FullHelp when sidebar is focused", key)
+	}
+
+	// The same keys stay advertised for the editor, where they are routed.
+	m.focus = uiFocusEditor
+	keys = collectKeys(m)
+	for _, key := range []string{"ctrl+s", "ctrl+y", "ctrl+n"} {
+		require.True(t, keys[key], "key %q should appear in FullHelp when the editor is focused", key)
 	}
 }
 

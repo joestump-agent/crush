@@ -311,7 +311,13 @@ func (c *Commands) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 	if area.Dx() != c.windowWidth && c.selected == SystemCommands {
 		c.windowWidth = area.Dx()
 		// since some items in the list depend on width (e.g. toggle sidebar command),
-		// we need to reset the command items when width changes
+		// we need to reset the command items when width changes. Repopulating
+		// replaces the list with top-level items, so any open sub-menu must be
+		// abandoned too — resetting to the top level is simpler than re-deriving
+		// the open sub-menu's children against the regenerated item set, and
+		// keeps the list, menu stack, and breadcrumb consistent.
+		c.menuStack = nil
+		c.breadcrumb = nil
 		c.setCommandItems(c.selected)
 	}
 
@@ -352,19 +358,26 @@ func (c *Commands) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 
 // ShortHelp implements [help.KeyMap].
 func (c *Commands) ShortHelp() []key.Binding {
-	return []key.Binding{
+	binds := []key.Binding{
 		c.keyMap.Tab,
 		c.keyMap.UpDown,
 		c.keyMap.Select,
-		c.keyMap.Close,
 	}
+	if c.inSubMenu() {
+		binds = append(binds, c.keyMap.Back)
+	}
+	return append(binds, c.keyMap.Close)
 }
 
 // FullHelp implements [help.KeyMap].
 func (c *Commands) FullHelp() [][]key.Binding {
+	second := []key.Binding{c.keyMap.Close}
+	if c.inSubMenu() {
+		second = append([]key.Binding{c.keyMap.Back}, second...)
+	}
 	return [][]key.Binding{
 		{c.keyMap.Select, c.keyMap.Next, c.keyMap.Previous, c.keyMap.Tab},
-		{c.keyMap.Close},
+		second,
 	}
 }
 
