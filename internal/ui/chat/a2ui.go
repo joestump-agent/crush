@@ -1,7 +1,6 @@
 package chat
 
 import (
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -76,9 +75,18 @@ func contentHasUnclosedA2UI(content string) bool {
 }
 
 // countDroppedTaggedBlocks scans content for complete
-// <a2ui-json>...</a2ui-json> pairs whose JSON body cannot be unmarshalled —
-// blocks a2tea silently drops. This is independent of bare-JSON parts, which
-// must not mask the alert (#7).
+// <a2ui-json>...</a2ui-json> pairs that yield no A2UI messages — blocks the
+// parser drops. This is independent of bare-JSON parts, which must not mask
+// the alert (#7).
+//
+// Each block is judged by running it through the SAME parser Scan uses, so
+// this check agrees with rendering by construction. The previous
+// implementation unmarshalled the body as a single JSON object, which
+// disagreed with the parser in both directions: valid-but-unrecognized JSON
+// ({"foo":1}) is silently dropped by the parser but unmarshals fine (missed
+// alert), while array-wrapped or multiple newline-delimited messages render
+// fine but fail a single-object unmarshal (false alert beside a working
+// surface).
 func countDroppedTaggedBlocks(content string) int {
 	const openTag, closeTag = "<a2ui-json>", "</a2ui-json>"
 	var dropped int
@@ -93,10 +101,16 @@ func countDroppedTaggedBlocks(content string) int {
 		if j < 0 {
 			break
 		}
-		body := strings.TrimSpace(s[:j])
+		body := s[:j]
 		s = s[j+len(closeTag):]
-		var raw map[string]any
-		if json.Unmarshal([]byte(body), &raw) != nil {
+
+		messages := 0
+		if parts, err := a2tea.Scan(openTag + body + closeTag); err == nil {
+			for _, p := range parts {
+				messages += len(p.Messages)
+			}
+		}
+		if messages == 0 {
 			dropped++
 		}
 	}
@@ -117,7 +131,7 @@ func countDroppedTaggedBlocks(content string) int {
 // This deliberately bypasses the streaming-markdown prefix cache (which assumes
 // a single glamour render per item) and renders each segment directly. The
 // renderer is shared, so the whole multi-render sequence holds its lock.
-func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int) string {
+func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, finished bool) string {
 	masked, fenceReps := maskFencedCode(content)
 
 	parts, err := a2tea.Scan(masked)
@@ -175,8 +189,11 @@ func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int) 
 
 	// Alert when a complete tag pair was dropped by the parser (#7) —
 	// checked directly so bare-JSON parts cannot mask the count — or when
-	// generation was truncated mid-block (#5).
-	if countDroppedTaggedBlocks(masked) > 0 || hasUnclosedA2UITag(masked) {
+	// generation was truncated mid-block (#5). Only for finished messages:
+	// while streaming, an "unclosed" tag usually just means the close tag
+	// hasn't arrived yet, and flashing a red alert between flushes that then
+	// vanishes reads as a glitch.
+	if finished && (countDroppedTaggedBlocks(masked) > 0 || hasUnclosedA2UITag(masked)) {
 		writeChunk(a.renderA2UIAlert(width))
 	}
 
@@ -189,12 +206,15 @@ func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int) 
 // surfaced through the standard A2UI alert instead of leaving a wall of raw
 // JSON.
 func (a *AssistantMessageItem) renderTruncatedA2UI(content string, width int) string {
-	stripped := stripFencedCode(content)
-	idx := strings.Index(stripped, "<a2ui-json>")
+	// Mask (not strip) fences: a fence containing an <a2ui-json> example must
+	// not be mistaken for the truncation point, but the fence's code must
+	// stay in the rendered prose — stripping deleted it from the message.
+	masked, fenceReps := maskFencedCode(content)
+	idx := strings.Index(masked, "<a2ui-json>")
 
 	var b strings.Builder
 	if idx > 0 {
-		prose := stripped[:idx]
+		prose := unmaskFencedCode(masked[:idx], fenceReps)
 		if strings.TrimSpace(prose) != "" {
 			b.WriteString(a.renderMarkdown(prose, width))
 		}

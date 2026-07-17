@@ -37,7 +37,7 @@ func TestRenderContentWithA2UIFencedCodeNotLiveSurface(t *testing.T) {
 	item := &AssistantMessageItem{sty: &sty}
 
 	content := "Example:\n\n```json\n" + a2uiSurface + "\n```\n\nAnd some text."
-	out := item.renderContentWithA2UI(content, 80)
+	out := item.renderContentWithA2UI(content, 80, true)
 	plain := ansi.Strip(out)
 
 	// The fenced example is rendered as code — the raw tags and JSON are
@@ -59,7 +59,7 @@ func TestRenderContentWithA2UIRealSurfaceNextToFencedExample(t *testing.T) {
 	// A real surface followed by a fenced example: both should render
 	// correctly — the real surface as live, the fenced example as code.
 	content := "Real: " + a2uiSurface + "\n\nExample:\n\n```json\n" + a2uiSurface + "\n```"
-	out := item.renderContentWithA2UI(content, 80)
+	out := item.renderContentWithA2UI(content, 80, true)
 	plain := ansi.Strip(out)
 
 	require.Contains(t, plain, "Hello from A2UI") // real surface rendered
@@ -107,7 +107,7 @@ func TestRenderContentWithA2UIMalformedShowsAlert(t *testing.T) {
 	// Malformed JSON inside the tags: a2uistream drops it (no messages), so
 	// crush must alert rather than silently losing the block.
 	content := "Look: <a2ui-json>{not valid json}</a2ui-json>"
-	out := item.renderContentWithA2UI(content, 80)
+	out := item.renderContentWithA2UI(content, 80, true)
 	plain := ansi.Strip(out)
 
 	require.Contains(t, plain, "A2UI")
@@ -128,7 +128,7 @@ func TestRenderContentWithA2UIMalformedNotMaskedByBareJSON(t *testing.T) {
 	bareJSON := `{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
 		`{"component":"Text","id":"t","text":"bare"}]}}`
 	content := "<a2ui-json>{not valid json}</a2ui-json>\n\n" + bareJSON
-	out := item.renderContentWithA2UI(content, 80)
+	out := item.renderContentWithA2UI(content, 80, true)
 	plain := ansi.Strip(out)
 
 	require.Contains(t, plain, "couldn't render") // the malformed tagged block alerted
@@ -143,7 +143,7 @@ func TestRenderContentWithA2UI(t *testing.T) {
 	item := &AssistantMessageItem{sty: &sty}
 
 	content := "Here is a card:\n\n" + a2uiSurface + "\n\nAnything else?"
-	out := item.renderContentWithA2UI(content, 80)
+	out := item.renderContentWithA2UI(content, 80, true)
 	plain := ansi.Strip(out)
 
 	// The A2UI surface renders (text pulled from the card's Text component)...
@@ -167,9 +167,94 @@ func TestRenderContentWithA2UIMixedGoodAndBadAlerts(t *testing.T) {
 	// One valid surface plus one malformed block: the good one renders AND the
 	// dropped one is still surfaced via an alert (not silently lost).
 	content := "ok: " + a2uiSurface + " bad: <a2ui-json>{nope}</a2ui-json>"
-	out := item.renderContentWithA2UI(content, 80)
+	out := item.renderContentWithA2UI(content, 80, true)
 	plain := ansi.Strip(out)
 
 	require.Contains(t, plain, "Hello from A2UI") // the good surface rendered
 	require.Contains(t, plain, "couldn't render") // the bad block alerted
+}
+
+// TestDroppedBlockAlert_UnrecognizedValidJSON pins the parser-agreement fix:
+// {"foo":1} is valid JSON — the old single-object unmarshal check passed it —
+// but the A2UI parser silently drops it (no recognized message), so the user
+// lost the block with no alert. The dropped-block check now runs each block
+// through the same parser rendering uses.
+func TestDroppedBlockAlert_UnrecognizedValidJSON(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	content := `Look: <a2ui-json>{"foo": 1}</a2ui-json>`
+	out := item.renderContentWithA2UI(content, 80, true)
+	plain := ansi.Strip(out)
+
+	require.Contains(t, plain, "couldn't render",
+		"valid-but-unrecognized JSON is dropped by the parser and must alert")
+}
+
+// TestNoDroppedBlockAlert_MultiMessageBody pins the other direction: a tagged
+// body carrying multiple newline-delimited A2UI messages renders fine, so no
+// alert may appear beside the working surface (the old single-object
+// unmarshal false-positived here).
+func TestNoDroppedBlockAlert_MultiMessageBody(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	body := `{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[{"component":"Text","id":"root","text":"First"}]}}
+{"version":"v0.9","updateDataModel":{"surfaceId":"s","path":"/x","value":"y"}}`
+	content := "Here: <a2ui-json>" + body + "</a2ui-json>"
+
+	// Sanity: the parser really does yield messages for this body.
+	require.Zero(t, countDroppedTaggedBlocks(content),
+		"multi-message body must not count as dropped")
+
+	out := item.renderContentWithA2UI(content, 80, true)
+	plain := ansi.Strip(out)
+	require.Contains(t, plain, "First", "the surface must render")
+	require.NotContains(t, plain, "couldn't render",
+		"no alert may appear next to a successfully rendered surface")
+}
+
+// TestNoAlertWhileStreaming pins the streaming gate: with one complete
+// surface rendered and a second block still open (its close tag not yet
+// arrived), an unfinished message must NOT flash the alert; the same content
+// on a finished message must show it.
+func TestNoAlertWhileStreaming(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	content := `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[{"component":"Text","id":"root","text":"Done"}]}}</a2ui-json>
+And a second one: <a2ui-json>{"version":"v0.9","updateComp`
+
+	streaming := ansi.Strip(item.renderContentWithA2UI(content, 80, false))
+	require.Contains(t, streaming, "Done", "the complete surface renders mid-stream")
+	require.NotContains(t, streaming, "couldn't render",
+		"no alert while the close tag simply hasn't arrived yet")
+
+	finished := ansi.Strip(item.renderContentWithA2UI(content, 80, true))
+	require.Contains(t, finished, "couldn't render",
+		"a finished message with a dangling open tag must alert")
+}
+
+// TestRenderTruncatedA2UIPreservesFencedCode pins the fence fix: prose before
+// the truncated block may contain fenced code, which must survive rendering —
+// the old implementation stripped fences from the whole message, deleting the
+// user-visible code block.
+func TestRenderTruncatedA2UIPreservesFencedCode(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	content := "Example:\n\n```go\nfunc keepMe() {}\n```\n\nForm: <a2ui-json>{\"version\":\"v0.9\",\"updateComp"
+	out := ansi.Strip(item.renderTruncatedA2UI(content, 80))
+
+	require.Contains(t, out, "keepMe", "fenced code before the truncated block must be preserved")
+	require.Contains(t, out, "couldn't render")
+	require.NotContains(t, out, "updateComp", "raw truncated JSON must not leak")
 }

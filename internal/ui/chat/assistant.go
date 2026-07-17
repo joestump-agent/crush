@@ -434,7 +434,7 @@ func (a *AssistantMessageItem) cachedContent(width int) string {
 	if contentHasA2UI(text) {
 		// The reply carries an A2UI document — route it through a2tea instead
 		// of rendering the raw JSON as a markdown code block.
-		out = a.renderContentWithA2UI(text, width)
+		out = a.renderContentWithA2UI(text, width, a.message.IsFinished())
 	} else if a.message.IsFinished() && contentHasUnclosedA2UI(text) {
 		// Generation was truncated mid-block: an <a2ui-json> tag never got
 		// its closing partner. Show the alert instead of raw partial JSON.
