@@ -850,6 +850,7 @@ func (w *ClientWorkspace) translateEvent(ev any) tea.Msg {
 					Prompts:   e.Payload.PromptCount,
 					Resources: e.Payload.ResourceCount,
 				},
+				ChannelMessage: e.Payload.ChannelMessage,
 			},
 		}
 	case pubsub.Event[proto.PermissionRequest]:
@@ -972,6 +973,8 @@ func protoToMCPEventType(t proto.MCPEventType) mcp.EventType {
 		return mcp.EventPromptsListChanged
 	case proto.MCPEventResourcesListChanged:
 		return mcp.EventResourcesListChanged
+	case proto.MCPEventChannelMessage:
+		return mcp.EventChannelMessage
 	default:
 		return mcp.EventStateChanged
 	}
