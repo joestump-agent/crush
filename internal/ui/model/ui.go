@@ -2539,7 +2539,7 @@ func (m *UI) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 		main := uv.NewStyledString(m.landingView())
 		main.Draw(scr, layout.main)
 
-		editor := uv.NewStyledString(m.renderEditorView(scr.Bounds().Dx()))
+		editor := uv.NewStyledString(m.renderEditorView(layout.editor.Dx()))
 		editor.Draw(scr, layout.editor)
 
 	case uiChat:
@@ -2554,11 +2554,9 @@ func (m *UI) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 			uv.NewStyledString(m.pillsView).Draw(scr, layout.pills)
 		}
 
-		editorWidth := scr.Bounds().Dx()
-		if !m.isCompact {
-			editorWidth -= layout.sidebar.Dx()
-		}
-		editor := uv.NewStyledString(m.renderEditorView(editorWidth))
+		// Render at the draw rect's width so the attachment row's
+		// overflow and hit-test bounds match what ends up on screen.
+		editor := uv.NewStyledString(m.renderEditorView(layout.editor.Dx()))
 		editor.Draw(scr, layout.editor)
 
 		// Draw details overlay in compact mode when open

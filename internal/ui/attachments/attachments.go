@@ -186,9 +186,14 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting, showRemove
 				chips = append(chips, removeStr)
 				removeStart := offset + chipW
 				removeW := lipgloss.Width(removeStr)
+				// removeW includes the style's trailing margin, which only
+				// separates adjacent chips: exclude it from the clickable
+				// zone so clicking the gap between chips doesn't remove an
+				// attachment, but keep advancing offset by the full width so
+				// subsequent chips' bounds stay aligned with the render.
 				r.bounds = append(r.bounds, chipBounds{
 					startX:    removeStart,
-					removeEnd: removeStart + removeW,
+					removeEnd: removeStart + removeW - r.removeStyle.GetMarginRight(),
 				})
 				offset = removeStart + removeW
 			} else {
