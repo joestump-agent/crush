@@ -53,6 +53,9 @@ type ClientSession struct {
 	*mcp.ClientSession
 	cancel       context.CancelFunc
 	oauthHandler *mcpoauth.Handler
+	// channel reports whether this server is an active channel (it declared
+	// the claude/channel capability and was opted in via --channels).
+	channel bool
 }
 
 // Close cancels the session context and then closes the underlying session.
@@ -180,6 +183,9 @@ type ClientInfo struct {
 	Client      *ClientSession
 	Counts      Counts
 	ConnectedAt time.Time
+	// Channel reports whether this server is an active channel (declared the
+	// claude/channel capability and opted in via --channels).
+	Channel bool
 }
 
 // SubscribeEvents returns a channel for MCP events.
@@ -601,11 +607,12 @@ func closeSession(name string, s *ClientSession) {
 // updateState updates the state of an MCP client and publishes an event
 func updateState(name string, state State, err error, client *ClientSession, counts Counts) {
 	info := ClientInfo{
-		Name:   name,
-		State:  state,
-		Error:  err,
-		Client: client,
-		Counts: counts,
+		Name:    name,
+		State:   state,
+		Error:   err,
+		Client:  client,
+		Counts:  counts,
+		Channel: client != nil && client.channel,
 	}
 	switch state {
 	case StateConnected:
@@ -714,7 +721,8 @@ func createSession(ctx context.Context, cfg *config.ConfigStore, name string, m 
 	// Otherwise close it (fail closed). Resolving drains buffered messages
 	// that arrived during negotiation so a fast server does not lose early
 	// events.
-	if channelOptIn && hasChannelCapability(session.InitializeResult()) {
+	isChannel := channelOptIn && hasChannelCapability(session.InitializeResult())
+	if isChannel {
 		buffered := channelGate.resolve(true)
 		for _, raw := range buffered {
 			publishChannelMessage(mcpCtx, name, raw)
@@ -728,6 +736,7 @@ func createSession(ctx context.Context, cfg *config.ConfigStore, name string, m 
 		ClientSession: session,
 		cancel:        cancel,
 		oauthHandler:  oauthHandler,
+		channel:       isChannel,
 	}, nil
 }
 
