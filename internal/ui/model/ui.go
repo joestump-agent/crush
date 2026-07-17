@@ -4301,8 +4301,10 @@ func (m *UI) handlePasteMsg(msg tea.PasteMsg) tea.Cmd {
 				return util.ReportWarn("Paste is too big (>5mb)")
 			}
 			name := fmt.Sprintf("paste_%d.txt", m.pasteIdx())
-			mimeBufferSize := min(512, len(content))
-			mimeType := http.DetectContentType(content[:mimeBufferSize])
+			mimeType, ok := common.SniffAttachmentMIME(content)
+			if !ok {
+				return util.ReportWarn(fmt.Sprintf("Paste looks binary (%s), not attaching", mimeType))
+			}
 			return message.Attachment{
 				FileName: name,
 				FilePath: name,
@@ -4380,9 +4382,14 @@ func (m *UI) handleFilePathPaste(path string) tea.Cmd {
 			return util.ReportError(err)
 		}
 
-		mimeBufferSize := min(512, len(content))
-		mimeType := http.DetectContentType(content[:mimeBufferSize])
 		fileName := filepath.Base(path)
+		mimeType, ok := common.SniffAttachmentMIME(content)
+		if !ok {
+			// Allowed by extension but the content sniffs as binary —
+			// attaching would inline byte soup or send a file part
+			// providers reject.
+			return util.ReportWarn(fmt.Sprintf("%s looks binary (%s), not attaching", fileName, mimeType))
+		}
 		return message.Attachment{
 			FilePath: path,
 			FileName: fileName,

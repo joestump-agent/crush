@@ -2,7 +2,6 @@ package dialog
 
 import (
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 
@@ -194,9 +193,17 @@ func (a ActionFilePickerSelected) Cmd() tea.Cmd {
 			}
 		}
 
-		mimeBufferSize := min(512, len(content))
-		mimeType := http.DetectContentType(content[:mimeBufferSize])
 		fileName := filepath.Base(path)
+		mimeType, ok := common.SniffAttachmentMIME(content)
+		if !ok {
+			// Allowed by extension but the content sniffs as binary —
+			// attaching would inline byte soup or send a file part
+			// providers reject.
+			return util.InfoMsg{
+				Type: util.InfoTypeWarn,
+				Msg:  fmt.Sprintf("%s looks binary (%s), not attaching", fileName, mimeType),
+			}
+		}
 
 		return message.Attachment{
 			FilePath: path,

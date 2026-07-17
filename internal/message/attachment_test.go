@@ -3,6 +3,7 @@ package message
 import (
 	"testing"
 
+	"charm.land/fantasy"
 	"github.com/stretchr/testify/require"
 )
 
@@ -122,4 +123,49 @@ func TestContainsTextAttachment(t *testing.T) {
 		}
 		require.True(t, ContainsTextAttachment(attachments))
 	})
+}
+
+// TestToAIMessage_TextAttachmentSurvivesHistoryRebuild pins the audit fix:
+// IsText() was widened to application/* text types, but ToAIMessage (which
+// rebuilds prior user messages on every later turn) still inlined only
+// text/* — so an application/json attachment worked on turn one and came
+// back on turn two as a BINARY file part with media type application/json,
+// which file-part-only-accepting providers reject, wedging the session.
+// The two paths must use the same predicate.
+func TestToAIMessage_TextAttachmentSurvivesHistoryRebuild(t *testing.T) {
+	t.Parallel()
+
+	msg := &Message{Role: User}
+	msg.Parts = []ContentPart{
+		TextContent{Text: "look at this config"},
+		BinaryContent{Path: "config.json", MIMEType: "application/json", Data: []byte(`{"a":1}`)},
+	}
+
+	aiMsgs := msg.ToAIMessage()
+	require.Len(t, aiMsgs, 1)
+
+	var sawFilePart bool
+	var text string
+	for _, part := range aiMsgs[0].Content {
+		switch p := part.(type) {
+		case fantasy.TextPart:
+			text = p.Text
+		case fantasy.FilePart:
+			sawFilePart = true
+		}
+	}
+	require.False(t, sawFilePart,
+		"application/json must be inlined as text on history rebuild, not re-sent as a binary file part")
+	require.Contains(t, text, `{"a":1}`, "attachment content must be inlined into the prompt text")
+}
+
+// TestIsTextMIME_AgreesWithAttachmentIsText pins the shared predicate.
+func TestIsTextMIME_AgreesWithAttachmentIsText(t *testing.T) {
+	t.Parallel()
+	for _, mt := range []string{
+		"text/plain", "application/json", "application/yaml",
+		"image/png", "application/pdf", "application/octet-stream",
+	} {
+		require.Equal(t, Attachment{MimeType: mt}.IsText(), IsTextMIME(mt), mt)
+	}
 }

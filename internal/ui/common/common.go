@@ -3,12 +3,15 @@ package common
 import (
 	"fmt"
 	"image"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/clipboard"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/crush/internal/ui/util"
 	"github.com/charmbracelet/crush/internal/workspace"
@@ -42,8 +45,14 @@ func AllAllowedAttachmentTypes() []string {
 	return result
 }
 
+// AllowedTextFileNames are extensionless file names attachable as text.
+// Suffix matching can't cover these: "Dockerfile" has no dot, so a
+// ".dockerfile" extension entry never matches it.
+var AllowedTextFileNames = []string{"dockerfile", "makefile", "gnumakefile"}
+
 // IsAllowedAttachmentType reports whether the given file path has an
-// extension that is in the allowed image or text file type list.
+// extension that is in the allowed image or text file type list, or is an
+// extensionless well-known text file (Dockerfile, Makefile).
 func IsAllowedAttachmentType(path string) bool {
 	lower := strings.ToLower(path)
 	for _, ext := range AllowedImageTypes {
@@ -56,7 +65,29 @@ func IsAllowedAttachmentType(path string) bool {
 			return true
 		}
 	}
+	base := filepath.Base(lower)
+	for _, name := range AllowedTextFileNames {
+		if base == name {
+			return true
+		}
+	}
 	return false
+}
+
+// SniffAttachmentMIME detects an attachment's MIME type from its content and
+// reports whether it is safe to attach. ok=false means the content sniffs as
+// something that is neither text nor an image — e.g. a ".log" with a NUL
+// byte in the first 512 bytes detects as application/octet-stream. Attaching
+// such a file would either inline byte soup into the prompt or send a binary
+// file part with a media type providers reject; callers should surface an
+// error instead.
+func SniffAttachmentMIME(content []byte) (string, bool) {
+	mimeBufferSize := min(512, len(content))
+	mimeType := http.DetectContentType(content[:mimeBufferSize])
+	if message.IsTextMIME(mimeType) || strings.HasPrefix(mimeType, "image/") {
+		return mimeType, true
+	}
+	return mimeType, false
 }
 
 // IsAllowedImageType reports whether the given file path has an allowed image
