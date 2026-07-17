@@ -365,50 +365,9 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 	// Discover models concurrently for custom providers that need it.
 	// A provider needs discovery when discover_models is explicitly true,
 	// or when the models list is empty (auto-trigger, unless opted out).
-	type discoveryResult struct {
-		models []catwalk.Model
-		err    error
-	}
-
-	discoveryResults := make(map[string]discoveryResult)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
+	// The same helper backs the interactive reload; see discovery.go.
 	discoverCtx, discoverCancel := context.WithTimeout(ctx, 3*time.Second)
-	for id, pc := range c.Providers.Seq2() {
-		if knownProviderNames[id] {
-			continue
-		}
-		if pc.Disable || pc.BaseURL == "" {
-			continue
-		}
-		wantsDiscovery := pc.AutoDiscoverModels != nil && *pc.AutoDiscoverModels
-		autoTrigger := len(pc.Models) == 0 && (pc.AutoDiscoverModels == nil || *pc.AutoDiscoverModels)
-		if !wantsDiscovery && !autoTrigger {
-			continue
-		}
-		providerID := cmp.Or(pc.ID, id)
-		cfg := discover.Config{
-			ID:             providerID,
-			BaseURL:        pc.BaseURL,
-			APIKey:         pc.APIKey,
-			ExtraHeaders:   pc.ExtraHeaders,
-			ExistingModels: pc.Models,
-		}
-		providerType := cmp.Or(pc.Type, catwalk.TypeOpenAICompat)
-		wg.Go(func() {
-			models, err := discover.DiscoverModels(discoverCtx, cfg, resolver)
-			if err == nil && len(models) > 0 {
-				if enricher := discover.GetEnricher(string(providerType)); enricher != nil {
-					models, _ = enricher.EnrichModels(discoverCtx, cfg, resolver, models)
-				}
-			}
-			mu.Lock()
-			discoveryResults[id] = discoveryResult{models: models, err: err}
-			mu.Unlock()
-		})
-	}
-	wg.Wait()
+	discoveryResults := discoverProviderModels(discoverCtx, c.Providers, knownProviderNames, resolver, false)
 	discoverCancel()
 
 	// Validate the custom providers.
@@ -446,19 +405,14 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 			continue
 		}
 
-		// Apply discovery results if available.
-		if result, ok := discoveryResults[id]; ok {
-			if result.err != nil {
-				slog.Warn("Model discovery failed", "provider", id, "error", result.err)
-				if len(providerConfig.Models) == 0 {
-					slog.Warn("Skipping provider with no models after failed discovery", "provider", id)
-					c.Providers.Del(id)
-					continue
-				}
-			} else if len(result.models) > 0 {
-				providerConfig.Models = result.models
-				slog.Info("Discovered models for provider", "provider", id, "count", len(result.models))
-			}
+		// Apply discovery results if available. discoverProviderModels
+		// only returns entries for providers whose discovery succeeded and
+		// yielded models; failures (and empty results) fall through to the
+		// no-models check below, which drops the provider when it has no
+		// user-specified models to fall back on.
+		if models, ok := discoveryResults[id]; ok {
+			providerConfig.Models = models
+			slog.Info("Discovered models for provider", "provider", id, "count", len(models))
 		}
 
 		if len(providerConfig.Models) == 0 {

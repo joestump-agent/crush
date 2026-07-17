@@ -85,6 +85,7 @@ type Models struct {
 		UpDown   key.Binding
 		Select   key.Binding
 		Edit     key.Binding
+		Reload   key.Binding
 		Next     key.Binding
 		Previous key.Binding
 		Close    key.Binding
@@ -128,6 +129,10 @@ func NewModels(com *common.Common, isOnboarding bool) (*Models, error) {
 	m.keyMap.Edit = key.NewBinding(
 		key.WithKeys("ctrl+e"),
 		key.WithHelp("ctrl+e", "edit"),
+	)
+	m.keyMap.Reload = key.NewBinding(
+		key.WithKeys("ctrl+r"),
+		key.WithHelp("ctrl+r", "reload"),
 	)
 	m.keyMap.UpDown = key.NewBinding(
 		key.WithKeys("up", "down"),
@@ -203,6 +208,8 @@ func (m *Models) HandleMsg(msg tea.Msg) Action {
 				ModelType:      modelItem.SelectedModelType(),
 				ReAuthenticate: isEdit,
 			}
+		case key.Matches(msg, m.keyMap.Reload):
+			return ActionReloadModelDiscovery{}
 		case key.Matches(msg, m.keyMap.Tab):
 			if m.isOnboarding {
 				break
@@ -326,7 +333,7 @@ func (m *Models) ShortHelp() []key.Binding {
 	if m.isSelectedConfigured() {
 		h = append(h, m.keyMap.Edit)
 	}
-	h = append(h, m.keyMap.Close)
+	h = append(h, m.keyMap.Reload, m.keyMap.Close)
 	return h
 }
 
@@ -506,6 +513,22 @@ func (m *Models) setProviderItems() error {
 		m.input.Placeholder = m.modelType.Placeholder()
 	}
 
+	return nil
+}
+
+// ReloadItems rebuilds the model list from the current config, preserving the
+// active filter query. It is called after a model-discovery reload so newly
+// discovered models appear without closing the dialog.
+func (m *Models) ReloadItems() error {
+	if err := m.setProviderItems(); err != nil {
+		return err
+	}
+	// setProviderItems repopulates the full item set; re-apply the filter
+	// the user had typed so the view doesn't jump back to the full list.
+	if query := m.input.Value(); query != "" {
+		m.list.SetFilter(query)
+		m.list.ScrollToSelected()
+	}
 	return nil
 }
 

@@ -565,6 +565,16 @@ func (w *ClientWorkspace) ReloadSkills() error {
 	return w.client.ReloadSkills(context.Background(), w.workspaceID())
 }
 
+func (w *ClientWorkspace) ReloadModelDiscovery(ctx context.Context) (int, error) {
+	added, err := w.client.ReloadModelDiscovery(ctx, w.workspaceID())
+	if err == nil {
+		// Pull the server's updated config so the newly discovered models
+		// are visible in this client's cached view (e.g. the /models dialog).
+		w.refreshWorkspace()
+	}
+	return added, err
+}
+
 func (w *ClientWorkspace) GetSkillStates() []*skills.SkillState {
 	if w.skills == nil {
 		return nil

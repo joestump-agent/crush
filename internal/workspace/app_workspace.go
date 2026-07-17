@@ -407,6 +407,10 @@ func (w *AppWorkspace) ReloadSkills() error {
 	return nil
 }
 
+func (w *AppWorkspace) ReloadModelDiscovery(ctx context.Context) (int, error) {
+	return w.store.ReloadModelDiscovery(ctx)
+}
+
 func (w *AppWorkspace) GetSkillStates() []*skills.SkillState {
 	if w.app.Skills == nil {
 		return nil
