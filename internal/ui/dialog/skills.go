@@ -2,6 +2,7 @@ package dialog
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 
 	"charm.land/bubbles/v2/help"
@@ -13,6 +14,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/list"
 	"github.com/charmbracelet/crush/internal/ui/styles"
+	"github.com/charmbracelet/crush/internal/ui/util"
 	"github.com/charmbracelet/crush/internal/workspace"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/sahilm/fuzzy"
@@ -96,10 +98,12 @@ func (s *SkillItem) Render(width int) string {
 	var parts []string
 	parts = append(parts, string(s.entry.Source))
 
-	if s.disabled {
-		parts = append(parts, "off")
-	} else if s.state != nil && s.state.State == skills.StateError {
+	// Error wins over disabled: a broken skill must surface as broken, not
+	// as merely switched off.
+	if s.state != nil && s.state.State == skills.StateError {
 		parts = append(parts, "error")
+	} else if s.disabled {
+		parts = append(parts, "off")
 	} else {
 		parts = append(parts, "on")
 	}
@@ -217,6 +221,20 @@ func (d *Skills) skillItems() []list.FilterableItem {
 
 	// Add skills that are discovered but disabled (not in the active catalog).
 	for _, st := range states {
+		if st.Name == "" {
+			// Walk/parse errors produce states with no name. Show them with a
+			// directory-derived fallback name (like the status sidebar does)
+			// so the breakage stays visible, keyed by path so multiple broken
+			// files don't collapse into duplicate empty IDs. These rows are
+			// not toggleable: there is no skill name to persist.
+			entry := skills.CatalogEntry{
+				ID:     st.Path,
+				Name:   filepath.Base(filepath.Dir(st.Path)),
+				Source: skills.SourceProject,
+			}
+			items = append(items, NewSkillItem(d.com.Styles, entry, st, false))
+			continue
+		}
 		if seenNames[st.Name] {
 			continue
 		}
@@ -262,6 +280,15 @@ func (d *Skills) HandleMsg(msg tea.Msg) Action {
 			return ActionSkillsReload{}
 		case key.Matches(msg, d.keyMap.Toggle):
 			if item := d.selectedSkill(); item != nil {
+				if item.state != nil && item.state.Name == "" {
+					// A broken skill file has no real name to toggle;
+					// surface its error instead of persisting an empty (or
+					// fallback) name to config.
+					if item.state.Err != nil {
+						return ActionCmd{util.ReportWarn(item.state.Err.Error())}
+					}
+					return nil
+				}
 				return ActionSkillToggle{SkillName: item.entry.Name}
 			}
 		default:

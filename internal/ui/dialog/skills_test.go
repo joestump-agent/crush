@@ -258,6 +258,88 @@ func TestSkillsDialog_ListSkillsErrorRendersEmpty(t *testing.T) {
 	require.True(t, ok, "reload should still fire even when the list is empty")
 }
 
+func TestSkillsDialog_BrokenSkillRendersFallbackName(t *testing.T) {
+	t.Parallel()
+
+	// Walk/parse errors produce states with an empty Name. Those must not
+	// become blank rows with duplicate empty IDs: they render with a
+	// directory-derived fallback name and an error indicator.
+	d := newTestSkillsDialog(
+		t,
+		[]skills.CatalogEntry{{ID: "/skills/alpha/SKILL.md", Name: "Alpha", Source: skills.SourceUser}},
+		[]*skills.SkillState{
+			{Name: "Alpha", State: skills.StateNormal},
+			{Name: "", Path: "/skills/broken-skill/SKILL.md", State: skills.StateError, Err: errors.New("bad frontmatter")},
+		},
+		nil,
+	)
+
+	items := d.list.FilteredItems()
+	require.Len(t, items, 2)
+	broken := items[1].(*SkillItem)
+	require.Equal(t, "broken-skill", broken.entry.Name, "fallback name should come from the skill directory")
+	require.Equal(t, "/skills/broken-skill/SKILL.md", broken.ID(), "ID should be the path, not an empty string")
+
+	rendered := broken.Render(60)
+	require.Contains(t, rendered, "broken-skill")
+	require.Contains(t, rendered, "error")
+	require.NotContains(t, rendered, "off", "a broken skill is an error, not merely off")
+}
+
+func TestSkillsDialog_BrokenSkillNotToggleable(t *testing.T) {
+	t.Parallel()
+
+	// Enter on a broken (empty-name) skill must not emit ActionSkillToggle:
+	// there is no real skill name to persist to disabled_skills.
+	d := newTestSkillsDialog(
+		t,
+		[]skills.CatalogEntry{{ID: "/skills/alpha/SKILL.md", Name: "Alpha", Source: skills.SourceUser}},
+		[]*skills.SkillState{
+			{Name: "Alpha", State: skills.StateNormal},
+			{Name: "", Path: "/skills/broken-skill/SKILL.md", State: skills.StateError, Err: errors.New("bad frontmatter")},
+		},
+		nil,
+	)
+
+	d.HandleMsg(tea.KeyPressMsg{Code: tea.KeyDown})
+	sel := d.selectedSkill()
+	require.NotNil(t, sel)
+	require.Equal(t, "broken-skill", sel.entry.Name)
+
+	action := d.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
+	_, isToggle := action.(ActionSkillToggle)
+	require.False(t, isToggle, "Enter on a broken skill must not emit a toggle")
+	cmdAction, ok := action.(ActionCmd)
+	require.True(t, ok, "Enter on a broken skill should surface its error")
+	require.NotNil(t, cmdAction.Cmd)
+}
+
+func TestSkillItem_NamedErrorSkillShowsErrorNotOff(t *testing.T) {
+	t.Parallel()
+
+	// A named skill in StateError (e.g. failed validation) is excluded from
+	// the active catalog and used to render as merely "off". The error state
+	// must win over the disabled flag.
+	d := newTestSkillsDialog(
+		t,
+		[]skills.CatalogEntry{{ID: "/skills/alpha/SKILL.md", Name: "Alpha", Source: skills.SourceUser}},
+		[]*skills.SkillState{
+			{Name: "Alpha", State: skills.StateNormal},
+			{Name: "Bad", Path: "/skills/bad/SKILL.md", State: skills.StateError, Err: errors.New("validation failed")},
+		},
+		nil,
+	)
+
+	items := d.list.FilteredItems()
+	require.Len(t, items, 2)
+	bad := items[1].(*SkillItem)
+	require.Equal(t, "Bad", bad.entry.Name)
+
+	rendered := bad.Render(60)
+	require.Contains(t, rendered, "error")
+	require.NotContains(t, rendered, "off", "error state must win over the disabled flag")
+}
+
 func TestSkillsDialog_ActiveSkillNotDuplicatedByState(t *testing.T) {
 	t.Parallel()
 
