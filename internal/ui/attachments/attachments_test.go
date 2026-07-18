@@ -1,11 +1,13 @@
 package attachments
 
 import (
+	"fmt"
 	"testing"
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/ui/styles"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -145,6 +147,76 @@ func TestHitTestRemove_ReturnsCorrectIndex(t *testing.T) {
 	b1 := r.bounds[1]
 	idx = r.HitTestRemove(atts, b1.startX)
 	require.Equal(t, 1, idx)
+}
+
+// removeGlyphCells returns the x cell position of each RemoveIcon glyph in
+// the ANSI-stripped render output, so hit zones can be checked against what
+// is actually on screen rather than against the recorded bounds.
+func removeGlyphCells(t *testing.T, rendered string) []int {
+	t.Helper()
+	var cells []int
+	x := 0
+	for _, r := range ansi.Strip(rendered) {
+		if string(r) == styles.RemoveIcon {
+			cells = append(cells, x)
+		}
+		x += ansi.StringWidth(string(r))
+	}
+	return cells
+}
+
+func TestHitTestRemove_MatchesRenderedGlyphs(t *testing.T) {
+	t.Parallel()
+
+	r := newTestRenderer()
+	atts := []message.Attachment{
+		{FileName: "first.txt"},
+		{FileName: "second.png"},
+		{FileName: "third.md"},
+	}
+	out := r.Render(atts, false, true, 200)
+
+	glyphs := removeGlyphCells(t, out)
+	require.Len(t, glyphs, len(atts))
+
+	marginW := r.removeStyle.GetMarginRight()
+	require.Positive(t, marginW, "test assumes the remove style has a trailing margin")
+	// Visible button width: padding + glyph, without the trailing margin.
+	btnW := lipgloss.Width(r.removeStyle.String()) - marginW
+
+	for i, glyphX := range glyphs {
+		start := glyphX - r.removeStyle.GetPaddingLeft()
+		for x := start; x < start+btnW; x++ {
+			require.Equalf(t, i, r.HitTestRemove(atts, x), "cell %d inside chip %d's remove button", x, i)
+		}
+		// The margin cells after the button are just the gap between
+		// chips; clicking there must not remove anything.
+		for x := start + btnW; x < start+btnW+marginW; x++ {
+			require.Equalf(t, -1, r.HitTestRemove(atts, x), "margin cell %d after chip %d's remove button", x, i)
+		}
+	}
+}
+
+func TestHitTestRemove_OverflowAreaHitsNothing(t *testing.T) {
+	t.Parallel()
+
+	r := newTestRenderer()
+	var atts []message.Attachment
+	for i := range 10 {
+		atts = append(atts, message.Attachment{FileName: fmt.Sprintf("file-%d.txt", i)})
+	}
+	out := r.Render(atts, false, true, 60)
+
+	stripped := ansi.Strip(out)
+	require.Contains(t, stripped, "more…", "expected the overflow label at this width")
+	require.Less(t, len(r.bounds), len(atts), "not every chip should fit at this width")
+
+	// Every cell from the end of the last remove button to past the end of
+	// the row (the overflow label area) must hit nothing.
+	last := r.bounds[len(r.bounds)-1]
+	for x := last.removeEnd; x < ansi.StringWidth(stripped)+5; x++ {
+		require.Equalf(t, -1, r.HitTestRemove(atts, x), "cell %d in the overflow label area", x)
+	}
 }
 
 func TestHitTestRemove_OutsideAnyRemoveReturnsMinusOne(t *testing.T) {
