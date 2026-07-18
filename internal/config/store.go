@@ -55,6 +55,15 @@ type RuntimeOverrides struct {
 	// pushes channel events when it also appears here. Entries may be written
 	// as "server:<name>" or as a bare "<name>".
 	EnabledChannels []string
+	// AllowAllCommands, when true, removes every bash-tool command block for
+	// this session (via the --allow-all-commands flag or CRUSH_ALLOW_ALL_COMMANDS).
+	AllowAllCommands bool
+	// AllowedCommands lists commands to drop from the bash tool's default
+	// banned list for this session (via the --allow-commands flag or
+	// CRUSH_ALLOW_COMMANDS). It is merged with options.allowed_commands from
+	// the config file. Held here rather than in Options so it survives config
+	// reloads.
+	AllowedCommands []string
 }
 
 // ConfigStore is the single entry point for all config access. It owns the
