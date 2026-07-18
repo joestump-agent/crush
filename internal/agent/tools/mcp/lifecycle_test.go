@@ -3,6 +3,10 @@ package mcp
 import (
 	"context"
 	"errors"
+	"io"
+	"os/exec"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/charmbracelet/crush/internal/config"
@@ -152,4 +156,152 @@ func TestSessionErrorThenRenew_RestoresTools(t *testing.T) {
 	require.True(t, ok, "tools must be restored after the session is renewed")
 	require.Len(t, got, 1)
 	require.Equal(t, "send_message", got[0].Name)
+}
+
+// TestUpdateState_ErrorFromStaleSessionPreservesHealthyReplacement pins the
+// audit fix: a StateError reported against a session that is NO LONGER the
+// registered one (a renewal already replaced it) must not tear down the
+// healthy replacement or its registrations. Before the fix updateState closed
+// whatever session was in the map, so a stale error transition — e.g. a slow
+// ping timing out after another path had already renewed — killed the fresh
+// session and wiped its tools.
+func TestUpdateState_ErrorFromStaleSessionPreservesHealthyReplacement(t *testing.T) {
+	const name = "test-stale-error"
+	t.Cleanup(func() {
+		sessions.Del(name)
+		allTools.Del(name)
+		allPrompts.Del(name)
+		states.Del(name)
+	})
+
+	stale, staleCtx := liveSession(t, "old_tool")
+	fresh, freshCtx := liveSession(t, "new_tool")
+
+	// The registry holds the fresh session and its registrations.
+	sessions.Set(name, fresh)
+	allTools.Set(name, []*Tool{{Name: "new_tool"}})
+	allPrompts.Set(name, []*Prompt{{Name: "new_prompt"}})
+
+	// A stale error arrives for the OLD session.
+	updateState(name, StateError, errors.New("ping timeout"), stale, Counts{})
+
+	// The fresh session must still be registered and open.
+	got, ok := sessions.Get(name)
+	require.True(t, ok, "healthy replacement session was removed")
+	require.Same(t, fresh, got)
+	require.NoError(t, freshCtx.Err(), "healthy replacement session was closed")
+	_, ok = allTools.Get(name)
+	require.True(t, ok, "healthy replacement's tools were cleared")
+	_, ok = allPrompts.Get(name)
+	require.True(t, ok, "healthy replacement's prompts were cleared")
+
+	// The stale session must have been closed.
+	require.Error(t, staleCtx.Err(), "stale session was not closed")
+}
+
+// TestUpdateState_ErrorFromCurrentSessionClearsEverything pins the complement:
+// when the erroring session IS the registered one, it is removed, closed, and
+// both tools and prompts are cleared (prompts were previously left behind —
+// dead servers kept their prompts in the commands menu).
+func TestUpdateState_ErrorFromCurrentSessionClearsEverything(t *testing.T) {
+	const name = "test-current-error"
+	t.Cleanup(func() {
+		sessions.Del(name)
+		allTools.Del(name)
+		allPrompts.Del(name)
+		states.Del(name)
+	})
+
+	sess, sessCtx := liveSession(t, "a_tool")
+	sessions.Set(name, sess)
+	allTools.Set(name, []*Tool{{Name: "a_tool"}})
+	allPrompts.Set(name, []*Prompt{{Name: "a_prompt"}})
+
+	updateState(name, StateError, errors.New("boom"), sess, Counts{})
+
+	_, ok := sessions.Get(name)
+	require.False(t, ok, "erroring session should be removed")
+	require.Error(t, sessCtx.Err(), "erroring session should be closed")
+	_, ok = allTools.Get(name)
+	require.False(t, ok, "tools should be cleared")
+	_, ok = allPrompts.Get(name)
+	require.False(t, ok, "prompts should be cleared (previously leaked)")
+
+	st, _ := states.Get(name)
+	require.Nil(t, st.Client, "error state must not publish a dead session")
+}
+
+// TestMaybeStdioErr_UnwrapsChannelTransport pins the diagnostics fix: every
+// transport is wrapped in a channelTransport before Connect, so maybeStdioErr
+// must unwrap it to find the CommandTransport. Before the fix the type
+// assertion always failed and stdio startup errors reported bare EOF with
+// none of the child's output attached.
+func TestMaybeStdioErr_UnwrapsChannelTransport(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "echo boom-diagnostic >&2; exit 3")
+	inner := &mcp.CommandTransport{Command: cmd}
+	wrapped := &channelTransport{inner: inner, name: "t", gate: &atomic.Bool{}}
+
+	got := maybeStdioErr(io.EOF, wrapped)
+	require.ErrorContains(t, got, "boom-diagnostic",
+		"stdio diagnostics should surface the child's output through the channelTransport wrapper")
+}
+
+// TestNameLock_ConcurrentFirstUseReturnsOneMutex pins that the per-name
+// lifecycle lock is minted atomically: racing first-use callers must all
+// receive the same mutex, or the serialization the whole lifecycle relies
+// on silently degrades to per-caller locks.
+func TestNameLock_ConcurrentFirstUseReturnsOneMutex(t *testing.T) {
+	const name = "test-name-lock-race"
+	t.Cleanup(func() { nameLocks.Del(name) })
+
+	const n = 32
+	locks := make([]*sync.Mutex, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			locks[i] = nameLock(name)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 1; i < n; i++ {
+		require.Same(t, locks[0], locks[i], "all callers must share one lifecycle mutex")
+	}
+}
+
+// TestUpdateState_ErrorClearsResources pins that both StateError teardown
+// branches clear the resources registry alongside tools and prompts — a
+// dead server must not keep advertising resources it can no longer serve.
+func TestUpdateState_ErrorClearsResources(t *testing.T) {
+	const name = "test-error-clears-resources"
+	t.Cleanup(func() {
+		sessions.Del(name)
+		allTools.Del(name)
+		allResources.Del(name)
+		states.Del(name)
+	})
+
+	// Branch 1: the registered session itself errored (client argument).
+	sess, _ := liveSession(t, "res_tool")
+	sessions.Set(name, sess)
+	allResources.Set(name, []*Resource{{Name: "doc"}})
+
+	updateState(name, StateError, errors.New("listing broke"), sess, Counts{})
+	_, ok := allResources.Get(name)
+	require.False(t, ok, "current-session error must clear the resources registry")
+
+	// Branch 2: no specific session (connect failed); anything registered
+	// under the name is unusable.
+	sess2, _ := liveSession(t, "res_tool2")
+	sessions.Set(name, sess2)
+	allResources.Set(name, []*Resource{{Name: "doc2"}})
+
+	updateState(name, StateError, errors.New("connect broke"), nil, Counts{})
+	_, ok = allResources.Get(name)
+	require.False(t, ok, "no-session error must clear the resources registry")
 }

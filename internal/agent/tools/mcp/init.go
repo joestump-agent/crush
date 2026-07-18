@@ -59,9 +59,20 @@ func (s *ClientSession) Close() error {
 var (
 	sessions = csync.NewMap[string, *ClientSession]()
 	states   = csync.NewMap[string, ClientInfo]()
-	broker   = pubsub.NewBroker[Event]()
-	initOnce sync.Once
-	initDone = make(chan struct{})
+
+	// nameLocks serializes per-server lifecycle mutations — init, disable,
+	// renew, refresh. Without it, two concurrent renewals for the same server
+	// interleave: the loser's error path tears down the winner's healthy,
+	// just-installed session, or the second success overwrites the first
+	// session without closing it. Different servers never contend.
+	nameLocks = csync.NewMap[string, *sync.Mutex]()
+	// nameLocksMu makes mutex creation in nameLock atomic:
+	// csync.Map.GetOrSet is check-then-act, so two first-op callers
+	// could otherwise mint different mutexes and proceed unserialized.
+	nameLocksMu sync.Mutex
+	broker      = pubsub.NewBroker[Event]()
+	initOnce    sync.Once
+	initDone    = make(chan struct{})
 )
 
 // State represents the current state of an MCP client
@@ -249,8 +260,24 @@ func InitializeSingle(ctx context.Context, name string, cfg *config.ConfigStore)
 	return initClient(ctx, cfg, name, m, cfg.Resolver())
 }
 
+// nameLock returns the mutex serializing lifecycle mutations for one server.
+func nameLock(name string) *sync.Mutex {
+	nameLocksMu.Lock()
+	defer nameLocksMu.Unlock()
+	if mu, ok := nameLocks.Get(name); ok {
+		return mu
+	}
+	mu := &sync.Mutex{}
+	nameLocks.Set(name, mu)
+	return mu
+}
+
 // initClient initializes a single MCP client with the given configuration.
 func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m config.MCPConfig, resolver config.VariableResolver) error {
+	mu := nameLock(name)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Set initial starting state.
 	updateState(name, StateStarting, nil, nil, Counts{})
 
@@ -263,20 +290,23 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 	toolCount, err := registerSessionTools(ctx, cfg, name, session)
 	if err != nil {
 		slog.Error("Error listing tools", "error", err)
-		updateState(name, StateError, err, nil, Counts{})
-		closeSession(name, session)
+		updateState(name, StateError, err, session, Counts{})
 		return err
 	}
 
 	prompts, err := getPrompts(ctx, session)
 	if err != nil {
 		slog.Error("Error listing prompts", "error", err)
-		updateState(name, StateError, err, nil, Counts{})
-		closeSession(name, session)
+		updateState(name, StateError, err, session, Counts{})
 		return err
 	}
 
 	updatePrompts(name, prompts)
+	// A repeated init (e.g. enable called twice) must not overwrite a live
+	// session without closing it — that leaks the child process and pipes.
+	if old, ok := sessions.Take(name); ok && old != session {
+		closeSession(name, old)
+	}
 	sessions.Set(name, session)
 
 	updateState(name, StateConnected, nil, session, Counts{
@@ -289,13 +319,18 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 
 // DisableSingle disables and closes a single MCP client by name.
 func DisableSingle(cfg *config.ConfigStore, name string) error {
+	mu := nameLock(name)
+	mu.Lock()
+	defer mu.Unlock()
+
 	if session, ok := sessions.Take(name); ok {
 		closeSession(name, session)
 	}
 
-	// Clear tools and prompts for this MCP.
+	// Clear tools, prompts, and resources for this MCP.
 	updateTools(cfg, name, nil)
 	updatePrompts(name, nil)
+	updateResources(name, nil)
 
 	// Update state to disabled.
 	updateState(name, StateDisabled, nil, nil, Counts{})
@@ -305,6 +340,14 @@ func DisableSingle(cfg *config.ConfigStore, name string) error {
 }
 
 func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string) (*ClientSession, error) {
+	// The whole ping→renew→re-register sequence runs under the per-name lock,
+	// making renewal single-flight: a caller that raced a renewal re-pings the
+	// fresh session the winner installed and returns it, instead of tearing it
+	// down and building another.
+	mu := nameLock(name)
+	mu.Lock()
+	defer mu.Unlock()
+
 	sess, ok := sessions.Get(name)
 	if !ok {
 		return nil, fmt.Errorf("mcp '%s' not available", name)
@@ -320,34 +363,46 @@ func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string)
 	if err == nil {
 		return sess, nil
 	}
-	updateState(name, StateError, maybeTimeoutErr(err, timeout), nil, state.Counts)
+	// Report the failure against the exact session that failed the ping, so
+	// only that session is closed and deregistered.
+	updateState(name, StateError, maybeTimeoutErr(err, timeout), sess, state.Counts)
 
-	sess, err = createSession(ctx, name, m, cfg.Resolver(), ChannelEnabled(cfg.Overrides().EnabledChannels, name))
+	fresh, err := createSession(ctx, name, m, cfg.Resolver(), ChannelEnabled(cfg.Overrides().EnabledChannels, name))
 	if err != nil {
 		return nil, err
 	}
 
-	// The StateError transition above cleared this server's tools from the
-	// registry (and closed the dead session). Re-list and re-register them on
-	// the fresh session; otherwise the agent reconnects but the LLM's tool
-	// list stays empty and the next call fails with "tool not found".
+	// The StateError transition above cleared this server's tools and prompts
+	// from the registry (and closed the dead session). Re-list and re-register
+	// both on the fresh session; otherwise the agent reconnects but the LLM's
+	// tool list stays empty and the next call fails with "tool not found",
+	// and the commands menu keeps stale prompts.
 	counts := state.Counts
-	counts.Tools, err = registerSessionTools(ctx, cfg, name, sess)
+	counts.Tools, err = registerSessionTools(ctx, cfg, name, fresh)
 	if err != nil {
-		updateState(name, StateError, err, nil, state.Counts)
-		closeSession(name, sess)
+		updateState(name, StateError, err, fresh, state.Counts)
 		return nil, err
 	}
 
-	sessions.Set(name, sess)
-	updateState(name, StateConnected, nil, sess, counts)
-	return sess, nil
+	prompts, err := getPrompts(ctx, fresh)
+	if err != nil {
+		slog.Warn("Error re-listing prompts after MCP renewal", "name", name, "error", err)
+	}
+	updatePrompts(name, prompts)
+	counts.Prompts = len(prompts)
+
+	sessions.Set(name, fresh)
+	updateState(name, StateConnected, nil, fresh, counts)
+	return fresh, nil
 }
 
 // closeSession closes an MCP session, logging only unexpected errors. EOF,
 // context cancellation, and a killed child are the ordinary result of tearing
 // a session down and are not worth surfacing.
 func closeSession(name string, s *ClientSession) {
+	if s == nil || s.ClientSession == nil {
+		return
+	}
 	if err := s.Close(); err != nil &&
 		!errors.Is(err, io.EOF) &&
 		!errors.Is(err, context.Canceled) &&
@@ -370,17 +425,36 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 	case StateConnected:
 		info.ConnectedAt = time.Now()
 	case StateError:
-		// A session that has errored is dead to us. Atomically remove it and
-		// close it so the child process and its stdio pipes are released — the
-		// bare map delete this used to do leaked both. Clearing the tool
-		// registry keeps the agent from advertising tools it can no longer
-		// call: without it, crush_info / the `/mcp` menu and the tool list
-		// handed to the LLM diverge, so a server still reads "connected, N
-		// tools" while every call fails with "tool not found".
-		if old, ok := sessions.Take(name); ok {
-			closeSession(name, old)
+		// A session that has errored is dead to us: close it so the child
+		// process and its stdio pipes are released, and clear its tool/prompt
+		// registrations so the agent stops advertising capabilities it can no
+		// longer call. Crucially, close exactly the session that errored (the
+		// client argument): if the registry already holds a DIFFERENT session
+		// — a newer, healthy one another path installed — leave it and its
+		// registrations alone. Closing "whatever is in the map" here used to
+		// let a stale error transition tear down a healthy replacement.
+		switch {
+		case client != nil:
+			if cur, ok := sessions.Get(name); ok && cur == client {
+				sessions.Del(name)
+				allTools.Del(name)
+				updatePrompts(name, nil)
+				updateResources(name, nil)
+			}
+			closeSession(name, client)
+		default:
+			// No specific session errored (e.g. connect itself failed);
+			// anything still registered under this name is unusable.
+			if old, ok := sessions.Take(name); ok {
+				closeSession(name, old)
+			}
+			allTools.Del(name)
+			updatePrompts(name, nil)
+			updateResources(name, nil)
 		}
-		allTools.Del(name)
+		// Never publish a dead session on the state.
+		info.Client = nil
+		info.Channel = false
 	}
 	states.Set(name, info)
 
@@ -482,6 +556,13 @@ func createSession(ctx context.Context, name string, m config.MCPConfig, resolve
 func maybeStdioErr(err error, transport mcp.Transport) error {
 	if !errors.Is(err, io.EOF) {
 		return err
+	}
+	// Every transport is wrapped in a channelTransport before Connect; the
+	// stdio transport we're probing for is the inner one. Without this unwrap
+	// the assertion below never matches and stdio startup failures report a
+	// bare EOF instead of the child's actual output.
+	if cw, ok := transport.(*channelTransport); ok {
+		transport = cw.inner
 	}
 	ct, ok := transport.(*mcp.CommandTransport)
 	if !ok {
@@ -615,7 +696,13 @@ func mcpTimeout(m config.MCPConfig) time.Duration {
 func stdioCheck(old *exec.Cmd) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, old.Path, old.Args...)
+	// old.Args already includes argv0; passing it whole would duplicate the
+	// program name in the re-exec.
+	var args []string
+	if len(old.Args) > 1 {
+		args = old.Args[1:]
+	}
+	cmd := exec.CommandContext(ctx, old.Path, args...)
 	cmd.Env = old.Env
 	out, err := cmd.CombinedOutput()
 	if err == nil || errors.Is(ctx.Err(), context.DeadlineExceeded) {

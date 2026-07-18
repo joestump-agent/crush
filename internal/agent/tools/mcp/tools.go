@@ -111,6 +111,12 @@ func RunTool(ctx context.Context, cfg *config.ConfigStore, name, toolName string
 // RefreshTools gets the updated list of tools from the MCP and updates the
 // global state.
 func RefreshTools(ctx context.Context, cfg *config.ConfigStore, name string) {
+	// Runs under the per-name lifecycle lock so a concurrent renewal can't
+	// swap the session between our Get and the state update below.
+	mu := nameLock(name)
+	mu.Lock()
+	defer mu.Unlock()
+
 	session, ok := sessions.Get(name)
 	if !ok {
 		slog.Warn("Refresh tools: no session", "name", name)
@@ -119,7 +125,7 @@ func RefreshTools(ctx context.Context, cfg *config.ConfigStore, name string) {
 
 	tools, err := getTools(ctx, session)
 	if err != nil {
-		updateState(name, StateError, err, nil, Counts{})
+		updateState(name, StateError, err, session, Counts{})
 		return
 	}
 
