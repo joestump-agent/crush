@@ -1,12 +1,22 @@
 package chat
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/joestump-agent/a2tea"
+)
+
+// a2uiOpenTag and a2uiCloseTag delimit an inline A2UI block in assistant
+// content — the wire format a2tea scans for.
+const (
+	a2uiOpenTag  = "<a2ui-json>"
+	a2uiCloseTag = "</a2ui-json>"
 )
 
 var fenceRe = regexp.MustCompile("(?s)```[^\n]*\n.*?```")
@@ -88,24 +98,23 @@ func contentHasUnclosedA2UI(content string) bool {
 // fine but fail a single-object unmarshal (false alert beside a working
 // surface).
 func countDroppedTaggedBlocks(content string) int {
-	const openTag, closeTag = "<a2ui-json>", "</a2ui-json>"
 	var dropped int
 	s := content
 	for {
-		i := strings.Index(s, openTag)
+		i := strings.Index(s, a2uiOpenTag)
 		if i < 0 {
 			break
 		}
-		s = s[i+len(openTag):]
-		j := strings.Index(s, closeTag)
+		s = s[i+len(a2uiOpenTag):]
+		j := strings.Index(s, a2uiCloseTag)
 		if j < 0 {
 			break
 		}
 		body := s[:j]
-		s = s[j+len(closeTag):]
+		s = s[j+len(a2uiCloseTag):]
 
 		messages := 0
-		if parts, err := a2tea.Scan(openTag + body + closeTag); err == nil {
+		if parts, err := a2tea.Scan(a2uiOpenTag + body + a2uiCloseTag); err == nil {
 			for _, p := range parts {
 				messages += len(p.Messages)
 			}
@@ -115,6 +124,166 @@ func countDroppedTaggedBlocks(content string) int {
 		}
 	}
 	return dropped
+}
+
+// repairA2UIButtons rewrites the raw JSON inside <a2ui-json> blocks to fix a
+// frequent model mistake (#47): a Button carrying its label in a `text` (or
+// `label`) field instead of a child Text component. A2UI's Button has no such
+// field in any schema version, so the label is silently dropped when the block
+// is parsed into typed components — which is why this repair must run on the
+// raw JSON, before a2tea.Scan.
+//
+// The repair is deliberately surgical: only a Button that has a non-empty
+// text/label AND no child is rewritten — a Text component is synthesized from
+// the stray label and the button's child pointed at it. Valid child-based
+// buttons and every other component are left untouched, and a block whose JSON
+// doesn't decode is returned verbatim so the existing error-alert path still
+// applies.
+func repairA2UIButtons(content string) string {
+	if !strings.Contains(content, a2uiOpenTag) {
+		return content
+	}
+	var b strings.Builder
+	s := content
+	for {
+		i := strings.Index(s, a2uiOpenTag)
+		if i < 0 {
+			break
+		}
+		j := strings.Index(s[i+len(a2uiOpenTag):], a2uiCloseTag)
+		if j < 0 {
+			break
+		}
+		body := s[i+len(a2uiOpenTag) : i+len(a2uiOpenTag)+j]
+		b.WriteString(s[:i+len(a2uiOpenTag)])
+		b.WriteString(repairA2UIBody(body))
+		b.WriteString(a2uiCloseTag)
+		s = s[i+len(a2uiOpenTag)+j+len(a2uiCloseTag):]
+	}
+	b.WriteString(s)
+	return b.String()
+}
+
+// repairA2UIBody repairs the JSON body of a single <a2ui-json> block. The body
+// may hold one message object, an array of messages, or several
+// newline-delimited messages — the same forms the a2tea parser accepts. If the
+// body doesn't decode, or no button needs fixing, it is returned unchanged
+// (preserving the author's formatting and the malformed-block alert path).
+func repairA2UIBody(body string) string {
+	dec := json.NewDecoder(strings.NewReader(body))
+	var vals []any
+	for {
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return body
+		}
+		vals = append(vals, v)
+	}
+
+	changed := false
+	for _, v := range vals {
+		switch m := v.(type) {
+		case map[string]any:
+			changed = repairA2UIMessage(m) || changed
+		case []any:
+			for _, e := range m {
+				if mm, ok := e.(map[string]any); ok {
+					changed = repairA2UIMessage(mm) || changed
+				}
+			}
+		}
+	}
+	if !changed {
+		return body
+	}
+
+	out := make([]string, 0, len(vals))
+	for _, v := range vals {
+		enc, err := json.Marshal(v)
+		if err != nil {
+			return body
+		}
+		out = append(out, string(enc))
+	}
+	return strings.Join(out, "\n")
+}
+
+// repairA2UIMessage fixes childless-but-labeled buttons inside one raw A2UI
+// message map, reporting whether it changed anything. For each such button it
+// moves the stray text/label into a new Text component (with a unique id
+// derived from the button's) and points the button's child at it.
+func repairA2UIMessage(msg map[string]any) bool {
+	uc, ok := msg["updateComponents"].(map[string]any)
+	if !ok {
+		return false
+	}
+	comps, ok := uc["components"].([]any)
+	if !ok {
+		return false
+	}
+
+	ids := make(map[string]bool, len(comps))
+	for _, c := range comps {
+		if m, ok := c.(map[string]any); ok {
+			if id, ok := m["id"].(string); ok {
+				ids[id] = true
+			}
+		}
+	}
+
+	var added []any
+	for _, c := range comps {
+		m, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if typ, _ := m["component"].(string); typ != "Button" {
+			continue
+		}
+		switch child := m["child"].(type) {
+		case nil: // absent (or JSON null): childless, repairable
+		case string:
+			if child != "" {
+				continue // valid child-based button: leave untouched
+			}
+		default:
+			continue // e.g. inline-nested object: not ours to rewrite
+		}
+		label, _ := m["text"].(string)
+		if label == "" {
+			label, _ = m["label"].(string)
+		}
+		if label == "" {
+			continue
+		}
+
+		base := "label"
+		if id, _ := m["id"].(string); id != "" {
+			base = id + "-label"
+		}
+		labelID := base
+		for n := 2; ids[labelID]; n++ {
+			labelID = fmt.Sprintf("%s-%d", base, n)
+		}
+		ids[labelID] = true
+
+		m["child"] = labelID
+		delete(m, "text")
+		delete(m, "label")
+		added = append(added, map[string]any{
+			"component": "Text",
+			"id":        labelID,
+			"text":      label,
+		})
+	}
+	if len(added) == 0 {
+		return false
+	}
+	uc["components"] = append(comps, added...)
+	return true
 }
 
 // renderContentWithA2UI renders assistant content that contains A2UI. a2tea
@@ -133,6 +302,10 @@ func countDroppedTaggedBlocks(content string) int {
 // renderer is shared, so the whole multi-render sequence holds its lock.
 func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, finished bool) string {
 	masked, fenceReps := maskFencedCode(content)
+	// Repair childless-but-labeled buttons on the raw JSON before parsing —
+	// the stray label field is dropped by the typed parser (#47). Runs after
+	// masking so button examples inside fenced code stay verbatim.
+	masked = repairA2UIButtons(masked)
 
 	parts, err := a2tea.Scan(masked)
 	if err != nil {

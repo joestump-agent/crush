@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -135,6 +136,140 @@ func TestRenderContentWithA2UIMalformedNotMaskedByBareJSON(t *testing.T) {
 	plain := ansi.Strip(out)
 
 	require.Contains(t, plain, "couldn't render") // the malformed tagged block alerted
+}
+
+// --- Issue #47: childless-but-labeled buttons are repaired on the raw JSON ---
+
+// TestRenderContentWithA2UIRepairsTextOnButton pins the DoD for #47: a model
+// reply carrying the {"component":"Button","text":"Send"} anti-pattern (label
+// in a text field, no child) renders the intended labels — not IDs, not
+// "missing component" placeholders.
+func TestRenderContentWithA2UIRepairsTextOnButton(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	content := `Form: <a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
+		`{"component":"Column","id":"root","children":["btn1","btn2"]},` +
+		`{"component":"Button","id":"btn1","text":"Send"},` +
+		`{"component":"Button","id":"btn2","text":"Cancel"}` +
+		`]}}</a2ui-json>`
+	out := item.renderContentWithA2UI(content, 80, true)
+	plain := ansi.Strip(out)
+
+	require.Contains(t, plain, "Send", "the button's intended label must render")
+	require.Contains(t, plain, "Cancel", "the second button's label must render")
+	require.NotContains(t, plain, "btn1", "the button must not fall back to its ID")
+	require.NotContains(t, plain, "missing component")
+	require.NotContains(t, plain, "couldn't render")
+}
+
+func TestRepairA2UIButtonsSynthesizesChildText(t *testing.T) {
+	t.Parallel()
+
+	content := `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
+		`{"component":"Button","id":"btn1","text":"Send"}]}}</a2ui-json>`
+	repaired := repairA2UIButtons(content)
+
+	body := strings.TrimSuffix(strings.TrimPrefix(repaired, "<a2ui-json>"), "</a2ui-json>")
+	var msg struct {
+		UpdateComponents struct {
+			Components []map[string]any `json:"components"`
+		} `json:"updateComponents"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(body), &msg))
+
+	comps := msg.UpdateComponents.Components
+	require.Len(t, comps, 2, "a Text component must be added for the label")
+
+	btn := comps[0]
+	require.Equal(t, "Button", btn["component"])
+	require.Equal(t, "btn1-label", btn["child"], "the button must point at the synthesized Text")
+	require.NotContains(t, btn, "text", "the stray text field must be removed")
+
+	label := comps[1]
+	require.Equal(t, "Text", label["component"])
+	require.Equal(t, "btn1-label", label["id"])
+	require.Equal(t, "Send", label["text"])
+}
+
+func TestRepairA2UIButtonsLabelFieldAndIDCollision(t *testing.T) {
+	t.Parallel()
+
+	// The same anti-pattern with a `label` field instead of `text`, plus an
+	// existing component already occupying the derived label id.
+	content := `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
+		`{"component":"Text","id":"btn1-label","text":"taken"},` +
+		`{"component":"Button","id":"btn1","label":"Send"}]}}</a2ui-json>`
+	repaired := repairA2UIButtons(content)
+
+	require.Contains(t, repaired, `"child":"btn1-label-2"`, "the synthesized id must not collide")
+	require.Contains(t, repaired, `"id":"btn1-label-2"`)
+	require.NotContains(t, repaired, `"label":"Send"`, "the stray label field must be removed")
+}
+
+// TestRepairA2UIButtonsLeavesValidUntouched pins the surgical guarantee:
+// content whose buttons already use a child Text id passes through repair
+// byte-for-byte unchanged, as does anything else the repair has no business
+// rewriting.
+func TestRepairA2UIButtonsLeavesValidUntouched(t *testing.T) {
+	t.Parallel()
+
+	valid := `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
+		`{"component":"Button","id":"btn","child":"lbl"},` +
+		`{"component":"Text","id":"lbl","text":"OK"}]}}</a2ui-json>`
+	require.Equal(t, valid, repairA2UIButtons(valid))
+
+	// A button with BOTH child and text keeps its child (text is the parser's
+	// problem to drop, not ours to rewire).
+	both := `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
+		`{"component":"Button","id":"btn","child":"lbl","text":"stray"},` +
+		`{"component":"Text","id":"lbl","text":"OK"}]}}</a2ui-json>`
+	require.Equal(t, both, repairA2UIButtons(both))
+
+	// Inline-nested child (an object, another anti-pattern) is not rewritten;
+	// it stays on the existing error path.
+	nested := `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
+		`{"component":"Button","id":"btn","child":{"component":"Text","text":"X"}}]}}</a2ui-json>`
+	require.Equal(t, nested, repairA2UIButtons(nested))
+
+	// The canonical card surface is untouched too.
+	require.Equal(t, "prose "+a2uiSurface, repairA2UIButtons("prose "+a2uiSurface))
+
+	// Plain prose without any block is returned as-is.
+	require.Equal(t, "no blocks here", repairA2UIButtons("no blocks here"))
+}
+
+// TestRepairA2UIButtonsMalformedUnchanged: undecodable JSON passes through
+// verbatim so the existing malformed-block alert still fires downstream.
+func TestRepairA2UIButtonsMalformedUnchanged(t *testing.T) {
+	t.Parallel()
+
+	malformed := `before <a2ui-json>{"component":"Button","text":"Send"</a2ui-json> after`
+	require.Equal(t, malformed, repairA2UIButtons(malformed))
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+	plain := ansi.Strip(item.renderContentWithA2UI(malformed, 80, true))
+	require.Contains(t, plain, "couldn't render", "malformed A2UI must still alert")
+}
+
+// TestRenderContentWithA2UIValidButtonStillRenders: a correctly authored
+// child-based button renders its label with the repair in the path.
+func TestRenderContentWithA2UIValidButtonStillRenders(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	content := `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
+		`{"component":"Button","id":"btn","child":"lbl"},` +
+		`{"component":"Text","id":"lbl","text":"Acknowledge"}]}}</a2ui-json>`
+	plain := ansi.Strip(item.renderContentWithA2UI(content, 80, true))
+
+	require.Contains(t, plain, "Acknowledge")
+	require.NotContains(t, plain, "couldn't render")
 }
 
 // --- Existing tests ---
