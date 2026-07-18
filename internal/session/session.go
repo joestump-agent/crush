@@ -373,20 +373,30 @@ func NewService(q *db.Queries, conn *sql.DB) Service {
 
 // CreateAgentToolSessionID creates a session ID for agent tool sessions using the format "messageID$$toolCallID"
 func (s *service) CreateAgentToolSessionID(messageID, toolCallID string) string {
-	return fmt.Sprintf("%s$$%s", messageID, toolCallID)
+	return agentToolSessionID(messageID, toolCallID)
 }
 
 // ParseAgentToolSessionID parses an agent tool session ID into its components
 func (s *service) ParseAgentToolSessionID(sessionID string) (messageID string, toolCallID string, ok bool) {
-	parts := strings.Split(sessionID, "$$")
-	if len(parts) != 2 {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
+	return parseAgentToolSessionID(sessionID)
 }
 
 // IsAgentToolSession checks if a session ID follows the agent tool session format
 func (s *service) IsAgentToolSession(sessionID string) bool {
 	_, _, ok := s.ParseAgentToolSessionID(sessionID)
 	return ok
+}
+
+// agentToolSessionID formats an agent tool session ID as "messageID$$toolCallID".
+func agentToolSessionID(messageID, toolCallID string) string {
+	return fmt.Sprintf("%s$$%s", messageID, toolCallID)
+}
+
+// parseAgentToolSessionID parses an agent tool session ID into its components.
+func parseAgentToolSessionID(sessionID string) (messageID string, toolCallID string, ok bool) {
+	parts := strings.Split(sessionID, "$$")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
