@@ -145,23 +145,46 @@ var bannedCommands = []string{
 	"ufw",
 }
 
+// effectiveBannedCommands returns the default banned command list with any
+// entries in allowed removed. The order of the defaults is preserved so the
+// tool description and the enforcement layer never drift apart.
+func effectiveBannedCommands(allowed []string) []string {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, cmd := range allowed {
+		allowedSet[cmd] = struct{}{}
+	}
+	effective := make([]string, 0, len(bannedCommands))
+	for _, cmd := range bannedCommands {
+		if _, ok := allowedSet[cmd]; !ok {
+			effective = append(effective, cmd)
+		}
+	}
+	return effective
+}
+
+// UnknownAllowedCommands returns the entries in allowed that are not present
+// in the default banned list. Such entries subtract nothing from the block
+// list and usually indicate a typo, so callers can warn about them.
+func UnknownAllowedCommands(allowed []string) []string {
+	bannedSet := make(map[string]struct{}, len(bannedCommands))
+	for _, cmd := range bannedCommands {
+		bannedSet[cmd] = struct{}{}
+	}
+	var unknown []string
+	for _, cmd := range allowed {
+		if _, ok := bannedSet[cmd]; !ok {
+			unknown = append(unknown, cmd)
+		}
+	}
+	return unknown
+}
+
 func bashDescription(attribution *config.Attribution, modelID string, allowedCommands []string, allowAllCommands bool) string {
-	// Build effective banned list for display
-	var bannedCommandsStr string
-	if allowAllCommands {
-		bannedCommandsStr = "(none - all commands allowed)"
-	} else {
-		effectiveBanned := make([]string, 0, len(bannedCommands))
-		allowedSet := make(map[string]bool, len(allowedCommands))
-		for _, cmd := range allowedCommands {
-			allowedSet[cmd] = true
-		}
-		for _, cmd := range bannedCommands {
-			if !allowedSet[cmd] {
-				effectiveBanned = append(effectiveBanned, cmd)
-			}
-		}
-		bannedCommandsStr = strings.Join(effectiveBanned, ", ")
+	// Build the effective banned list for display. When every command is
+	// allowed the block list is empty.
+	bannedCommandsStr := "(none - all commands allowed)"
+	if !allowAllCommands {
+		bannedCommandsStr = strings.Join(effectiveBannedCommands(allowedCommands), ", ")
 	}
 	var out bytes.Buffer
 	if err := bashDescriptionTpl.Execute(&out, bashDescriptionData{
@@ -179,25 +202,15 @@ func bashDescription(attribution *config.Attribution, modelID string, allowedCom
 }
 
 func blockFuncs(allowedCommands []string, allowAllCommands bool) []shell.BlockFunc {
-	// If allowAllCommands is set, don't block any commands
+	// If allowAllCommands is set, don't block any commands. Note this also
+	// removes the argument-level blockers below (apt install, npm -g, ...);
+	// allowed_commands only subtracts from the exact-command block list.
 	if allowAllCommands {
 		return []shell.BlockFunc{}
 	}
 
-	// Build effective banned list by removing allowed commands from the defaults
-	effectiveBanned := make([]string, 0, len(bannedCommands))
-	allowedSet := make(map[string]bool, len(allowedCommands))
-	for _, cmd := range allowedCommands {
-		allowedSet[cmd] = true
-	}
-	for _, cmd := range bannedCommands {
-		if !allowedSet[cmd] {
-			effectiveBanned = append(effectiveBanned, cmd)
-		}
-	}
-
 	return []shell.BlockFunc{
-		shell.CommandsBlocker(effectiveBanned),
+		shell.CommandsBlocker(effectiveBannedCommands(allowedCommands)),
 
 		// System package managers
 		shell.ArgumentsBlocker("apk", []string{"add"}, nil),
@@ -227,13 +240,7 @@ func blockFuncs(allowedCommands []string, allowAllCommands bool) []shell.BlockFu
 	}
 }
 
-func NewBashTool(permissions permission.Service, workingDir string, attribution *config.Attribution, modelID string, opts *config.Options) fantasy.AgentTool {
-	var allowedCommands []string
-	var allowAllCommands bool
-	if opts != nil {
-		allowedCommands = opts.AllowedCommands
-		allowAllCommands = opts.AllowAllCommands
-	}
+func NewBashTool(permissions permission.Service, workingDir string, attribution *config.Attribution, modelID string, allowedCommands []string, allowAllCommands bool) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		BashToolName,
 		string(bashDescription(attribution, modelID, allowedCommands, allowAllCommands)),
