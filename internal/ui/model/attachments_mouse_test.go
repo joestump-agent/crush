@@ -67,3 +67,32 @@ func TestAttachmentClickIgnoredWhileInlineEditorIsActive(t *testing.T) {
 
 	require.Len(t, u.attachments.List(), 1)
 }
+
+func TestAttachmentClickRequiresLeftMouseButton(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		button    tea.MouseButton
+		remaining int
+	}{
+		{name: "left", button: uv.MouseLeft, remaining: 0},
+		{name: "middle", button: uv.MouseMiddle, remaining: 1},
+		{name: "right", button: uv.MouseRight, remaining: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			u, removeX := newAttachmentClickTestUI(t)
+			_, _ = u.Update(tea.MouseClickMsg(tea.Mouse{
+				X:      u.layout.editor.Min.X + removeX,
+				Y:      u.layout.editor.Min.Y,
+				Button: tt.button,
+			}))
+
+			require.Len(t, u.attachments.List(), tt.remaining)
+		})
+	}
+}
