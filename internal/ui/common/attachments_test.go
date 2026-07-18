@@ -53,7 +53,10 @@ func TestIsAllowedAttachmentType(t *testing.T) {
 		{name: "zip", path: "archive.zip", want: false},
 		{name: "docx", path: "report.docx", want: false},
 		{name: "exe", path: "binary.exe", want: false},
-		{name: "no extension", path: "Makefile", want: false},
+		// Makefile/Dockerfile are extensionless but allowlisted by name —
+		// the ".makefile"/".dockerfile" extension entries never matched them.
+		{name: "no extension allowlisted", path: "Makefile", want: true},
+		{name: "no extension not allowlisted", path: "LICENSE", want: false},
 		{name: "mp4", path: "video.mp4", want: false},
 	}
 
@@ -106,4 +109,45 @@ func TestAllAllowedAttachmentTypes(t *testing.T) {
 
 	// Should have combined length.
 	require.Len(t, types, len(AllowedImageTypes)+len(AllowedTextFileTypes))
+}
+
+// TestIsAllowedAttachmentType_ExtensionlessNames verifies Dockerfile/Makefile
+// are attachable: suffix matching can't cover them (no dot), so the old
+// ".dockerfile"/".makefile" entries never matched the real files.
+func TestIsAllowedAttachmentType_ExtensionlessNames(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"Dockerfile", "Makefile", "GNUmakefile", "/repo/sub/Dockerfile", "some/Makefile"} {
+		require.True(t, IsAllowedAttachmentType(path), path)
+	}
+	// The dotted variants still work for files that genuinely have them.
+	require.True(t, IsAllowedAttachmentType("build.dockerfile"))
+	// Non-allowlisted extensionless names stay rejected.
+	require.False(t, IsAllowedAttachmentType("LICENSE"))
+}
+
+// TestSniffAttachmentMIME verifies the binary-content guard: a file allowed
+// by a text extension whose content sniffs as binary (e.g. a NUL byte in the
+// first 512 bytes) must be reported not-ok instead of becoming a bogus
+// binary file part or byte soup inlined into the prompt.
+func TestSniffAttachmentMIME(t *testing.T) {
+	t.Parallel()
+
+	mt, ok := SniffAttachmentMIME([]byte("plain text content"))
+	require.True(t, ok)
+	require.Contains(t, mt, "text/plain")
+
+	// PNG magic bytes → image, ok.
+	png := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+	mt, ok = SniffAttachmentMIME(png)
+	require.True(t, ok)
+	require.Equal(t, "image/png", mt)
+
+	// NUL byte in the sniff window → application/octet-stream, not ok.
+	mt, ok = SniffAttachmentMIME([]byte("looks like a log\x00but binary"))
+	require.False(t, ok, "binary-sniffing content must be rejected")
+	require.Equal(t, "application/octet-stream", mt)
+
+	// Empty content sniffs as text; harmless.
+	_, ok = SniffAttachmentMIME(nil)
+	require.True(t, ok)
 }

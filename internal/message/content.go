@@ -504,7 +504,11 @@ func (m *Message) ToAIMessage() []fantasy.Message {
 		text := strings.TrimSpace(m.Content().Text)
 		var textAttachments []Attachment
 		for _, content := range m.BinaryContent() {
-			if !strings.HasPrefix(content.MIMEType, "text/") {
+			// Same predicate as the initial send (Attachment.IsText): the
+			// history rebuild must inline exactly what the first turn
+			// inlined, or application/* text attachments come back as
+			// binary file parts that providers reject.
+			if !IsTextMIME(content.MIMEType) {
 				continue
 			}
 			textAttachments = append(textAttachments, Attachment{
@@ -527,8 +531,9 @@ func (m *Message) ToAIMessage() []fantasy.Message {
 			parts = append(parts, fantasy.TextPart{Text: text})
 		}
 		for _, content := range m.BinaryContent() {
-			// skip text attachements
-			if strings.HasPrefix(content.MIMEType, "text/") {
+			// Skip text attachments — they were inlined above. Must mirror
+			// the inlining predicate exactly.
+			if IsTextMIME(content.MIMEType) {
 				continue
 			}
 			parts = append(parts, fantasy.FilePart{

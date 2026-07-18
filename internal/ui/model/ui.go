@@ -3528,10 +3528,18 @@ func (m *UI) insertFileCompletion(path string) tea.Cmd {
 			return nil
 		}
 
+		mimeType, ok := common.SniffAttachmentMIME(content)
+		if !ok {
+			// Content sniffs as binary: skip the attachment. The
+			// @-mention stays in the prompt, so the LLM can still
+			// read the file through tools later.
+			return nil
+		}
+
 		return message.Attachment{
 			FilePath: path,
 			FileName: filepath.Base(path),
-			MimeType: mimeOf(content),
+			MimeType: mimeType,
 			Content:  content,
 		}
 	}
@@ -4470,8 +4478,10 @@ func (m *UI) handlePasteMsg(msg tea.PasteMsg) tea.Cmd {
 				return util.ReportWarn("Paste is too big (>5mb)")
 			}
 			name := fmt.Sprintf("paste_%d.txt", m.pasteIdx())
-			mimeBufferSize := min(512, len(content))
-			mimeType := http.DetectContentType(content[:mimeBufferSize])
+			mimeType, ok := common.SniffAttachmentMIME(content)
+			if !ok {
+				return util.ReportWarn(fmt.Sprintf("Paste looks binary (%s), not attaching", mimeType))
+			}
 			return message.Attachment{
 				FileName: name,
 				FilePath: name,
@@ -4549,9 +4559,14 @@ func (m *UI) handleFilePathPaste(path string) tea.Cmd {
 			return util.ReportError(err)
 		}
 
-		mimeBufferSize := min(512, len(content))
-		mimeType := http.DetectContentType(content[:mimeBufferSize])
 		fileName := filepath.Base(path)
+		mimeType, ok := common.SniffAttachmentMIME(content)
+		if !ok {
+			// Allowed by extension but the content sniffs as binary —
+			// attaching would inline byte soup or send a file part
+			// providers reject.
+			return util.ReportWarn(fmt.Sprintf("%s looks binary (%s), not attaching", fileName, mimeType))
+		}
 		return message.Attachment{
 			FilePath: path,
 			FileName: fileName,
@@ -4597,34 +4612,11 @@ func (m *UI) pasteImageFromClipboard() tea.Msg {
 		return util.NewInfoMsg("File type is not supported")
 	}
 
-	fileInfo, statErr := os.Stat(path)
-	if statErr != nil {
-		return util.InfoMsg{
-			Type: util.InfoTypeError,
-			Msg:  fmt.Sprintf("Unable to read file: %v", statErr),
-		}
-	}
-	if fileInfo.Size() > common.MaxAttachmentSize {
-		return util.InfoMsg{
-			Type: util.InfoTypeError,
-			Msg:  "File too large, max 5MB",
-		}
-	}
-
-	content, readErr := os.ReadFile(path)
-	if readErr != nil {
-		return util.InfoMsg{
-			Type: util.InfoTypeError,
-			Msg:  fmt.Sprintf("Unable to read file: %v", readErr),
-		}
-	}
-
-	return message.Attachment{
-		FilePath: path,
-		FileName: filepath.Base(path),
-		MimeType: mimeOf(content),
-		Content:  content,
-	}
+	// Same pipeline as pasting a path into the terminal: stat, size cap,
+	// and the binary-content sniff. Duplicating it here previously let a
+	// binary file attach through the PasteImage key that the terminal
+	// paste path would have rejected.
+	return m.handleFilePathPaste(path)()
 }
 
 var pasteRE = regexp.MustCompile(`paste_(\d+).txt`)
