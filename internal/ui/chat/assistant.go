@@ -386,9 +386,17 @@ func (a *AssistantMessageItem) thinkingKey() (uint64, uint64) {
 }
 
 // contentKey returns the (srcHash, extra) cache key components for the
-// main content section.
+// main content section. Finish state is folded into the key because the
+// rendered output depends on IsFinished() (A2UI alert gating and the
+// truncated-block branch): the last streaming delta and the finished
+// message often carry byte-identical text, and the finished render must
+// not be served from a cache entry stored while streaming.
 func (a *AssistantMessageItem) contentKey() (uint64, uint64) {
-	return fnv64(a.message.Content().Text), 0
+	var fin uint64
+	if a.message.IsFinished() {
+		fin = 1
+	}
+	return fnv64(a.message.Content().Text), fin
 }
 
 // errorKey returns the (srcHash, extra) cache key components for the
@@ -434,7 +442,7 @@ func (a *AssistantMessageItem) cachedContent(width int) string {
 	if contentHasA2UI(text) {
 		// The reply carries an A2UI document — route it through a2tea instead
 		// of rendering the raw JSON as a markdown code block.
-		out = a.renderContentWithA2UI(text, width)
+		out = a.renderContentWithA2UI(text, width, a.message.IsFinished())
 	} else if a.message.IsFinished() && contentHasUnclosedA2UI(text) {
 		// Generation was truncated mid-block: an <a2ui-json> tag never got
 		// its closing partner. Show the alert instead of raw partial JSON.
