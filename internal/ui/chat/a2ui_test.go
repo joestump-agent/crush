@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/crush/internal/message"
@@ -158,6 +159,44 @@ func TestRenderContentWithA2UI(t *testing.T) {
 	require.NotContains(t, plain, "updateComponents")
 	// No alert when the surface rendered fine.
 	require.NotContains(t, plain, "couldn't render")
+}
+
+// TestRenderContentWithA2UIThemedContainer asserts the rendered surface is
+// wrapped in the themed A2UISurface container (#46): the surface line sits
+// between the container's vertical border runes, under a top border and above
+// a bottom border. Prose outside the surface stays unboxed.
+func TestRenderContentWithA2UIThemedContainer(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	content := "Here is a card:\n\n" + a2uiSurface + "\n\nAnything else?"
+	out := item.renderContentWithA2UI(content, 80, true)
+	plain := ansi.Strip(out)
+
+	// Container corners from the rounded border are present.
+	require.Contains(t, plain, "╭")
+	require.Contains(t, plain, "╰")
+
+	// The surface content line is enclosed by the container's side borders.
+	var surfaceLine string
+	for _, line := range strings.Split(plain, "\n") {
+		if strings.Contains(line, "Hello from A2UI") {
+			surfaceLine = strings.TrimRight(line, " ")
+			break
+		}
+	}
+	require.NotEmpty(t, surfaceLine, "surface content line not found")
+	require.True(t, strings.HasPrefix(surfaceLine, "│"), "surface line should start with container border: %q", surfaceLine)
+	require.True(t, strings.HasSuffix(surfaceLine, "│"), "surface line should end with container border: %q", surfaceLine)
+
+	// Prose outside the surface is not boxed.
+	for _, line := range strings.Split(plain, "\n") {
+		if strings.Contains(line, "Here is a card") || strings.Contains(line, "Anything else") {
+			require.False(t, strings.Contains(line, "│"), "prose should not be inside the container: %q", line)
+		}
+	}
 }
 
 func TestRenderContentWithA2UIMixedGoodAndBadAlerts(t *testing.T) {

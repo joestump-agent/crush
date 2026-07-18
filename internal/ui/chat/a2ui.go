@@ -170,6 +170,11 @@ func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, 
 		b.WriteString(s)
 	}
 
+	// a2tea's chrome renders with terminal defaults (monochrome by design),
+	// so each surface is wrapped in a themed container to match the rest of
+	// the chat. The a2tea model is sized to the container's inner width.
+	surface := a.sty.Messages.A2UISurface
+	innerWidth := max(width-surface.GetHorizontalFrameSize(), 1)
 	for _, p := range parts {
 		writeChunk(renderMarkdown(p.Text))
 		if len(p.Messages) == 0 {
@@ -182,9 +187,10 @@ func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, 
 			continue
 		}
 		if sz, ok := model.(interface{ SetSize(width, height int) }); ok {
-			sz.SetSize(width, 0)
+			sz.SetSize(innerWidth, 0)
 		}
-		writeChunk(strings.TrimRight(model.View().Content, "\n"))
+		rendered := strings.TrimRight(model.View().Content, "\n")
+		writeChunk(surface.Width(max(width-surface.GetHorizontalBorderSize(), 1)).Render(rendered))
 	}
 
 	// Alert when a complete tag pair was dropped by the parser (#7) —
