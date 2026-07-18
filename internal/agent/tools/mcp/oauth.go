@@ -39,6 +39,15 @@ type mcptoken struct {
 	Endpoints oauthEndpoints `json:"endpoints"`
 }
 
+// tokenFileMu serializes token-file access across ALL tokenStore
+// instances. Each HTTP MCP server's handler owns its own store; with only
+// the per-store mutex, two handlers refreshing concurrently could both
+// read the file before either wrote it, and the last writer erased the
+// other's just-saved token — with OAuth 2.1 refresh-token rotation the
+// surviving on-disk copy is the invalidated one, forcing a browser
+// re-auth on the next restart.
+var tokenFileMu sync.Mutex
+
 // tokenStore persists MCP OAuth tokens keyed by server URL. It is safe
 // for concurrent access.
 type tokenStore struct {
@@ -60,6 +69,8 @@ func newTokenStore() *tokenStore {
 }
 
 func (s *tokenStore) load() {
+	tokenFileMu.Lock()
+	defer tokenFileMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, err := os.ReadFile(s.path)
@@ -77,6 +88,8 @@ func (s *tokenStore) get(serverURL string) (mcptoken, bool) {
 }
 
 func (s *tokenStore) save(serverURL string, t mcptoken) {
+	tokenFileMu.Lock()
+	defer tokenFileMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Merge with what's on disk before rewriting the file. Each HTTP MCP
@@ -108,7 +121,6 @@ func (s *tokenStore) save(serverURL string, t mcptoken) {
 type mcpOAuthHandler struct {
 	serverURL string
 	store     *tokenStore
-	inner     *auth.AuthorizationCodeHandler
 	mu        sync.Mutex
 	tokenSrc  oauth2.TokenSource
 	// clientID is the dynamically registered OAuth client ID, captured from
@@ -174,12 +186,16 @@ func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Persist while holding p.mu: two Token() calls straddling an expiry
+	// could otherwise interleave so the earlier (rotated-out) token is
+	// persisted after the newer one. Lock order p.mu -> h.mu -> store.mu
+	// has no reverse path.
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	changed := p.last == nil ||
 		p.last.AccessToken != tok.AccessToken ||
 		p.last.RefreshToken != tok.RefreshToken
 	p.last = tok
-	p.mu.Unlock()
 	if changed {
 		p.h.persistToken(tok)
 	}
@@ -197,6 +213,14 @@ func (h *mcpOAuthHandler) TokenSource(_ context.Context) (oauth2.TokenSource, er
 // authorization-code flow (discovery, registration, browser, PKCE,
 // token exchange) then persists the resulting token.
 func (h *mcpOAuthHandler) Authorize(ctx context.Context, req *http.Request, resp *http.Response) error {
+	// A full re-authorization means the cached endpoints may be stale
+	// (the server may have moved them — often why we are re-authorizing
+	// at all). Clear the token endpoint so the post-auth persistToken
+	// re-runs discovery; captureFromAuthURL refreshes the auth endpoint.
+	h.mu.Lock()
+	h.endpoints.TokenURL = ""
+	h.mu.Unlock()
+
 	inner, ln, err := h.buildInner()
 	if err != nil {
 		resp.Body.Close()
@@ -224,7 +248,6 @@ func (h *mcpOAuthHandler) Authorize(ctx context.Context, req *http.Request, resp
 	}
 	h.mu.Lock()
 	h.tokenSrc = wrapped
-	h.inner = inner
 	h.mu.Unlock()
 	return nil
 }
@@ -283,12 +306,13 @@ func (h *mcpOAuthHandler) captureFromAuthURL(authURL string) {
 	if cid := u.Query().Get("client_id"); cid != "" {
 		h.clientID = cid
 	}
-	if h.endpoints.AuthURL == "" {
-		base := *u
-		base.RawQuery = ""
-		base.Fragment = ""
-		h.endpoints.AuthURL = base.String()
-	}
+	// Overwrite unconditionally: this runs during a live authorization,
+	// which is the freshest possible source. Keeping a cached value here
+	// would pin a stale endpoint forever after the AS moves.
+	base := *u
+	base.RawQuery = ""
+	base.Fragment = ""
+	h.endpoints.AuthURL = base.String()
 }
 
 // persistToken saves the current token to the store, together with the

@@ -1,10 +1,12 @@
 package mcp
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -292,4 +294,56 @@ func TestCallbackHandler_DuplicateHitDoesNotBlock(t *testing.T) {
 	require.Len(t, resultCh, 1, "exactly one result delivered")
 	got := <-resultCh
 	require.Equal(t, "abc", got.Code)
+}
+
+// TestTokenStore_ConcurrentCrossStoreSavesKeepAllTokens pins that saves
+// racing across DIFFERENT store instances (one per HTTP MCP handler in
+// production) cannot erase each other's entries. With only the per-store
+// mutex, both stores could read the file before either wrote it, and the
+// last writer dropped the other's token; the shared file mutex serializes
+// them so the read-merge-write in save always sees the previous winner.
+func TestTokenStore_ConcurrentCrossStoreSavesKeepAllTokens(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "tokens.json")
+	const n = 8
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range n {
+		store := &tokenStore{path: path, data: make(map[string]mcptoken)}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			store.save(
+				fmt.Sprintf("https://mcp%d.example.com/mcp", i),
+				mcptoken{Token: &oauth2.Token{AccessToken: fmt.Sprintf("tok-%d", i)}},
+			)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	check := &tokenStore{path: path, data: make(map[string]mcptoken)}
+	check.load()
+	for i := range n {
+		_, ok := check.get(fmt.Sprintf("https://mcp%d.example.com/mcp", i))
+		require.True(t, ok, "server %d's token was erased by a concurrent save from another store", i)
+	}
+}
+
+// TestCaptureFromAuthURL_OverwritesStaleAuthEndpoint pins the re-authorize
+// healing path: a live authorization is the freshest source of the auth
+// endpoint, so a previously cached (possibly stale) value must be replaced,
+// not kept forever.
+func TestCaptureFromAuthURL_OverwritesStaleAuthEndpoint(t *testing.T) {
+	t.Setenv("CRUSH_GLOBAL_CONFIG", t.TempDir())
+	h := newMCPOAuthHandler("https://stale.example.com/mcp")
+	h.endpoints.AuthURL = "https://old-as.example.com/authorize"
+	h.endpoints.TokenURL = "https://old-as.example.com/token"
+
+	h.captureFromAuthURL("https://new-as.example.com/authorize?client_id=cid&response_type=code")
+
+	require.Equal(t, "https://new-as.example.com/authorize", h.endpoints.AuthURL,
+		"a live authorization must replace the cached auth endpoint")
 }
