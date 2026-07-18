@@ -2311,16 +2311,19 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 					return m.openQuitDialog()
 				}
 
-				if cmd, ok := m.handleSlashCommand(value); ok {
-					return cmd
-				}
-
+				// Bang mode wins over slash commands: a shell command that
+				// happens to start with "/clear" or "/compact" must run in
+				// the shell, not be hijacked as a slash command.
 				if m.bangMode && value != "" {
 					m.bangMode = false
 					m.setEditorPrompt(m.yoloModeCached())
 					m.randomizePlaceholders()
 					m.historyReset()
 					return tea.Batch(m.runShellCommand(value))
+				}
+
+				if cmd, ok := m.handleSlashCommand(value); ok {
+					return cmd
 				}
 
 				attachments := m.attachments.List()
@@ -2337,7 +2340,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				if !m.hasSession() {
 					break
 				}
-				if m.isAgentBusy() {
+				if m.isCurrentSessionBusy() {
 					cmds = append(cmds, util.ReportWarn("Agent is busy, please wait before starting a new session..."))
 					break
 				}
@@ -2511,7 +2514,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				if !m.hasSession() {
 					break
 				}
-				if m.isAgentBusy() {
+				if m.isCurrentSessionBusy() {
 					cmds = append(cmds, util.ReportWarn("Agent is busy, please wait before starting a new session..."))
 					break
 				}
@@ -3862,7 +3865,7 @@ func (m *UI) handleChannelMessage(ev mcp.Event) tea.Cmd {
 	}
 	loadCmd, err := m.ensureSession()
 	if err != nil {
-		slog.Debug("Failed to create session for channel message", "error", err)
+		slog.Warn("Failed to create session for channel message", "error", err)
 		return nil
 	}
 	if !m.hasSession() {
@@ -3870,7 +3873,7 @@ func (m *UI) handleChannelMessage(ev mcp.Event) tea.Cmd {
 	}
 	updatedSession, err := m.com.Workspace.SetSessionChannel(context.Background(), m.session.ID, ev.Name)
 	if err != nil {
-		slog.Debug("Failed to set session channel", "error", err, "session", m.session.ID, "channel", ev.Name)
+		slog.Warn("Failed to set session channel", "error", err, "session", m.session.ID, "channel", ev.Name)
 		return loadCmd
 	}
 	m.session = &updatedSession
@@ -3879,8 +3882,7 @@ func (m *UI) handleChannelMessage(ev mcp.Event) tea.Cmd {
 	content := ev.ChannelMessage
 	runCmd := func() tea.Msg {
 		if err := m.com.Workspace.AgentRunChannel(context.Background(), channel, sessionID, content); err != nil {
-			slog.Debug("Failed to inject channel message", "error", err, "session", sessionID)
-			return nil
+			slog.Warn("Failed to inject channel message", "error", err, "session", sessionID)
 		}
 		// The prompt may have been enqueued behind a running turn;
 		// re-fetch busy/queue state.
@@ -4341,7 +4343,7 @@ func (m *UI) handleSlashCommand(value string) (tea.Cmd, bool) {
 	switch value {
 	case "/clear":
 		m.randomizePlaceholders()
-		if m.isAgentBusy() {
+		if m.isCurrentSessionBusy() {
 			m.historyReset()
 			return util.ReportWarn("Agent is busy, please wait before starting a new session..."), true
 		}
@@ -4357,7 +4359,7 @@ func (m *UI) handleSlashCommand(value string) (tea.Cmd, bool) {
 	case "/compact":
 		m.randomizePlaceholders()
 		m.historyReset()
-		if m.isAgentBusy() {
+		if m.isCurrentSessionBusy() {
 			return util.ReportWarn("Agent is busy, please wait before summarizing session..."), true
 		}
 		if !m.hasSession() {
