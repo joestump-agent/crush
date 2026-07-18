@@ -751,10 +751,13 @@ func workspaceToProto(ws *Workspace) proto.Workspace {
 // while the first set one will still log the mismatch.
 func logFirstWinsMismatch(existing *Workspace, args proto.Workspace) {
 	existingCfg := existing.Cfg.Config()
-	existingYOLO := existing.Cfg.Overrides().SkipPermissionRequests
+	existingOverrides := existing.Cfg.Overrides()
+	existingYOLO := existingOverrides.SkipPermissionRequests
 	if existingYOLO == args.YOLO &&
 		existingCfg.Options.Debug == args.Debug &&
 		existingCfg.Options.DataDirectory == args.DataDir &&
+		existingOverrides.AllowAllCommands == args.AllowAllCommands &&
+		stringSlicesEqual(existingOverrides.AllowedCommands, args.AllowedCommands) &&
 		stringSlicesEqual(existing.Env, args.Env) {
 		return
 	}
@@ -768,6 +771,10 @@ func logFirstWinsMismatch(existing *Workspace, args proto.Workspace) {
 		"requested_debug", args.Debug,
 		"existing_data_dir", existingCfg.Options.DataDirectory,
 		"requested_data_dir", args.DataDir,
+		"existing_allow_all_commands", existingOverrides.AllowAllCommands,
+		"requested_allow_all_commands", args.AllowAllCommands,
+		"existing_allowed_commands", existingOverrides.AllowedCommands,
+		"requested_allowed_commands", args.AllowedCommands,
 		"existing_env", existing.Env,
 		"requested_env", args.Env,
 	)
