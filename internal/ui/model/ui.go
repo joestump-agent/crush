@@ -306,9 +306,24 @@ type UI struct {
 	pillsExpanded      bool
 	pillsAutoExpanded  bool
 	focusedPillSection pillSection
-	promptQueue        int
-	sidebarScroll      int
-	pillsView          string
+	// promptQueue / promptQueueItems mirror the session's queued prompts.
+	// They are event-driven with a TTL backstop, fetched off-thread by
+	// dispatchPromptQueueRefresh (see workspace_cache.go); promptQueue is
+	// always len(promptQueueItems).
+	promptQueue          int
+	promptQueueItems     []string
+	promptQueueCheckedAt time.Time
+	promptQueueInFlight  bool
+	// sessionBusyCache / agentBusyCache / yoloCache memoize the workspace
+	// busy and permission probes (synchronous HTTP round-trips in
+	// client/server mode). Reads never probe; refreshes happen off-thread
+	// (see workspace_cache.go).
+	sessionBusyCache  ttlCache
+	agentBusyCache    ttlCache
+	yoloCache         ttlCache
+	busyFetchInFlight bool
+	sidebarScroll     int
+	pillsView         string
 
 	// Todo spinner
 	todoSpinner    spinner.Model
@@ -407,7 +422,12 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 		ui.themeKey = styles.ThemeKeyForProvider(cfg.Models[config.SelectedModelTypeLarge].Provider)
 	}
 
-	ui.setEditorPrompt(com.Workspace.PermissionSkipRequests())
+	// Seed the yolo cache once at construction; afterwards it is kept
+	// fresh by write-through toggles and off-thread refreshes so Update
+	// and View never probe the workspace synchronously.
+	yolo := com.Workspace.PermissionSkipRequests()
+	ui.yoloCache.set(yolo)
+	ui.setEditorPrompt(yolo)
 	ui.randomizePlaceholders()
 	ui.textarea.Placeholder = ui.readyPlaceholder
 	ui.status = status
@@ -457,6 +477,10 @@ func (m *UI) Init() tea.Cmd {
 	}
 	if m.com.IsHyper() {
 		cmds = append(cmds, m.fetchHyperCredits())
+	}
+	// Prime the memoized busy/permission state off-thread.
+	if cmd := m.dispatchBusyRefresh(); cmd != nil {
+		cmds = append(cmds, cmd)
 	}
 	return tea.Batch(cmds...)
 }
@@ -608,13 +632,6 @@ func (m *UI) loadMCPrompts() tea.Msg {
 // Update handles updates to the UI model.
 func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
-	if m.hasSession() {
-		queueSize := m.com.Workspace.AgentQueuedPrompts(m.session.ID)
-		if queueSize != m.promptQueue {
-			m.promptQueue = queueSize
-			m.updateLayoutAndSize()
-		}
-	}
 	// Update terminal capabilities
 	m.caps.Update(msg)
 	switch msg := msg.(type) {
@@ -636,6 +653,21 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.handleAgentNotification(msg.Payload); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case busyStateMsg:
+		cmds = append(cmds, m.applyBusyState(msg)...)
+	case promptQueueMsg:
+		cmds = append(cmds, m.applyPromptQueue(msg)...)
+	case agentRunSubmittedMsg:
+		// A prompt was just accepted (run started or enqueued): fetch the
+		// authoritative busy/queue state to confirm the optimistic values
+		// sendMessage wrote.
+		m.invalidateBusyCaches()
+		if cmd := m.dispatchBusyRefresh(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if cmd := m.dispatchPromptQueueRefresh(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case loadSessionMsg:
 		if m.forceCompactMode {
 			m.isCompact = true
@@ -643,6 +675,20 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setState(uiChat, m.focus)
 		m.session = msg.session
 		m.sessionFiles = msg.files
+		// Session switch: the memoized busy state and queued prompts
+		// belong to the previous session. Drop them and re-fetch
+		// off-thread so the queue pill and esc behavior track the new
+		// session instead of a stale one.
+		m.invalidateBusyCaches()
+		m.promptQueue = 0
+		m.promptQueueItems = nil
+		m.promptQueueCheckedAt = time.Time{}
+		if cmd := m.dispatchBusyRefresh(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if cmd := m.dispatchPromptQueueRefresh(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		cmds = append(cmds, m.startLSPs(msg.lspFilePaths()))
 		msgs, err := m.com.Workspace.ListMessages(context.Background(), m.session.ID)
 		if err != nil {
@@ -731,6 +777,10 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.session != nil && msg.Payload.ID == m.session.ID {
 			prevHasInProgress := hasInProgressTodo(m.session.Todos)
 			prevPillsHeight := m.pillsAreaHeight()
+			// Session rows update constantly during a run (token
+			// accounting, title, todos); deliberately no busy/queue
+			// refresh here — run boundaries are signaled by message
+			// CreatedEvents and agent-finished notifications.
 			m.session = &msg.Payload
 			if !prevHasInProgress && hasInProgressTodo(m.session.Todos) {
 				m.todoIsSpinning = true
@@ -765,6 +815,19 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case pubsub.CreatedEvent:
 			cmds = append(cmds, m.appendSessionMessage(msg.Payload))
+			// A new message is a run boundary — a user prompt starting
+			// a turn or the agent replying/dequeueing. Drop the
+			// memoized busy state and re-fetch it and the queue
+			// off-thread. Per-chunk UpdatedEvents deliberately do NOT
+			// trigger this: during streaming that would put workspace
+			// probes on every token.
+			m.invalidateBusyCaches()
+			if cmd := m.dispatchBusyRefresh(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			if cmd := m.dispatchPromptQueueRefresh(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		case pubsub.UpdatedEvent:
 			cmds = append(cmds, m.updateSessionMessage(msg.Payload))
 		case pubsub.DeletedEvent:
@@ -1161,10 +1224,15 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.textarea.Placeholder = m.readyPlaceholder
 		}
-		if !m.bangMode && m.com.Workspace.PermissionSkipRequests() {
+		if !m.bangMode && m.yoloModeCached() {
 			m.textarea.Placeholder = "Yolo mode!"
 		}
 	}
+
+	// TTL backstop: schedule an off-thread re-probe for any memoized
+	// workspace state that has gone stale. Never does IO on this
+	// goroutine.
+	cmds = append(cmds, m.staleWorkspaceRefreshCmds()...)
 
 	// at this point this can only handle [message.Attachment] message, and we
 	// should return all cmds anyway.
@@ -1599,9 +1667,7 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 
 	// Command dialog messages.
 	case dialog.ActionToggleYoloMode:
-		yolo := !m.com.Workspace.PermissionSkipRequests()
-		m.com.Workspace.PermissionSetSkipRequests(yolo)
-		m.setEditorPrompt(yolo)
+		m.toggleYoloMode()
 		m.dialog.CloseDialog(dialog.CommandsID)
 	case dialog.ActionSelectNotificationStyle:
 		cfg := m.com.Config()
@@ -2141,9 +2207,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			cmds = append(cmds, tea.Suspend)
 			return true
 		case key.Matches(msg, m.keyMap.ToggleYolo):
-			yolo := !m.com.Workspace.PermissionSkipRequests()
-			m.com.Workspace.PermissionSetSkipRequests(yolo)
-			m.setEditorPrompt(yolo)
+			yolo := m.toggleYoloMode()
 			status := "disabled"
 			if yolo {
 				status = "enabled"
@@ -2253,8 +2317,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 
 				if m.bangMode && value != "" {
 					m.bangMode = false
-					yolo := m.com.Workspace.PermissionSkipRequests()
-					m.setEditorPrompt(yolo)
+					m.setEditorPrompt(m.yoloModeCached())
 					m.randomizePlaceholders()
 					m.historyReset()
 					return tea.Batch(m.runShellCommand(value))
@@ -2332,8 +2395,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				if m.bangMode && m.bangWasEmpty && msg.Code == tea.KeyBackspace {
 					m.bangMode = false
 					m.bangWasEmpty = false
-					yolo := m.com.Workspace.PermissionSkipRequests()
-					m.setEditorPrompt(yolo)
+					m.setEditorPrompt(m.yoloModeCached())
 					break
 				}
 
@@ -2382,8 +2444,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 					m.textarea.SetValue(stripped)
 					m.textarea.SetCursorColumn(max(0, col-(len(newVal)-len(stripped))))
 					_ = line // cursor line doesn't change; prefix removed
-					yolo := m.com.Workspace.PermissionSkipRequests()
-					m.setEditorPrompt(yolo)
+					m.setEditorPrompt(m.yoloModeCached())
 				} else if m.bangMode && newVal == "" && curValue != "" {
 					// Just cleared last character; mark empty, stay in bang mode.
 					m.bangWasEmpty = true
@@ -2731,7 +2792,7 @@ func (m *UI) ShortHelp() []key.Binding {
 			cancelBinding := k.Chat.Cancel
 			if m.isCanceling {
 				cancelBinding.SetHelp("esc", "press again to cancel")
-			} else if m.com.Workspace.AgentQueuedPrompts(m.session.ID) > 0 {
+			} else if m.promptQueue > 0 {
 				cancelBinding.SetHelp("esc", "clear queue")
 			}
 			binds = append(binds, cancelBinding)
@@ -2824,7 +2885,7 @@ func (m *UI) FullHelp() [][]key.Binding {
 			cancelBinding := k.Chat.Cancel
 			if m.isCanceling {
 				cancelBinding.SetHelp("esc", "press again to cancel")
-			} else if m.com.Workspace.AgentQueuedPrompts(m.session.ID) > 0 {
+			} else if m.promptQueue > 0 {
 				cancelBinding.SetHelp("esc", "clear queue")
 			}
 			binds = append(binds, []key.Binding{cancelBinding})
@@ -3538,7 +3599,10 @@ func isWhitespace(b byte) bool {
 }
 
 // isAgentBusy returns true if the agent coordinator exists and is currently
-// busy processing a request.
+// busy processing a request. It only reads the memoized state (it runs in
+// per-message paths like the textarea placeholder, where a workspace probe
+// would be an HTTP round-trip per keystroke in client/server mode); the
+// value is refreshed off-thread, see workspace_cache.go.
 func (m *UI) isAgentBusy() bool {
 	if m.bangCancel != nil {
 		return true
@@ -3546,14 +3610,17 @@ func (m *UI) isAgentBusy() bool {
 	if m.com == nil || m.com.Workspace == nil {
 		return false
 	}
-	return m.com.Workspace.AgentIsReady() &&
-		m.com.Workspace.AgentIsBusy()
+	return m.agentBusyCache.val
 }
 
 // isCurrentSessionBusy reports whether the agent is actively processing a
 // request for the session the user is currently viewing. Unlike
 // isAgentBusy, activity in another session does not make the current
 // session appear busy.
+//
+// Like isAgentBusy this is a pure cache read (it is called from render
+// paths such as renderPills); a value cached for a different session reads
+// as idle until the off-thread refresh for this session lands.
 func (m *UI) isCurrentSessionBusy() bool {
 	if m.bangCancel != nil {
 		return true
@@ -3561,8 +3628,10 @@ func (m *UI) isCurrentSessionBusy() bool {
 	if !m.hasSession() || m.com == nil || m.com.Workspace == nil {
 		return false
 	}
-	return m.com.Workspace.AgentIsReady() &&
-		m.com.Workspace.AgentIsSessionBusy(m.session.ID)
+	if m.sessionBusyCache.session != m.session.ID {
+		return false
+	}
+	return m.sessionBusyCache.val
 }
 
 // hasSession returns true if there is an active session with a valid ID.
@@ -3749,6 +3818,12 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 
 	// Capture session ID to avoid race with main goroutine updating m.session.
 	sessionID := m.session.ID
+	// Optimistically mark the agent busy: the prompt we are about to submit
+	// either starts a run or is enqueued behind one. This keeps esc pressed
+	// right after enter routing to cancelAgent instead of reading a stale
+	// idle value; the authoritative state arrives via agentRunSubmittedMsg.
+	m.agentBusyCache.set(true)
+	m.sessionBusyCache.setForSession(true, sessionID)
 	cmds = append(cmds, func() tea.Msg {
 		// AgentRun is fire-and-forget: it returns once the prompt has
 		// been accepted (HTTP 202) or synchronously with a validation
@@ -3761,7 +3836,7 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 				Msg:  fmt.Sprintf("%v", err),
 			}
 		}
-		return nil
+		return agentRunSubmittedMsg{}
 	})
 	return tea.Batch(cmds...)
 }
@@ -3805,8 +3880,11 @@ func (m *UI) handleChannelMessage(ev mcp.Event) tea.Cmd {
 	runCmd := func() tea.Msg {
 		if err := m.com.Workspace.AgentRunChannel(context.Background(), channel, sessionID, content); err != nil {
 			slog.Debug("Failed to inject channel message", "error", err, "session", sessionID)
+			return nil
 		}
-		return nil
+		// The prompt may have been enqueued behind a running turn;
+		// re-fetch busy/queue state.
+		return agentRunSubmittedMsg{}
 	}
 	if loadCmd != nil {
 		return tea.Batch(loadCmd, runCmd)
@@ -3937,15 +4015,24 @@ func (m *UI) cancelAgent() tea.Cmd {
 		}
 
 		m.com.Workspace.AgentCancel(m.session.ID)
-		// Stop the spinning todo indicator.
+		// Stop the spinning todo indicator and drop the memoized busy
+		// state the cancel just changed; the pill re-renders now from
+		// last-known state and again when the off-thread refresh (and
+		// the agent's own events) land.
 		m.todoIsSpinning = false
+		m.invalidateBusyCaches()
 		m.renderPills()
-		return nil
+		return m.dispatchBusyRefresh()
 	}
 
-	// Check if there are queued prompts - if so, clear the queue.
-	if m.com.Workspace.AgentQueuedPrompts(m.session.ID) > 0 {
+	// Queued prompts pending: esc clears the queue. Decide from the cached
+	// count (event-driven) instead of a synchronous workspace probe.
+	if m.promptQueue > 0 {
 		m.com.Workspace.AgentClearQueue(m.session.ID)
+		m.promptQueue = 0
+		m.promptQueueItems = nil
+		m.promptQueueCheckedAt = time.Now()
+		m.updateLayoutAndSize()
 		return nil
 	}
 
@@ -4198,9 +4285,9 @@ func (m *UI) handlePermissionNotification(notification permission.PermissionNoti
 // handleAgentNotification translates domain agent events into desktop
 // notifications using the UI notification backend.
 func (m *UI) handleAgentNotification(n notify.Notification) tea.Cmd {
+	var cmds []tea.Cmd
 	switch n.Type {
 	case notify.TypeAgentFinished:
-		var cmds []tea.Cmd
 		cmds = append(cmds, m.sendNotification(notification.Notification{
 			Title:   "Crush is waiting...",
 			Message: fmt.Sprintf("Agent's turn completed in \"%s\"", n.SessionTitle),
@@ -4208,12 +4295,26 @@ func (m *UI) handleAgentNotification(n notify.Notification) tea.Cmd {
 		if m.com.IsHyper() {
 			cmds = append(cmds, m.fetchHyperCredits())
 		}
-		return tea.Batch(cmds...)
+	case notify.TypeAgentError:
+		// Terminal edge like TypeAgentFinished; fall through to the
+		// busy/queue refresh below.
 	case notify.TypeReAuthenticate:
 		return m.handleReAuthenticate(n.ProviderID)
 	default:
 		return nil
 	}
+	// TypeAgentFinished / TypeAgentError are the busy→idle edge: the agent
+	// clears its active request BEFORE publishing precisely so observers
+	// can re-probe. Drop the memoized busy state and re-fetch it and the
+	// prompt queue off-thread.
+	m.invalidateBusyCaches()
+	if cmd := m.dispatchBusyRefresh(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	if cmd := m.dispatchPromptQueueRefresh(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m *UI) handleReAuthenticate(providerID string) tea.Cmd {
@@ -4294,6 +4395,9 @@ func (m *UI) newSession() tea.Cmd {
 	m.pillsExpanded = false
 	m.pillsAutoExpanded = false
 	m.promptQueue = 0
+	m.promptQueueItems = nil
+	m.promptQueueCheckedAt = time.Now()
+	m.invalidateBusyCaches()
 	m.pillsView = ""
 	m.historyReset()
 	agenttools.ResetCache()
@@ -4325,8 +4429,7 @@ func (m *UI) checkBangModeAfterPaste() {
 	m.textarea.SetValue(stripped)
 	col := m.textarea.Column()
 	m.textarea.SetCursorColumn(max(0, col-(len(val)-len(stripped))))
-	yolo := m.com.Workspace.PermissionSkipRequests()
-	m.setEditorPrompt(yolo)
+	m.setEditorPrompt(m.yoloModeCached())
 }
 
 // handlePasteMsg handles a paste message.

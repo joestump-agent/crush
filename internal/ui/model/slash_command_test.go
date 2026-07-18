@@ -100,6 +100,9 @@ func TestSlashClearBlockedWhenAgentBusy(t *testing.T) {
 
 	m := newSlashCommandUI(&slashCommandWorkspace{ready: true, busy: map[string]bool{"s1": true}})
 	m.session = &session.Session{ID: "s1"}
+	// isAgentBusy is a pure cache read (workspace probes happen off-thread);
+	// seed the memoized busy state the way a refresh would.
+	m.agentBusyCache.set(true)
 	m.promptHistory.index = 3
 	m.promptHistory.draft = "wip"
 
@@ -178,6 +181,9 @@ func TestSlashCompactBlockedWhenAgentBusy(t *testing.T) {
 	ws := &slashCommandWorkspace{ready: true, busy: map[string]bool{"s1": true}}
 	m := newSlashCommandUI(ws)
 	m.session = &session.Session{ID: "s1"}
+	// isAgentBusy is a pure cache read (workspace probes happen off-thread);
+	// seed the memoized busy state the way a refresh would.
+	m.agentBusyCache.set(true)
 
 	cmd, ok := m.handleSlashCommand("/compact")
 	if !ok {
