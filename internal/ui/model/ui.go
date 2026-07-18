@@ -2914,14 +2914,12 @@ func (m *UI) FullHelp() [][]key.Binding {
 			tab,
 		)
 		if !isSidebar {
-			mainBinds = append(mainBinds, commands, k.Models)
-		}
-		mainBinds = append(mainBinds,
-			k.Sessions,
-			k.ToggleYolo,
-		)
-		if hasSession {
-			mainBinds = append(mainBinds, k.Chat.NewSession)
+			// The sidebar key handler only routes focus/scroll keys, so
+			// don't advertise bindings that are inert while it's focused.
+			mainBinds = append(mainBinds, commands, k.Models, k.Sessions, k.ToggleYolo)
+			if hasSession {
+				mainBinds = append(mainBinds, k.Chat.NewSession)
+			}
 		}
 
 		binds = append(binds, mainBinds)
@@ -3063,6 +3061,14 @@ func (m *UI) updateLayoutAndSize() {
 			m.isCompact = true
 		} else {
 			m.isCompact = false
+		}
+		// The sidebar isn't drawn in compact mode; if it kept focus, its key
+		// handler would keep swallowing input and help would keep showing
+		// sidebar bindings. Return focus to the editor, mirroring the
+		// sidebar's esc handler.
+		if m.isCompact && m.focus == uiFocusSidebar {
+			m.focus = uiFocusEditor
+			m.textarea.Focus()
 		}
 	}
 

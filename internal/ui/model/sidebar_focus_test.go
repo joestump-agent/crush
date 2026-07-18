@@ -85,6 +85,28 @@ func TestSidebarMouseWheelScrollsInChatDirection(t *testing.T) {
 	require.False(t, handled, "wheel outside the sidebar should not be handled by it")
 }
 
+// TestCompactModeResizeReturnsFocusToEditor verifies that when a resize flips
+// the UI into compact mode while the sidebar has focus, focus returns to the
+// editor. The sidebar is not drawn in compact mode, so leaving focus on it
+// would swallow keys and keep showing sidebar help bindings.
+func TestCompactModeResizeReturnsFocusToEditor(t *testing.T) {
+	t.Parallel()
+	m := newTestUI() // 140x45 is a non-compact chat layout
+	m.updateLayoutAndSize()
+	require.False(t, m.isCompact)
+
+	m.focusSidebar()
+	require.Equal(t, uiFocusSidebar, m.focus)
+
+	// Shrink below the compact width breakpoint, as a WindowSizeMsg would.
+	m.width = compactModeWidthBreakpoint - 1
+	m.updateLayoutAndSize()
+
+	require.True(t, m.isCompact)
+	require.Equal(t, uiFocusEditor, m.focus, "focus must not remain on the hidden sidebar")
+	require.True(t, m.textarea.Focused(), "the editor should be refocused")
+}
+
 // TestSidebarFocusEnumExists documents the three-state non-compact cycle.
 func TestSidebarFocusEnumExists(t *testing.T) {
 	t.Parallel()

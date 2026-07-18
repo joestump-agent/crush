@@ -228,7 +228,6 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 		layout.Len(lipgloss.Height(sidebarHeader)),
 		layout.Fill(1),
 	).Split(m.layout.sidebar).Assign(new(image.Rectangle), &remainingHeightArea)
-	remainingHeight := remainingHeightArea.Dy() - 6
 	filesCount := 0
 	for _, f := range m.sessionFiles {
 		if f.Additions == 0 && f.Deletions == 0 {
@@ -248,6 +247,15 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 
 	skillsCount := len(m.skillStatusItems())
 	channelsCount := len(m.channelStatusItems())
+
+	// Each section below the header renders a title line plus a blank line
+	// before its items, and adjacent sections are joined with one blank
+	// separator line (see fullContent below). That overhead must come out
+	// of the height before budgeting item lines, or the bottom section is
+	// silently clipped by the MaxHeight applied at the end.
+	sectionCounts := []int{filesCount, lspsCount, mcpsCount, skillsCount, channelsCount}
+	sectionOverhead := len(sectionCounts)*2 + len(sectionCounts) - 1
+	remainingHeight := remainingHeightArea.Dy() - sectionOverhead
 
 	maxFiles, maxLSPs, maxMCPs, maxSkills, maxChannels := getDynamicHeightLimits(remainingHeight, filesCount, lspsCount, mcpsCount, skillsCount, channelsCount)
 
