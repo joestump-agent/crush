@@ -145,8 +145,24 @@ var bannedCommands = []string{
 	"ufw",
 }
 
-func bashDescription(attribution *config.Attribution, modelID string) string {
-	bannedCommandsStr := strings.Join(bannedCommands, ", ")
+func bashDescription(attribution *config.Attribution, modelID string, allowedCommands []string, allowAllCommands bool) string {
+	// Build effective banned list for display
+	var bannedCommandsStr string
+	if allowAllCommands {
+		bannedCommandsStr = "(none - all commands allowed)"
+	} else {
+		effectiveBanned := make([]string, 0, len(bannedCommands))
+		allowedSet := make(map[string]bool, len(allowedCommands))
+		for _, cmd := range allowedCommands {
+			allowedSet[cmd] = true
+		}
+		for _, cmd := range bannedCommands {
+			if !allowedSet[cmd] {
+				effectiveBanned = append(effectiveBanned, cmd)
+			}
+		}
+		bannedCommandsStr = strings.Join(effectiveBanned, ", ")
+	}
 	var out bytes.Buffer
 	if err := bashDescriptionTpl.Execute(&out, bashDescriptionData{
 		BannedCommands:  bannedCommandsStr,
@@ -162,9 +178,26 @@ func bashDescription(attribution *config.Attribution, modelID string) string {
 	return out.String()
 }
 
-func blockFuncs() []shell.BlockFunc {
+func blockFuncs(allowedCommands []string, allowAllCommands bool) []shell.BlockFunc {
+	// If allowAllCommands is set, don't block any commands
+	if allowAllCommands {
+		return []shell.BlockFunc{}
+	}
+
+	// Build effective banned list by removing allowed commands from the defaults
+	effectiveBanned := make([]string, 0, len(bannedCommands))
+	allowedSet := make(map[string]bool, len(allowedCommands))
+	for _, cmd := range allowedCommands {
+		allowedSet[cmd] = true
+	}
+	for _, cmd := range bannedCommands {
+		if !allowedSet[cmd] {
+			effectiveBanned = append(effectiveBanned, cmd)
+		}
+	}
+
 	return []shell.BlockFunc{
-		shell.CommandsBlocker(bannedCommands),
+		shell.CommandsBlocker(effectiveBanned),
 
 		// System package managers
 		shell.ArgumentsBlocker("apk", []string{"add"}, nil),
@@ -194,10 +227,16 @@ func blockFuncs() []shell.BlockFunc {
 	}
 }
 
-func NewBashTool(permissions permission.Service, workingDir string, attribution *config.Attribution, modelID string) fantasy.AgentTool {
+func NewBashTool(permissions permission.Service, workingDir string, attribution *config.Attribution, modelID string, opts *config.Options) fantasy.AgentTool {
+	var allowedCommands []string
+	var allowAllCommands bool
+	if opts != nil {
+		allowedCommands = opts.AllowedCommands
+		allowAllCommands = opts.AllowAllCommands
+	}
 	return fantasy.NewAgentTool(
 		BashToolName,
-		string(bashDescription(attribution, modelID)),
+		string(bashDescription(attribution, modelID, allowedCommands, allowAllCommands)),
 		func(ctx context.Context, params BashParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if params.Command == "" {
 				return fantasy.NewTextErrorResponse("missing command"), nil
@@ -251,7 +290,7 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 				bgManager := shell.GetBackgroundShellManager()
 				bgManager.Cleanup()
 				// Use background context so it continues after tool returns
-				bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(), params.Command, params.Description)
+				bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(allowedCommands, allowAllCommands), params.Command, params.Description)
 				if err != nil {
 					return fantasy.ToolResponse{}, fmt.Errorf("error starting background shell: %w", err)
 				}
@@ -306,7 +345,7 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 			// Start with detached context so it can survive if moved to background
 			bgManager := shell.GetBackgroundShellManager()
 			bgManager.Cleanup()
-			bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(), params.Command, params.Description)
+			bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(allowedCommands, allowAllCommands), params.Command, params.Description)
 			if err != nil {
 				return fantasy.ToolResponse{}, fmt.Errorf("error starting shell: %w", err)
 			}

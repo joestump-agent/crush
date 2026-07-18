@@ -298,6 +298,15 @@ type Options struct {
 	NotificationStyle         string       `json:"notification_style,omitempty" jsonschema:"description=Notification style to use. Options: auto (default), native, osc, bell, disabled. Auto selects based on environment: native for local sessions, osc for SSH (with automatic OSC 99/777 detection).,enum=auto,enum=native,enum=osc,enum=bell,enum=disabled,default=auto"`
 	DisabledSkills            []string     `json:"disabled_skills,omitempty" jsonschema:"description=List of skill names to disable and hide from the agent,example=crush-config"`
 	DisableA2UI               bool         `json:"disable_a2ui,omitempty" jsonschema:"description=Disable the A2UI prompt section that invites the model to emit renderable <a2ui-json> UI surfaces in chat,default=false"`
+	// AllowedCommands specifies commands that should be removed from the default
+	// banned commands list, allowing the agent to execute them via the bash tool.
+	// This provides a way to selectively enable commands like "ssh" or "curl"
+	// that are blocked by default for security reasons.
+	AllowedCommands []string `json:"allowed_commands,omitempty" jsonschema:"description=List of commands to allow that are normally banned,example=ssh,example=curl,example=scp"`
+	// AllowAllCommands removes all restrictions from the banned commands list,
+	// allowing the agent to execute any command via the bash tool.
+	// This is a dangerous option and should be used with caution.
+	AllowAllCommands bool `json:"allow_all_commands,omitempty" jsonschema:"description=Remove all command restrictions from the bash tool (dangerous),default=false"`
 }
 
 type MCPs map[string]MCPConfig

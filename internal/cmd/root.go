@@ -60,6 +60,8 @@ func init() {
 	rootCmd.Flags().StringSlice("channels", nil, "MCP servers to enable as channels (repeatable), e.g. --channels server:webhook")
 	rootCmd.Flags().StringP("session", "s", "", "Continue a previous session by ID")
 	rootCmd.Flags().BoolP("continue", "C", false, "Continue the most recent session")
+	rootCmd.Flags().StringSlice("allow-commands", nil, "Allow commands that are normally banned (repeatable), e.g. --allow-commands ssh --allow-commands curl")
+	rootCmd.Flags().Bool("allow-all-commands", false, "Allow all commands that are normally banned (removes all blocklist restrictions)")
 	rootCmd.MarkFlagsMutuallyExclusive("session", "continue")
 
 	rootCmd.AddCommand(
@@ -252,8 +254,23 @@ func setupLocalWorkspace(cmd *cobra.Command) (workspace.Workspace, func(), error
 	debug, _ := cmd.Flags().GetBool("debug")
 	yolo, _ := cmd.Flags().GetBool("yolo")
 	channels, _ := cmd.Flags().GetStringSlice("channels")
+	allowCommands, _ := cmd.Flags().GetStringSlice("allow-commands")
+	allowAllCommands, _ := cmd.Flags().GetBool("allow-all-commands")
 	dataDir, _ := cmd.Flags().GetString("data-dir")
 	ctx := cmd.Context()
+
+	// Support environment variables for 12-factor app compliance
+	// CLI flags take precedence over env vars
+	if !allowAllCommands {
+		if v := os.Getenv("CRUSH_ALLOW_ALL_COMMANDS"); v != "" {
+			allowAllCommands = strings.EqualFold(v, "true") || v == "1"
+		}
+	}
+	if len(allowCommands) == 0 {
+		if v := os.Getenv("CRUSH_ALLOW_COMMANDS"); v != "" {
+			allowCommands = strings.Split(v, ",")
+		}
+	}
 
 	cwd, err := ResolveCwd(cmd)
 	if err != nil {
@@ -268,6 +285,15 @@ func setupLocalWorkspace(cmd *cobra.Command) (workspace.Workspace, func(), error
 	cfg := store.Config()
 	store.Overrides().SkipPermissionRequests = yolo
 	store.Overrides().EnabledChannels = channels
+
+	// Handle --allow-all-commands and --allow-commands flags
+	if allowAllCommands || len(allowCommands) > 0 {
+		if cfg.Options == nil {
+			cfg.Options = &config.Options{}
+		}
+		cfg.Options.AllowAllCommands = allowAllCommands
+		cfg.Options.AllowedCommands = append(cfg.Options.AllowedCommands, allowCommands...)
+	}
 
 	if err := os.MkdirAll(cfg.Options.DataDirectory, 0o700); err != nil {
 		return nil, nil, fmt.Errorf("failed to create data directory: %q %w", cfg.Options.DataDirectory, err)
