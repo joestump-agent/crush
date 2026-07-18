@@ -17,7 +17,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
@@ -194,20 +193,21 @@ func PushPopCrushEnv() func() {
 }
 
 func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env env.Env, resolver VariableResolver, knownProviders []catwalk.Provider) error {
-	knownProviderNames := make(map[string]bool)
 	restore := PushPopCrushEnv()
 	defer restore()
 
 	// When disable_default_providers is enabled, skip all default/embedded
 	// providers entirely. Users must fully specify any providers they want.
 	// We skip to the custom provider validation loop which handles all
-	// user-configured providers uniformly.
+	// user-configured providers uniformly. knownProviderNameSet mirrors
+	// this policy so the interactive discovery reload agrees with load on
+	// which providers count as custom.
+	knownProviderNames := knownProviderNameSet(knownProviders, c.Options.DisableDefaultProviders)
 	if c.Options.DisableDefaultProviders {
 		knownProviders = nil
 	}
 
 	for _, p := range knownProviders {
-		knownProviderNames[string(p.ID)] = true
 		config, configExists := c.Providers.Get(string(p.ID))
 		// if the user configured a known provider we need to allow it to override a couple of parameters
 		if configExists {
@@ -366,8 +366,26 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 	// A provider needs discovery when discover_models is explicitly true,
 	// or when the models list is empty (auto-trigger, unless opted out).
 	// The same helper backs the interactive reload; see discovery.go.
-	discoverCtx, discoverCancel := context.WithTimeout(ctx, 3*time.Second)
-	discoveryResults := discoverProviderModels(discoverCtx, c.Providers, knownProviderNames, resolver, false)
+	//
+	// Record each custom provider's user-configured models first, before
+	// discovery merges endpoint models into the live config: the reload
+	// seeds re-discovery from this set so endpoint-removed models get
+	// pruned while user-specified ones survive.
+	store.userConfiguredModels = make(map[string][]catwalk.Model)
+	store.failedDiscoveryProviders = make(map[string]ProviderConfig)
+	candidates := maps.Collect(c.Providers.Seq2())
+	for id, pc := range candidates {
+		if knownProviderNames[id] {
+			continue
+		}
+		store.userConfiguredModels[id] = slices.Clone(pc.Models)
+	}
+
+	// Per-provider errors are logged by the helper; providers that fail
+	// with no user models to fall back on are recorded below so the
+	// interactive reload can retry them.
+	discoverCtx, discoverCancel := context.WithTimeout(ctx, loadModelDiscoveryTimeout)
+	discoveryResults, _ := discoverProviderModels(discoverCtx, candidates, knownProviderNames, resolver)
 	discoverCancel()
 
 	// Validate the custom providers.
@@ -406,16 +424,22 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 		}
 
 		// Apply discovery results if available. discoverProviderModels
-		// only returns entries for providers whose discovery succeeded and
-		// yielded models; failures (and empty results) fall through to the
-		// no-models check below, which drops the provider when it has no
+		// returns entries only for providers whose discovery succeeded;
+		// failures (and empty results) fall through to the no-models
+		// check below, which drops the provider when it has no
 		// user-specified models to fall back on.
-		if models, ok := discoveryResults[id]; ok {
+		if models, ok := discoveryResults[id]; ok && len(models) > 0 {
 			providerConfig.Models = models
 			slog.Info("Discovered models for provider", "provider", id, "count", len(models))
 		}
 
 		if len(providerConfig.Models) == 0 {
+			// Remember discovery-eligible providers dropped here so an
+			// interactive reload can resurrect them once their endpoint
+			// comes up (e.g. Crush started before Ollama was running).
+			if providerWantsDiscovery(providerConfig, store.userConfiguredModels[id]) {
+				store.failedDiscoveryProviders[id] = providerConfig
+			}
 			slog.Warn("Skipping custom provider because the provider has no models", "provider", id)
 			c.Providers.Del(id)
 			continue

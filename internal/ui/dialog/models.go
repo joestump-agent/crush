@@ -525,9 +525,13 @@ func (m *Models) ReloadItems() error {
 	}
 	// setProviderItems repopulates the full item set; re-apply the filter
 	// the user had typed so the view doesn't jump back to the full list.
+	// Mirror the typing path: filtering invalidates the previous
+	// selection, so select the first match rather than leaving the cursor
+	// on an arbitrary (possibly hidden) item.
 	if query := m.input.Value(); query != "" {
 		m.list.SetFilter(query)
-		m.list.ScrollToSelected()
+		m.list.SelectFirst()
+		m.list.ScrollToTop()
 	}
 	return nil
 }

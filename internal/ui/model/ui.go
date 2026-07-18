@@ -1086,6 +1086,13 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, util.ReportError(msg.err))
 			break
 		}
+		if msg.added == 0 {
+			// Nothing was added, so skip the list rebuild. (Enrichment
+			// could in theory tweak metadata on existing models, but that
+			// is not worth resetting the dialog's list state for.)
+			cmds = append(cmds, util.ReportInfo("No new models found"))
+			break
+		}
 		// Refresh the models dialog in place if it's still open.
 		if d := m.dialog.Dialog(dialog.ModelsID); d != nil {
 			if md, ok := d.(*dialog.Models); ok {
@@ -1095,14 +1102,11 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		switch {
-		case msg.added == 1:
-			cmds = append(cmds, util.ReportInfo("Discovered 1 new model"))
-		case msg.added > 1:
-			cmds = append(cmds, util.ReportInfo(fmt.Sprintf("Discovered %d new models", msg.added)))
-		default:
-			cmds = append(cmds, util.ReportInfo("No new models found"))
+		label := "models"
+		if msg.added == 1 {
+			label = "model"
 		}
+		cmds = append(cmds, util.ReportInfo(fmt.Sprintf("Discovered %d new %s", msg.added, label)))
 	case util.InfoMsg:
 		if msg.Type == util.InfoTypeError {
 			slog.Error("Error reported", "error", msg.Msg)
@@ -1760,10 +1764,7 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		// Keep the dialog open; run discovery in the background and refresh
 		// the list when the result arrives (modelsDiscoveryReloadedMsg).
 		cmds = append(cmds, util.ReportInfo("Reloading models…"))
-		cmds = append(cmds, func() tea.Msg {
-			added, err := m.com.Workspace.ReloadModelDiscovery(context.Background())
-			return modelsDiscoveryReloadedMsg{added: added, err: err}
-		})
+		cmds = append(cmds, m.reloadModelDiscovery)
 
 	case dialog.ActionSelectModel:
 		if cmd := m.handleSelectModel(msg); cmd != nil {
@@ -1894,6 +1895,14 @@ func (m *UI) refreshHyperAndRetrySelect(msg dialog.ActionSelectModel) tea.Cmd {
 		}
 		return hyperRefreshDoneMsg{action: msg}
 	}
+}
+
+// reloadModelDiscovery re-runs provider model discovery and reports the
+// outcome back to the update loop as a modelsDiscoveryReloadedMsg. It is
+// used as a tea.Cmd.
+func (m *UI) reloadModelDiscovery() tea.Msg {
+	added, err := m.com.Workspace.ReloadModelDiscovery(context.Background())
+	return modelsDiscoveryReloadedMsg{added: added, err: err}
 }
 
 // fetchHyperCredits returns a command that asynchronously fetches the
