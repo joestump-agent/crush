@@ -153,6 +153,12 @@ type (
 	// closeDialogMsg is sent to close the current dialog.
 	closeDialogMsg struct{}
 
+	// skillsRefreshedMsg is sent after a skill reload or toggle finishes so
+	// the skills dialog (if open) can refresh in place.
+	skillsRefreshedMsg struct {
+		info string
+	}
+
 	// hyperRefreshDoneMsg is sent after a silent Hyper OAuth refresh
 	// finishes. It carries the original model-selection action so the
 	// selection can be resumed.
@@ -764,6 +770,14 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case closeDialogMsg:
 		m.dialog.CloseFrontDialog()
+
+	case skillsRefreshedMsg:
+		// Refresh the skills dialog in place (if it is still open) so the
+		// toggled/reloaded state shows up without slamming the dialog shut.
+		if skillsDialog, ok := m.dialog.Dialog(dialog.SkillsID).(*dialog.Skills); ok {
+			skillsDialog.Refresh()
+		}
+		return m, util.ReportInfo(msg.info)
 
 	case pubsub.Event[session.Session]:
 		if msg.Type == pubsub.DeletedEvent {
@@ -1820,12 +1834,10 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 			if err := m.com.Workspace.ReloadSkills(); err != nil {
 				return util.ReportError(err)()
 			}
-			return util.NewInfoMsg("Skills reloaded")
+			return skillsRefreshedMsg{info: "Skills reloaded"}
 		})
-		m.dialog.CloseDialog(dialog.SkillsID)
 	case dialog.ActionSkillToggle:
 		cmds = append(cmds, m.toggleSkill(msg.SkillName))
-		m.dialog.CloseDialog(dialog.SkillsID)
 	case dialog.ActionReloadModelDiscovery:
 		// Keep the dialog open; run discovery in the background and refresh
 		// the list when the result arrives (modelsDiscoveryReloadedMsg).
@@ -4768,6 +4780,12 @@ func (m *UI) disableDockerMCP() tea.Msg {
 // toggleSkill enables or disables a skill by name, persisting the change
 // to config and reloading skills so the change takes effect immediately.
 func (m *UI) toggleSkill(skillName string) tea.Cmd {
+	if skillName == "" {
+		// Never persist an empty name to disabled_skills. Broken skill
+		// files produce states with no name; toggling them is meaningless.
+		slog.Warn("Ignoring skill toggle with empty skill name")
+		return nil
+	}
 	return func() tea.Msg {
 		cfg := m.com.Config()
 		if cfg == nil || cfg.Options == nil {
@@ -4800,7 +4818,7 @@ func (m *UI) toggleSkill(skillName string) tea.Cmd {
 			return util.ReportError(err)()
 		}
 
-		return util.NewInfoMsg(fmt.Sprintf("Skill %q %s", skillName, action))
+		return skillsRefreshedMsg{info: fmt.Sprintf("Skill %q %s", skillName, action)}
 	}
 }
 
