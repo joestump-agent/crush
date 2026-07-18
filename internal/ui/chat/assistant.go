@@ -386,9 +386,17 @@ func (a *AssistantMessageItem) thinkingKey() (uint64, uint64) {
 }
 
 // contentKey returns the (srcHash, extra) cache key components for the
-// main content section.
+// main content section. Finish state is folded into the key because the
+// rendered output depends on IsFinished() (A2UI alert gating and the
+// truncated-block branch): the last streaming delta and the finished
+// message often carry byte-identical text, and the finished render must
+// not be served from a cache entry stored while streaming.
 func (a *AssistantMessageItem) contentKey() (uint64, uint64) {
-	return fnv64(a.message.Content().Text), 0
+	var fin uint64
+	if a.message.IsFinished() {
+		fin = 1
+	}
+	return fnv64(a.message.Content().Text), fin
 }
 
 // errorKey returns the (srcHash, extra) cache key components for the

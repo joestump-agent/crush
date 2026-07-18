@@ -3,6 +3,8 @@ package chat
 import (
 	"testing"
 
+	"github.com/charmbracelet/crush/internal/message"
+
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
@@ -257,4 +259,43 @@ func TestRenderTruncatedA2UIPreservesFencedCode(t *testing.T) {
 	require.Contains(t, out, "keepMe", "fenced code before the truncated block must be preserved")
 	require.Contains(t, out, "couldn't render")
 	require.NotContains(t, out, "updateComp", "raw truncated JSON must not leak")
+}
+
+// TestContentCache_FinishedRenderNotServedFromStreamingEntry pins the cache
+// key folding in the finish state: the last streaming delta and the Finish
+// part often carry byte-identical text, so without finish state in the key
+// the no-alert render cached mid-stream would be served forever and the
+// dropped-block alert the finished gate promises could never appear.
+func TestContentCache_FinishedRenderNotServedFromStreamingEntry(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	content := `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[{"component":"Text","id":"root","text":"Done"}]}}</a2ui-json>
+And a second one: <a2ui-json>{"version":"v0.9","updateComp`
+
+	// Final content delta arrives while the message is still streaming;
+	// the no-alert render lands in the section cache.
+	item.message = &message.Message{
+		ID:    "m-finish-key",
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{message.TextContent{Text: content}},
+	}
+	streaming := ansi.Strip(item.cachedContent(80))
+	require.NotContains(t, streaming, "couldn't render", "no alert while streaming")
+
+	// The Finish part lands with the text unchanged. The finished render
+	// must re-render and alert, not serve the streaming cache entry.
+	item.message = &message.Message{
+		ID:   "m-finish-key",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: content},
+			message.Finish{Reason: message.FinishReasonEndTurn},
+		},
+	}
+	finished := ansi.Strip(item.cachedContent(80))
+	require.Contains(t, finished, "couldn't render",
+		"finished message with a dangling block must alert even when its text matches the cached streaming render")
 }
