@@ -5,10 +5,12 @@ import (
 	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/message"
 
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/joestump-agent/a2tea/render"
 	"github.com/stretchr/testify/require"
 )
 
@@ -634,4 +636,162 @@ And a second one: <a2ui-json>{"version":"v0.9","updateComp`
 	finished := ansi.Strip(item.cachedContent(80))
 	require.Contains(t, finished, "couldn't render",
 		"finished message with a dangling block must alert even when its text matches the cached streaming render")
+}
+
+// --- Issue #44: keep the surface model live; route focus + keys to it ---
+
+// a2uiTwoButtonForm is a surface with two focusable buttons so Tab moves
+// focus between distinct elements.
+const a2uiTwoButtonForm = `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"form","components":[` +
+	`{"component":"Card","id":"root","child":"col"},` +
+	`{"component":"Column","id":"col","children":["b1","b2"]},` +
+	`{"component":"Button","id":"b1","child":"b1t"},` +
+	`{"component":"Text","id":"b1t","text":"Send"},` +
+	`{"component":"Button","id":"b2","child":"b2t"},` +
+	`{"component":"Text","id":"b2t","text":"Cancel"}` +
+	`]}}</a2ui-json>`
+
+// newA2UIFormItem builds a fully-constructed assistant item (version rail,
+// focus rail) whose message carries a two-button A2UI form.
+func newA2UIFormItem(t *testing.T) *AssistantMessageItem {
+	t.Helper()
+	sty := styles.CharmtonePantera()
+	msg := &message.Message{
+		ID:   "a2ui-form",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "Here is a form:\n\n" + a2uiTwoButtonForm},
+		},
+	}
+	item, ok := NewAssistantMessageItem(&sty, msg).(*AssistantMessageItem)
+	require.True(t, ok)
+	return item
+}
+
+// firstLiveA2UISurface returns the item's first non-nil surface model.
+func firstLiveA2UISurface(t *testing.T, item *AssistantMessageItem) render.Model {
+	t.Helper()
+	for _, s := range item.a2uiSurfaces {
+		if s != nil {
+			return s
+		}
+	}
+	t.Fatal("item holds no live A2UI surface")
+	return nil
+}
+
+func TestA2UIItemHoldsLiveSurfaceModel(t *testing.T) {
+	t.Parallel()
+
+	item := newA2UIFormItem(t)
+	_ = item.RawRender(80)
+
+	require.True(t, item.hasLiveA2UISurfaces(), "rendering must keep the a2tea model, not just its string")
+	surf := firstLiveA2UISurface(t, item)
+	require.False(t, surf.Focused(), "surface starts blurred until the item is selected")
+}
+
+func TestA2UISetFocusedRoutesFocusToSurface(t *testing.T) {
+	t.Parallel()
+
+	item := newA2UIFormItem(t)
+	_ = item.RawRender(80)
+
+	require.Equal(t, -1, item.focusedA2UISurfaceIndex())
+	item.SetFocused(true)
+	require.GreaterOrEqual(t, item.focusedA2UISurfaceIndex(), 0, "selecting the item must focus its surface")
+	item.SetFocused(false)
+	require.Equal(t, -1, item.focusedA2UISurfaceIndex(), "deselecting the item must blur its surface")
+}
+
+func TestA2UIHandleKeyEventTabMovesFocus(t *testing.T) {
+	t.Parallel()
+
+	item := newA2UIFormItem(t)
+	_ = item.RawRender(80)
+	item.SetFocused(true)
+
+	before := item.RawRender(80)
+	v := item.Version()
+
+	handled, _ := item.HandleKeyEvent(tea.KeyPressMsg{Code: tea.KeyTab})
+	require.True(t, handled, "a focused surface must consume tab")
+	require.Greater(t, item.Version(), v, "key handling must bump the item version so the list re-renders")
+
+	after := item.RawRender(80)
+	require.NotEqual(t, before, after, "tab must visibly move the focus indicator")
+
+	// Two buttons: a second tab wraps the ring back to the first.
+	handled, _ = item.HandleKeyEvent(tea.KeyPressMsg{Code: tea.KeyTab})
+	require.True(t, handled)
+	require.Equal(t, before, item.RawRender(80), "tab must cycle back around the two-element ring")
+}
+
+func TestA2UIHandleKeyEventEnterActivatesButton(t *testing.T) {
+	t.Parallel()
+
+	item := newA2UIFormItem(t)
+	_ = item.RawRender(80)
+	item.SetFocused(true)
+
+	handled, cmd := item.HandleKeyEvent(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.True(t, handled, "enter must reach the surface")
+	require.NotNil(t, cmd, "button activation must emit the ButtonClicked cmd")
+}
+
+func TestA2UIHandleKeyEventIgnoresKeysWhileBlurred(t *testing.T) {
+	t.Parallel()
+
+	item := newA2UIFormItem(t)
+	_ = item.RawRender(80)
+
+	handled, _ := item.HandleKeyEvent(tea.KeyPressMsg{Code: tea.KeyTab})
+	require.False(t, handled, "a blurred surface must not consume tab")
+
+	// The copy shortcut still works when the surface is not focused.
+	handled, cmd := item.HandleKeyEvent(tea.KeyPressMsg{Code: 'c', Text: "c"})
+	require.True(t, handled)
+	require.NotNil(t, cmd)
+}
+
+func TestA2UISurfaceModelStableAcrossRenders(t *testing.T) {
+	t.Parallel()
+
+	item := newA2UIFormItem(t)
+	_ = item.RawRender(80)
+	first := firstLiveA2UISurface(t, item)
+
+	_ = item.RawRender(80) // same width
+	_ = item.RawRender(60) // width change
+	require.Same(t, first, firstLiveA2UISurface(t, item),
+		"re-renders must reuse the live model — rebuilding would drop interaction state")
+}
+
+func TestA2UIContentCacheBypassedForLiveSurfaces(t *testing.T) {
+	t.Parallel()
+
+	item := newA2UIFormItem(t)
+	_ = item.RawRender(80)
+	_ = item.RawRender(80)
+
+	require.True(t, item.hasLiveA2UISurfaces())
+	require.False(t, item.contentSec.valid,
+		"the content-hash cache must not freeze a live surface")
+}
+
+func TestPureTextContentStillCaches(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	msg := &message.Message{
+		ID:    "plain",
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{message.TextContent{Text: "just prose, no UI"}},
+	}
+	item, ok := NewAssistantMessageItem(&sty, msg).(*AssistantMessageItem)
+	require.True(t, ok)
+
+	_ = item.RawRender(80)
+	require.False(t, item.hasLiveA2UISurfaces())
+	require.True(t, item.contentSec.valid, "pure-text messages must keep the content cache")
 }

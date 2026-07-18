@@ -2515,6 +2515,13 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 		case uiFocusMain:
 			switch {
 			case key.Matches(msg, m.keyMap.Tab):
+				// A selected live A2UI surface consumes Tab for its own
+				// focus ring (#44); pane switching applies only when no
+				// item claims the key.
+				if ok, cmd := m.chat.HandleKeyMsg(msg); ok {
+					cmds = append(cmds, cmd)
+					break
+				}
 				if m.isCompact {
 					m.focus = uiFocusEditor
 					cmds = append(cmds, m.textarea.Focus())

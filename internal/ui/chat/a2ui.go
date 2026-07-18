@@ -8,8 +8,10 @@ import (
 	"regexp"
 	"strings"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/joestump-agent/a2tea"
+	"github.com/joestump-agent/a2tea/render"
 	"github.com/tmc/a2ui/a2uistream"
 )
 
@@ -553,6 +555,145 @@ func repairA2UIMessage(msg map[string]any) bool {
 	return true
 }
 
+// syncA2UISurfaces builds — or reuses — the live a2tea models for the
+// scanned parts (#44). Surfaces are keyed by a hash of the scanned source:
+// streaming deltas rebuild them, while pure re-renders (width changes,
+// focus flips, key events) reuse the same models and preserve their
+// interaction state (focus ring position, edited field values). The slice
+// is part-indexed; parts without a renderable surface hold nil.
+func (a *AssistantMessageItem) syncA2UISurfaces(src string, parts []a2tea.Part) {
+	h := fnv64(src)
+	if a.a2uiScanned && a.a2uiSrcHash == h && len(a.a2uiSurfaces) == len(parts) {
+		return
+	}
+	surfaces := make([]render.Model, len(parts))
+	for i, p := range parts {
+		if len(p.Messages) == 0 {
+			continue
+		}
+		model, err := a2tea.Render(p.Messages)
+		if err != nil {
+			// Valid A2UI with nothing to draw (e.g. a bare data-model
+			// update). The render loop skips nil entries; the block-stats
+			// pass decides whether anything needs alerting.
+			continue
+		}
+		if rm, ok := model.(render.Model); ok {
+			surfaces[i] = rm
+		}
+	}
+	a.a2uiSurfaces = surfaces
+	a.a2uiSrcHash = h
+	a.a2uiScanned = true
+	// A rebuild replaces focused models with fresh blurred ones; re-grant
+	// focus when the item is selected so the ring survives streaming.
+	if a.focusableMessageItem.isFocused() {
+		a.focusA2UISurfaces()
+	}
+}
+
+// dropA2UISurfaces discards the live surface models, e.g. when the content
+// no longer scans as A2UI.
+func (a *AssistantMessageItem) dropA2UISurfaces() {
+	a.a2uiSurfaces = nil
+	a.a2uiSrcHash = 0
+	a.a2uiScanned = false
+}
+
+// a2uiSurfaceAt returns the live surface for scan-part i, or nil when the
+// part has none (or the index is stale).
+func (a *AssistantMessageItem) a2uiSurfaceAt(i int) render.Model {
+	if i < 0 || i >= len(a.a2uiSurfaces) {
+		return nil
+	}
+	return a.a2uiSurfaces[i]
+}
+
+// hasLiveA2UISurfaces reports whether the item holds at least one live
+// a2tea surface model. While true, the content-hash render caches are
+// bypassed so surface interaction is never served a frozen frame.
+func (a *AssistantMessageItem) hasLiveA2UISurfaces() bool {
+	for _, s := range a.a2uiSurfaces {
+		if s != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// focusA2UISurfaces grants keyboard focus to the first live surface and
+// blurs the rest, honoring the a2tea composition contract of at most one
+// focused child at a time. render.Surface's Focus returns a nil cmd, so
+// dropping it here loses nothing.
+func (a *AssistantMessageItem) focusA2UISurfaces() {
+	granted := false
+	for _, s := range a.a2uiSurfaces {
+		if s == nil {
+			continue
+		}
+		if !granted {
+			_ = s.Focus()
+			granted = true
+			continue
+		}
+		s.Blur()
+	}
+}
+
+// blurA2UISurfaces revokes keyboard focus from every live surface.
+func (a *AssistantMessageItem) blurA2UISurfaces() {
+	for _, s := range a.a2uiSurfaces {
+		if s != nil {
+			s.Blur()
+		}
+	}
+}
+
+// focusedA2UISurfaceIndex returns the index of the surface currently
+// holding keyboard focus, or -1 when none does.
+func (a *AssistantMessageItem) focusedA2UISurfaceIndex() int {
+	for i, s := range a.a2uiSurfaces {
+		if s != nil && s.Focused() {
+			return i
+		}
+	}
+	return -1
+}
+
+// updateA2UISurface forwards msg into the surface's Update, stores the
+// returned model back, and bumps the item version so the list re-renders
+// the surface's new state on the next draw.
+func (a *AssistantMessageItem) updateA2UISurface(idx int, msg tea.Msg) tea.Cmd {
+	model, cmd := a.a2uiSurfaces[idx].Update(msg)
+	if rm, ok := model.(render.Model); ok {
+		a.a2uiSurfaces[idx] = rm
+	}
+	a.Bump()
+	return cmd
+}
+
+// a2uiSurfaceWantsKey reports whether a focused surface should consume the
+// key. The whitelist mirrors the keys render.Surface.Update reacts to —
+// forwarding everything would swallow host shortcuts (copy, help, quit)
+// whenever a surface item is selected. While a text-editable component is
+// being edited every key is potential input; Esc stays with the host
+// unless a modal is open to close.
+func a2uiSurfaceWantsKey(s render.Model, key tea.KeyMsg) bool {
+	k := key.String()
+	if k == "esc" {
+		m, ok := s.(interface{ HasOpenModal() bool })
+		return ok && m.HasOpenModal()
+	}
+	if e, ok := s.(interface{ EditingText() bool }); ok && e.EditingText() {
+		return true
+	}
+	switch k {
+	case "tab", "shift+tab", "enter", "space", "up", "down", "left", "right", "h", "l", "backspace":
+		return true
+	}
+	return false
+}
+
 // renderContentWithA2UI renders assistant content that contains A2UI. a2tea
 // scans the content into ordered parts of prose text and typed A2UI messages;
 // crush renders the prose as markdown and hands each part's messages to
@@ -579,8 +720,14 @@ func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, 
 	if err != nil {
 		// Not parseable as A2UI — render everything as markdown so nothing is
 		// lost.
+		a.dropA2UISurfaces()
 		return a.renderMarkdown(content, width)
 	}
+
+	// Keep the a2tea models alive on the item (rebuilt only when the source
+	// changed) so the surfaces can receive focus and key input instead of
+	// being frozen to a string (#44).
+	a.syncA2UISurfaces(masked, parts)
 
 	renderer := common.MarkdownRenderer(a.sty, width)
 	mu := common.LockMarkdownRenderer(renderer)
@@ -616,20 +763,20 @@ func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, 
 	// the chat. The a2tea model is sized to the container's inner width.
 	surface := a.sty.Messages.A2UISurface
 	innerWidth := max(width-surface.GetHorizontalFrameSize(), 1)
-	for _, p := range parts {
+	for i, p := range parts {
 		writeChunk(renderMarkdown(p.Text))
 		if len(p.Messages) == 0 {
 			continue
 		}
-		model, err := a2tea.Render(p.Messages)
-		if err != nil {
+		model := a.a2uiSurfaceAt(i)
+		if model == nil {
 			// Valid A2UI messages with nothing to draw (e.g. a data-model
 			// update). Not an error worth alarming the user about.
 			continue
 		}
-		if sz, ok := model.(interface{ SetSize(width, height int) }); ok {
-			sz.SetSize(innerWidth, 0)
-		}
+		// Render from the live model each call: its View reflects the
+		// current focus ring and edited values, not a frozen snapshot.
+		model.SetSize(innerWidth, 0)
 		rendered := strings.TrimRight(model.View().Content, "\n")
 		writeChunk(surface.Width(max(width-surface.GetHorizontalBorderSize(), 1)).Render(rendered))
 	}
