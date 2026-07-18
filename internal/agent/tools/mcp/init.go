@@ -66,9 +66,13 @@ var (
 	// just-installed session, or the second success overwrites the first
 	// session without closing it. Different servers never contend.
 	nameLocks = csync.NewMap[string, *sync.Mutex]()
-	broker    = pubsub.NewBroker[Event]()
-	initOnce  sync.Once
-	initDone  = make(chan struct{})
+	// nameLocksMu makes mutex creation in nameLock atomic:
+	// csync.Map.GetOrSet is check-then-act, so two first-op callers
+	// could otherwise mint different mutexes and proceed unserialized.
+	nameLocksMu sync.Mutex
+	broker      = pubsub.NewBroker[Event]()
+	initOnce    sync.Once
+	initDone    = make(chan struct{})
 )
 
 // State represents the current state of an MCP client
@@ -258,7 +262,14 @@ func InitializeSingle(ctx context.Context, name string, cfg *config.ConfigStore)
 
 // nameLock returns the mutex serializing lifecycle mutations for one server.
 func nameLock(name string) *sync.Mutex {
-	return nameLocks.GetOrSet(name, func() *sync.Mutex { return &sync.Mutex{} })
+	nameLocksMu.Lock()
+	defer nameLocksMu.Unlock()
+	if mu, ok := nameLocks.Get(name); ok {
+		return mu
+	}
+	mu := &sync.Mutex{}
+	nameLocks.Set(name, mu)
+	return mu
 }
 
 // initClient initializes a single MCP client with the given configuration.
@@ -316,9 +327,10 @@ func DisableSingle(cfg *config.ConfigStore, name string) error {
 		closeSession(name, session)
 	}
 
-	// Clear tools and prompts for this MCP.
+	// Clear tools, prompts, and resources for this MCP.
 	updateTools(cfg, name, nil)
 	updatePrompts(name, nil)
+	updateResources(name, nil)
 
 	// Update state to disabled.
 	updateState(name, StateDisabled, nil, nil, Counts{})
@@ -427,6 +439,7 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 				sessions.Del(name)
 				allTools.Del(name)
 				updatePrompts(name, nil)
+				updateResources(name, nil)
 			}
 			closeSession(name, client)
 		default:
@@ -437,6 +450,7 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 			}
 			allTools.Del(name)
 			updatePrompts(name, nil)
+			updateResources(name, nil)
 		}
 		// Never publish a dead session on the state.
 		info.Client = nil

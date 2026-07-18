@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -243,4 +244,64 @@ func TestMaybeStdioErr_UnwrapsChannelTransport(t *testing.T) {
 	got := maybeStdioErr(io.EOF, wrapped)
 	require.ErrorContains(t, got, "boom-diagnostic",
 		"stdio diagnostics should surface the child's output through the channelTransport wrapper")
+}
+
+// TestNameLock_ConcurrentFirstUseReturnsOneMutex pins that the per-name
+// lifecycle lock is minted atomically: racing first-use callers must all
+// receive the same mutex, or the serialization the whole lifecycle relies
+// on silently degrades to per-caller locks.
+func TestNameLock_ConcurrentFirstUseReturnsOneMutex(t *testing.T) {
+	const name = "test-name-lock-race"
+	t.Cleanup(func() { nameLocks.Del(name) })
+
+	const n = 32
+	locks := make([]*sync.Mutex, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			locks[i] = nameLock(name)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 1; i < n; i++ {
+		require.Same(t, locks[0], locks[i], "all callers must share one lifecycle mutex")
+	}
+}
+
+// TestUpdateState_ErrorClearsResources pins that both StateError teardown
+// branches clear the resources registry alongside tools and prompts — a
+// dead server must not keep advertising resources it can no longer serve.
+func TestUpdateState_ErrorClearsResources(t *testing.T) {
+	const name = "test-error-clears-resources"
+	t.Cleanup(func() {
+		sessions.Del(name)
+		allTools.Del(name)
+		allResources.Del(name)
+		states.Del(name)
+	})
+
+	// Branch 1: the registered session itself errored (client argument).
+	sess, _ := liveSession(t, "res_tool")
+	sessions.Set(name, sess)
+	allResources.Set(name, []*Resource{{Name: "doc"}})
+
+	updateState(name, StateError, errors.New("listing broke"), sess, Counts{})
+	_, ok := allResources.Get(name)
+	require.False(t, ok, "current-session error must clear the resources registry")
+
+	// Branch 2: no specific session (connect failed); anything registered
+	// under the name is unusable.
+	sess2, _ := liveSession(t, "res_tool2")
+	sessions.Set(name, sess2)
+	allResources.Set(name, []*Resource{{Name: "doc2"}})
+
+	updateState(name, StateError, errors.New("connect broke"), nil, Counts{})
+	_, ok = allResources.Get(name)
+	require.False(t, ok, "no-session error must clear the resources registry")
 }
