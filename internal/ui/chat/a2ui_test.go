@@ -338,6 +338,102 @@ func TestRenderContentWithA2UIValidButtonStillRenders(t *testing.T) {
 	require.NotContains(t, plain, "couldn't render")
 }
 
+// --- Issue #168: parser-derived segmentation; protocol-only blocks ---
+
+// a2uiDocSurface is a bare A2UI message whose *string content* mentions the
+// wire tags — documentation text inside a live surface. The parser consumes
+// the whole object as one message; the tag literals are content, not
+// delimiters.
+const a2uiDocSurface = `{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
+	`{"component":"Text","id":"t","text":"Wrap payloads in <a2ui-json> and </a2ui-json> tags"}]}}`
+
+func TestScanA2UIBlocks(t *testing.T) {
+	t.Parallel()
+
+	// A tag pair inside a bare message's JSON string is not a block.
+	require.Equal(t, a2uiBlockStats{}, scanA2UIBlocks(a2uiDocSurface))
+
+	// A lone open-tag literal inside a string is not a truncated block either.
+	lone := `{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
+		`{"component":"Text","id":"t","text":"start blocks with <a2ui-json>"}]}}`
+	require.Equal(t, a2uiBlockStats{}, scanA2UIBlocks(lone))
+
+	// Real blocks are still found and judged: rendered, malformed, unclosed.
+	require.Equal(t, a2uiBlockStats{}, scanA2UIBlocks("hi "+a2uiSurface))
+	require.Equal(t, a2uiBlockStats{dropped: 1}, scanA2UIBlocks(`<a2ui-json>{nope}</a2ui-json>`))
+	require.Equal(t, a2uiBlockStats{dropped: 1}, scanA2UIBlocks(`<a2ui-json>{"foo":1}</a2ui-json>`))
+	require.Equal(t, a2uiBlockStats{unclosed: true}, scanA2UIBlocks(`text <a2ui-json>{"version":"v0`))
+
+	// A consumed bare message followed by a real malformed block: the bare
+	// message must not hide the drop.
+	require.Equal(t, a2uiBlockStats{dropped: 1},
+		scanA2UIBlocks(a2uiDocSurface+"\n<a2ui-json>{nope}</a2ui-json>"))
+
+	// Protocol-only block: recognized but not drawable.
+	require.Equal(t, a2uiBlockStats{protocolOnly: 1},
+		scanA2UIBlocks(`<a2ui-json>{"version":"v0.9","callFunction":{"name":"getWeather"}}</a2ui-json>`))
+
+	// An incomplete bare candidate buffers the rest as text — the parser
+	// never honors the tag, so neither do we.
+	require.Equal(t, a2uiBlockStats{},
+		scanA2UIBlocks(`{"updateComponents": "unterminated <a2ui-json>{nope}</a2ui-json>`))
+}
+
+// TestNoAlertForTagLiteralInsideBareJSONString pins the #168 segmentation
+// fix end to end: a working bare surface whose text mentions the tag pair
+// must render without the false "couldn't render" alert the blind tag-pair
+// scan used to raise.
+func TestNoAlertForTagLiteralInsideBareJSONString(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	require.True(t, contentHasA2UI(a2uiDocSurface))
+	plain := ansi.Strip(item.renderContentWithA2UI(a2uiDocSurface, 80, true))
+
+	require.Contains(t, plain, "Wrap payloads in", "the surface must render its text")
+	require.NotContains(t, plain, "couldn't render",
+		"tag literals inside a consumed message's strings must not alert")
+}
+
+// TestProtocolOnlyBlockGetsNoticeNotAlert pins the #168 copy fix: a block
+// carrying only protocol messages was understood — it must show the quiet
+// notice, not the malformed-content alert.
+func TestProtocolOnlyBlockGetsNoticeNotAlert(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	content := `One sec: <a2ui-json>{"version":"v0.9","callFunction":{"name":"getWeather","args":{}}}</a2ui-json>`
+	plain := ansi.Strip(item.renderContentWithA2UI(content, 80, true))
+
+	require.Contains(t, plain, "nothing to display", "the protocol notice must show")
+	require.NotContains(t, plain, "couldn't render",
+		"a recognized protocol-only block is not a malformed block")
+	require.Contains(t, plain, "One sec", "surrounding prose is preserved")
+
+	// While streaming, notices stay quiet like the alert does.
+	streaming := ansi.Strip(item.renderContentWithA2UI(content, 80, false))
+	require.NotContains(t, streaming, "nothing to display")
+}
+
+// TestProtocolOnlyDoesNotMaskMalformedAlert: when both a protocol-only block
+// and a genuinely dropped block are present, the alert wins.
+func TestProtocolOnlyDoesNotMaskMalformedAlert(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	content := `<a2ui-json>{"version":"v0.9","callFunction":{"name":"f"}}</a2ui-json>` +
+		"\n\n<a2ui-json>{nope}</a2ui-json>"
+	plain := ansi.Strip(item.renderContentWithA2UI(content, 80, true))
+
+	require.Contains(t, plain, "couldn't render")
+}
+
 // --- Existing tests ---
 
 func TestRenderContentWithA2UI(t *testing.T) {
@@ -450,7 +546,7 @@ func TestNoDroppedBlockAlert_MultiMessageBody(t *testing.T) {
 	content := "Here: <a2ui-json>" + body + "</a2ui-json>"
 
 	// Sanity: the parser really does yield messages for this body.
-	require.Zero(t, countDroppedTaggedBlocks(content),
+	require.Zero(t, scanA2UIBlocks(content).dropped,
 		"multi-message body must not count as dropped")
 
 	out := item.renderContentWithA2UI(content, 80, true)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/joestump-agent/a2tea"
+	"github.com/tmc/a2ui/a2uistream"
 )
 
 // a2uiOpenTag and a2uiCloseTag delimit an inline A2UI block in assistant
@@ -116,46 +117,280 @@ func contentHasUnclosedA2UI(content string) bool {
 	return hasUnclosedA2UITag(masked)
 }
 
-// countDroppedTaggedBlocks scans content for complete
-// <a2ui-json>...</a2ui-json> pairs that yield no A2UI messages — blocks the
-// parser drops. This is independent of bare-JSON parts, which must not mask
-// the alert (#7).
-//
-// Each block is judged by running it through the SAME parser Scan uses, so
-// this check agrees with rendering by construction. The previous
-// implementation unmarshalled the body as a single JSON object, which
-// disagreed with the parser in both directions: valid-but-unrecognized JSON
-// ({"foo":1}) is silently dropped by the parser but unmarshals fine (missed
-// alert), while array-wrapped or multiple newline-delimited messages render
-// fine but fail a single-object unmarshal (false alert beside a working
-// surface).
-func countDroppedTaggedBlocks(content string) int {
-	var dropped int
-	s := content
-	for {
-		i := strings.Index(s, a2uiOpenTag)
-		if i < 0 {
-			break
-		}
-		s = s[i+len(a2uiOpenTag):]
-		j := strings.Index(s, a2uiCloseTag)
-		if j < 0 {
-			break
-		}
-		body := s[:j]
-		s = s[j+len(a2uiCloseTag):]
+// a2uiBlockStats summarizes how the a2uistream parser treats the complete
+// <a2ui-json> blocks in content (#7, #168).
+type a2uiBlockStats struct {
+	// dropped counts blocks the parser consumed but produced nothing from —
+	// malformed JSON or objects it doesn't recognize. These lose content and
+	// must alert.
+	dropped int
+	// protocolOnly counts blocks holding only protocol messages
+	// (callFunction/actionResponse): recognized, just not drawable. These get
+	// a quiet notice, not the malformed-content alert.
+	protocolOnly int
+	// unclosed reports an open tag the parser honors as a delimiter that
+	// never got its closing partner — a truncated generation (#5).
+	unclosed bool
+}
 
-		messages := 0
-		if parts, err := a2tea.Scan(a2uiOpenTag + body + a2uiCloseTag); err == nil {
-			for _, p := range parts {
-				messages += len(p.Messages)
-			}
+// scanA2UIBlocks classifies the tagged blocks in content the way the
+// a2uistream parser does. Both the segmentation and the per-block judgment
+// derive from the parser's own rules, so this check agrees with rendering by
+// construction.
+//
+// Segmentation used to pair tag literals with a blind string scan, which
+// disagreed with the parser when a bare A2UI message's *string content*
+// mentioned the tags — the parser consumes the whole object (tag literals and
+// all) as one message, while the blind scan saw a "block" between the
+// mentions and raised a false alert beside a working surface (#168). This
+// mirrors the parser's pre-tag scan instead: a bare A2UI object opened before
+// a tag swallows it, and only a tag the parser would honor as a delimiter
+// starts a block.
+//
+// Judging each block by re-parsing it also fixes what a single-object
+// unmarshal got wrong in both directions: valid-but-unrecognized JSON
+// ({"foo":1}) is silently dropped by the parser but unmarshals fine (missed
+// alert), while multiple newline-delimited messages render fine but fail a
+// single-object unmarshal (false alert).
+func scanA2UIBlocks(content string) a2uiBlockStats {
+	var stats a2uiBlockStats
+	s := content
+scan:
+	for {
+		tagIdx := strings.Index(s, a2uiOpenTag)
+		if tagIdx < 0 {
+			return stats
 		}
-		if messages == 0 {
-			dropped++
+		// Mirror the parser's scan of the text ahead of the tag for bare
+		// A2UI JSON objects.
+		for from := 0; from < tagIdx; {
+			rel := strings.IndexByte(s[from:tagIdx], '{')
+			if rel < 0 {
+				break
+			}
+			idx := from + rel
+			if !atBareJSONBoundary(s, idx) || !possibleBareA2UIPrefix(s[idx:]) {
+				from = idx + 1
+				continue
+			}
+			end, complete := scanJSONObject(s[idx:])
+			if !complete {
+				// The parser buffers the incomplete object and everything
+				// after it as plain text; the tag never becomes a delimiter.
+				return stats
+			}
+			if acceptedBareA2UIObject(s[idx : idx+end]) {
+				// The parser consumes the object and rescans from after it —
+				// a tag literal inside the object's strings is message
+				// content, not a delimiter.
+				s = s[idx+end:]
+				continue scan
+			}
+			from = idx + 1
+		}
+		rest := s[tagIdx+len(a2uiOpenTag):]
+		j := strings.Index(rest, a2uiCloseTag)
+		if j < 0 {
+			stats.unclosed = true
+			return stats
+		}
+		messages, payloads := classifyA2UIBlock(rest[:j])
+		switch {
+		case messages > 0: // renders — nothing to report
+		case payloads > 0:
+			stats.protocolOnly++
+		default:
+			stats.dropped++
+		}
+		s = rest[j+len(a2uiCloseTag):]
+	}
+}
+
+// classifyA2UIBlock judges one complete tagged block's body with the same
+// parser rendering uses, reporting how many typed (renderable) messages and
+// version-neutral payload objects it yields. A block with payloads but no
+// messages carries only protocol traffic (callFunction/actionResponse);
+// one with neither was dropped entirely.
+func classifyA2UIBlock(body string) (messages, payloads int) {
+	parts, err := a2uistream.ParseAndValidate(a2uiOpenTag+body+a2uiCloseTag, nil)
+	if err != nil {
+		return 0, 0
+	}
+	for _, p := range parts {
+		messages += len(p.Messages)
+		payloads += len(p.Payload)
+	}
+	return messages, payloads
+}
+
+// The helpers below mirror a2uistream's unexported bare-JSON scanning rules
+// so scanA2UIBlocks segments content exactly as the parser does.
+
+// a2uiBareKeys are the JSON keys whose presence as a first key makes an
+// object a bare A2UI message candidate for the parser.
+var a2uiBareKeys = []string{
+	"version",
+	"functionCallId",
+	"actionId",
+	"wantResponse",
+	"createSurface",
+	"updateComponents",
+	"updateDataModel",
+	"deleteSurface",
+	"callFunction",
+	"actionResponse",
+}
+
+// a2uiPayloadKeys are the message-type keys that make the parser actually
+// consume a candidate object (the version-neutral payload check).
+var a2uiPayloadKeys = []string{
+	"createSurface",
+	"updateComponents",
+	"updateDataModel",
+	"deleteSurface",
+	"callFunction",
+	"actionResponse",
+}
+
+// atBareJSONBoundary reports whether an object starting at s[idx] sits at a
+// position the parser treats as a bare-JSON boundary: the start of its
+// buffer, or after whitespace.
+func atBareJSONBoundary(s string, idx int) bool {
+	if idx == 0 {
+		return true
+	}
+	switch s[idx-1] {
+	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
+}
+
+// possibleBareA2UIPrefix reports whether s (starting at '{') could open a
+// bare A2UI message: its first key must be one of the keys the parser
+// recognizes.
+func possibleBareA2UIPrefix(s string) bool {
+	if s == "" || s[0] != '{' {
+		return false
+	}
+	i := 1
+	for i < len(s) && isJSONSpace(s[i]) {
+		i++
+	}
+	if i == len(s) {
+		return true
+	}
+	if s[i] != '"' {
+		return false
+	}
+	i++
+	start := i
+	for i < len(s) && isJSONKeyChar(s[i]) {
+		i++
+	}
+	fragment := s[start:i]
+	if i == len(s) || s[i] != '"' {
+		return hasBareA2UIKeyPrefix(fragment)
+	}
+	if !isBareA2UIKey(fragment) {
+		return false
+	}
+	i++
+	for i < len(s) && isJSONSpace(s[i]) {
+		i++
+	}
+	return i == len(s) || s[i] == ':'
+}
+
+func hasBareA2UIKeyPrefix(fragment string) bool {
+	if fragment == "" {
+		return true
+	}
+	for _, key := range a2uiBareKeys {
+		if strings.HasPrefix(key, fragment) {
+			return true
 		}
 	}
-	return dropped
+	return false
+}
+
+func isBareA2UIKey(fragment string) bool {
+	for _, key := range a2uiBareKeys {
+		if key == fragment {
+			return true
+		}
+	}
+	return false
+}
+
+func isJSONKeyChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+func isJSONSpace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
+}
+
+// scanJSONObject reports the end of the JSON object starting at s[0] ('{'),
+// tracking strings and escapes so braces (and tag literals) inside string
+// values don't fool the scan. complete is false when the object runs past the
+// end of s.
+func scanJSONObject(s string) (end int, complete bool) {
+	if s == "" || s[0] != '{' {
+		return 0, false
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i + 1, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// acceptedBareA2UIObject reports whether the parser would consume obj as a
+// bare A2UI message: valid JSON carrying at least one message-type key.
+func acceptedBareA2UIObject(obj string) bool {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(obj), &m); err != nil {
+		return false
+	}
+	for _, key := range a2uiPayloadKeys {
+		if _, ok := m[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // repairA2UIButtons rewrites the raw JSON inside <a2ui-json> blocks to fix a
@@ -399,14 +634,21 @@ func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, 
 		writeChunk(surface.Width(max(width-surface.GetHorizontalBorderSize(), 1)).Render(rendered))
 	}
 
-	// Alert when a complete tag pair was dropped by the parser (#7) —
-	// checked directly so bare-JSON parts cannot mask the count — or when
-	// generation was truncated mid-block (#5). Only for finished messages:
-	// while streaming, an "unclosed" tag usually just means the close tag
-	// hasn't arrived yet, and flashing a red alert between flushes that then
-	// vanishes reads as a glitch.
-	if finished && (countDroppedTaggedBlocks(masked) > 0 || hasUnclosedA2UITag(masked)) {
-		writeChunk(a.renderA2UIAlert(width))
+	// Alert when the parser dropped a complete tagged block (#7) — checked
+	// directly so bare-JSON parts cannot mask the count — or when generation
+	// was truncated mid-block (#5). Blocks carrying only protocol messages
+	// were understood, just not drawable, so they get a quiet notice instead
+	// (#168). Only for finished messages: while streaming, an "unclosed" tag
+	// usually just means the close tag hasn't arrived yet, and flashing a red
+	// alert between flushes that then vanishes reads as a glitch.
+	if finished {
+		stats := scanA2UIBlocks(masked)
+		switch {
+		case stats.dropped > 0 || stats.unclosed:
+			writeChunk(a.renderA2UIAlert(width))
+		case stats.protocolOnly > 0:
+			writeChunk(a.renderA2UIProtocolNotice(width))
+		}
 	}
 
 	return b.String()
@@ -449,4 +691,14 @@ func (a *AssistantMessageItem) renderA2UIAlert(width int) string {
 	reason := a.sty.Messages.ErrorDetails.Width(inner).Render(
 		"The A2UI content was malformed or used unsupported components.")
 	return tag + " " + title + "\n\n" + reason
+}
+
+// renderA2UIProtocolNotice is the quiet counterpart to renderA2UIAlert for
+// tagged blocks holding only protocol messages (callFunction/actionResponse):
+// the content was understood, there is simply nothing to draw, so a muted
+// one-liner replaces the misleading malformed-content alert (#168).
+func (a *AssistantMessageItem) renderA2UIProtocolNotice(width int) string {
+	inner := max(width-2, 1)
+	return a.sty.Messages.ErrorDetails.Width(inner).Render(
+		"This message includes A2UI protocol data with nothing to display.")
 }
