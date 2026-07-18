@@ -172,6 +172,15 @@ type (
 	creditsUpdatedMsg struct {
 		credits int
 	}
+
+	// modelsDiscoveryReloadedMsg is sent after a model-discovery reload
+	// triggered from the /models dialog completes. It carries the number of
+	// newly discovered models (or an error) so the dialog can refresh its
+	// list and the user can be told what happened.
+	modelsDiscoveryReloadedMsg struct {
+		added int
+		err   error
+	}
 )
 
 // UI represents the main user interface model.
@@ -1072,6 +1081,32 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case creditsUpdatedMsg:
 		m.hyperCredits = &msg.credits
+	case modelsDiscoveryReloadedMsg:
+		if msg.err != nil {
+			cmds = append(cmds, util.ReportError(msg.err))
+			break
+		}
+		if msg.added == 0 {
+			// Nothing was added, so skip the list rebuild. (Enrichment
+			// could in theory tweak metadata on existing models, but that
+			// is not worth resetting the dialog's list state for.)
+			cmds = append(cmds, util.ReportInfo("No new models found"))
+			break
+		}
+		// Refresh the models dialog in place if it's still open.
+		if d := m.dialog.Dialog(dialog.ModelsID); d != nil {
+			if md, ok := d.(*dialog.Models); ok {
+				if err := md.ReloadItems(); err != nil {
+					cmds = append(cmds, util.ReportError(err))
+					break
+				}
+			}
+		}
+		label := "models"
+		if msg.added == 1 {
+			label = "model"
+		}
+		cmds = append(cmds, util.ReportInfo(fmt.Sprintf("Discovered %d new %s", msg.added, label)))
 	case util.InfoMsg:
 		if msg.Type == util.InfoTypeError {
 			slog.Error("Error reported", "error", msg.Msg)
@@ -1725,6 +1760,11 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 	case dialog.ActionSkillToggle:
 		cmds = append(cmds, m.toggleSkill(msg.SkillName))
 		m.dialog.CloseDialog(dialog.SkillsID)
+	case dialog.ActionReloadModelDiscovery:
+		// Keep the dialog open; run discovery in the background and refresh
+		// the list when the result arrives (modelsDiscoveryReloadedMsg).
+		cmds = append(cmds, util.ReportInfo("Reloading models…"))
+		cmds = append(cmds, m.reloadModelDiscovery)
 
 	case dialog.ActionSelectModel:
 		if cmd := m.handleSelectModel(msg); cmd != nil {
@@ -1855,6 +1895,14 @@ func (m *UI) refreshHyperAndRetrySelect(msg dialog.ActionSelectModel) tea.Cmd {
 		}
 		return hyperRefreshDoneMsg{action: msg}
 	}
+}
+
+// reloadModelDiscovery re-runs provider model discovery and reports the
+// outcome back to the update loop as a modelsDiscoveryReloadedMsg. It is
+// used as a tea.Cmd.
+func (m *UI) reloadModelDiscovery() tea.Msg {
+	added, err := m.com.Workspace.ReloadModelDiscovery(context.Background())
+	return modelsDiscoveryReloadedMsg{added: added, err: err}
 }
 
 // fetchHyperCredits returns a command that asynchronously fetches the

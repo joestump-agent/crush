@@ -67,12 +67,21 @@ func NewClientWorkspace(c *client.Client, ws proto.Workspace) *ClientWorkspace {
 }
 
 // refreshWorkspace re-fetches the workspace from the server, updating
-// the cached snapshot. Called after config-mutating operations.
+// the cached snapshot. Called after config-mutating operations. Failures
+// are logged only; callers that must surface them use
+// refreshWorkspaceErr instead.
 func (w *ClientWorkspace) refreshWorkspace() {
+	if err := w.refreshWorkspaceErr(); err != nil {
+		slog.Error("Failed to refresh workspace", "error", err)
+	}
+}
+
+// refreshWorkspaceErr re-fetches the workspace from the server, updating
+// the cached snapshot, and returns any fetch error to the caller.
+func (w *ClientWorkspace) refreshWorkspaceErr() error {
 	updated, err := w.client.GetWorkspace(context.Background(), w.workspaceID())
 	if err != nil {
-		slog.Error("Failed to refresh workspace", "error", err)
-		return
+		return err
 	}
 	if updated.Config != nil {
 		updated.Config.SetupAgents()
@@ -80,6 +89,7 @@ func (w *ClientWorkspace) refreshWorkspace() {
 	w.mu.Lock()
 	w.ws = *updated
 	w.mu.Unlock()
+	return nil
 }
 
 // cached returns a snapshot of the cached workspace.
@@ -563,6 +573,25 @@ func (w *ClientWorkspace) ReadSkill(ctx context.Context, skillID string) ([]byte
 
 func (w *ClientWorkspace) ReloadSkills() error {
 	return w.client.ReloadSkills(context.Background(), w.workspaceID())
+}
+
+func (w *ClientWorkspace) ReloadModelDiscovery(ctx context.Context) (int, error) {
+	added, err := w.client.ReloadModelDiscovery(ctx, w.workspaceID())
+	if err != nil {
+		return added, err
+	}
+	if added == 0 {
+		// Nothing changed server-side, so the cached snapshot is
+		// already current.
+		return 0, nil
+	}
+	// Pull the server's updated config so the newly discovered models are
+	// visible in this client's cached view (e.g. the /models dialog). A
+	// stale snapshot must not masquerade as success.
+	if err := w.refreshWorkspaceErr(); err != nil {
+		return added, fmt.Errorf("reload succeeded but refreshing workspace failed: %w", err)
+	}
+	return added, nil
 }
 
 func (w *ClientWorkspace) GetSkillStates() []*skills.SkillState {

@@ -160,6 +160,10 @@ type Workspace interface {
 	// ReloadSkills re-discovers skills from disk and publishes updated
 	// states to all subscribers (sidebar, commands dialog, etc.).
 	ReloadSkills() error
+	// ReloadModelDiscovery re-runs model discovery for custom providers and
+	// merges any newly found models into the in-memory config. It returns
+	// the number of models added across all providers.
+	ReloadModelDiscovery(ctx context.Context) (int, error)
 	// GetSkillStates returns the current per-skill discovery states.
 	GetSkillStates() []*skills.SkillState
 
