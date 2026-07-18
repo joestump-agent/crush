@@ -2340,7 +2340,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				if !m.hasSession() {
 					break
 				}
-				if m.isAgentBusy() {
+				if m.isCurrentSessionBusy() {
 					cmds = append(cmds, util.ReportWarn("Agent is busy, please wait before starting a new session..."))
 					break
 				}
@@ -2514,7 +2514,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				if !m.hasSession() {
 					break
 				}
-				if m.isAgentBusy() {
+				if m.isCurrentSessionBusy() {
 					cmds = append(cmds, util.ReportWarn("Agent is busy, please wait before starting a new session..."))
 					break
 				}

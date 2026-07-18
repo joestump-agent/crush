@@ -343,6 +343,11 @@ func (b *Backend) MCPReconnect(ctx context.Context, workspaceID, name string) er
 	}
 	if err := ws.Cfg.ReloadFromDisk(ctx); err != nil {
 		slog.Warn("Failed to reload config from disk before reconnecting MCP; using existing config", "name", name, "error", err)
+	} else {
+		// Remote clients render from a cached config snapshot that only
+		// refreshes on ConfigChanged, so a reload that picked up on-disk
+		// edits must be published like every other config mutation here.
+		publishConfigChanged(ws)
 	}
 	return mcptools.InitializeSingle(ctx, name, ws.Cfg)
 }

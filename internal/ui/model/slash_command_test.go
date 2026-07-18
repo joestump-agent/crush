@@ -230,6 +230,30 @@ func TestSlashCompactNotBlockedByOtherSessionBusy(t *testing.T) {
 	}
 }
 
+// TestNewSessionKeyNotBlockedByOtherSessionBusy verifies the ctrl+n
+// new-session gate is session-scoped like /clear (both run newSession):
+// agent activity in a different session must not block it.
+func TestNewSessionKeyNotBlockedByOtherSessionBusy(t *testing.T) {
+	t.Parallel()
+
+	m := newSlashCommandUI(&slashCommandWorkspace{ready: true, busy: map[string]bool{"other": true}})
+	m.keyMap = DefaultKeyMap()
+	m.dialog = dialog.NewOverlay()
+	m.attachments = attachments.New(nil, attachments.Keymap{})
+	m.session = &session.Session{ID: "s1"}
+	// A busy value cached for a DIFFERENT session must not gate this one.
+	m.sessionBusyCache.setForSession(true, "other")
+
+	m.handleKeyPressMsg(tea.KeyPressMsg{Code: 'n', Mod: tea.ModCtrl})
+
+	if m.session != nil {
+		t.Fatal("busy state of another session must not block ctrl+n new session")
+	}
+	if m.state != uiLanding {
+		t.Fatal("expected state to be uiLanding after new session")
+	}
+}
+
 // TestBangModeWinsOverSlashCommands verifies that in bang (!) shell mode a
 // command that is literally "/clear" is executed in the shell instead of
 // being hijacked by the slash-command handler.

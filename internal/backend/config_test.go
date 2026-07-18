@@ -284,3 +284,26 @@ func TestMCPReconnect_ReloadsConfigFromDisk(t *testing.T) {
 		_ = mcptools.DisableSingle(ws.Cfg, "added-server")
 	})
 }
+
+// TestMCPReconnect_PublishesConfigChanged verifies that a reconnect whose
+// disk reload succeeded publishes ConfigChanged, so remote clients refresh
+// their cached config snapshot and render the reloaded MCP list. Not
+// parallel: newPublishingWorkspace uses t.Setenv via xdgIsolated.
+func TestMCPReconnect_PublishesConfigChanged(t *testing.T) {
+	b, ws, evc := newPublishingWorkspace(t)
+
+	// Put a disabled stdio server on disk so the reload succeeds with an
+	// explicit provider and InitializeSingle marks the server
+	// StateDisabled without spawning a process.
+	writeReconnectConfig(t, filepath.Join(ws.Path, "crush.json"), map[string]any{
+		"added-server": map[string]any{"type": "stdio", "command": "echo", "disabled": true},
+	})
+	drainEvents(evc, 100*time.Millisecond)
+
+	require.NoError(t, b.MCPReconnect(context.Background(), ws.ID, "added-server"))
+	awaitConfigChanged(t, evc, ws.ID)
+
+	t.Cleanup(func() {
+		_ = mcptools.DisableSingle(ws.Cfg, "added-server")
+	})
+}
