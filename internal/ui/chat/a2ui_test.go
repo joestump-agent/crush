@@ -69,6 +69,72 @@ func TestRenderContentWithA2UIRealSurfaceNextToFencedExample(t *testing.T) {
 	require.Contains(t, plain, "Hello from A2UI") // real surface rendered
 }
 
+// --- Issue #96: tag mentions in inline code must not be scanned ---
+
+func TestContentHasA2UIIgnoresInlineCode(t *testing.T) {
+	t.Parallel()
+	// A complete-looking tag pair in inline code is documentation, not live UI.
+	require.False(t, contentHasA2UI("Wrap the payload in `<a2ui-json>` and `</a2ui-json>` tags."))
+	// Double-backtick spans too.
+	require.False(t, contentHasA2UI("Wrap it in ``<a2ui-json>`` and ``</a2ui-json>``."))
+	// A whole example block quoted in one inline span.
+	require.False(t, contentHasA2UI("Like this: `"+a2uiSurface+"`"))
+}
+
+func TestContentHasUnclosedA2UIIgnoresInlineCode(t *testing.T) {
+	t.Parallel()
+	// A lone open tag in inline code is not a truncated block — without this,
+	// renderTruncatedA2UI chops the message at the mention.
+	require.False(t, contentHasUnclosedA2UI("Use the `<a2ui-json>` tag to open a block. More prose."))
+}
+
+func TestRenderContentWithA2UIInlineCodeMentionPreserved(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	// The exact repro from #96: prose explaining the format, with the tag pair
+	// in inline code. The scanner used to consume the pair, swallowing the
+	// prose between the mentions and raising a false alert.
+	content := "Wrap the payload in `<a2ui-json>` and `</a2ui-json>` tags, then send it."
+	plain := ansi.Strip(item.renderContentWithA2UI(content, 80, true))
+
+	require.Contains(t, plain, "<a2ui-json>", "the mention must render verbatim")
+	require.Contains(t, plain, "</a2ui-json>")
+	require.Contains(t, plain, "then send it", "prose after the mention must survive")
+	require.NotContains(t, plain, "couldn't render", "a documentation mention is not a dropped block")
+	require.NotContains(t, plain, "\x00", "mask placeholders must not leak")
+}
+
+func TestRenderContentWithA2UIRealSurfaceNextToInlineMention(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	item := &AssistantMessageItem{sty: &sty}
+
+	// A live surface and an inline-code mention side by side: the surface
+	// renders, the mention stays prose, and no alert fires.
+	content := "I used the `<a2ui-json>` tag:\n\n" + a2uiSurface + "\n\nDone."
+	plain := ansi.Strip(item.renderContentWithA2UI(content, 80, true))
+
+	require.Contains(t, plain, "Hello from A2UI", "the real surface must render")
+	require.Contains(t, plain, "<a2ui-json>", "the inline mention must stay visible prose")
+	require.Contains(t, plain, "Done")
+	require.NotContains(t, plain, "couldn't render")
+}
+
+func TestMaskMarkdownCodeLeavesPlainInlineCodeAlone(t *testing.T) {
+	t.Parallel()
+
+	// Inline code without A2UI markers is not masked — a live surface whose
+	// JSON strings contain backticks must reach the parser byte-for-byte.
+	content := "Run `go test` first. " + a2uiSurface
+	masked, reps := maskMarkdownCode(content)
+	require.Equal(t, content, masked)
+	require.Empty(t, reps)
+}
+
 // --- Issue #5: truncated mid-block should show alert ---
 
 func TestContentHasUnclosedA2UI(t *testing.T) {
