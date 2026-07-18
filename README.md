@@ -454,6 +454,50 @@ A common interactive channel is [Signal MCP](https://github.com/joestump/signal-
 
 Incoming messages arrive as `<channel>` tags; use the `send_message_to_user` tool to reply.
 
+#### Channel reply routing
+
+By default a channel-originated turn only produces terminal output, so a
+person messaging you on Signal never sees the answer unless the model decides
+to call a send tool itself. Adding a `channel_reply` block to a channel
+server's MCP config makes the routing deterministic: when a turn that
+originated from that channel finishes without the model having replied through
+the channel, Crush sends the final assistant response back through the
+configured tool — to the sender for direct messages, or to the group for group
+messages.
+
+```json
+{
+  "mcp": {
+    "signal": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "signal_mcp/main.py", "--operator", "+15551234567", "--channel"],
+      "channel_reply": {
+        "user": { "tool": "send_message_to_user", "target_param": "user_id" },
+        "group": { "tool": "send_message_to_group", "target_param": "group_id" },
+        "suppress_tools": ["send"]
+      }
+    }
+  }
+}
+```
+
+How it routes:
+
+- **Group pushes** (meta carries `group`) go through the `group` route;
+  **direct pushes** (meta carries `sender`) go through the `user` route.
+  `target_meta` overrides which meta attribute supplies the target;
+  `message_param` (default `message`) names the tool argument that receives
+  the reply text.
+- If the model already called a route tool — or any tool listed in
+  `suppress_tools` — during the turn, the automatic reply is skipped, so
+  richer model-driven replies aren't duplicated.
+- Local (non-channel) turns and channels without a `channel_reply` block are
+  unaffected.
+
+The same shape works for any messaging channel (Discord, Slack, …): point the
+routes at that server's send tools and the matching meta attributes.
+
 The `source` attribute is always the (trusted) server name. Payloads are
 untrusted, server-initiated input: Crush validates their structure, caps the
 body and attribute sizes, restricts `meta` keys to identifiers
