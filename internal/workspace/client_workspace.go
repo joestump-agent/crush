@@ -11,6 +11,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/agent/notify"
+	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/client"
 	"github.com/charmbracelet/crush/internal/config"
@@ -324,6 +325,10 @@ func (w *ClientWorkspace) SidekickIsBusy() bool { return false }
 func (w *ClientWorkspace) SidekickClear(ctx context.Context) error { return nil }
 
 func (w *ClientWorkspace) SidekickSubscribe(ctx context.Context) <-chan pubsub.Event[message.Message] {
+	return nil
+}
+
+func (w *ClientWorkspace) SidekickDashboardSubscribe(ctx context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
 	return nil
 }
 

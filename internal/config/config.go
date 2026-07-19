@@ -809,6 +809,7 @@ func allToolNames() []string {
 		"glob",
 		"grep",
 		"ls",
+		"sidekick_update",
 		"sourcegraph",
 		"todos",
 		"view",

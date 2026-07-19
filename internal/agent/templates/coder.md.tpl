@@ -361,6 +361,10 @@ Emit a single inline `<a2ui-json>{...}</a2ui-json>` block containing one `update
 <a2ui-json>{"version":"{{.A2UIVersion}}","updateComponents":{"surfaceId":"s1","components":[{"component":"Card","id":"root","child":"col"},{"component":"Column","id":"col","children":["title","body"]},{"component":"Text","id":"title","variant":"h2","text":"Build passed"},{"component":"Text","id":"body","text":"142 tests, 0 failures."}]}}</a2ui-json>
 
 Renderable components: Text (variants h1-h5, caption), Card, Column, Row, List, Divider, Button; input components render read-only. Never put code in a surface — use fenced code blocks.
+{{if .SidekickUpdate}}
+
+Use the `sidekick_update` tool to show progress on multi-step tasks: it pushes an `updateComponents` payload to the pinned Sidekick dashboard in the sidebar without adding anything to the chat. Update in place — reuse the same surfaceId and component ids so each push replaces the previous dashboard (e.g. a progress readout stepping 20% → 40% → 60%) instead of accumulating new UI. Keep inline `<a2ui-json>` blocks for content that belongs in the conversation itself.
+{{end}}
 </a2ui>
 {{end}}
 <env>

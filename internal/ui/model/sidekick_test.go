@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -25,6 +26,7 @@ type sidekickTestWorkspace struct {
 	clearCalls   int
 	cancelCalls  int
 	events       chan pubsub.Event[message.Message]
+	dashboards   chan pubsub.Event[agenttools.SidekickSurface]
 	runErr       error
 	unavailable  bool
 	subscribeNil bool
@@ -56,6 +58,16 @@ func (w *sidekickTestWorkspace) SidekickSubscribe(context.Context) <-chan pubsub
 		w.events = make(chan pubsub.Event[message.Message], 8)
 	}
 	return w.events
+}
+
+func (w *sidekickTestWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
+	if w.subscribeNil {
+		return nil
+	}
+	if w.dashboards == nil {
+		w.dashboards = make(chan pubsub.Event[agenttools.SidekickSurface], 8)
+	}
+	return w.dashboards
 }
 
 // newSidekickPanelTestUI builds a chat-state UI focused on the Sidekick

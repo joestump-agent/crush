@@ -8,9 +8,11 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -56,6 +58,9 @@ func (c *errorCoordinator) Sidekick() *agent.EphemeralAgent     { return nil }
 func (c *errorCoordinator) CancelSidekick()                     {}
 func (c *errorCoordinator) IsSidekickBusy() bool                { return false }
 func (c *errorCoordinator) ClearSidekick(context.Context) error { return nil }
+func (c *errorCoordinator) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
+	return nil
+}
 
 // insertRunCompleteWorkspace installs a workspace backed by a real
 // app.App (so the runCompletions broker exists) with the given

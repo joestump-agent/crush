@@ -9,6 +9,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/agent"
+	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/commands"
@@ -297,6 +298,13 @@ func (w *AppWorkspace) SidekickSubscribe(ctx context.Context) <-chan pubsub.Even
 		return nil
 	}
 	return sk.Messages.Subscribe(ctx)
+}
+
+func (w *AppWorkspace) SidekickDashboardSubscribe(ctx context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
+	if w.app.AgentCoordinator == nil {
+		return nil
+	}
+	return w.app.AgentCoordinator.SidekickDashboardSubscribe(ctx)
 }
 
 // -- Permissions --
