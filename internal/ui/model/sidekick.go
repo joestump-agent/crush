@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/pubsub"
+	"github.com/charmbracelet/crush/internal/ui/chat"
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/crush/internal/ui/util"
 )
@@ -371,7 +372,10 @@ func sidekickStreaming(msgs []message.Message) bool {
 
 // renderSidekickMessage renders one conversation entry: user prompts as
 // "> ..." lines, assistant turns as compact tool-call lines plus the
-// response text. Tool-result messages render nothing themselves.
+// response text. Assistant replies carrying A2UI render their surfaces
+// inline through the shared a2tea pipeline at sidebar width (#55);
+// surfaces are display-only in v1. Tool-result messages render nothing
+// themselves.
 func renderSidekickMessage(t *styles.Styles, msg *message.Message, width int) string {
 	switch msg.Role {
 	case message.User:
@@ -390,7 +394,11 @@ func renderSidekickMessage(t *styles.Styles, msg *message.Message, width int) st
 			parts = append(parts, t.Sidebar.SidekickTool.MaxWidth(width).Render(label))
 		}
 		if text := strings.TrimSpace(msg.Content().Text); text != "" {
-			parts = append(parts, t.Sidebar.SidekickAssistant.Width(width).Render(text))
+			if out, ok := chat.RenderA2UIInline(t, text, width, msg.IsFinished()); ok {
+				parts = append(parts, out)
+			} else {
+				parts = append(parts, t.Sidebar.SidekickAssistant.Width(width).Render(text))
+			}
 		}
 		return strings.Join(parts, "\n")
 	default:
