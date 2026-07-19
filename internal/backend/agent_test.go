@@ -62,7 +62,10 @@ func (c *blockingCoordinator) RunSidekick(context.Context, string) (*fantasy.Age
 	return nil, nil
 }
 
-func (c *blockingCoordinator) Sidekick() *agent.EphemeralAgent { return nil }
+func (c *blockingCoordinator) Sidekick() *agent.EphemeralAgent     { return nil }
+func (c *blockingCoordinator) CancelSidekick()                     {}
+func (c *blockingCoordinator) IsSidekickBusy() bool                { return false }
+func (c *blockingCoordinator) ClearSidekick(context.Context) error { return nil }
 
 // insertAgentWorkspace installs a synthetic workspace with the given
 // coordinator (or none) and a workspace run context, mirroring the

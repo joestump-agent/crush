@@ -337,6 +337,10 @@ type UI struct {
 	sidebarTab     sidebarTab
 	sidekickUnread int
 
+	// sidekick is the Sidekick tab's chat panel state (see sidekick.go).
+	// Fully independent of the main agent's busy/queue plumbing.
+	sidekick sidekickState
+
 	// Todo spinner
 	todoSpinner    spinner.Model
 	todoIsSpinning bool
@@ -492,6 +496,11 @@ func (m *UI) Init() tea.Cmd {
 	}
 	// Prime the memoized busy/permission state off-thread.
 	if cmd := m.dispatchBusyRefresh(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	// Start draining the Sidekick's private message stream (no-op when
+	// the Sidekick is unavailable; retried lazily on tab activation).
+	if cmd := m.subscribeSidekick(); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
 	return tea.Batch(cmds...)
@@ -665,6 +674,15 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.handleAgentNotification(msg.Payload); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case sidekickEventMsg:
+		// Sidekick traffic arrives on its own message type so it can
+		// never leak into the main chat's session/message handling.
+		m.applySidekickEvent(msg.event)
+		if cmd := m.awaitSidekickEvent(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case sidekickRunFinishedMsg:
+		m.handleSidekickRunFinished(msg.err)
 	case busyStateMsg:
 		cmds = append(cmds, m.applyBusyState(msg)...)
 	case promptQueueMsg:
@@ -2255,9 +2273,22 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 	// state with a session, non-compact layout.
 	if key.Matches(msg, m.keyMap.Sidekick) {
 		if m.state == uiChat && m.hasSession() && !m.isCompact {
-			m.focusSidekick()
+			if cmd := m.focusSidekick(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 			return tea.Batch(cmds...)
 		}
+	}
+
+	// Esc inside the Sidekick pane acts on the Sidekick only: cancel its
+	// streaming run or hand focus back to the editor. It must run before
+	// the main-agent cancel check below so Sidekick activity can never
+	// trigger — or be blocked by — the main agent's busy state.
+	if key.Matches(msg, m.keyMap.Chat.Cancel) && m.sidekickPaneFocused() {
+		if cmd := m.handleSidekickEscape(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return tea.Batch(cmds...)
 	}
 
 	// Handle cancel key when agent is busy.
@@ -2511,19 +2542,26 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				}
 			}
 		case uiFocusSidebar:
-			// The sidebar is currently a read-only status panel, so it only
-			// handles tab-cycling/focus/scroll keys and intentionally does NOT
-			// fall through to handleGlobalKeys — every other key is inert while
-			// it's focused. Tab cycles the sidebar tabs (Info/Sidekick); Esc
-			// returns focus to the editor.
-			// When the interactive secondary-agent sidebar lands, route its keys
-			// here (and add `default: handleGlobalKeys(msg)` to keep global keys
-			// working, mirroring the editor/main cases). handleGlobalKeys already
-			// gates commands/models/help for sidebar focus, so those stay inert
-			// unless you also un-hide them from the sidebar help (#114).
+			// The Sidekick tab hosts an interactive chat panel: its keys
+			// (Enter submits, text feeds the prompt) route there. The Info
+			// tab remains a read-only status panel that only handles
+			// tab-cycling/focus/scroll keys. Neither falls through to
+			// handleGlobalKeys — every other key is inert while the sidebar
+			// is focused (see TestSidebarSuppressesGlobalKeys and #114); on
+			// the Sidekick tab unmatched keys are consumed by the textarea.
+			if m.sidekickTabInView() {
+				cmds = append(cmds, m.handleSidekickKey(msg))
+				break
+			}
 			switch {
 			case key.Matches(msg, m.keyMap.Tab):
 				m.cycleSidebarTab()
+				if m.sidekickTabInView() {
+					// Landed on the Sidekick tab: focus its prompt and
+					// make sure the event stream is being drained.
+					m.ensureSidekickInput()
+					cmds = append(cmds, m.sidekick.input.Focus(), m.subscribeSidekick())
+				}
 			case key.Matches(msg, m.keyMap.Editor.Escape):
 				m.focus = uiFocusEditor
 				cmds = append(cmds, m.textarea.Focus())
@@ -3700,10 +3738,15 @@ func (m *UI) hasSession() bool {
 }
 
 // focusSidebar moves focus to the sidebar panel, blurring the editor and chat.
+// When the Sidekick tab is showing, the cursor lands in its prompt input.
 func (m *UI) focusSidebar() {
 	m.focus = uiFocusSidebar
 	m.textarea.Blur()
 	m.chat.Blur()
+	if m.sidekickTabInView() {
+		m.ensureSidekickInput()
+		m.sidekick.input.Focus()
+	}
 	m.updateLayoutAndSize()
 }
 

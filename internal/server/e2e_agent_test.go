@@ -225,7 +225,10 @@ func (c *scriptedCoordinator) RunSidekick(context.Context, string) (*fantasy.Age
 	return nil, nil
 }
 
-func (c *scriptedCoordinator) Sidekick() *agent.EphemeralAgent { return nil }
+func (c *scriptedCoordinator) Sidekick() *agent.EphemeralAgent     { return nil }
+func (c *scriptedCoordinator) CancelSidekick()                     {}
+func (c *scriptedCoordinator) IsSidekickBusy() bool                { return false }
+func (c *scriptedCoordinator) ClearSidekick(context.Context) error { return nil }
 
 // agentE2EHarness extends the SSE harness with a scripted coordinator
 // wired into the workspace's embedded app.App, so POST /agent drives a

@@ -19,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/proto"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/charmbracelet/crush/internal/skills"
@@ -244,6 +245,58 @@ func (w *AppWorkspace) InitCoderAgent(ctx context.Context) error {
 
 func (w *AppWorkspace) GetDefaultSmallModel(providerID string) config.SelectedModel {
 	return w.app.GetDefaultSmallModel(providerID)
+}
+
+// -- Sidekick --
+
+// sidekick returns the Sidekick's ephemeral agent, or nil when the
+// coordinator is not initialized or the sidekick agent is not
+// configured.
+func (w *AppWorkspace) sidekick() *agent.EphemeralAgent {
+	if w.app.AgentCoordinator == nil {
+		return nil
+	}
+	return w.app.AgentCoordinator.Sidekick()
+}
+
+func (w *AppWorkspace) SidekickAvailable() bool {
+	return w.sidekick() != nil
+}
+
+func (w *AppWorkspace) SidekickRun(ctx context.Context, prompt string) error {
+	if w.app.AgentCoordinator == nil {
+		return errors.New("agent coordinator not initialized")
+	}
+	_, err := w.app.AgentCoordinator.RunSidekick(ctx, prompt)
+	return err
+}
+
+func (w *AppWorkspace) SidekickCancel() {
+	if w.app.AgentCoordinator != nil {
+		w.app.AgentCoordinator.CancelSidekick()
+	}
+}
+
+func (w *AppWorkspace) SidekickIsBusy() bool {
+	if w.app.AgentCoordinator == nil {
+		return false
+	}
+	return w.app.AgentCoordinator.IsSidekickBusy()
+}
+
+func (w *AppWorkspace) SidekickClear(ctx context.Context) error {
+	if w.app.AgentCoordinator == nil {
+		return nil
+	}
+	return w.app.AgentCoordinator.ClearSidekick(ctx)
+}
+
+func (w *AppWorkspace) SidekickSubscribe(ctx context.Context) <-chan pubsub.Event[message.Message] {
+	sk := w.sidekick()
+	if sk == nil {
+		return nil
+	}
+	return sk.Messages.Subscribe(ctx)
 }
 
 // -- Permissions --

@@ -112,6 +112,17 @@ type Coordinator interface {
 	// state. A busy Sidekick rejects the call with ErrSessionBusy
 	// instead of queueing it.
 	RunSidekick(ctx context.Context, prompt string) (*fantasy.AgentResult, error)
+	// CancelSidekick cancels any in-flight Sidekick run. It never
+	// touches the main agent's active requests or queue.
+	CancelSidekick()
+	// IsSidekickBusy reports whether the Sidekick is processing a
+	// prompt. Independent of the main agent's busy state.
+	IsSidekickBusy() bool
+	// ClearSidekick wipes the Sidekick conversation: it cancels any
+	// in-flight run, destroys the ephemeral session and its in-memory
+	// messages, and resets the session ID so the next RunSidekick
+	// starts a fresh conversation. Nothing was ever persisted (#48).
+	ClearSidekick(ctx context.Context) error
 	// Sidekick exposes the Sidekick's ephemeral agent so a UI can
 	// subscribe to its private session/message stores and cancel runs.
 	// Nil when the sidekick agent is not configured.
@@ -818,6 +829,40 @@ func (c *coordinator) RunSidekick(ctx context.Context, prompt string) (*fantasy.
 // Sidekick implements Coordinator.
 func (c *coordinator) Sidekick() *EphemeralAgent {
 	return c.sidekickAgent
+}
+
+// CancelSidekick implements Coordinator.
+func (c *coordinator) CancelSidekick() {
+	if c.sidekickAgent == nil {
+		return
+	}
+	c.sidekickAgent.CancelAll()
+}
+
+// IsSidekickBusy implements Coordinator.
+func (c *coordinator) IsSidekickBusy() bool {
+	return c.sidekickAgent != nil && c.sidekickAgent.IsBusy()
+}
+
+// ClearSidekick implements Coordinator.
+func (c *coordinator) ClearSidekick(ctx context.Context) error {
+	if c.sidekickAgent == nil {
+		return errSidekickAgentNotConfigured
+	}
+	c.sidekickMu.Lock()
+	sessionID := c.sidekickSessionID
+	c.sidekickSessionID = ""
+	c.sidekickMu.Unlock()
+	if sessionID == "" {
+		return nil
+	}
+	// Cancel before deleting so the in-flight run stops writing into
+	// the store being wiped.
+	c.sidekickAgent.Cancel(sessionID)
+	if err := c.sidekickAgent.Messages.DeleteSessionMessages(ctx, sessionID); err != nil {
+		return err
+	}
+	return c.sidekickAgent.Sessions.Delete(ctx, sessionID)
 }
 
 // sidekickSession returns the Sidekick's ephemeral session ID, creating

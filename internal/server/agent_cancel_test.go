@@ -86,7 +86,10 @@ func (s *runCoordinator) RunSidekick(context.Context, string) (*fantasy.AgentRes
 	return nil, nil
 }
 
-func (s *runCoordinator) Sidekick() *agent.EphemeralAgent { return nil }
+func (s *runCoordinator) Sidekick() *agent.EphemeralAgent     { return nil }
+func (s *runCoordinator) CancelSidekick()                     {}
+func (s *runCoordinator) IsSidekickBusy() bool                { return false }
+func (s *runCoordinator) ClearSidekick(context.Context) error { return nil }
 
 func (s *runCoordinator) capturedCtx() context.Context {
 	s.mu.Lock()
