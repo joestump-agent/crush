@@ -100,10 +100,11 @@ func TestSidebarAllSectionTitlesVisibleAtTightHeight(t *testing.T) {
 
 	m := newSidebarHeightTestUI(t)
 
-	// Header is 7 lines (logo, title, blank, cwd, blank, model info, blank).
-	// The five sections at minimum need 2 title+blank lines each, 4 blank
-	// separators, and 2 item lines each: 7 + (5*2 + 4) + 5*2 = 31.
-	const width, height = 32, 31
+	// Header is 9 lines (tab bar, blank, logo, title, blank, cwd, blank,
+	// model info, blank). The five sections at minimum need 2 title+blank
+	// lines each, 4 blank separators, and 2 item lines each:
+	// 9 + (5*2 + 4) + 5*2 = 33.
+	const width, height = 32, 33
 	m.layout.sidebar = uv.Rect(0, 0, width, height)
 
 	scr := uv.NewScreenBuffer(width, height)
