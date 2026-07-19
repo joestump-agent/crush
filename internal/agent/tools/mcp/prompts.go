@@ -19,6 +19,27 @@ func Prompts() iter.Seq2[string, []*Prompt] {
 	return allPrompts.Seq2()
 }
 
+// ListPrompts returns the current prompts for an MCP server, refreshing the
+// cache from the live server. It get-or-renews the client so listing works
+// even if the session dropped since connect, mirroring ListResources.
+func ListPrompts(ctx context.Context, cfg *config.ConfigStore, name string) ([]*Prompt, error) {
+	session, err := getOrRenewClient(ctx, cfg, name)
+	if err != nil {
+		return nil, err
+	}
+
+	prompts, err := getPrompts(ctx, session)
+	if err != nil {
+		return nil, err
+	}
+
+	updatePrompts(name, prompts)
+	prev, _ := states.Get(name)
+	prev.Counts.Prompts = len(prompts)
+	updateState(name, StateConnected, nil, session, prev.Counts)
+	return prompts, nil
+}
+
 // GetPromptMessages retrieves the content of an MCP prompt with the given arguments.
 func GetPromptMessages(ctx context.Context, cfg *config.ConfigStore, clientName, promptName string, args map[string]string) ([]string, error) {
 	c, err := getOrRenewClient(ctx, cfg, clientName)
