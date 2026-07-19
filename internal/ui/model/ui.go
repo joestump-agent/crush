@@ -3954,7 +3954,9 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 	// dashboard (#56): the pinned surface persists only until the next
 	// prompt. The subscription is also (re)attempted here in case the
 	// agent was not ready at Init.
-	m.sidekick.dashboard = ""
+	if cmd := m.dismissSidekickDashboard(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 	if cmd := m.subscribeSidekickDashboard(); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
@@ -3997,6 +3999,19 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 // the surface rebuilt without an ID — in which case the submission still
 // goes out with just the button identity rather than being dropped.
 func (m *UI) handleA2UIButtonClicked(clicked a2uievent.ButtonClicked) tea.Cmd {
+	// The Sidekick dashboard slot hosts a live surface too (#56): when the
+	// event came from it (it holds focus and the surface ID matches), the
+	// submission still goes to the MAIN agent — the dashboard is the main
+	// agent's push channel — with focus stepping back to the Sidekick
+	// prompt. A cancel unpins the dashboard outright.
+	if values, ok := m.retireSidekickDashboardSurface(clicked.SurfaceID); ok {
+		refocus := m.focusSidekickInput()
+		if chat.A2UIButtonIsCancel(clicked) {
+			_ = m.dismissSidekickDashboard()
+			return refocus
+		}
+		return tea.Batch(refocus, m.sendMessage(chat.A2UISubmissionPrompt(clicked, values)))
+	}
 	values, _ := m.chat.RetireA2UISurface(clicked.SurfaceID)
 	if chat.A2UIButtonIsCancel(clicked) {
 		return nil
