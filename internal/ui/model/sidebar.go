@@ -139,7 +139,14 @@ func (m *UI) scrollSidebarOnWheel(msg common.CoalescedWheelMsg) bool {
 		return false
 	}
 	if lines := int(msg.DeltaY); lines != 0 {
-		m.sidebarScroll = max(0, m.sidebarScroll+lines)
+		if m.sidebarTab == sidebarTabSidekick {
+			// The Sidekick list is bottom-anchored: wheel-up grows the
+			// scrollback, wheel-down returns toward the live tail. The
+			// upper bound is clamped at render time.
+			m.sidekick.scrollback = max(0, m.sidekick.scrollback-lines)
+		} else {
+			m.sidebarScroll = max(0, m.sidebarScroll+lines)
+		}
 	}
 	return true
 }

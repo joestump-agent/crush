@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	uv "github.com/charmbracelet/ultraviolet"
 )
@@ -38,6 +39,9 @@ func (m *UI) setSidebarTab(tab sidebarTab) {
 	m.sidebarTab = tab
 	if tab == sidebarTabSidekick {
 		m.sidekickUnread = 0
+	} else if m.sidekick.initialized {
+		// Leaving the Sidekick tab: stop routing the cursor there.
+		m.sidekick.input.Blur()
 	}
 }
 
@@ -47,12 +51,15 @@ func (m *UI) cycleSidebarTab() {
 	m.setSidebarTab((m.sidebarTab + 1) % sidebarTabCount)
 }
 
-// focusSidekick focuses the sidebar and jumps straight to the Sidekick tab.
-// Bound globally to ctrl+a; only meaningful when the sidebar is visible
-// (chat state, non-compact layout).
-func (m *UI) focusSidekick() {
+// focusSidekick focuses the sidebar, jumps straight to the Sidekick tab,
+// and puts the cursor in the Sidekick prompt. Bound globally to ctrl+a;
+// only meaningful when the sidebar is visible (chat state, non-compact
+// layout).
+func (m *UI) focusSidekick() tea.Cmd {
 	m.focusSidebar()
 	m.setSidebarTab(sidebarTabSidekick)
+	m.ensureSidekickInput()
+	return tea.Batch(m.sidekick.input.Focus(), m.subscribeSidekick())
 }
 
 // sidekickTabInView reports whether the Sidekick tab is currently being
@@ -102,27 +109,21 @@ func (m *UI) renderSidebarTabBar(width int) string {
 	return lipgloss.NewStyle().MaxWidth(width).Render(bar)
 }
 
-// renderSidekickPanel renders the Sidekick tab's content. This is the tab
-// shell only: the chat panel (message list, input, streaming) and the pinned
-// dashboard surface land in follow-ups, so for now it shows a placeholder.
-func (m *UI) renderSidekickPanel(width int) string {
-	t := m.com.Styles
-	return t.Sidebar.TabPlaceholder.Width(width).Render("Nothing here yet.")
-}
-
-// drawSidekickTab draws the Sidekick tab: the tab bar on top, panel content
-// below. Like drawSidebar's Info path it reserves the right pad and scrollbar
-// gutter columns (as blanks — the placeholder never overflows) so nothing
-// shifts when switching tabs.
+// drawSidekickTab draws the Sidekick tab: the tab bar on top, the chat
+// panel (message list, input, footer — see sidekick.go) filling the rest.
+// Like drawSidebar's Info path it reserves the right pad and scrollbar
+// gutter columns (as blanks — the panel windows its own scrollback) so
+// nothing shifts when switching tabs.
 func (m *UI) drawSidekickTab(scr uv.Screen, area uv.Rectangle, tabBar string, contentWidth, height int) {
 	// The tab is on screen, so any pending unread content has been viewed.
 	m.sidekickUnread = 0
 
+	panelHeight := height - lipgloss.Height(tabBar) - 1
 	content := lipgloss.JoinVertical(
 		lipgloss.Left,
 		tabBar,
 		"",
-		m.renderSidekickPanel(contentWidth),
+		m.renderSidekickPanel(contentWidth, panelHeight),
 	)
 	rendered := lipgloss.NewStyle().
 		MaxWidth(contentWidth).

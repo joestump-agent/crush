@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -8,6 +9,8 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/lsp"
+	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/charmbracelet/crush/internal/ui/common"
@@ -29,9 +32,14 @@ func (w *sidebarHeightTestWorkspace) Config() *config.Config { return w.cfg }
 func (w *sidebarHeightTestWorkspace) WorkingDir() string     { return "/tmp/project" }
 func (w *sidebarHeightTestWorkspace) AgentIsReady() bool     { return false }
 func (w *sidebarHeightTestWorkspace) AgentReadyErr() error   { return nil }
-func (w *sidebarHeightTestWorkspace) LSPGetStates() map[string]workspace.LSPClientInfo {
+func (w *sidebarHeightTestWorkspace) SidekickAvailable() bool {
+	return true // exercise the full Sidekick chat panel in draw tests
+}
+
+func (w *sidebarHeightTestWorkspace) SidekickSubscribe(context.Context) <-chan pubsub.Event[message.Message] {
 	return nil
 }
+func (w *sidebarHeightTestWorkspace) LSPGetStates() map[string]workspace.LSPClientInfo {
 
 func (w *sidebarHeightTestWorkspace) LSPGetDiagnosticCounts(string) lsp.DiagnosticCounts {
 	return lsp.DiagnosticCounts{}

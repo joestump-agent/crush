@@ -244,3 +244,66 @@ func TestRunSidekickBusyRejects(t *testing.T) {
 	require.Equal(t, 0, sidekick.QueuedPrompts(coord.sidekickSessionID),
 		"busy sidekick must reject, never queue")
 }
+
+// TestClearSidekick verifies /clear semantics: the ephemeral session and
+// its messages are destroyed and the next run starts a fresh session.
+func TestClearSidekick(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	srv := newSidekickSSEServer(t, "hi")
+	coord := newSidekickTestCoordinator(t, env, srv.URL+"/v1")
+
+	_, err := coord.RunSidekick(t.Context(), "hello")
+	require.NoError(t, err)
+	firstSession := coord.sidekickSessionID
+	require.NotEmpty(t, firstSession)
+
+	require.NoError(t, coord.ClearSidekick(t.Context()))
+	require.Empty(t, coord.sidekickSessionID, "clear must reset the session ID")
+
+	ea := coord.Sidekick()
+	sessions, err := ea.Sessions.List(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, sessions, "clear must destroy the ephemeral session")
+	msgs, err := ea.Messages.List(t.Context(), firstSession)
+	require.NoError(t, err)
+	require.Empty(t, msgs, "clear must destroy the ephemeral messages")
+
+	// Clearing an already-empty conversation is a no-op.
+	require.NoError(t, coord.ClearSidekick(t.Context()))
+
+	// The next run starts a brand-new session.
+	_, err = coord.RunSidekick(t.Context(), "fresh start")
+	require.NoError(t, err)
+	require.NotEmpty(t, coord.sidekickSessionID)
+	require.NotEqual(t, firstSession, coord.sidekickSessionID)
+	msgs, err = ea.Messages.List(t.Context(), coord.sidekickSessionID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2, "the fresh conversation must not inherit history")
+}
+
+// TestClearSidekickNotConfigured verifies ClearSidekick fails cleanly
+// without a sidekick agent.
+func TestClearSidekickNotConfigured(t *testing.T) {
+	t.Parallel()
+	c := &coordinator{}
+	require.ErrorIs(t, c.ClearSidekick(t.Context()), errSidekickAgentNotConfigured)
+	require.False(t, c.IsSidekickBusy())
+	c.CancelSidekick() // must not panic
+}
+
+// TestIsSidekickBusy verifies the busy probe reads the Sidekick's own
+// activeRequests and nothing else.
+func TestIsSidekickBusy(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	coord := newSidekickTestCoordinator(t, env, "http://127.0.0.1:0/v1")
+
+	require.False(t, coord.IsSidekickBusy())
+	sidekick := coord.Sidekick().SessionAgent.(*sessionAgent)
+	sidekick.activeRequests.Set("sk", func() {})
+	require.True(t, coord.IsSidekickBusy())
+	require.False(t, coord.IsBusy(), "sidekick busy must not leak into the main agent")
+	sidekick.activeRequests.Del("sk")
+	require.False(t, coord.IsSidekickBusy())
+}
