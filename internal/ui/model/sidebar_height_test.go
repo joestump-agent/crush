@@ -39,6 +39,10 @@ func (w *sidebarHeightTestWorkspace) SidekickSubscribe(context.Context) <-chan p
 	return nil
 }
 
+func (w *sidebarHeightTestWorkspace) SidekickModel() config.SelectedModel {
+	return config.SelectedModel{}
+}
+
 func (w *sidebarHeightTestWorkspace) LSPGetDiagnosticCounts(string) lsp.DiagnosticCounts {
 	return lsp.DiagnosticCounts{}
 }

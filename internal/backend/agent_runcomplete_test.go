@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/app"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -61,6 +62,10 @@ func (c *errorCoordinator) ClearSidekick(context.Context) error { return nil }
 func (c *errorCoordinator) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
 	return nil
 }
+
+func (c *errorCoordinator) SidekickModel() config.SelectedModel { return config.SelectedModel{} }
+
+func (c *errorCoordinator) SetSidekickModel(config.SelectedModel) error { return nil }
 
 // insertRunCompleteWorkspace installs a workspace backed by a real
 // app.App (so the runCompletions broker exists) with the given

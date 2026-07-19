@@ -307,3 +307,99 @@ func TestIsSidekickBusy(t *testing.T) {
 	sidekick.activeRequests.Del("sk")
 	require.False(t, coord.IsSidekickBusy())
 }
+
+// TestSidekickModelDefaultsAndFallback pins the Sidekick model
+// resolution order (#54): without the zai provider the Sidekick falls
+// back to the configured small model; once zai is configured with
+// glm-5.2 discovered, that pair becomes the default.
+func TestSidekickModelDefaultsAndFallback(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	coord := newSidekickTestCoordinator(t, env, "http://127.0.0.1:0/v1")
+
+	// No zai provider configured: graceful fallback to the small model.
+	small := coord.cfg.Config().Models[config.SelectedModelTypeSmall]
+	require.Equal(t, small, coord.SidekickModel(),
+		"without zai the sidekick must fall back to the configured small model")
+
+	// Configure zai with glm-5.2 (as model discovery would): it becomes
+	// the default.
+	coord.cfg.Config().Providers.Set(sidekickDefaultProvider, config.ProviderConfig{
+		ID:      sidekickDefaultProvider,
+		Name:    "Z.ai",
+		Type:    openaicompat.Name,
+		BaseURL: "https://api.z.ai/api/coding/paas/v4",
+		APIKey:  "test",
+		Models:  []catwalk.Model{{ID: sidekickDefaultModelID, DefaultMaxTokens: 4096, ContextWindow: 200000}},
+	})
+	sel := coord.SidekickModel()
+	require.Equal(t, sidekickDefaultProvider, sel.Provider)
+	require.Equal(t, sidekickDefaultModelID, sel.Model)
+
+	// A zai provider without the model (discovery failed / token
+	// missing) must not be selected.
+	coord.cfg.Config().Providers.Set(sidekickDefaultProvider, config.ProviderConfig{
+		ID:      sidekickDefaultProvider,
+		Type:    openaicompat.Name,
+		BaseURL: "https://api.z.ai/api/coding/paas/v4",
+	})
+	require.Equal(t, small, coord.SidekickModel(),
+		"zai without discovered models must fall back to the small model")
+}
+
+// TestSetSidekickModelSessionScoped verifies the Sidekick model override
+// (#54): it wins the resolution, validates against configured providers,
+// and never leaks into the main agent's model selection.
+func TestSetSidekickModelSessionScoped(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	coord := newSidekickTestCoordinator(t, env, "http://127.0.0.1:0/v1")
+
+	cfg := coord.cfg.Config()
+	largeBefore := cfg.Models[config.SelectedModelTypeLarge]
+	smallBefore := cfg.Models[config.SelectedModelTypeSmall]
+
+	// Another configured provider/model to switch to.
+	cfg.Providers.Set("other", config.ProviderConfig{
+		ID:      "other",
+		Type:    openaicompat.Name,
+		BaseURL: "http://127.0.0.1:0/v1",
+		APIKey:  "test",
+		Models:  []catwalk.Model{{ID: "other-model", DefaultMaxTokens: 4096, ContextWindow: 200000}},
+	})
+
+	// Unknown provider or model: rejected.
+	require.Error(t, coord.SetSidekickModel(config.SelectedModel{Provider: "nope", Model: "x"}))
+	require.Error(t, coord.SetSidekickModel(config.SelectedModel{Provider: "other", Model: "nope"}))
+	require.Error(t, coord.SetSidekickModel(config.SelectedModel{}))
+
+	// Valid override: it becomes the Sidekick's model...
+	sel := config.SelectedModel{Provider: "other", Model: "other-model"}
+	require.NoError(t, coord.SetSidekickModel(sel))
+	got := coord.SidekickModel()
+	require.Equal(t, "other", got.Provider)
+	require.Equal(t, "other-model", got.Model)
+
+	// ...and the override actually resolves to a runnable model.
+	agentCfg := cfg.Agents[config.AgentSidekick]
+	model, err := coord.buildSidekickModel(t.Context(), agentCfg)
+	require.NoError(t, err)
+	require.Equal(t, "other-model", model.ModelCfg.Model)
+
+	// Session-scoped: the main agent's selections are untouched.
+	require.Equal(t, largeBefore, cfg.Models[config.SelectedModelTypeLarge])
+	require.Equal(t, smallBefore, cfg.Models[config.SelectedModelTypeSmall])
+
+	// An override whose provider later disappears degrades gracefully.
+	cfg.Providers.Del("other")
+	require.Equal(t, smallBefore, coord.SidekickModel(),
+		"a stale override must fall back instead of erroring")
+}
+
+// TestSetSidekickModelNotConfigured verifies the setter fails cleanly
+// without a sidekick agent.
+func TestSetSidekickModelNotConfigured(t *testing.T) {
+	t.Parallel()
+	c := &coordinator{}
+	require.ErrorIs(t, c.SetSidekickModel(config.SelectedModel{Provider: "p", Model: "m"}), errSidekickAgentNotConfigured)
+}

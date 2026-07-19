@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/app"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -71,6 +72,10 @@ func (c *blockingCoordinator) ClearSidekick(context.Context) error { return nil 
 func (c *blockingCoordinator) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
 	return nil
 }
+
+func (c *blockingCoordinator) SidekickModel() config.SelectedModel { return config.SelectedModel{} }
+
+func (c *blockingCoordinator) SetSidekickModel(config.SelectedModel) error { return nil }
 
 // insertAgentWorkspace installs a synthetic workspace with the given
 // coordinator (or none) and a workspace run context, mirroring the

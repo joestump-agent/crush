@@ -133,6 +133,18 @@ type Coordinator interface {
 	// dashboard slot (#56): the payload travels on its own broker and
 	// never enters any message stream.
 	SidekickDashboardSubscribe(ctx context.Context) <-chan pubsub.Event[tools.SidekickSurface]
+	// SidekickModel reports the provider/model selection the Sidekick
+	// will use for its next run (#54): the session-scoped override when
+	// one was chosen, otherwise the zai/glm-5.2 default when available,
+	// otherwise the configured model for the sidekick agent's model
+	// type (small by default). Zero value when no sidekick agent is
+	// configured.
+	SidekickModel() config.SelectedModel
+	// SetSidekickModel sets a session-scoped Sidekick model override
+	// (#54). Strictly scoped to the Sidekick: it never persists to
+	// crush.json and never touches the main agent's model selection.
+	// The override takes effect on the next Sidekick run.
+	SetSidekickModel(sel config.SelectedModel) error
 }
 
 type coordinator struct {
@@ -155,12 +167,18 @@ type coordinator struct {
 	// Sidekick activity never affects the main agent's busy/queue state
 	// and vice versa. Nil when the sidekick agent is not configured.
 	sidekickAgent *EphemeralAgent
-	// sidekickMu guards lazy creation of sidekickSessionID.
+	// sidekickMu guards lazy creation of sidekickSessionID and the
+	// session-scoped sidekickModelOverride.
 	sidekickMu sync.Mutex
 	// sidekickSessionID is the single ephemeral session all Sidekick
 	// prompts run in, created on first RunSidekick so consecutive
 	// prompts share conversation context.
 	sidekickSessionID string
+	// sidekickModelOverride is the Sidekick model chosen through the
+	// Sidekick model picker (#54). Ephemeral by design: it is never
+	// persisted and dies with the process. The zero value means "no
+	// override", letting the default resolution apply.
+	sidekickModelOverride config.SelectedModel
 	// sidekickDashboard fans agent-pushed dashboard surfaces (the
 	// sidekick_update tool, #57) out to UI subscribers (#56).
 	sidekickDashboard *pubsub.Broker[tools.SidekickSurface]
@@ -738,10 +756,30 @@ func (c *coordinator) buildSidekickAgent(ctx context.Context, agentCfg config.Ag
 	return agent, nil
 }
 
-// buildSidekickModel resolves the model the Sidekick runs with, honoring
-// the model type on the sidekick agent config (small by default,
-// user-switchable to large).
+// Default Sidekick model (#54): glm-5.2 on the zai provider (Z.ai GLM
+// Coding Plan, an openai-compat provider with model discovery). Used only
+// when that provider is configured and the model was discovered;
+// otherwise the Sidekick falls back to the configured small model.
+const (
+	sidekickDefaultProvider = "zai"
+	sidekickDefaultModelID  = "glm-5.2"
+)
+
+// buildSidekickModel resolves the model the Sidekick runs with (#54):
+// the session-scoped override when one was chosen, else the zai/glm-5.2
+// default when available, else the model type on the sidekick agent
+// config (small by default). Resolution failures degrade to the
+// configured small/large models rather than erroring, so a missing
+// ZAI_API_TOKEN never breaks the Sidekick.
 func (c *coordinator) buildSidekickModel(ctx context.Context, agentCfg config.Agent) (Model, error) {
+	if sel := c.sidekickSelection(agentCfg); sel.Provider != "" && sel.Model != "" {
+		model, err := c.buildModelFromSelection(ctx, sel)
+		if err == nil {
+			return model, nil
+		}
+		slog.Warn("Sidekick model unavailable, falling back to configured models",
+			"provider", sel.Provider, "model", sel.Model, "error", err)
+	}
 	large, small, err := c.buildAgentModels(ctx, true)
 	if err != nil {
 		return Model{}, err
@@ -750,6 +788,97 @@ func (c *coordinator) buildSidekickModel(ctx context.Context, agentCfg config.Ag
 		return large, nil
 	}
 	return small, nil
+}
+
+// sidekickSelection resolves which provider/model the Sidekick should
+// use, in priority order: the session-scoped override (when set and
+// still available), the zai/glm-5.2 default (when that provider is
+// configured and the model discovered), then the configured model for
+// the sidekick agent's model type.
+func (c *coordinator) sidekickSelection(agentCfg config.Agent) config.SelectedModel {
+	c.sidekickMu.Lock()
+	override := c.sidekickModelOverride
+	c.sidekickMu.Unlock()
+	if override.Provider != "" && override.Model != "" && c.selectionAvailable(override) {
+		return override
+	}
+	def := config.SelectedModel{Provider: sidekickDefaultProvider, Model: sidekickDefaultModelID}
+	if c.selectionAvailable(def) {
+		return def
+	}
+	return c.cfg.Config().Models[agentCfg.Model]
+}
+
+// selectionAvailable reports whether sel points at a configured,
+// enabled provider that actually has the model. For discovery-based
+// providers (like zai) an unreachable endpoint or missing API token
+// means the provider carries no models — and is therefore unavailable.
+func (c *coordinator) selectionAvailable(sel config.SelectedModel) bool {
+	providerCfg, ok := c.cfg.Config().Providers.Get(sel.Provider)
+	if !ok || providerCfg.Disable {
+		return false
+	}
+	return c.cfg.Config().GetModel(sel.Provider, sel.Model) != nil
+}
+
+// buildModelFromSelection constructs a runnable Model for an arbitrary
+// provider/model pair. It mirrors buildAgentModels for a single,
+// explicitly chosen selection (the Sidekick's model is picked
+// per-session rather than read from cfg.Models). The provider is always
+// built in sub-agent mode: the Sidekick never drives interactive auth.
+func (c *coordinator) buildModelFromSelection(ctx context.Context, sel config.SelectedModel) (Model, error) {
+	providerCfg, ok := c.cfg.Config().Providers.Get(sel.Provider)
+	if !ok {
+		return Model{}, errModelProviderNotConfigured
+	}
+	catwalkModel := c.cfg.Config().GetModel(sel.Provider, sel.Model)
+	if catwalkModel == nil {
+		return Model{}, fmt.Errorf("model %s not found in provider %s", sel.Model, sel.Provider)
+	}
+	provider, err := c.buildProvider(providerCfg, sel, true)
+	if err != nil {
+		return Model{}, err
+	}
+	modelID := sel.Model
+	if sel.Provider == openrouter.Name && isExactoSupported(modelID) {
+		modelID += ":exacto"
+	}
+	languageModel, err := provider.LanguageModel(ctx, modelID)
+	if err != nil {
+		return Model{}, err
+	}
+	return Model{
+		Model:      languageModel,
+		CatwalkCfg: *catwalkModel,
+		ModelCfg:   sel,
+		FlatRate:   providerCfg.FlatRate,
+	}, nil
+}
+
+// SidekickModel implements Coordinator.
+func (c *coordinator) SidekickModel() config.SelectedModel {
+	agentCfg, ok := c.cfg.Config().Agents[config.AgentSidekick]
+	if !ok {
+		return config.SelectedModel{}
+	}
+	return c.sidekickSelection(agentCfg)
+}
+
+// SetSidekickModel implements Coordinator.
+func (c *coordinator) SetSidekickModel(sel config.SelectedModel) error {
+	if c.sidekickAgent == nil {
+		return errSidekickAgentNotConfigured
+	}
+	if sel.Provider == "" || sel.Model == "" {
+		return errors.New("sidekick model selection requires both provider and model")
+	}
+	if !c.selectionAvailable(sel) {
+		return fmt.Errorf("model %s/%s is not available", sel.Provider, sel.Model)
+	}
+	c.sidekickMu.Lock()
+	c.sidekickModelOverride = sel
+	c.sidekickMu.Unlock()
+	return nil
 }
 
 // buildSidekickTools returns the Sidekick's read-only tool set: the

@@ -30,6 +30,7 @@ type sidekickTestWorkspace struct {
 	runErr       error
 	unavailable  bool
 	subscribeNil bool
+	model        config.SelectedModel
 }
 
 func (w *sidekickTestWorkspace) Config() *config.Config { return w.cfg }
@@ -58,6 +59,13 @@ func (w *sidekickTestWorkspace) SidekickSubscribe(context.Context) <-chan pubsub
 		w.events = make(chan pubsub.Event[message.Message], 8)
 	}
 	return w.events
+}
+
+func (w *sidekickTestWorkspace) SidekickModel() config.SelectedModel { return w.model }
+
+func (w *sidekickTestWorkspace) SidekickSetModel(sel config.SelectedModel) error {
+	w.model = sel
+	return nil
 }
 
 func (w *sidekickTestWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {

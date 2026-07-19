@@ -135,6 +135,14 @@ type Workspace interface {
 	// workspace cannot deliver dashboard pushes (client/server mode, or
 	// agent not initialized yet).
 	SidekickDashboardSubscribe(ctx context.Context) <-chan pubsub.Event[agenttools.SidekickSurface]
+	// SidekickModel reports the provider/model selection the Sidekick
+	// will use for its next run (#54). Zero value when the Sidekick is
+	// unavailable.
+	SidekickModel() config.SelectedModel
+	// SidekickSetModel sets the session-scoped Sidekick model override
+	// (#54). Ephemeral: it is never persisted to crush.json and never
+	// touches the main coder agent's model selection.
+	SidekickSetModel(sel config.SelectedModel) error
 
 	// Permissions
 	//

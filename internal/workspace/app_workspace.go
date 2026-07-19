@@ -307,6 +307,20 @@ func (w *AppWorkspace) SidekickDashboardSubscribe(ctx context.Context) <-chan pu
 	return w.app.AgentCoordinator.SidekickDashboardSubscribe(ctx)
 }
 
+func (w *AppWorkspace) SidekickModel() config.SelectedModel {
+	if w.app.AgentCoordinator == nil {
+		return config.SelectedModel{}
+	}
+	return w.app.AgentCoordinator.SidekickModel()
+}
+
+func (w *AppWorkspace) SidekickSetModel(sel config.SelectedModel) error {
+	if w.app.AgentCoordinator == nil {
+		return errors.New("agent coordinator not initialized")
+	}
+	return w.app.AgentCoordinator.SetSidekickModel(sel)
+}
+
 // -- Permissions --
 
 func (w *AppWorkspace) PermissionGrant(perm permission.PermissionRequest) bool {
