@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/backend"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -66,6 +67,10 @@ func (s *stubCoordinator) ClearSidekick(context.Context) error { return nil }
 func (s *stubCoordinator) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
 	return nil
 }
+
+func (s *stubCoordinator) SidekickModel() config.SelectedModel { return config.SelectedModel{} }
+
+func (s *stubCoordinator) SetSidekickModel(config.SelectedModel) error { return nil }
 
 // stubSessions is a minimal session.Service that returns a fixed list
 // (and supports Get by ID). All other methods return zero values; the

@@ -1218,14 +1218,22 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, util.ReportInfo("No new models found"))
 			break
 		}
-		// Refresh the models dialog in place if it's still open.
-		if d := m.dialog.Dialog(dialog.ModelsID); d != nil {
-			if md, ok := d.(*dialog.Models); ok {
-				if err := md.ReloadItems(); err != nil {
-					cmds = append(cmds, util.ReportError(err))
-					break
+		// Refresh the models dialog in place if it's still open. The
+		// Sidekick-scoped picker shares the same list machinery (#54).
+		var reloadErr error
+		for _, id := range []string{dialog.ModelsID, dialog.SidekickModelsID} {
+			if d := m.dialog.Dialog(id); d != nil {
+				if md, ok := d.(*dialog.Models); ok {
+					if err := md.ReloadItems(); err != nil {
+						reloadErr = err
+						break
+					}
 				}
 			}
+		}
+		if reloadErr != nil {
+			cmds = append(cmds, util.ReportError(reloadErr))
+			break
 		}
 		label := "models"
 		if msg.added == 1 {
@@ -2076,9 +2084,45 @@ func (m *UI) fetchHyperCredits() tea.Cmd {
 	}
 }
 
+// handleSelectSidekickModel applies a selection made in the
+// Sidekick-scoped model picker (#54). Strictly session-scoped: the
+// choice goes through the workspace to the Sidekick agent only — the
+// main coder agent's model selection (cfg.Models) is never touched and
+// nothing is persisted to crush.json.
+func (m *UI) handleSelectSidekickModel(msg dialog.ActionSelectModel) tea.Cmd {
+	m.dialog.CloseDialog(dialog.SidekickModelsID)
+
+	cfg := m.com.Config()
+	if cfg == nil {
+		return util.ReportError(errors.New("configuration not found"))
+	}
+	ws := m.com.Workspace
+	if ws == nil || !ws.SidekickAvailable() {
+		return util.ReportWarn("Sidekick is not available in this workspace")
+	}
+	if _, ok := cfg.Providers.Get(msg.Model.Provider); !ok {
+		return util.ReportWarn("Provider is not configured — set it up in the main model picker first")
+	}
+	if err := ws.SidekickSetModel(msg.Model); err != nil {
+		return util.ReportError(err)
+	}
+
+	name := msg.Model.Model
+	if catwalkModel := cfg.GetModel(msg.Model.Provider, msg.Model.Model); catwalkModel != nil && catwalkModel.Name != "" {
+		name = catwalkModel.Name
+	}
+	return util.ReportInfo("Sidekick model changed to " + name)
+}
+
 // handleSelectModel performs the model selection after any provider
 // pre-checks (such as a silent Hyper OAuth refresh) have completed.
 func (m *UI) handleSelectModel(msg dialog.ActionSelectModel) tea.Cmd {
+	if msg.ForSidekick {
+		// Sidekick-scoped selection (#54): never flows into the
+		// config-mutating path below.
+		return m.handleSelectSidekickModel(msg)
+	}
+
 	var cmds []tea.Cmd
 
 	// we ignore dialogs with the oauth id as they need to be able to be dismissed
@@ -4286,6 +4330,30 @@ func (m *UI) openModelsDialog() tea.Cmd {
 
 	isOnboarding := m.state == uiOnboarding
 	modelsDialog, err := dialog.NewModels(m.com, isOnboarding)
+	if err != nil {
+		return util.ReportError(err)
+	}
+
+	m.dialog.OpenDialog(modelsDialog)
+
+	return nil
+}
+
+// openSidekickModelsDialog opens the Sidekick-scoped model picker
+// (#54). Selections made here apply to the Sidekick session only.
+func (m *UI) openSidekickModelsDialog() tea.Cmd {
+	if m.dialog.ContainsDialog(dialog.SidekickModelsID) {
+		// Bring to front
+		m.dialog.BringToFront(dialog.SidekickModelsID)
+		return nil
+	}
+
+	ws := m.com.Workspace
+	if ws == nil || !ws.SidekickAvailable() {
+		return util.ReportWarn("Sidekick is not available in this workspace")
+	}
+
+	modelsDialog, err := dialog.NewSidekickModels(m.com, ws.SidekickModel())
 	if err != nil {
 		return util.ReportError(err)
 	}

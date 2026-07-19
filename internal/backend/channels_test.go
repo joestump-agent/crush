@@ -172,6 +172,10 @@ func (c *recordingCoordinator) SidekickDashboardSubscribe(context.Context) <-cha
 	return nil
 }
 
+func (c *recordingCoordinator) SidekickModel() config.SelectedModel { return config.SelectedModel{} }
+
+func (c *recordingCoordinator) SetSidekickModel(config.SelectedModel) error { return nil }
+
 // fullFakeSessions adapts fakeChannelSessions to the full session.Service
 // interface by embedding it; only the channelSessionStore subset is
 // implemented, which is all the channel router touches.

@@ -332,6 +332,12 @@ func (w *ClientWorkspace) SidekickDashboardSubscribe(ctx context.Context) <-chan
 	return nil
 }
 
+func (w *ClientWorkspace) SidekickModel() config.SelectedModel { return config.SelectedModel{} }
+
+func (w *ClientWorkspace) SidekickSetModel(config.SelectedModel) error {
+	return errors.New("sidekick is not available in client/server mode")
+}
+
 // -- Permissions --
 
 func (w *ClientWorkspace) PermissionGrant(perm permission.PermissionRequest) bool {

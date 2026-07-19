@@ -40,6 +40,10 @@ type ActionSelectModel struct {
 	Model          config.SelectedModel
 	ModelType      config.SelectedModelType
 	ReAuthenticate bool
+	// ForSidekick marks a selection made in the Sidekick-scoped model
+	// picker (#54): it applies to the Sidekick session only and must
+	// never touch the main agent's model selection or the config.
+	ForSidekick bool
 }
 
 // Messages for commands
