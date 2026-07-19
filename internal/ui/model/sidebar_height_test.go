@@ -41,6 +41,10 @@ func (w *sidebarHeightTestWorkspace) SidekickSubscribe(context.Context) <-chan p
 }
 func (w *sidebarHeightTestWorkspace) LSPGetStates() map[string]workspace.LSPClientInfo {
 
+func (w *sidebarHeightTestWorkspace) SidekickModel() config.SelectedModel {
+	return config.SelectedModel{}
+}
+
 func (w *sidebarHeightTestWorkspace) LSPGetDiagnosticCounts(string) lsp.DiagnosticCounts {
 	return lsp.DiagnosticCounts{}
 }

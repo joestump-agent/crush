@@ -23,6 +23,11 @@ import (
 // nothing is persisted, so clearing simply starts a fresh session.
 const sidekickClearCommand = "/clear"
 
+// sidekickModelCommand opens the Sidekick-scoped model picker (#54).
+// The selection applies to the Sidekick session only — it never touches
+// the main coder agent's model and is never persisted.
+const sidekickModelCommand = "/model"
+
 // Sidekick input textarea height bounds, in rows.
 const (
 	sidekickInputMinHeight = 1
@@ -404,6 +409,14 @@ func (m *UI) handleSidekickKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch {
 	case key.Matches(msg, m.keyMap.SidekickFocusSurface):
 		m.focusSidekickDashboard()
+	case key.Matches(msg, m.keyMap.Models):
+		// The models key inside the Sidekick pane opens the
+		// Sidekick-scoped picker (#54), never the main model dialog —
+		// the sidebar's global keys stay inert (see
+		// sidebar_inert_keys_test.go).
+		if cmd := m.openSidekickModelsDialog(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case key.Matches(msg, m.keyMap.Tab):
 		m.cycleSidebarTab()
 	case key.Matches(msg, m.keyMap.SidekickDismiss):
@@ -468,6 +481,9 @@ func (m *UI) submitSidekickPrompt() tea.Cmd {
 
 	if value == sidekickClearCommand {
 		return m.clearSidekickConversation()
+	}
+	if value == sidekickModelCommand {
+		return m.openSidekickModelsDialog()
 	}
 
 	ws := m.com.Workspace
@@ -603,7 +619,7 @@ func (m *UI) renderSidekickMessages(width, height int) string {
 	}
 	if len(blocks) == 0 {
 		blocks = append(blocks, t.Sidebar.TabPlaceholder.Width(width).Render(
-			"Ask the sidekick anything about this workspace. Enter sends, /clear starts over."))
+			"Ask the sidekick anything about this workspace. Enter sends, /clear starts over, /model switches its model."))
 	}
 
 	lines := strings.Split(strings.Join(blocks, "\n\n"), "\n")
@@ -671,6 +687,9 @@ func renderSidekickMessage(t *styles.Styles, msg *message.Message, width int) st
 
 // renderSidekickFooter renders the one-line panel footer: the Sidekick's
 // active model and its tool state (e.g. `◇ Model · bash ✓ · grep ✓`).
+// The model comes from the workspace's live Sidekick selection (#54) so
+// a session-scoped switch shows up immediately; the config-derived model
+// is the fallback for workspaces that cannot report it.
 func (m *UI) renderSidekickFooter(width int) string {
 	t := m.com.Styles
 	cfg := m.com.Config()
@@ -682,15 +701,22 @@ func (m *UI) renderSidekickFooter(width int) string {
 	if !ok {
 		return ""
 	}
+
+	var sel config.SelectedModel
+	if ws := m.com.Workspace; ws != nil && ws.SidekickAvailable() {
+		sel = ws.SidekickModel()
+	}
+	if sel.Model == "" {
+		sel = cfg.Models[agentCfg.Model]
+	}
+
 	var parts []string
-	if sel, ok := cfg.Models[agentCfg.Model]; ok {
+	if sel.Model != "" {
 		name := sel.Model
 		if mdl := cfg.GetModel(sel.Provider, sel.Model); mdl != nil && mdl.Name != "" {
 			name = mdl.Name
 		}
-		if name != "" {
-			parts = append(parts, "◇ "+name)
-		}
+		parts = append(parts, "◇ "+name)
 	}
 	for _, tool := range agentCfg.AllowedTools {
 		parts = append(parts, tool+" ✓")

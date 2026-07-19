@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/backend"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/scheduler"
@@ -97,6 +98,10 @@ func (s *runCoordinator) ClearSidekick(context.Context) error { return nil }
 func (s *runCoordinator) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
 	return nil
 }
+
+func (s *runCoordinator) SidekickModel() config.SelectedModel { return config.SelectedModel{} }
+
+func (s *runCoordinator) SetSidekickModel(config.SelectedModel) error { return nil }
 
 func (s *runCoordinator) capturedCtx() context.Context {
 	s.mu.Lock()
