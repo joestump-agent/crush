@@ -405,6 +405,12 @@ type UI struct {
 	// refreshed on session load and after cron tool results.
 	cronTasks []scheduler.Task
 
+	// sidebarTab is the active sidebar tab ([Info] [Sidekick]);
+	// sidekickUnread counts agent-pushed Sidekick content not yet viewed
+	// (rendered as a ● N badge on the tab, cleared when the tab is viewed).
+	sidebarTab     sidebarTab
+	sidekickUnread int
+
 	// Todo spinner
 	todoSpinner    spinner.Model
 	todoIsSpinning bool
@@ -2545,6 +2551,16 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 		return tea.Batch(cmds...)
 	}
 
+	// Ctrl+A jumps straight to the Sidekick tab from anywhere (editor, main,
+	// or sidebar focus). Only meaningful where the sidebar is drawn: chat
+	// state with a session, non-compact layout.
+	if key.Matches(msg, m.keyMap.Sidekick) {
+		if m.state == uiChat && m.hasSession() && !m.isCompact {
+			m.focusSidekick()
+			return tea.Batch(cmds...)
+		}
+	}
+
 	// Handle cancel key when agent is busy.
 	if key.Matches(msg, m.keyMap.Chat.Cancel) {
 		if m.isAgentBusy() {
@@ -2950,15 +2966,19 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			}
 		case uiFocusSidebar:
 			// The sidebar is currently a read-only status panel, so it only
-			// handles focus/scroll keys and intentionally does NOT fall through
-			// to handleGlobalKeys — every other key is inert while it's focused.
+			// handles tab-cycling/focus/scroll keys and intentionally does NOT
+			// fall through to handleGlobalKeys — every other key is inert while
+			// it's focused. Tab cycles the sidebar tabs (Info/Sidekick); Esc
+			// returns focus to the editor.
 			// When the interactive secondary-agent sidebar lands, route its keys
 			// here (and add `default: handleGlobalKeys(msg)` to keep global keys
 			// working, mirroring the editor/main cases). handleGlobalKeys already
 			// gates commands/models/help for sidebar focus, so those stay inert
 			// unless you also un-hide them from the sidebar help (#114).
 			switch {
-			case key.Matches(msg, m.keyMap.Tab), key.Matches(msg, m.keyMap.Editor.Escape):
+			case key.Matches(msg, m.keyMap.Tab):
+				m.cycleSidebarTab()
+			case key.Matches(msg, m.keyMap.Editor.Escape):
 				m.focus = uiFocusEditor
 				cmds = append(cmds, m.textarea.Focus())
 			case key.Matches(msg, m.keyMap.Chat.Up):
@@ -3319,6 +3339,11 @@ func (m *UI) ShortHelp() []key.Binding {
 
 		isSidebar := m.focus == uiFocusSidebar
 
+		if isSidebar {
+			// While the sidebar is focused, Tab cycles its tabs instead of
+			// moving focus.
+			tab.SetHelp("tab", "switch tab")
+		}
 		commonBinds := []key.Binding{tab}
 		if !isSidebar {
 			commonBinds = append(commonBinds, commands, k.Models)
@@ -3417,9 +3442,17 @@ func (m *UI) FullHelp() [][]key.Binding {
 
 		isSidebar := m.focus == uiFocusSidebar
 
+		if isSidebar {
+			// While the sidebar is focused, Tab cycles its tabs instead of
+			// moving focus.
+			tab.SetHelp("tab", "switch tab")
+		}
 		mainBinds = append(
 			mainBinds,
 			tab,
+			// ctrl+a jumps to the Sidekick tab from any focus, so it is
+			// advertised regardless of which panel is focused.
+			k.Sidekick,
 		)
 		if !isSidebar {
 			// The sidebar key handler only routes focus/scroll keys, so
