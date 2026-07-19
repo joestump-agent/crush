@@ -1144,3 +1144,59 @@ func renderA2UIContent(sty *styles.Styles, content string, width int, finished b
 	return b.String()
 }
 
+// NewA2UIDashboardSurface builds a live a2tea surface model from
+// agent-pushed dashboard content (the sidekick_update tool payload, #57).
+// The content goes through the same masking, button repair, and scan as the
+// main chat; the first part carrying renderable messages becomes the
+// surface. Returns the live model, its A2UI surface ID, and ok=false when
+// nothing renderable was found.
+func NewA2UIDashboardSurface(content string) (render.Model, string, bool) {
+	masked, _ := maskMarkdownCode(content)
+	masked = repairA2UIButtons(masked)
+	parts, err := a2tea.Scan(masked)
+	if err != nil {
+		return nil, "", false
+	}
+	for _, p := range parts {
+		if len(p.Messages) == 0 {
+			continue
+		}
+		model, err := a2tea.Render(p.Messages)
+		if err != nil {
+			continue
+		}
+		if rm, ok := model.(render.Model); ok {
+			return rm, a2uiPartSurfaceID(p.Messages), true
+		}
+	}
+	return nil, "", false
+}
+
+// RenderA2UISurfaceModel renders a live surface model inside the themed
+// container at the given width — the same chrome the main chat wraps its
+// surfaces in. The view reflects the model's current focus ring and edited
+// values, so callers holding a live surface (the Sidekick dashboard slot)
+// re-render through this on every frame.
+func RenderA2UISurfaceModel(sty *styles.Styles, model render.Model, width int) string {
+	surface := sty.Messages.A2UISurface
+	innerWidth := max(width-surface.GetHorizontalFrameSize(), 1)
+	model.SetSize(innerWidth, 0)
+	rendered := strings.TrimRight(model.View().Content, "\n")
+	return surface.Width(max(width-surface.GetHorizontalBorderSize(), 1)).Render(rendered)
+}
+
+// A2UISurfaceWantsKey reports whether a focused live surface should consume
+// the key — the exported form of a2uiSurfaceWantsKey for hosts outside this
+// package (the Sidekick dashboard slot).
+func A2UISurfaceWantsKey(s render.Model, key tea.KeyMsg) bool {
+	return a2uiSurfaceWantsKey(s, key)
+}
+
+// A2UISurfaceFieldValues reads a live surface's current field values (by
+// component ID), or nil when the model cannot report them.
+func A2UISurfaceFieldValues(s render.Model) map[string]any {
+	if fv, ok := s.(interface{ FieldValues() map[string]any }); ok {
+		return fv.FieldValues()
+	}
+	return nil
+}
