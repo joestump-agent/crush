@@ -8,8 +8,10 @@ import (
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 
+	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/ui/chat"
 	"github.com/charmbracelet/crush/internal/ui/common"
@@ -27,6 +29,13 @@ type a2uiWorkspace struct {
 
 func (w *a2uiWorkspace) AgentIsReady() bool     { return true }
 func (w *a2uiWorkspace) Config() *config.Config { return nil }
+
+// SidekickDashboardSubscribe reports no dashboard push channel; sendMessage
+// probes it on every prompt (#56) and a nil channel keeps the subscription
+// path a no-op.
+func (w *a2uiWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
+	return nil
+}
 
 func (w *a2uiWorkspace) AgentRun(_ context.Context, _, prompt string, _ ...message.Attachment) error {
 	w.prompts = append(w.prompts, prompt)

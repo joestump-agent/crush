@@ -332,6 +332,16 @@ type UI struct {
 	sidebarScroll     int
 	pillsView         string
 
+	// sidebarTab is the active sidebar tab ([Info] [Sidekick]);
+	// sidekickUnread counts agent-pushed Sidekick content not yet viewed
+	// (rendered as a ● N badge on the tab, cleared when the tab is viewed).
+	sidebarTab     sidebarTab
+	sidekickUnread int
+
+	// sidekick is the Sidekick tab's chat panel state (see sidekick.go).
+	// Fully independent of the main agent's busy/queue plumbing.
+	sidekick sidekickState
+
 	// Todo spinner
 	todoSpinner    spinner.Model
 	todoIsSpinning bool
@@ -487,6 +497,18 @@ func (m *UI) Init() tea.Cmd {
 	}
 	// Prime the memoized busy/permission state off-thread.
 	if cmd := m.dispatchBusyRefresh(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	// Start draining the Sidekick's private message stream (no-op when
+	// the Sidekick is unavailable; retried lazily on tab activation).
+	if cmd := m.subscribeSidekick(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	// Start draining agent-pushed dashboard surfaces (#56/#57). Unlike
+	// the chat stream this must be live without any user action —
+	// pushes arrive while the user works in the main chat — so it is
+	// also retried from sendMessage until the agent is ready.
+	if cmd := m.subscribeSidekickDashboard(); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
 	return tea.Batch(cmds...)
@@ -658,6 +680,23 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.notifyWindowFocused = false
 	case pubsub.Event[notify.Notification]:
 		if cmd := m.handleAgentNotification(msg.Payload); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case sidekickEventMsg:
+		// Sidekick traffic arrives on its own message type so it can
+		// never leak into the main chat's session/message handling.
+		m.applySidekickEvent(msg.event)
+		if cmd := m.awaitSidekickEvent(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case sidekickRunFinishedMsg:
+		m.handleSidekickRunFinished(msg.err)
+	case sidekickDashboardMsg:
+		// Deterministic dashboard routing (#56): pushes from the main
+		// agent's sidekick_update tool replace the pinned surface in
+		// place and never touch any chat stream.
+		m.applySidekickDashboard(msg.event)
+		if cmd := m.awaitSidekickDashboardEvent(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 	case busyStateMsg:
@@ -1179,14 +1218,22 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, util.ReportInfo("No new models found"))
 			break
 		}
-		// Refresh the models dialog in place if it's still open.
-		if d := m.dialog.Dialog(dialog.ModelsID); d != nil {
-			if md, ok := d.(*dialog.Models); ok {
-				if err := md.ReloadItems(); err != nil {
-					cmds = append(cmds, util.ReportError(err))
-					break
+		// Refresh the models dialog in place if it's still open. The
+		// Sidekick-scoped picker shares the same list machinery (#54).
+		var reloadErr error
+		for _, id := range []string{dialog.ModelsID, dialog.SidekickModelsID} {
+			if d := m.dialog.Dialog(id); d != nil {
+				if md, ok := d.(*dialog.Models); ok {
+					if err := md.ReloadItems(); err != nil {
+						reloadErr = err
+						break
+					}
 				}
 			}
+		}
+		if reloadErr != nil {
+			cmds = append(cmds, util.ReportError(reloadErr))
+			break
 		}
 		label := "models"
 		if msg.added == 1 {
@@ -2037,9 +2084,45 @@ func (m *UI) fetchHyperCredits() tea.Cmd {
 	}
 }
 
+// handleSelectSidekickModel applies a selection made in the
+// Sidekick-scoped model picker (#54). Strictly session-scoped: the
+// choice goes through the workspace to the Sidekick agent only — the
+// main coder agent's model selection (cfg.Models) is never touched and
+// nothing is persisted to crush.json.
+func (m *UI) handleSelectSidekickModel(msg dialog.ActionSelectModel) tea.Cmd {
+	m.dialog.CloseDialog(dialog.SidekickModelsID)
+
+	cfg := m.com.Config()
+	if cfg == nil {
+		return util.ReportError(errors.New("configuration not found"))
+	}
+	ws := m.com.Workspace
+	if ws == nil || !ws.SidekickAvailable() {
+		return util.ReportWarn("Sidekick is not available in this workspace")
+	}
+	if _, ok := cfg.Providers.Get(msg.Model.Provider); !ok {
+		return util.ReportWarn("Provider is not configured — set it up in the main model picker first")
+	}
+	if err := ws.SidekickSetModel(msg.Model); err != nil {
+		return util.ReportError(err)
+	}
+
+	name := msg.Model.Model
+	if catwalkModel := cfg.GetModel(msg.Model.Provider, msg.Model.Model); catwalkModel != nil && catwalkModel.Name != "" {
+		name = catwalkModel.Name
+	}
+	return util.ReportInfo("Sidekick model changed to " + name)
+}
+
 // handleSelectModel performs the model selection after any provider
 // pre-checks (such as a silent Hyper OAuth refresh) have completed.
 func (m *UI) handleSelectModel(msg dialog.ActionSelectModel) tea.Cmd {
+	if msg.ForSidekick {
+		// Sidekick-scoped selection (#54): never flows into the
+		// config-mutating path below.
+		return m.handleSelectSidekickModel(msg)
+	}
+
 	var cmds []tea.Cmd
 
 	// we ignore dialogs with the oauth id as they need to be able to be dismissed
@@ -2251,6 +2334,29 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 	// Route all messages to dialog if one is open.
 	if m.dialog.HasDialogs() {
 		return m.handleDialogMsg(msg)
+	}
+
+	// Ctrl+A jumps straight to the Sidekick tab from anywhere (editor, main,
+	// or sidebar focus). Only meaningful where the sidebar is drawn: chat
+	// state with a session, non-compact layout.
+	if key.Matches(msg, m.keyMap.Sidekick) {
+		if m.state == uiChat && m.hasSession() && !m.isCompact {
+			if cmd := m.focusSidekick(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			return tea.Batch(cmds...)
+		}
+	}
+
+	// Esc inside the Sidekick pane acts on the Sidekick only: cancel its
+	// streaming run or hand focus back to the editor. It must run before
+	// the main-agent cancel check below so Sidekick activity can never
+	// trigger — or be blocked by — the main agent's busy state.
+	if key.Matches(msg, m.keyMap.Chat.Cancel) && m.sidekickPaneFocused() {
+		if cmd := m.handleSidekickEscape(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return tea.Batch(cmds...)
 	}
 
 	// Handle cancel key when agent is busy.
@@ -2504,16 +2610,27 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				}
 			}
 		case uiFocusSidebar:
-			// The sidebar is currently a read-only status panel, so it only
-			// handles focus/scroll keys and intentionally does NOT fall through
-			// to handleGlobalKeys — every other key is inert while it's focused.
-			// When the interactive secondary-agent sidebar lands, route its keys
-			// here (and add `default: handleGlobalKeys(msg)` to keep global keys
-			// working, mirroring the editor/main cases). handleGlobalKeys already
-			// gates commands/models/help for sidebar focus, so those stay inert
-			// unless you also un-hide them from the sidebar help (#114).
+			// The Sidekick tab hosts an interactive chat panel: its keys
+			// (Enter submits, text feeds the prompt) route there. The Info
+			// tab remains a read-only status panel that only handles
+			// tab-cycling/focus/scroll keys. Neither falls through to
+			// handleGlobalKeys — every other key is inert while the sidebar
+			// is focused (see TestSidebarSuppressesGlobalKeys and #114); on
+			// the Sidekick tab unmatched keys are consumed by the textarea.
+			if m.sidekickTabInView() {
+				cmds = append(cmds, m.handleSidekickKey(msg))
+				break
+			}
 			switch {
-			case key.Matches(msg, m.keyMap.Tab), key.Matches(msg, m.keyMap.Editor.Escape):
+			case key.Matches(msg, m.keyMap.Tab):
+				m.cycleSidebarTab()
+				if m.sidekickTabInView() {
+					// Landed on the Sidekick tab: focus its prompt and
+					// make sure the event streams are being drained.
+					m.ensureSidekickInput()
+					cmds = append(cmds, m.sidekick.input.Focus(), m.subscribeSidekick(), m.subscribeSidekickDashboard())
+				}
+			case key.Matches(msg, m.keyMap.Editor.Escape):
 				m.focus = uiFocusEditor
 				cmds = append(cmds, m.textarea.Focus())
 			case key.Matches(msg, m.keyMap.Chat.Up):
@@ -2829,6 +2946,11 @@ func (m *UI) ShortHelp() []key.Binding {
 
 		isSidebar := m.focus == uiFocusSidebar
 
+		if isSidebar {
+			// While the sidebar is focused, Tab cycles its tabs instead of
+			// moving focus.
+			tab.SetHelp("tab", "switch tab")
+		}
 		commonBinds := []key.Binding{tab}
 		if !isSidebar {
 			commonBinds = append(commonBinds, commands, k.Models)
@@ -2925,9 +3047,17 @@ func (m *UI) FullHelp() [][]key.Binding {
 
 		isSidebar := m.focus == uiFocusSidebar
 
+		if isSidebar {
+			// While the sidebar is focused, Tab cycles its tabs instead of
+			// moving focus.
+			tab.SetHelp("tab", "switch tab")
+		}
 		mainBinds = append(
 			mainBinds,
 			tab,
+			// ctrl+a jumps to the Sidekick tab from any focus, so it is
+			// advertised regardless of which panel is focused.
+			k.Sidekick,
 		)
 		if !isSidebar {
 			// The sidebar key handler only routes focus/scroll keys, so
@@ -3683,10 +3813,15 @@ func (m *UI) hasSession() bool {
 }
 
 // focusSidebar moves focus to the sidebar panel, blurring the editor and chat.
+// When the Sidekick tab is showing, the cursor lands in its prompt input.
 func (m *UI) focusSidebar() {
 	m.focus = uiFocusSidebar
 	m.textarea.Blur()
 	m.chat.Blur()
+	if m.sidekickTabInView() {
+		m.ensureSidekickInput()
+		m.sidekick.input.Focus()
+	}
 	m.updateLayoutAndSize()
 }
 
@@ -3859,6 +3994,17 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 		return nil
 	})
 
+	// A new main-agent turn retires the previous turn's Sidekick
+	// dashboard (#56): the pinned surface persists only until the next
+	// prompt. The subscription is also (re)attempted here in case the
+	// agent was not ready at Init.
+	if cmd := m.dismissSidekickDashboard(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	if cmd := m.subscribeSidekickDashboard(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+
 	// Capture session ID to avoid race with main goroutine updating m.session.
 	sessionID := m.session.ID
 	// Optimistically mark the agent busy: the prompt we are about to submit
@@ -3897,6 +4043,19 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 // the surface rebuilt without an ID — in which case the submission still
 // goes out with just the button identity rather than being dropped.
 func (m *UI) handleA2UIButtonClicked(clicked a2uievent.ButtonClicked) tea.Cmd {
+	// The Sidekick dashboard slot hosts a live surface too (#56): when the
+	// event came from it (it holds focus and the surface ID matches), the
+	// submission still goes to the MAIN agent — the dashboard is the main
+	// agent's push channel — with focus stepping back to the Sidekick
+	// prompt. A cancel unpins the dashboard outright.
+	if values, ok := m.retireSidekickDashboardSurface(clicked.SurfaceID); ok {
+		refocus := m.focusSidekickInput()
+		if chat.A2UIButtonIsCancel(clicked) {
+			_ = m.dismissSidekickDashboard()
+			return refocus
+		}
+		return tea.Batch(refocus, m.sendMessage(chat.A2UISubmissionPrompt(clicked, values)))
+	}
 	values, _ := m.chat.RetireA2UISurface(clicked.SurfaceID)
 	if chat.A2UIButtonIsCancel(clicked) {
 		return nil
@@ -4171,6 +4330,30 @@ func (m *UI) openModelsDialog() tea.Cmd {
 
 	isOnboarding := m.state == uiOnboarding
 	modelsDialog, err := dialog.NewModels(m.com, isOnboarding)
+	if err != nil {
+		return util.ReportError(err)
+	}
+
+	m.dialog.OpenDialog(modelsDialog)
+
+	return nil
+}
+
+// openSidekickModelsDialog opens the Sidekick-scoped model picker
+// (#54). Selections made here apply to the Sidekick session only.
+func (m *UI) openSidekickModelsDialog() tea.Cmd {
+	if m.dialog.ContainsDialog(dialog.SidekickModelsID) {
+		// Bring to front
+		m.dialog.BringToFront(dialog.SidekickModelsID)
+		return nil
+	}
+
+	ws := m.com.Workspace
+	if ws == nil || !ws.SidekickAvailable() {
+		return util.ReportWarn("Sidekick is not available in this workspace")
+	}
+
+	modelsDialog, err := dialog.NewSidekickModels(m.com, ws.SidekickModel())
 	if err != nil {
 		return util.ReportError(err)
 	}

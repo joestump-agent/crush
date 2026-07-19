@@ -10,6 +10,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/catwalk/pkg/catwalk"
+	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/history"
@@ -18,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/proto"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
 )
@@ -107,6 +109,40 @@ type Workspace interface {
 	UpdateAgentModel(ctx context.Context) error
 	InitCoderAgent(ctx context.Context) error
 	GetDefaultSmallModel(providerID string) config.SelectedModel
+
+	// Sidekick — the ephemeral sidebar assistant. It runs on its own
+	// agent with a private in-memory store, so nothing here interacts
+	// with the main agent's busy or queue state. Unavailable
+	// (SidekickAvailable returns false) in client/server mode and when
+	// the sidekick agent is not configured.
+	SidekickAvailable() bool
+	// SidekickRun dispatches prompt to the Sidekick and blocks until
+	// the run finishes. A busy Sidekick rejects the call instead of
+	// queueing it.
+	SidekickRun(ctx context.Context, prompt string) error
+	SidekickCancel()
+	SidekickIsBusy() bool
+	// SidekickClear wipes the ephemeral Sidekick conversation so the
+	// next run starts fresh.
+	SidekickClear(ctx context.Context) error
+	// SidekickSubscribe subscribes to the Sidekick's private message
+	// event stream (streaming deltas included). Returns nil when the
+	// Sidekick is unavailable.
+	SidekickSubscribe(ctx context.Context) <-chan pubsub.Event[message.Message]
+	// SidekickDashboardSubscribe subscribes to agent-pushed dashboard
+	// surfaces for the Sidekick panel's pinned dashboard slot (the main
+	// coder agent's sidekick_update tool, #56/#57). Returns nil when the
+	// workspace cannot deliver dashboard pushes (client/server mode, or
+	// agent not initialized yet).
+	SidekickDashboardSubscribe(ctx context.Context) <-chan pubsub.Event[agenttools.SidekickSurface]
+	// SidekickModel reports the provider/model selection the Sidekick
+	// will use for its next run (#54). Zero value when the Sidekick is
+	// unavailable.
+	SidekickModel() config.SelectedModel
+	// SidekickSetModel sets the session-scoped Sidekick model override
+	// (#54). Ephemeral: it is never persisted to crush.json and never
+	// touches the main coder agent's model selection.
+	SidekickSetModel(sel config.SelectedModel) error
 
 	// Permissions
 	//

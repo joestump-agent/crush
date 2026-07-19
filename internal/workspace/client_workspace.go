@@ -11,6 +11,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/agent/notify"
+	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/client"
 	"github.com/charmbracelet/crush/internal/config"
@@ -304,6 +305,37 @@ func (w *ClientWorkspace) GetDefaultSmallModel(providerID string) config.Selecte
 		return config.SelectedModel{}
 	}
 	return *model
+}
+
+// -- Sidekick --
+//
+// The Sidekick is an in-process ephemeral assistant; it has no
+// client/server transport, so remote workspaces report it unavailable.
+
+func (w *ClientWorkspace) SidekickAvailable() bool { return false }
+
+func (w *ClientWorkspace) SidekickRun(ctx context.Context, prompt string) error {
+	return errors.New("sidekick is not available in client/server mode")
+}
+
+func (w *ClientWorkspace) SidekickCancel() {}
+
+func (w *ClientWorkspace) SidekickIsBusy() bool { return false }
+
+func (w *ClientWorkspace) SidekickClear(ctx context.Context) error { return nil }
+
+func (w *ClientWorkspace) SidekickSubscribe(ctx context.Context) <-chan pubsub.Event[message.Message] {
+	return nil
+}
+
+func (w *ClientWorkspace) SidekickDashboardSubscribe(ctx context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
+	return nil
+}
+
+func (w *ClientWorkspace) SidekickModel() config.SelectedModel { return config.SelectedModel{} }
+
+func (w *ClientWorkspace) SidekickSetModel(config.SelectedModel) error {
+	return errors.New("sidekick is not available in client/server mode")
 }
 
 // -- Permissions --

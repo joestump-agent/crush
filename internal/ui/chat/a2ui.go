@@ -13,6 +13,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/ui/common"
+	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/joestump-agent/a2tea"
 	"github.com/joestump-agent/a2tea/event"
 	"github.com/joestump-agent/a2tea/render"
@@ -952,9 +953,9 @@ func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, 
 		stats := scanA2UIBlocks(masked)
 		switch {
 		case stats.dropped > 0 || stats.unclosed:
-			writeChunk(a.renderA2UIAlert(width))
+			writeChunk(renderA2UIAlert(a.sty, width))
 		case stats.protocolOnly > 0:
-			writeChunk(a.renderA2UIProtocolNotice(width))
+			writeChunk(renderA2UIProtocolNotice(a.sty, width))
 		}
 	}
 
@@ -962,11 +963,18 @@ func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, 
 }
 
 // renderTruncatedA2UI handles a finished message whose <a2ui-json> block was
-// never closed — generation was truncated mid-block (#5). The prose before
-// the unclosed tag is rendered as markdown, and the truncated block is
-// surfaced through the standard A2UI alert instead of leaving a wall of raw
-// JSON.
+// never closed, rendering the prose through the streaming-markdown prefix
+// cache.
 func (a *AssistantMessageItem) renderTruncatedA2UI(content string, width int) string {
+	return renderTruncatedA2UIContent(a.sty, content, width, a.renderMarkdown)
+}
+
+// renderTruncatedA2UIContent handles a finished message whose <a2ui-json>
+// block was never closed — generation was truncated mid-block (#5). The prose
+// before the unclosed tag is rendered as markdown (via renderProse), and the
+// truncated block is surfaced through the standard A2UI alert instead of
+// leaving a wall of raw JSON.
+func renderTruncatedA2UIContent(sty *styles.Styles, content string, width int, renderProse func(content string, width int) string) string {
 	// Mask (not strip) markdown code: a fence or inline span containing an
 	// <a2ui-json> example must not be mistaken for the truncation point, but
 	// the code must stay in the rendered prose — stripping deleted it from
@@ -978,24 +986,24 @@ func (a *AssistantMessageItem) renderTruncatedA2UI(content string, width int) st
 	if idx > 0 {
 		prose := unmaskMarkdownCode(masked[:idx], codeReps)
 		if strings.TrimSpace(prose) != "" {
-			b.WriteString(a.renderMarkdown(prose, width))
+			b.WriteString(renderProse(prose, width))
 		}
 	}
 	if b.Len() > 0 {
 		b.WriteString("\n\n")
 	}
-	b.WriteString(a.renderA2UIAlert(width))
+	b.WriteString(renderA2UIAlert(sty, width))
 	return b.String()
 }
 
 // renderA2UIAlert builds an alert element shown when content advertised A2UI but
 // a2tea could not turn it into a surface. Styled in crush's existing
 // error-message language.
-func (a *AssistantMessageItem) renderA2UIAlert(width int) string {
+func renderA2UIAlert(sty *styles.Styles, width int) string {
 	inner := max(width-2, 1)
-	tag := a.sty.Messages.ErrorTag.Render("A2UI")
-	title := a.sty.Messages.ErrorTitle.Render("couldn't render a UI block in this message")
-	reason := a.sty.Messages.ErrorDetails.Width(inner).Render(
+	tag := sty.Messages.ErrorTag.Render("A2UI")
+	title := sty.Messages.ErrorTitle.Render("couldn't render a UI block in this message")
+	reason := sty.Messages.ErrorDetails.Width(inner).Render(
 		"The A2UI content was malformed or used unsupported components.")
 	return tag + " " + title + "\n\n" + reason
 }
@@ -1004,8 +1012,191 @@ func (a *AssistantMessageItem) renderA2UIAlert(width int) string {
 // tagged blocks holding only protocol messages (callFunction/actionResponse):
 // the content was understood, there is simply nothing to draw, so a muted
 // one-liner replaces the misleading malformed-content alert (#168).
-func (a *AssistantMessageItem) renderA2UIProtocolNotice(width int) string {
+func renderA2UIProtocolNotice(sty *styles.Styles, width int) string {
 	inner := max(width-2, 1)
-	return a.sty.Messages.ErrorDetails.Width(inner).Render(
+	return sty.Messages.ErrorDetails.Width(inner).Render(
 		"This message includes A2UI protocol data with nothing to display.")
+}
+
+// RenderA2UIInline renders assistant content that carries A2UI at the given
+// width via the shared a2tea.Scan + render pipeline — the same one the main
+// chat uses. The Sidekick panel calls it to draw surfaces inline in its
+// message list at sidebar (narrow) width; chat surfaces there are
+// display-only (no live model, no event routing), so buttons and inputs
+// render as read-only visuals. The pinned dashboard slot uses
+// NewA2UIDashboardSurface instead, which keeps a live, focusable model.
+//
+// Returns ok=false when the content carries no A2UI (and, for unfinished
+// messages, no truncated block), leaving the caller to render the text its
+// own way.
+func RenderA2UIInline(sty *styles.Styles, content string, width int, finished bool) (out string, ok bool) {
+	switch {
+	case contentHasA2UI(content):
+		return renderA2UIContent(sty, content, width, finished, plainMarkdownRenderer(sty)), true
+	case finished && contentHasUnclosedA2UI(content):
+		// Generation was truncated mid-block: an <a2ui-json> tag never got
+		// its closing partner. Show the alert instead of raw partial JSON.
+		return renderTruncatedA2UIContent(sty, content, width, plainMarkdownRenderer(sty)), true
+	}
+	return "", false
+}
+
+// plainMarkdownRenderer returns a whole-content markdown fallback for callers
+// without a streaming prefix cache (the Sidekick panel). It acquires the
+// shared renderer lock itself, so it must not be called with that lock held.
+func plainMarkdownRenderer(sty *styles.Styles) func(content string, width int) string {
+	return func(content string, width int) string {
+		renderer := common.MarkdownRenderer(sty, width)
+		mu := common.LockMarkdownRenderer(renderer)
+		mu.Lock()
+		defer mu.Unlock()
+		out, err := renderer.Render(content)
+		if err != nil {
+			return strings.TrimSpace(content)
+		}
+		return trimGlamourMargins(out)
+	}
+}
+
+// renderA2UIContent is the display-only counterpart to the
+// AssistantMessageItem method renderContentWithA2UI: same masking, button
+// repair, scanning, themed container, and alert rules, but each surface is
+// rendered from a fresh throwaway model instead of a live one kept on an
+// item — the Sidekick chat scrollback has no per-item state to host live
+// models, and its surfaces do not receive focus or keys.
+//
+// fallback renders the whole content as markdown when the scan fails; it is
+// called without the shared renderer lock held.
+func renderA2UIContent(sty *styles.Styles, content string, width int, finished bool, fallback func(content string, width int) string) string {
+	masked, codeReps := maskMarkdownCode(content)
+	// Repair childless-but-labeled buttons on the raw JSON before parsing —
+	// the stray label field is dropped by the typed parser (#47).
+	masked = repairA2UIButtons(masked)
+
+	parts, err := a2tea.Scan(masked)
+	if err != nil {
+		// Not parseable as A2UI — render everything as markdown so nothing
+		// is lost.
+		return fallback(content, width)
+	}
+
+	renderer := common.MarkdownRenderer(sty, width)
+	mu := common.LockMarkdownRenderer(renderer)
+	mu.Lock()
+	defer mu.Unlock()
+
+	renderMarkdown := func(text string) string {
+		if strings.TrimSpace(text) == "" {
+			return ""
+		}
+		// Restore masked code before markdown rendering.
+		text = unmaskMarkdownCode(text, codeReps)
+		out, err := renderer.Render(text)
+		if err != nil {
+			return strings.TrimSpace(text)
+		}
+		return trimGlamourMargins(out)
+	}
+
+	var b strings.Builder
+	writeChunk := func(s string) {
+		if s == "" {
+			return
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(s)
+	}
+
+	surface := sty.Messages.A2UISurface
+	innerWidth := max(width-surface.GetHorizontalFrameSize(), 1)
+	for _, p := range parts {
+		writeChunk(renderMarkdown(p.Text))
+		if len(p.Messages) == 0 {
+			continue
+		}
+		model, err := a2tea.Render(p.Messages)
+		if err != nil {
+			// Valid A2UI messages with nothing to draw (e.g. a data-model
+			// update). Not an error worth alarming the user about.
+			continue
+		}
+		rm, ok := model.(render.Model)
+		if !ok {
+			continue
+		}
+		rm.SetSize(innerWidth, 0)
+		rendered := strings.TrimRight(rm.View().Content, "\n")
+		writeChunk(surface.Width(max(width-surface.GetHorizontalBorderSize(), 1)).Render(rendered))
+	}
+
+	if finished {
+		stats := scanA2UIBlocks(masked)
+		switch {
+		case stats.dropped > 0 || stats.unclosed:
+			writeChunk(renderA2UIAlert(sty, width))
+		case stats.protocolOnly > 0:
+			writeChunk(renderA2UIProtocolNotice(sty, width))
+		}
+	}
+
+	return b.String()
+}
+
+// NewA2UIDashboardSurface builds a live a2tea surface model from
+// agent-pushed dashboard content (the sidekick_update tool payload, #57).
+// The content goes through the same masking, button repair, and scan as the
+// main chat; the first part carrying renderable messages becomes the
+// surface. Returns the live model, its A2UI surface ID, and ok=false when
+// nothing renderable was found.
+func NewA2UIDashboardSurface(content string) (render.Model, string, bool) {
+	masked, _ := maskMarkdownCode(content)
+	masked = repairA2UIButtons(masked)
+	parts, err := a2tea.Scan(masked)
+	if err != nil {
+		return nil, "", false
+	}
+	for _, p := range parts {
+		if len(p.Messages) == 0 {
+			continue
+		}
+		model, err := a2tea.Render(p.Messages)
+		if err != nil {
+			continue
+		}
+		if rm, ok := model.(render.Model); ok {
+			return rm, a2uiPartSurfaceID(p.Messages), true
+		}
+	}
+	return nil, "", false
+}
+
+// RenderA2UISurfaceModel renders a live surface model inside the themed
+// container at the given width — the same chrome the main chat wraps its
+// surfaces in. The view reflects the model's current focus ring and edited
+// values, so callers holding a live surface (the Sidekick dashboard slot)
+// re-render through this on every frame.
+func RenderA2UISurfaceModel(sty *styles.Styles, model render.Model, width int) string {
+	surface := sty.Messages.A2UISurface
+	innerWidth := max(width-surface.GetHorizontalFrameSize(), 1)
+	model.SetSize(innerWidth, 0)
+	rendered := strings.TrimRight(model.View().Content, "\n")
+	return surface.Width(max(width-surface.GetHorizontalBorderSize(), 1)).Render(rendered)
+}
+
+// A2UISurfaceWantsKey reports whether a focused live surface should consume
+// the key — the exported form of a2uiSurfaceWantsKey for hosts outside this
+// package (the Sidekick dashboard slot).
+func A2UISurfaceWantsKey(s render.Model, key tea.KeyMsg) bool {
+	return a2uiSurfaceWantsKey(s, key)
+}
+
+// A2UISurfaceFieldValues reads a live surface's current field values (by
+// component ID), or nil when the model cannot report them.
+func A2UISurfaceFieldValues(s render.Model) map[string]any {
+	if fv, ok := s.(interface{ FieldValues() map[string]any }); ok {
+		return fv.FieldValues()
+	}
+	return nil
 }

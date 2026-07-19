@@ -601,6 +601,57 @@ func TestRenderTruncatedA2UIPreservesFencedCode(t *testing.T) {
 	require.NotContains(t, out, "updateComp", "raw truncated JSON must not leak")
 }
 
+// --- Issue #55: shared pipeline entry point for the Sidekick panel ---
+
+func TestRenderA2UIInlineSurfaceAtSidebarWidth(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	content := "Here is a card:\n\n" + a2uiSurface + "\n\nAnything else?"
+	out, ok := RenderA2UIInline(&sty, content, 40, true)
+	require.True(t, ok, "content carrying A2UI must take the a2tea path")
+
+	plain := ansi.Strip(out)
+	require.Contains(t, plain, "Hello from A2UI")
+	require.Contains(t, plain, "Here is a card")
+	require.NotContains(t, plain, "a2ui-json")
+	require.NotContains(t, plain, "updateComponents")
+	require.NotContains(t, plain, "couldn't render")
+}
+
+func TestRenderA2UIInlineNoA2UI(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	out, ok := RenderA2UIInline(&sty, "plain prose, no surfaces here", 40, true)
+	require.False(t, ok, "plain prose must be left to the caller")
+	require.Empty(t, out)
+
+	// A tagged example inside a fenced code block is not live UI either.
+	fenced := "Example:\n\n```json\n" + a2uiSurface + "\n```"
+	_, ok = RenderA2UIInline(&sty, fenced, 40, true)
+	require.False(t, ok)
+}
+
+func TestRenderA2UIInlineTruncatedFinishedAlerts(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	content := "Here is a card:\n\n<a2ui-json>{\"version\":\"v0.9\",\"updateComponents"
+
+	out, ok := RenderA2UIInline(&sty, content, 40, true)
+	require.True(t, ok, "a finished message truncated mid-block must be handled")
+	plain := ansi.Strip(out)
+	require.Contains(t, plain, "Here is a card")
+	require.Contains(t, plain, "couldn't render")
+	require.NotContains(t, plain, "updateComponents", "raw partial JSON must not leak")
+
+	// While streaming the close tag simply hasn't arrived yet: no alert,
+	// caller keeps rendering the text its own way.
+	_, ok = RenderA2UIInline(&sty, content, 40, false)
+	require.False(t, ok)
+}
+
 // TestContentCache_FinishedRenderNotServedFromStreamingEntry pins the cache
 // key folding in the finish state: the last streaming delta and the Finish
 // part often carry byte-identical text, so without finish state in the key

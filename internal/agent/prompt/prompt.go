@@ -23,12 +23,13 @@ import (
 
 // Prompt represents a template-based prompt generator.
 type Prompt struct {
-	name       string
-	template   string
-	now        func() time.Time
-	platform   string
-	workingDir string
-	a2ui       bool
+	name           string
+	template       string
+	now            func() time.Time
+	platform       string
+	workingDir     string
+	a2ui           bool
+	sidekickUpdate bool
 }
 
 type PromptDat struct {
@@ -45,6 +46,7 @@ type PromptDat struct {
 	AvailSkillXML      string
 	A2UI               bool
 	A2UIVersion        string
+	SidekickUpdate     bool
 }
 
 type ContextFile struct {
@@ -81,6 +83,17 @@ func WithWorkingDir(workingDir string) Option {
 func WithA2UI() Option {
 	return func(p *Prompt) {
 		p.a2ui = true
+	}
+}
+
+// WithSidekickUpdate enables the template's sidekick_update guidance: the
+// main coder agent is told to push live progress surfaces to the pinned
+// Sidekick dashboard via the sidekick_update tool instead of accumulating
+// inline surfaces in chat. Only meaningful together with WithA2UI (the
+// dashboard payload is A2UI); the coordinator applies both gates.
+func WithSidekickUpdate() Option {
+	return func(p *Prompt) {
+		p.sidekickUpdate = true
 	}
 }
 
@@ -223,16 +236,17 @@ func (p *Prompt) promptData(ctx context.Context, provider, model string, store *
 
 	isGit := isGitRepo(store.WorkingDir())
 	data := PromptDat{
-		Provider:      provider,
-		Model:         model,
-		Config:        *cfg,
-		WorkingDir:    filepath.ToSlash(workingDir),
-		IsGitRepo:     isGit,
-		Platform:      platform,
-		Date:          p.now().Format("1/2/2006"),
-		AvailSkillXML: availSkillXML,
-		A2UI:          p.a2ui,
-		A2UIVersion:   a2ui.Version,
+		Provider:       provider,
+		Model:          model,
+		Config:         *cfg,
+		WorkingDir:     filepath.ToSlash(workingDir),
+		IsGitRepo:      isGit,
+		Platform:       platform,
+		Date:           p.now().Format("1/2/2006"),
+		AvailSkillXML:  availSkillXML,
+		A2UI:           p.a2ui,
+		A2UIVersion:    a2ui.Version,
+		SidekickUpdate: p.sidekickUpdate,
 	}
 	if isGit {
 		var err error
