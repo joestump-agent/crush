@@ -203,6 +203,14 @@ type Styles struct {
 		TabInactive    lipgloss.Style // Inactive tab label in the sidebar tab bar
 		TabBadge       lipgloss.Style // Unread badge (● N) on the Sidekick tab
 		TabPlaceholder lipgloss.Style // Placeholder text for empty tab content
+
+		// Sidekick chat panel (message list + input + footer).
+		SidekickUser      lipgloss.Style // User prompt lines ("> ..." marker included)
+		SidekickAssistant lipgloss.Style // Assistant response text
+		SidekickTool      lipgloss.Style // Compact tool-call lines (⚙ bash)
+		SidekickThinking  lipgloss.Style // "Thinking…" indicator while a run streams
+		SidekickError     lipgloss.Style // Inline error line when a run fails
+		SidekickFooter    lipgloss.Style // Footer: active model + tool state
 	}
 
 	// ModelInfo (model name, provider, reasoning, token/cost summary)

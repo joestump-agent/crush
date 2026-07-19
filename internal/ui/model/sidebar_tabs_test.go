@@ -3,6 +3,8 @@ package model
 import (
 	"testing"
 
+	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/ui/attachments"
 	"github.com/charmbracelet/crush/internal/ui/dialog"
@@ -169,7 +171,8 @@ func TestDrawSidebarInfoTabShowsTabBar(t *testing.T) {
 }
 
 // TestDrawSidebarSidekickTab verifies the Sidekick tab renders the tab bar
-// plus the shell placeholder, and that drawing it clears the unread badge.
+// plus the chat panel (empty-state hint and prompt input), and that drawing
+// it clears the unread badge.
 func TestDrawSidebarSidekickTab(t *testing.T) {
 	t.Parallel()
 	m := newSidebarHeightTestUI(t)
@@ -183,7 +186,44 @@ func TestDrawSidebarSidekickTab(t *testing.T) {
 	out := ansi.Strip(scr.Render())
 
 	require.Contains(t, out, "[Sidekick]")
-	require.Contains(t, out, "Nothing here yet.")
+	require.Contains(t, out, "Ask the sidekick", "prompt input (or empty-state hint) must render")
 	require.NotContains(t, out, "Modified Files", "Info content must not bleed into the Sidekick tab")
 	require.Equal(t, 0, m.sidekickUnread, "drawing the Sidekick tab counts as viewing it")
+}
+
+// TestDrawSidebarSidekickTabConversation verifies streamed conversation
+// content renders in the panel: the user prompt, the assistant text, and a
+// compact tool-call line.
+func TestDrawSidebarSidekickTabConversation(t *testing.T) {
+	t.Parallel()
+	m := newSidebarHeightTestUI(t)
+	m.sidebarTab = sidebarTabSidekick
+
+	m.applySidekickEvent(pubsub.Event[message.Message]{
+		Type: pubsub.CreatedEvent,
+		Payload: message.Message{
+			ID: "u1", SessionID: "sk", Role: message.User,
+			Parts: []message.ContentPart{message.TextContent{Text: "what is this repo?"}},
+		},
+	})
+	m.applySidekickEvent(pubsub.Event[message.Message]{
+		Type: pubsub.CreatedEvent,
+		Payload: message.Message{
+			ID: "a1", SessionID: "sk", Role: message.Assistant,
+			Parts: []message.ContentPart{
+				message.ToolCall{ID: "t1", Name: "bash", Finished: true},
+				message.TextContent{Text: "A Go TUI."},
+			},
+		},
+	})
+
+	const width, height = 32, 40
+	m.layout.sidebar = uv.Rect(0, 0, width, height)
+	scr := uv.NewScreenBuffer(width, height)
+	m.drawSidebar(scr, m.layout.sidebar)
+	out := ansi.Strip(scr.Render())
+
+	require.Contains(t, out, "> what is this repo?")
+	require.Contains(t, out, "A Go TUI.")
+	require.Contains(t, out, "⚙ bash")
 }

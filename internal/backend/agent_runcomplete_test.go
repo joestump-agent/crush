@@ -52,7 +52,10 @@ func (c *errorCoordinator) RunSidekick(context.Context, string) (*fantasy.AgentR
 	return nil, nil
 }
 
-func (c *errorCoordinator) Sidekick() *agent.EphemeralAgent { return nil }
+func (c *errorCoordinator) Sidekick() *agent.EphemeralAgent     { return nil }
+func (c *errorCoordinator) CancelSidekick()                     {}
+func (c *errorCoordinator) IsSidekickBusy() bool                { return false }
+func (c *errorCoordinator) ClearSidekick(context.Context) error { return nil }
 
 // insertRunCompleteWorkspace installs a workspace backed by a real
 // app.App (so the runCompletions broker exists) with the given

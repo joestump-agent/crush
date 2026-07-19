@@ -162,7 +162,10 @@ func (c *recordingCoordinator) RunSidekick(context.Context, string) (*fantasy.Ag
 	return nil, nil
 }
 
-func (c *recordingCoordinator) Sidekick() *agent.EphemeralAgent { return nil }
+func (c *recordingCoordinator) Sidekick() *agent.EphemeralAgent     { return nil }
+func (c *recordingCoordinator) CancelSidekick()                     {}
+func (c *recordingCoordinator) IsSidekickBusy() bool                { return false }
+func (c *recordingCoordinator) ClearSidekick(context.Context) error { return nil }
 
 // fullFakeSessions adapts fakeChannelSessions to the full session.Service
 // interface by embedding it; only the channelSessionStore subset is

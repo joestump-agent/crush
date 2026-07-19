@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/proto"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
 )
@@ -107,6 +108,26 @@ type Workspace interface {
 	UpdateAgentModel(ctx context.Context) error
 	InitCoderAgent(ctx context.Context) error
 	GetDefaultSmallModel(providerID string) config.SelectedModel
+
+	// Sidekick — the ephemeral sidebar assistant. It runs on its own
+	// agent with a private in-memory store, so nothing here interacts
+	// with the main agent's busy or queue state. Unavailable
+	// (SidekickAvailable returns false) in client/server mode and when
+	// the sidekick agent is not configured.
+	SidekickAvailable() bool
+	// SidekickRun dispatches prompt to the Sidekick and blocks until
+	// the run finishes. A busy Sidekick rejects the call instead of
+	// queueing it.
+	SidekickRun(ctx context.Context, prompt string) error
+	SidekickCancel()
+	SidekickIsBusy() bool
+	// SidekickClear wipes the ephemeral Sidekick conversation so the
+	// next run starts fresh.
+	SidekickClear(ctx context.Context) error
+	// SidekickSubscribe subscribes to the Sidekick's private message
+	// event stream (streaming deltas included). Returns nil when the
+	// Sidekick is unavailable.
+	SidekickSubscribe(ctx context.Context) <-chan pubsub.Event[message.Message]
 
 	// Permissions
 	//

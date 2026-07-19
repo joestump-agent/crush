@@ -306,6 +306,27 @@ func (w *ClientWorkspace) GetDefaultSmallModel(providerID string) config.Selecte
 	return *model
 }
 
+// -- Sidekick --
+//
+// The Sidekick is an in-process ephemeral assistant; it has no
+// client/server transport, so remote workspaces report it unavailable.
+
+func (w *ClientWorkspace) SidekickAvailable() bool { return false }
+
+func (w *ClientWorkspace) SidekickRun(ctx context.Context, prompt string) error {
+	return errors.New("sidekick is not available in client/server mode")
+}
+
+func (w *ClientWorkspace) SidekickCancel() {}
+
+func (w *ClientWorkspace) SidekickIsBusy() bool { return false }
+
+func (w *ClientWorkspace) SidekickClear(ctx context.Context) error { return nil }
+
+func (w *ClientWorkspace) SidekickSubscribe(ctx context.Context) <-chan pubsub.Event[message.Message] {
+	return nil
+}
+
 // -- Permissions --
 
 func (w *ClientWorkspace) PermissionGrant(perm permission.PermissionRequest) bool {

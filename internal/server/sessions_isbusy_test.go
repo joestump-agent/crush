@@ -57,7 +57,10 @@ func (s *stubCoordinator) RunSidekick(context.Context, string) (*fantasy.AgentRe
 	return nil, nil
 }
 
-func (s *stubCoordinator) Sidekick() *agent.EphemeralAgent { return nil }
+func (s *stubCoordinator) Sidekick() *agent.EphemeralAgent     { return nil }
+func (s *stubCoordinator) CancelSidekick()                     {}
+func (s *stubCoordinator) IsSidekickBusy() bool                { return false }
+func (s *stubCoordinator) ClearSidekick(context.Context) error { return nil }
 
 // stubSessions is a minimal session.Service that returns a fixed list
 // (and supports Get by ID). All other methods return zero values; the
