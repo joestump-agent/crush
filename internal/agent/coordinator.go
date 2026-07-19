@@ -707,6 +707,8 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 			allTools,
 			tools.NewListMCPResourcesTool(c.cfg, c.permissions),
 			tools.NewReadMCPResourceTool(c.cfg, c.permissions),
+			tools.NewListMCPPromptsTool(c.cfg, c.permissions),
+			tools.NewCallMCPPromptTool(c.cfg, c.permissions),
 		)
 	}
 
