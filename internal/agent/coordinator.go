@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
@@ -54,6 +55,7 @@ import (
 // Coordinator errors.
 var (
 	errCoderAgentNotConfigured         = errors.New("coder agent not configured")
+	errSidekickAgentNotConfigured      = errors.New("sidekick agent not configured")
 	errModelProviderNotConfigured      = errors.New("model provider not configured")
 	errLargeModelNotSelected           = errors.New("large model not selected")
 	errSmallModelNotSelected           = errors.New("small model not selected")
@@ -103,6 +105,17 @@ type Coordinator interface {
 	Model() Model
 	UpdateModels(ctx context.Context) error
 	GenerateTitle(ctx context.Context, sessionID, prompt string)
+	// RunSidekick dispatches prompt to the independent Sidekick agent:
+	// a second SessionAgent with its own read-only tool set, its own
+	// model config, its own busy tracking, and no hooks. Sidekick runs
+	// never interact with the main agent's queue, busy state, or todo
+	// state. A busy Sidekick rejects the call with ErrSessionBusy
+	// instead of queueing it.
+	RunSidekick(ctx context.Context, prompt string) (*fantasy.AgentResult, error)
+	// Sidekick exposes the Sidekick's ephemeral agent so a UI can
+	// subscribe to its private session/message stores and cancel runs.
+	// Nil when the sidekick agent is not configured.
+	Sidekick() *EphemeralAgent
 }
 
 type coordinator struct {
@@ -118,6 +131,19 @@ type coordinator struct {
 
 	currentAgent SessionAgent
 	agents       map[string]SessionAgent
+
+	// sidekickAgent is the fully independent Sidekick agent: its own
+	// (ephemeral, in-memory) sessions and messages, its own read-only
+	// tool set, its own model config, and its own activeRequests — so
+	// Sidekick activity never affects the main agent's busy/queue state
+	// and vice versa. Nil when the sidekick agent is not configured.
+	sidekickAgent *EphemeralAgent
+	// sidekickMu guards lazy creation of sidekickSessionID.
+	sidekickMu sync.Mutex
+	// sidekickSessionID is the single ephemeral session all Sidekick
+	// prompts run in, created on first RunSidekick so consecutive
+	// prompts share conversation context.
+	sidekickSessionID string
 
 	// Skills discovery results (session-start snapshot).
 	allSkills    []*skills.Skill // Pre-filter: all discovered after dedup.
@@ -192,6 +218,16 @@ func NewCoordinator(
 	}
 	c.currentAgent = agent
 	c.agents[config.AgentCoder] = agent
+
+	// The Sidekick is optional: legacy configs without the agent entry
+	// simply run without one.
+	if sidekickCfg, ok := cfg.Config().Agents[config.AgentSidekick]; ok {
+		sidekick, err := c.buildSidekickAgent(ctx, sidekickCfg)
+		if err != nil {
+			return nil, err
+		}
+		c.sidekickAgent = sidekick
+	}
 	return c, nil
 }
 
@@ -632,6 +668,172 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 	})
 
 	return result, nil
+}
+
+// buildSidekickAgent constructs the Sidekick: an ephemeral agent with the
+// read-only tool subset, its own model (per the sidekick agent config,
+// small by default), and no hook interception. Its in-memory session and
+// message stores plus its own activeRequests registry make it fully
+// independent of the main agent.
+func (c *coordinator) buildSidekickAgent(ctx context.Context, agentCfg config.Agent) (*EphemeralAgent, error) {
+	model, err := c.buildSidekickModel(ctx, agentCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	providerCfg, _ := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
+	agent := NewEphemeralAgent(SessionAgentOptions{
+		LargeModel:         model,
+		SmallModel:         model,
+		SystemPromptPrefix: providerCfg.SystemPromptPrefix,
+		IsSubAgent:         true,
+		IsYolo:             c.permissions.SkipRequests(),
+		Cfg:                c.cfg,
+		Tools:              c.buildSidekickTools(agentCfg),
+	})
+
+	c.readyWg.Go(func() error {
+		promptOpts := []prompt.Option{prompt.WithWorkingDir(c.cfg.WorkingDir())}
+		if !c.cfg.Config().Options.DisableA2UI {
+			promptOpts = append(promptOpts, prompt.WithA2UI())
+		}
+		sysPrompt, err := sidekickPrompt(promptOpts...)
+		if err != nil {
+			return err
+		}
+		systemPrompt, err := sysPrompt.Build(ctx, model.Model.Provider(), model.Model.Model(), c.cfg)
+		if err != nil {
+			return err
+		}
+		agent.SetSystemPrompt(systemPrompt)
+		return nil
+	})
+
+	return agent, nil
+}
+
+// buildSidekickModel resolves the model the Sidekick runs with, honoring
+// the model type on the sidekick agent config (small by default,
+// user-switchable to large).
+func (c *coordinator) buildSidekickModel(ctx context.Context, agentCfg config.Agent) (Model, error) {
+	large, small, err := c.buildAgentModels(ctx, true)
+	if err != nil {
+		return Model{}, err
+	}
+	if agentCfg.Model == config.SelectedModelTypeLarge {
+		return large, nil
+	}
+	return small, nil
+}
+
+// buildSidekickTools returns the Sidekick's read-only tool set: the
+// read-only bash variant plus the search/inspection tools, filtered by the
+// sidekick agent config. Unlike buildTools it never wraps with PreToolUse
+// hooks and never includes MCP, LSP, todo, or write-capable tools.
+func (c *coordinator) buildSidekickTools(agentCfg config.Agent) []fantasy.AgentTool {
+	modelID := ""
+	if modelCfg, ok := c.cfg.Config().Models[agentCfg.Model]; ok {
+		if model := c.cfg.Config().GetModel(modelCfg.Provider, modelCfg.Model); model != nil {
+			modelID = model.ID
+		}
+	}
+
+	allTools := []fantasy.AgentTool{
+		tools.NewSidekickBashTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Options.Attribution, modelID),
+		tools.NewGlobTool(c.cfg.WorkingDir(), c.cfg.Config().Tools.Glob),
+		tools.NewGrepTool(c.cfg.WorkingDir(), c.cfg.Config().Tools.Grep),
+		tools.NewLsTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Tools.Ls),
+		tools.NewSourcegraphTool(nil),
+		tools.NewViewTool(c.lspManager, c.permissions, c.filetracker, c.skillTracker, c.cfg.WorkingDir(), c.cfg.Config().Options.SkillsPaths...),
+	}
+
+	var filtered []fantasy.AgentTool
+	for _, tool := range allTools {
+		if slices.Contains(agentCfg.AllowedTools, tool.Info().Name) {
+			filtered = append(filtered, tool)
+		}
+	}
+	slices.SortFunc(filtered, func(a, b fantasy.AgentTool) int {
+		return strings.Compare(a.Info().Name, b.Info().Name)
+	})
+	return filtered
+}
+
+// RunSidekick implements Coordinator. It runs prompt on the Sidekick's
+// own ephemeral session, refreshing the Sidekick model first so config
+// changes take effect on the next run.
+func (c *coordinator) RunSidekick(ctx context.Context, prompt string) (*fantasy.AgentResult, error) {
+	if c.sidekickAgent == nil {
+		return nil, errSidekickAgentNotConfigured
+	}
+	if err := c.readyWg.Wait(); err != nil {
+		return nil, err
+	}
+
+	agentCfg, ok := c.cfg.Config().Agents[config.AgentSidekick]
+	if !ok {
+		return nil, errSidekickAgentNotConfigured
+	}
+	model, err := c.buildSidekickModel(ctx, agentCfg)
+	if err != nil {
+		return nil, err
+	}
+	c.sidekickAgent.SetModels(model, model)
+
+	sessionID, err := c.sidekickSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	maxTokens := model.CatwalkCfg.DefaultMaxTokens
+	if model.ModelCfg.MaxTokens != 0 {
+		maxTokens = model.ModelCfg.MaxTokens
+	}
+	providerCfg, ok := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
+	if !ok {
+		return nil, errModelProviderNotConfigured
+	}
+	mergedOptions, temp, topP, topK, freqPenalty, presPenalty := mergeCallOptions(model, providerCfg)
+
+	var result *fantasy.AgentResult
+	err = c.runWithUnauthorizedRetry(ctx, providerCfg, func() error {
+		var runErr error
+		result, runErr = c.sidekickAgent.Run(ctx, SessionAgentCall{
+			SessionID:        sessionID,
+			Prompt:           prompt,
+			MaxOutputTokens:  maxTokens,
+			ProviderOptions:  mergedOptions,
+			Temperature:      temp,
+			TopP:             topP,
+			TopK:             topK,
+			FrequencyPenalty: freqPenalty,
+			PresencePenalty:  presPenalty,
+			NonInteractive:   true,
+		})
+		return runErr
+	})
+	return result, err
+}
+
+// Sidekick implements Coordinator.
+func (c *coordinator) Sidekick() *EphemeralAgent {
+	return c.sidekickAgent
+}
+
+// sidekickSession returns the Sidekick's ephemeral session ID, creating
+// the session in the Sidekick's private in-memory store on first use.
+func (c *coordinator) sidekickSession(ctx context.Context) (string, error) {
+	c.sidekickMu.Lock()
+	defer c.sidekickMu.Unlock()
+	if c.sidekickSessionID != "" {
+		return c.sidekickSessionID, nil
+	}
+	sess, err := c.sidekickAgent.Sessions.Create(ctx, "Sidekick")
+	if err != nil {
+		return "", err
+	}
+	c.sidekickSessionID = sess.ID
+	return sess.ID, nil
 }
 
 func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubAgent bool) ([]fantasy.AgentTool, error) {
