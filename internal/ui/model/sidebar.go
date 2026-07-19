@@ -200,6 +200,14 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 
 	focused := m.focus == uiFocusSidebar
 
+	// The tab bar ([Info] [Sidekick]) sits above all tab content.
+	tabBar := m.renderSidebarTabBar(contentWidth)
+
+	if m.sidebarTab == sidebarTabSidekick {
+		m.drawSidekickTab(scr, area, tabBar, contentWidth, height)
+		return
+	}
+
 	title := t.Sidebar.SessionTitle.Width(contentWidth).MaxHeight(2).Render(m.session.Title)
 	cwd := common.PrettyPath(t, m.com.Workspace.WorkingDir(), contentWidth)
 	sidebarLogo := m.sidebarLogo
@@ -209,6 +217,8 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 		})
 	}
 	blocks := []string{
+		tabBar,
+		"",
 		sidebarLogo,
 		title,
 		"",

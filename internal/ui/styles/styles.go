@@ -197,8 +197,12 @@ type Styles struct {
 
 	// Sidebar
 	Sidebar struct {
-		SessionTitle lipgloss.Style // Current session title at top of sidebar
-		WorkingDir   lipgloss.Style // Working directory path (PrettyPath)
+		SessionTitle   lipgloss.Style // Current session title at top of sidebar
+		WorkingDir     lipgloss.Style // Working directory path (PrettyPath)
+		TabActive      lipgloss.Style // Active tab label in the sidebar tab bar
+		TabInactive    lipgloss.Style // Inactive tab label in the sidebar tab bar
+		TabBadge       lipgloss.Style // Unread badge (● N) on the Sidekick tab
+		TabPlaceholder lipgloss.Style // Placeholder text for empty tab content
 	}
 
 	// ModelInfo (model name, provider, reasoning, token/cost summary)

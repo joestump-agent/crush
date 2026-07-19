@@ -784,6 +784,10 @@ func quickStyle(o quickStyleOpts) Styles {
 	// Sidebar
 	s.Sidebar.SessionTitle = lipgloss.NewStyle().Foreground(o.fgMoreSubtle)
 	s.Sidebar.WorkingDir = lipgloss.NewStyle().Foreground(o.fgMoreSubtle)
+	s.Sidebar.TabActive = lipgloss.NewStyle().Foreground(o.fgBase).Bold(true)
+	s.Sidebar.TabInactive = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
+	s.Sidebar.TabBadge = lipgloss.NewStyle().Foreground(o.secondary)
+	s.Sidebar.TabPlaceholder = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
 
 	// ModelInfo
 	s.ModelInfo.Icon = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
