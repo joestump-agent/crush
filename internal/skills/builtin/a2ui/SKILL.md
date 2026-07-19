@@ -71,11 +71,11 @@ These components render beautifully with full styling and layout:
 - `Row`: Lays out children horizontally. Expects a `children` array of IDs.
 - `List`: Lays out children as a list. Expects a `children` array of IDs.
 - `Divider`: A horizontal rule.
-- `Button`: Focusable button. Its label comes from a single `child` ID pointing at a `Text` component (there is no `label` field). Pressing Enter emits a click event to the host.
+- `Button`: Focusable button. Its label comes from a single `child` ID pointing at a `Text` component (there is no `label` field). When the user presses it, you receive a new message naming the pressed button and carrying the surface's current field values — a button whose id reads as a cancel (e.g. `btn-cancel`, `dismiss`, `close`) just dismisses the form instead.
 
-### Input Components (Read-Only Visuals)
+### Input Components (Editable)
 
-These components will render their current values, but currently do not allow the user to interactively edit them or send input back to the agent:
+These components render their current values and the user can edit them; their values (keyed by component `id`) are sent back to you when a button on the surface is pressed:
 - `TextField`
 - `CheckBox`
 - `ChoicePicker`

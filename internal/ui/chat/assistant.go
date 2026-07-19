@@ -159,6 +159,17 @@ type AssistantMessageItem struct {
 	// scan-part: parts without a renderable surface hold nil. See
 	// syncA2UISurfaces in a2ui.go.
 	a2uiSurfaces []render.Model
+	// a2uiSurfaceIDs holds the A2UI surface ID for each entry of
+	// a2uiSurfaces (empty where the part has no renderable surface), so a
+	// ButtonClicked event's SurfaceID can be routed back to the model
+	// that emitted it (#45).
+	a2uiSurfaceIDs []string
+	// a2uiRetired marks surfaces (by A2UI surface ID) that were
+	// submitted or dismissed: they still render, but no longer receive
+	// focus or keys, so a form cannot be re-submitted (#45). Keyed by ID
+	// rather than index so the mark survives streaming rebuilds of the
+	// models.
+	a2uiRetired map[string]bool
 	// a2uiSrcHash fingerprints the scanned source the surfaces were
 	// built from, so streaming deltas rebuild them while pure re-renders
 	// (width changes, key events) reuse the same models and keep their

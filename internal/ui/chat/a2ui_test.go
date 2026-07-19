@@ -10,8 +10,10 @@ import (
 
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/joestump-agent/a2tea/event"
 	"github.com/joestump-agent/a2tea/render"
 	"github.com/stretchr/testify/require"
+	a2ui "github.com/tmc/a2ui"
 )
 
 // a2uiSurface is an <a2ui-json> block: a card wrapping a single text component.
@@ -794,4 +796,147 @@ func TestPureTextContentStillCaches(t *testing.T) {
 	_ = item.RawRender(80)
 	require.False(t, item.hasLiveA2UISurfaces())
 	require.True(t, item.contentSec.valid, "pure-text messages must keep the content cache")
+}
+
+// --- Issue #45: turn form submission into an agent turn ---
+
+// a2uiFieldForm is a surface with input components carrying literal values,
+// plus a submit and a cancel button.
+const a2uiFieldForm = `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"contact","components":[` +
+	`{"component":"Card","id":"root","child":"col"},` +
+	`{"component":"Column","id":"col","children":["name","subscribe","btn-send","btn-cancel"]},` +
+	`{"component":"TextField","id":"name","label":"Name","value":"Joe"},` +
+	`{"component":"CheckBox","id":"subscribe","value":true},` +
+	`{"component":"Button","id":"btn-send","child":"btn-send-t"},` +
+	`{"component":"Text","id":"btn-send-t","text":"Send"},` +
+	`{"component":"Button","id":"btn-cancel","child":"btn-cancel-t"},` +
+	`{"component":"Text","id":"btn-cancel-t","text":"Cancel"}` +
+	`]}}</a2ui-json>`
+
+// newA2UIFieldFormItem builds an assistant item whose message carries the
+// input-bearing form surface.
+func newA2UIFieldFormItem(t *testing.T) *AssistantMessageItem {
+	t.Helper()
+	sty := styles.CharmtonePantera()
+	msg := &message.Message{
+		ID:   "a2ui-field-form",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "Fill this in:\n\n" + a2uiFieldForm},
+		},
+	}
+	item, ok := NewAssistantMessageItem(&sty, msg).(*AssistantMessageItem)
+	require.True(t, ok)
+	return item
+}
+
+func TestA2UISubmissionPrompt(t *testing.T) {
+	t.Parallel()
+
+	clicked := event.ButtonClicked{
+		Source: event.Source{ComponentID: "btn-send", SurfaceID: "contact"},
+		ID:     "btn-send",
+	}
+
+	// Button only, no field values.
+	require.Equal(t,
+		`[A2UI form submission] The user pressed the "btn-send" button on surface "contact".`,
+		A2UISubmissionPrompt(clicked, nil))
+
+	// Field values are sorted by key and JSON-encoded so their types survive.
+	got := A2UISubmissionPrompt(clicked, map[string]any{
+		"name":      "Joe",
+		"subscribe": true,
+		"count":     float64(3),
+		"tags":      []string{"a", "b"},
+	})
+	require.Equal(t,
+		`[A2UI form submission] The user pressed the "btn-send" button on surface "contact".`+
+			"\nField values:"+
+			"\n- count: 3"+
+			"\n- name: \"Joe\""+
+			"\n- subscribe: true"+
+			"\n- tags: [\"a\",\"b\"]",
+		got)
+
+	// A server-side action's name is included when present.
+	withAction := clicked
+	withAction.Action = &a2ui.EventAction{Name: "submitContact"}
+	require.Equal(t,
+		`[A2UI form submission] The user pressed the "btn-send" button (action "submitContact") on surface "contact".`,
+		A2UISubmissionPrompt(withAction, nil))
+}
+
+func TestA2UIButtonIsCancel(t *testing.T) {
+	t.Parallel()
+
+	cancelIDs := []string{"btn-cancel", "cancel", "dismissBtn", "close_form", "btn-no", "Cancel"}
+	for _, id := range cancelIDs {
+		require.True(t, A2UIButtonIsCancel(event.ButtonClicked{ID: id}), "id %q must read as cancel", id)
+	}
+
+	submitIDs := []string{"btn-send", "submit", "ok", "notify", "disclose", "closest-match"}
+	for _, id := range submitIDs {
+		require.False(t, A2UIButtonIsCancel(event.ButtonClicked{ID: id}), "id %q must not read as cancel", id)
+	}
+
+	// The action name counts too.
+	require.True(t, A2UIButtonIsCancel(event.ButtonClicked{
+		ID:     "btn-2",
+		Action: &a2ui.EventAction{Name: "cancelOrder"},
+	}))
+	require.False(t, A2UIButtonIsCancel(event.ButtonClicked{
+		ID:     "btn-2",
+		Action: &a2ui.EventAction{Name: "placeOrder"},
+	}))
+}
+
+func TestRetireA2UISurfaceCollectsFieldValues(t *testing.T) {
+	t.Parallel()
+
+	item := newA2UIFieldFormItem(t)
+	_ = item.RawRender(80)
+
+	values, ok := item.RetireA2UISurface("contact")
+	require.True(t, ok, "the surface must be found by its A2UI surface ID")
+	require.Equal(t, "Joe", values["name"], "the TextField literal must be collected")
+	require.Equal(t, true, values["subscribe"], "the CheckBox literal must be collected")
+}
+
+func TestRetireA2UISurfaceBlocksRefocusAndKeys(t *testing.T) {
+	t.Parallel()
+
+	item := newA2UIFormItem(t)
+	_ = item.RawRender(80)
+	item.SetFocused(true)
+	require.GreaterOrEqual(t, item.focusedA2UISurfaceIndex(), 0)
+
+	_, ok := item.RetireA2UISurface("form")
+	require.True(t, ok)
+	require.Equal(t, -1, item.focusedA2UISurfaceIndex(), "retiring must blur the surface")
+
+	// Keys no longer reach the retired surface (enter cannot re-submit).
+	handled, _ := item.HandleKeyEvent(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.False(t, handled, "a retired surface must not consume enter")
+
+	// Re-selecting the item must not re-focus the retired surface.
+	item.SetFocused(false)
+	item.SetFocused(true)
+	require.Equal(t, -1, item.focusedA2UISurfaceIndex(), "a retired surface must never regain focus")
+}
+
+func TestRetireA2UISurfaceUnknownID(t *testing.T) {
+	t.Parallel()
+
+	item := newA2UIFormItem(t)
+	_ = item.RawRender(80)
+
+	_, ok := item.RetireA2UISurface("nope")
+	require.False(t, ok)
+	_, ok = item.RetireA2UISurface("")
+	require.False(t, ok)
+
+	// The live surface is untouched: it can still be focused.
+	item.SetFocused(true)
+	require.GreaterOrEqual(t, item.focusedA2UISurfaceIndex(), 0)
 }

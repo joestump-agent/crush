@@ -5,13 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"regexp"
+	"slices"
 	"strings"
+	"unicode"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/joestump-agent/a2tea"
+	"github.com/joestump-agent/a2tea/event"
 	"github.com/joestump-agent/a2tea/render"
+	a2ui "github.com/tmc/a2ui"
 	"github.com/tmc/a2ui/a2uistream"
 )
 
@@ -567,6 +572,7 @@ func (a *AssistantMessageItem) syncA2UISurfaces(src string, parts []a2tea.Part) 
 		return
 	}
 	surfaces := make([]render.Model, len(parts))
+	ids := make([]string, len(parts))
 	for i, p := range parts {
 		if len(p.Messages) == 0 {
 			continue
@@ -580,9 +586,11 @@ func (a *AssistantMessageItem) syncA2UISurfaces(src string, parts []a2tea.Part) 
 		}
 		if rm, ok := model.(render.Model); ok {
 			surfaces[i] = rm
+			ids[i] = a2uiPartSurfaceID(p.Messages)
 		}
 	}
 	a.a2uiSurfaces = surfaces
+	a.a2uiSurfaceIDs = ids
 	a.a2uiSrcHash = h
 	a.a2uiScanned = true
 	// A rebuild replaces focused models with fresh blurred ones; re-grant
@@ -593,11 +601,162 @@ func (a *AssistantMessageItem) syncA2UISurfaces(src string, parts []a2tea.Part) 
 }
 
 // dropA2UISurfaces discards the live surface models, e.g. when the content
-// no longer scans as A2UI.
+// no longer scans as A2UI. Retirement marks are kept: they are keyed by
+// surface ID, and a surface that reappears after a rescan was still already
+// submitted (#45).
 func (a *AssistantMessageItem) dropA2UISurfaces() {
 	a.a2uiSurfaces = nil
+	a.a2uiSurfaceIDs = nil
 	a.a2uiSrcHash = 0
 	a.a2uiScanned = false
+}
+
+// a2uiPartSurfaceID extracts the surface ID a scan-part's messages establish:
+// the first updateComponents' surfaceId — the same rule a2tea.Render uses to
+// pick the surface it draws, so the ID here always names the rendered model.
+func a2uiPartSurfaceID(msgs []a2ui.ServerMessage) string {
+	for _, m := range msgs {
+		if m.UpdateComponents != nil {
+			return m.UpdateComponents.SurfaceID
+		}
+	}
+	return ""
+}
+
+// a2uiSurfaceRetired reports whether the surface at part-index i has been
+// retired after a submission (#45). Retired surfaces still render (showing
+// their final state) but no longer receive focus or keys.
+func (a *AssistantMessageItem) a2uiSurfaceRetired(i int) bool {
+	if i < 0 || i >= len(a.a2uiSurfaceIDs) {
+		return false
+	}
+	return a.a2uiRetired[a.a2uiSurfaceIDs[i]]
+}
+
+// RetireA2UISurface retires the live surface with the given A2UI surface ID
+// after a button press (#45): it reads the surface's current field values,
+// revokes its focus, and marks it retired so the form cannot be re-submitted
+// — the mark is keyed by surface ID, so it survives streaming rebuilds of
+// the model. It returns the gathered values and whether the surface was
+// found on this item.
+func (a *AssistantMessageItem) RetireA2UISurface(surfaceID string) (map[string]any, bool) {
+	if surfaceID == "" {
+		return nil, false
+	}
+	for i, s := range a.a2uiSurfaces {
+		if s == nil || i >= len(a.a2uiSurfaceIDs) || a.a2uiSurfaceIDs[i] != surfaceID {
+			continue
+		}
+		if a.a2uiRetired[surfaceID] {
+			// Already submitted or dismissed: report not-found so a
+			// duplicate event cannot re-read values from a dead form.
+			return nil, false
+		}
+		var values map[string]any
+		if fv, ok := s.(interface{ FieldValues() map[string]any }); ok {
+			values = fv.FieldValues()
+		}
+		if a.a2uiRetired == nil {
+			a.a2uiRetired = make(map[string]bool)
+		}
+		a.a2uiRetired[surfaceID] = true
+		s.Blur()
+		a.Bump()
+		return values, true
+	}
+	return nil, false
+}
+
+// a2uiCancelWords are the button-name tokens read as "dismiss this form":
+// pressing such a button retires the surface without starting an agent turn
+// (#45). Matched against whole tokens of the button's component ID and its
+// action name, never as substrings, so ids like "notify" or "disclose" do
+// not false-positive.
+var a2uiCancelWords = map[string]bool{
+	"cancel":  true,
+	"dismiss": true,
+	"close":   true,
+	"no":      true,
+}
+
+// A2UIButtonIsCancel reports whether an activated button reads as a cancel /
+// dismiss control. A2UI has no cancel semantics of its own — model-authored
+// buttons typically carry no action at all — so the judgment is by naming
+// convention on the component ID (e.g. "btn-cancel", "dismissBtn") and, when
+// present, the server action's name.
+func A2UIButtonIsCancel(clicked event.ButtonClicked) bool {
+	if a2uiHasCancelToken(clicked.ID) {
+		return true
+	}
+	return clicked.Action != nil && a2uiHasCancelToken(clicked.Action.Name)
+}
+
+// a2uiHasCancelToken tokenizes s on non-alphanumeric and camelCase
+// boundaries and reports whether any token is a cancel word.
+func a2uiHasCancelToken(s string) bool {
+	for _, tok := range a2uiNameTokens(s) {
+		if a2uiCancelWords[tok] {
+			return true
+		}
+	}
+	return false
+}
+
+// a2uiNameTokens splits an identifier-ish name ("btn-cancel", "dismissBtn",
+// "close_form") into lowercase word tokens.
+func a2uiNameTokens(s string) []string {
+	var tokens []string
+	var b strings.Builder
+	flush := func() {
+		if b.Len() > 0 {
+			tokens = append(tokens, strings.ToLower(b.String()))
+			b.Reset()
+		}
+	}
+	var prev rune
+	for _, r := range s {
+		switch {
+		case !unicode.IsLetter(r) && !unicode.IsDigit(r):
+			flush()
+		case unicode.IsUpper(r) && unicode.IsLower(prev):
+			flush()
+			b.WriteRune(r)
+		default:
+			b.WriteRune(r)
+		}
+		prev = r
+	}
+	flush()
+	return tokens
+}
+
+// A2UISubmissionPrompt builds the agent-facing message for an A2UI form
+// submission (#45): which button was pressed on which surface, plus the
+// surface's field values at the moment of submission. Values are keyed by
+// component ID, sorted for determinism, and JSON-encoded so their types
+// (string, bool, number, string list) survive the trip through prose.
+func A2UISubmissionPrompt(clicked event.ButtonClicked, values map[string]any) string {
+	var b strings.Builder
+	b.WriteString("[A2UI form submission] The user pressed the ")
+	fmt.Fprintf(&b, "%q button", clicked.ID)
+	if clicked.Action != nil && clicked.Action.Name != "" {
+		fmt.Fprintf(&b, " (action %q)", clicked.Action.Name)
+	}
+	if clicked.SurfaceID != "" {
+		fmt.Fprintf(&b, " on surface %q", clicked.SurfaceID)
+	}
+	b.WriteString(".")
+	if len(values) > 0 {
+		b.WriteString("\nField values:")
+		for _, k := range slices.Sorted(maps.Keys(values)) {
+			enc, err := json.Marshal(values[k])
+			if err != nil {
+				enc = fmt.Appendf(nil, "%q", fmt.Sprintf("%v", values[k]))
+			}
+			fmt.Fprintf(&b, "\n- %s: %s", k, enc)
+		}
+	}
+	return b.String()
 }
 
 // a2uiSurfaceAt returns the live surface for scan-part i, or nil when the
@@ -621,17 +780,18 @@ func (a *AssistantMessageItem) hasLiveA2UISurfaces() bool {
 	return false
 }
 
-// focusA2UISurfaces grants keyboard focus to the first live surface and
-// blurs the rest, honoring the a2tea composition contract of at most one
-// focused child at a time. render.Surface's Focus returns a nil cmd, so
-// dropping it here loses nothing.
+// focusA2UISurfaces grants keyboard focus to the first live, non-retired
+// surface and blurs the rest, honoring the a2tea composition contract of at
+// most one focused child at a time. Retired surfaces (#45) never regain
+// focus — a submitted form must not be re-submittable. render.Surface's
+// Focus returns a nil cmd, so dropping it here loses nothing.
 func (a *AssistantMessageItem) focusA2UISurfaces() {
 	granted := false
-	for _, s := range a.a2uiSurfaces {
+	for i, s := range a.a2uiSurfaces {
 		if s == nil {
 			continue
 		}
-		if !granted {
+		if !granted && !a.a2uiSurfaceRetired(i) {
 			_ = s.Focus()
 			granted = true
 			continue
