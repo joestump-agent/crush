@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/crush/internal/ui/common"
+	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/joestump-agent/a2tea"
 )
 
@@ -117,10 +118,56 @@ func countDroppedTaggedBlocks(content string) int {
 	return dropped
 }
 
-// renderContentWithA2UI renders assistant content that contains A2UI. a2tea
+// renderContentWithA2UI renders assistant content that contains A2UI through
+// the shared pipeline, using the streaming-markdown prefix cache as the
+// whole-content fallback when the scan fails.
+func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, finished bool) string {
+	return renderA2UIContent(a.sty, content, width, finished, a.renderMarkdown)
+}
+
+// RenderA2UIInline renders assistant content that carries A2UI at the given
+// width via the shared a2tea.Scan + render pipeline — the same one the main
+// chat uses. The Sidekick panel calls it to draw surfaces inline in its
+// message list at sidebar (narrow) width; surfaces there are display-only in
+// v1 (no event routing), so buttons and inputs render as read-only visuals.
+//
+// Returns ok=false when the content carries no A2UI (and, for unfinished
+// messages, no truncated block), leaving the caller to render the text its
+// own way.
+func RenderA2UIInline(sty *styles.Styles, content string, width int, finished bool) (out string, ok bool) {
+	switch {
+	case contentHasA2UI(content):
+		return renderA2UIContent(sty, content, width, finished, plainMarkdownRenderer(sty)), true
+	case finished && contentHasUnclosedA2UI(content):
+		// Generation was truncated mid-block: an <a2ui-json> tag never got
+		// its closing partner. Show the alert instead of raw partial JSON.
+		return renderTruncatedA2UIContent(sty, content, width, plainMarkdownRenderer(sty)), true
+	}
+	return "", false
+}
+
+// plainMarkdownRenderer returns a whole-content markdown fallback for callers
+// without a streaming prefix cache (the Sidekick panel). It acquires the
+// shared renderer lock itself, so it must not be called with that lock held.
+func plainMarkdownRenderer(sty *styles.Styles) func(content string, width int) string {
+	return func(content string, width int) string {
+		renderer := common.MarkdownRenderer(sty, width)
+		mu := common.LockMarkdownRenderer(renderer)
+		mu.Lock()
+		defer mu.Unlock()
+		out, err := renderer.Render(content)
+		if err != nil {
+			return strings.TrimSpace(content)
+		}
+		return trimGlamourMargins(out)
+	}
+}
+
+// renderA2UIContent renders assistant content that contains A2UI. a2tea
 // scans the content into ordered parts of prose text and typed A2UI messages;
 // crush renders the prose as markdown and hands each part's messages to
-// a2tea.Render, stitching the rendered surface in place.
+// a2tea.Render, stitching the rendered surface in place. Shared by the main
+// chat (AssistantMessageItem) and the Sidekick panel.
 //
 // Fenced code blocks are masked before scanning so that A2UI examples inside
 // code fences are not extracted as live surfaces (#6). If any complete tag
@@ -128,20 +175,23 @@ func countDroppedTaggedBlocks(content string) int {
 // element is appended (#7). An unclosed <a2ui-json> tag (truncated
 // generation) also triggers the alert (#5).
 //
+// fallback renders the whole content as markdown when the scan fails; it is
+// called without the shared renderer lock held.
+//
 // This deliberately bypasses the streaming-markdown prefix cache (which assumes
 // a single glamour render per item) and renders each segment directly. The
 // renderer is shared, so the whole multi-render sequence holds its lock.
-func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, finished bool) string {
+func renderA2UIContent(sty *styles.Styles, content string, width int, finished bool, fallback func(content string, width int) string) string {
 	masked, fenceReps := maskFencedCode(content)
 
 	parts, err := a2tea.Scan(masked)
 	if err != nil {
 		// Not parseable as A2UI — render everything as markdown so nothing is
 		// lost.
-		return a.renderMarkdown(content, width)
+		return fallback(content, width)
 	}
 
-	renderer := common.MarkdownRenderer(a.sty, width)
+	renderer := common.MarkdownRenderer(sty, width)
 	mu := common.LockMarkdownRenderer(renderer)
 	mu.Lock()
 	defer mu.Unlock()
@@ -194,18 +244,25 @@ func (a *AssistantMessageItem) renderContentWithA2UI(content string, width int, 
 	// hasn't arrived yet, and flashing a red alert between flushes that then
 	// vanishes reads as a glitch.
 	if finished && (countDroppedTaggedBlocks(masked) > 0 || hasUnclosedA2UITag(masked)) {
-		writeChunk(a.renderA2UIAlert(width))
+		writeChunk(renderA2UIAlert(sty, width))
 	}
 
 	return b.String()
 }
 
 // renderTruncatedA2UI handles a finished message whose <a2ui-json> block was
-// never closed — generation was truncated mid-block (#5). The prose before
-// the unclosed tag is rendered as markdown, and the truncated block is
-// surfaced through the standard A2UI alert instead of leaving a wall of raw
-// JSON.
+// never closed, rendering the prose through the streaming-markdown prefix
+// cache.
 func (a *AssistantMessageItem) renderTruncatedA2UI(content string, width int) string {
+	return renderTruncatedA2UIContent(a.sty, content, width, a.renderMarkdown)
+}
+
+// renderTruncatedA2UIContent handles a finished message whose <a2ui-json>
+// block was never closed — generation was truncated mid-block (#5). The prose
+// before the unclosed tag is rendered as markdown (via renderProse), and the
+// truncated block is surfaced through the standard A2UI alert instead of
+// leaving a wall of raw JSON.
+func renderTruncatedA2UIContent(sty *styles.Styles, content string, width int, renderProse func(content string, width int) string) string {
 	// Mask (not strip) fences: a fence containing an <a2ui-json> example must
 	// not be mistaken for the truncation point, but the fence's code must
 	// stay in the rendered prose — stripping deleted it from the message.
@@ -216,24 +273,24 @@ func (a *AssistantMessageItem) renderTruncatedA2UI(content string, width int) st
 	if idx > 0 {
 		prose := unmaskFencedCode(masked[:idx], fenceReps)
 		if strings.TrimSpace(prose) != "" {
-			b.WriteString(a.renderMarkdown(prose, width))
+			b.WriteString(renderProse(prose, width))
 		}
 	}
 	if b.Len() > 0 {
 		b.WriteString("\n\n")
 	}
-	b.WriteString(a.renderA2UIAlert(width))
+	b.WriteString(renderA2UIAlert(sty, width))
 	return b.String()
 }
 
 // renderA2UIAlert builds an alert element shown when content advertised A2UI but
 // a2tea could not turn it into a surface. Styled in crush's existing
 // error-message language.
-func (a *AssistantMessageItem) renderA2UIAlert(width int) string {
+func renderA2UIAlert(sty *styles.Styles, width int) string {
 	inner := max(width-2, 1)
-	tag := a.sty.Messages.ErrorTag.Render("A2UI")
-	title := a.sty.Messages.ErrorTitle.Render("couldn't render a UI block in this message")
-	reason := a.sty.Messages.ErrorDetails.Width(inner).Render(
+	tag := sty.Messages.ErrorTag.Render("A2UI")
+	title := sty.Messages.ErrorTitle.Render("couldn't render a UI block in this message")
+	reason := sty.Messages.ErrorDetails.Width(inner).Render(
 		"The A2UI content was malformed or used unsupported components.")
 	return tag + " " + title + "\n\n" + reason
 }
