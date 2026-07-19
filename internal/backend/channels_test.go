@@ -11,10 +11,12 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -166,6 +168,9 @@ func (c *recordingCoordinator) Sidekick() *agent.EphemeralAgent     { return nil
 func (c *recordingCoordinator) CancelSidekick()                     {}
 func (c *recordingCoordinator) IsSidekickBusy() bool                { return false }
 func (c *recordingCoordinator) ClearSidekick(context.Context) error { return nil }
+func (c *recordingCoordinator) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
+	return nil
+}
 
 // fullFakeSessions adapts fakeChannelSessions to the full session.Service
 // interface by embedding it; only the channelSessionStore subset is

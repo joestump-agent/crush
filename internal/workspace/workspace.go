@@ -10,6 +10,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/catwalk/pkg/catwalk"
+	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/history"
@@ -128,6 +129,12 @@ type Workspace interface {
 	// event stream (streaming deltas included). Returns nil when the
 	// Sidekick is unavailable.
 	SidekickSubscribe(ctx context.Context) <-chan pubsub.Event[message.Message]
+	// SidekickDashboardSubscribe subscribes to agent-pushed dashboard
+	// surfaces for the Sidekick panel's pinned dashboard slot (the main
+	// coder agent's sidekick_update tool, #56/#57). Returns nil when the
+	// workspace cannot deliver dashboard pushes (client/server mode, or
+	// agent not initialized yet).
+	SidekickDashboardSubscribe(ctx context.Context) <-chan pubsub.Event[agenttools.SidekickSurface]
 
 	// Permissions
 	//

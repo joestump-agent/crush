@@ -14,6 +14,7 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/backend"
 	"github.com/charmbracelet/crush/internal/message"
@@ -229,6 +230,9 @@ func (c *scriptedCoordinator) Sidekick() *agent.EphemeralAgent     { return nil 
 func (c *scriptedCoordinator) CancelSidekick()                     {}
 func (c *scriptedCoordinator) IsSidekickBusy() bool                { return false }
 func (c *scriptedCoordinator) ClearSidekick(context.Context) error { return nil }
+func (c *scriptedCoordinator) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
+	return nil
+}
 
 // agentE2EHarness extends the SSE harness with a scripted coordinator
 // wired into the workspace's embedded app.App, so POST /agent drives a

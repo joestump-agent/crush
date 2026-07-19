@@ -503,6 +503,13 @@ func (m *UI) Init() tea.Cmd {
 	if cmd := m.subscribeSidekick(); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
+	// Start draining agent-pushed dashboard surfaces (#56/#57). Unlike
+	// the chat stream this must be live without any user action —
+	// pushes arrive while the user works in the main chat — so it is
+	// also retried from sendMessage until the agent is ready.
+	if cmd := m.subscribeSidekickDashboard(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -683,6 +690,14 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case sidekickRunFinishedMsg:
 		m.handleSidekickRunFinished(msg.err)
+	case sidekickDashboardMsg:
+		// Deterministic dashboard routing (#56): pushes from the main
+		// agent's sidekick_update tool replace the pinned surface in
+		// place and never touch any chat stream.
+		m.applySidekickDashboard(msg.event)
+		if cmd := m.awaitSidekickDashboardEvent(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case busyStateMsg:
 		cmds = append(cmds, m.applyBusyState(msg)...)
 	case promptQueueMsg:
@@ -2558,9 +2573,9 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				m.cycleSidebarTab()
 				if m.sidekickTabInView() {
 					// Landed on the Sidekick tab: focus its prompt and
-					// make sure the event stream is being drained.
+					// make sure the event streams are being drained.
 					m.ensureSidekickInput()
-					cmds = append(cmds, m.sidekick.input.Focus(), m.subscribeSidekick())
+					cmds = append(cmds, m.sidekick.input.Focus(), m.subscribeSidekick(), m.subscribeSidekickDashboard())
 				}
 			case key.Matches(msg, m.keyMap.Editor.Escape):
 				m.focus = uiFocusEditor
@@ -3918,6 +3933,15 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 		}
 		return nil
 	})
+
+	// A new main-agent turn retires the previous turn's Sidekick
+	// dashboard (#56): the pinned surface persists only until the next
+	// prompt. The subscription is also (re)attempted here in case the
+	// agent was not ready at Init.
+	m.sidekick.dashboard = ""
+	if cmd := m.subscribeSidekickDashboard(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 
 	// Capture session ID to avoid race with main goroutine updating m.session.
 	sessionID := m.session.ID

@@ -67,6 +67,9 @@ type KeyMap struct {
 	Tab        key.Binding
 	ToggleYolo key.Binding
 	Sidekick   key.Binding
+	// SidekickDismiss drops the pinned dashboard surface; only active
+	// while the Sidekick pane is focused.
+	SidekickDismiss key.Binding
 }
 
 func DefaultKeyMap() KeyMap {
@@ -106,6 +109,10 @@ func DefaultKeyMap() KeyMap {
 		Sidekick: key.NewBinding(
 			key.WithKeys("ctrl+a"),
 			key.WithHelp("ctrl+a", "sidekick"),
+		),
+		SidekickDismiss: key.NewBinding(
+			key.WithKeys("ctrl+x"),
+			key.WithHelp("ctrl+x", "dismiss dashboard"),
 		),
 	}
 
