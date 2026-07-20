@@ -34,19 +34,23 @@ type EphemeralAgent struct {
 	Messages message.Service
 }
 
-// NewEphemeralAgent builds an [EphemeralAgent] from opts. The Sessions,
-// Messages, Ephemeral, DisableAutoSummarize, and Notify fields of opts
-// are overridden to enforce the ephemeral contract; everything else
-// (models, prompt, tools, config) is used as provided.
+// NewEphemeralAgent builds an [EphemeralAgent] from opts. Ephemeral is
+// forced on to enforce the fire-and-forget contract. Sessions and
+// Messages default to fresh private in-memory stores, but a caller may
+// supply its own in-memory stores (both must be in-memory to preserve
+// the no-persistence contract) — a dispatched agent does this so it can
+// subscribe to the same store its todos tool writes to (#65).
 func NewEphemeralAgent(opts SessionAgentOptions) *EphemeralAgent {
-	sessions := session.NewInMemoryService()
-	messages := message.NewInMemoryService()
-	opts.Sessions = sessions
-	opts.Messages = messages
+	if opts.Sessions == nil {
+		opts.Sessions = session.NewInMemoryService()
+	}
+	if opts.Messages == nil {
+		opts.Messages = message.NewInMemoryService()
+	}
 	opts.Ephemeral = true
 	return &EphemeralAgent{
 		SessionAgent: NewSessionAgent(opts),
-		Sessions:     sessions,
-		Messages:     messages,
+		Sessions:     opts.Sessions,
+		Messages:     opts.Messages,
 	}
 }

@@ -14,6 +14,8 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/session"
 )
 
 //go:embed templates/dispatch_agent.md
@@ -122,6 +124,12 @@ func (c *coordinator) runDispatch(ctx context.Context, params DispatchAgentParam
 	c.dispatchRegistry.SetSessionID(ws.ID, sess.ID)
 	c.dispatchRegistry.SetStatus(ws.ID, dispatch.StatusRunning)
 
+	// Stream the dispatched agent's todo progress to the Sidekick
+	// dashboard for the duration of the run (#65); untrack collapses its
+	// card when the run finishes.
+	c.dispatchProgress.track(ctx, ws.ID, ws.Path, sess.ID, agent.Sessions)
+	defer c.dispatchProgress.untrack(ws.ID)
+
 	maxTokens := model.CatwalkCfg.DefaultMaxTokens
 	if model.ModelCfg.MaxTokens != 0 {
 		maxTokens = model.ModelCfg.MaxTokens
@@ -226,7 +234,14 @@ func (c *coordinator) buildDispatchAgent(ctx context.Context, workspacePath, mod
 		model = large
 	}
 
-	agentTools, err := c.buildTools(ctx, dispatchCfg, true, workspacePath)
+	// Private in-memory stores for this dispatch. The toolchain's todos
+	// tool writes into this session store, and the progress collector
+	// (#65) subscribes to the same store — so todo updates stream to the
+	// dashboard instead of vanishing against the main store.
+	sessions := session.NewInMemoryService()
+	messages := message.NewInMemoryService()
+
+	agentTools, err := c.buildTools(ctx, dispatchCfg, true, workspacePath, sessions)
 	if err != nil {
 		return nil, Model{}, err
 	}
@@ -250,6 +265,8 @@ func (c *coordinator) buildDispatchAgent(ctx context.Context, workspacePath, mod
 		IsYolo:             c.permissions.SkipRequests(),
 		Cfg:                c.cfg,
 		Tools:              agentTools,
+		Sessions:           sessions,
+		Messages:           messages,
 	})
 	return agent, model, nil
 }
