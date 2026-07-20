@@ -256,7 +256,7 @@ func NewCoordinator(
 		return nil, err
 	}
 
-	agent, err := c.buildAgent(ctx, prompt, agentCfg, false)
+	agent, err := c.buildAgent(ctx, prompt, agentCfg, false, "")
 	if err != nil {
 		return nil, err
 	}
@@ -663,7 +663,13 @@ func mergeCallOptions(model Model, cfg config.ProviderConfig) (fantasy.ProviderO
 	return modelOptions, temp, topP, topK, freqPenalty, presPenalty
 }
 
-func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, agent config.Agent, isSubAgent bool) (SessionAgent, error) {
+// buildAgent constructs a SessionAgent for agent. workingDir roots the
+// agent's toolchain (bash/edit/glob/grep/view/...): an empty value uses
+// the coordinator's workspace root, while a dispatched agent passes the
+// path of its isolated workspace so every file and shell tool operates
+// there instead. The prompt's working dir is the caller's concern; it is
+// set on the passed-in prompt.
+func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, agent config.Agent, isSubAgent bool, workingDir string) (SessionAgent, error) {
 	large, small, err := c.buildAgentModels(ctx, isSubAgent)
 	if err != nil {
 		return nil, err
@@ -703,7 +709,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		if err := mcp.WaitForInit(ctx); err != nil {
 			return err
 		}
-		tools, err := c.buildTools(ctx, agent, isSubAgent)
+		tools, err := c.buildTools(ctx, agent, isSubAgent, workingDir)
 		if err != nil {
 			return err
 		}
@@ -1030,7 +1036,17 @@ func (c *coordinator) sidekickSession(ctx context.Context) (string, error) {
 	return sess.ID, nil
 }
 
-func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubAgent bool) ([]fantasy.AgentTool, error) {
+// buildTools assembles agent's tool set. workingDir roots every
+// filesystem-scoped tool (bash, edit, glob, grep, ls, view, write,
+// download, fetch), the PreToolUse hook runner, and the MCP tools; an
+// empty value falls back to the coordinator's workspace root so all
+// existing callers are unchanged. A dispatched agent passes its isolated
+// workspace path here, which is the whole isolation boundary — the tools
+// resolve their paths against the workspace rather than the main tree.
+func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubAgent bool, workingDir string) ([]fantasy.AgentTool, error) {
+	if workingDir == "" {
+		workingDir = c.cfg.WorkingDir()
+	}
 	var allTools []fantasy.AgentTool
 	if slices.Contains(agent.AllowedTools, AgentToolName) {
 		agentTool, err := c.agentTool(ctx)
@@ -1070,7 +1086,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// Build hook runner if PreToolUse hooks are configured.
 	var hookRunner *hooks.Runner
 	if preToolHooks := c.cfg.Config().Hooks[hooks.EventPreToolUse]; len(preToolHooks) > 0 {
-		hookRunner = hooks.NewRunner(preToolHooks, c.cfg.WorkingDir(), c.cfg.WorkingDir())
+		hookRunner = hooks.NewRunner(preToolHooks, workingDir, workingDir)
 	}
 
 	// The Sidekick dashboard push channel (#57): main coder agent only —
@@ -1084,22 +1100,22 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 
 	allTools = append(
 		allTools,
-		tools.NewBashTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Options.Attribution, modelID, allowedCommands, allowAllCommands),
+		tools.NewBashTool(c.permissions, workingDir, c.cfg.Config().Options.Attribution, modelID, allowedCommands, allowAllCommands),
 		tools.NewCrushInfoTool(c.cfg, c.lspManager, c.allSkills, c.activeSkills, c.skillTracker),
 		tools.NewCrushLogsTool(logFile),
 		tools.NewJobOutputTool(),
 		tools.NewJobKillTool(),
-		tools.NewDownloadTool(c.permissions, c.cfg.WorkingDir(), nil),
-		tools.NewEditTool(c.lspManager, c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
-		tools.NewMultiEditTool(c.lspManager, c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
-		tools.NewFetchTool(c.permissions, c.cfg.WorkingDir(), nil),
-		tools.NewGlobTool(c.cfg.WorkingDir(), c.cfg.Config().Tools.Glob),
-		tools.NewGrepTool(c.cfg.WorkingDir(), c.cfg.Config().Tools.Grep),
-		tools.NewLsTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Tools.Ls),
+		tools.NewDownloadTool(c.permissions, workingDir, nil),
+		tools.NewEditTool(c.lspManager, c.permissions, c.history, c.filetracker, workingDir),
+		tools.NewMultiEditTool(c.lspManager, c.permissions, c.history, c.filetracker, workingDir),
+		tools.NewFetchTool(c.permissions, workingDir, nil),
+		tools.NewGlobTool(workingDir, c.cfg.Config().Tools.Glob),
+		tools.NewGrepTool(workingDir, c.cfg.Config().Tools.Grep),
+		tools.NewLsTool(c.permissions, workingDir, c.cfg.Config().Tools.Ls),
 		tools.NewSourcegraphTool(nil),
 		tools.NewTodosTool(c.sessions),
-		tools.NewViewTool(c.lspManager, c.permissions, c.filetracker, c.skillTracker, c.cfg.WorkingDir(), c.cfg.Config().Options.SkillsPaths...),
-		tools.NewWriteTool(c.lspManager, c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
+		tools.NewViewTool(c.lspManager, c.permissions, c.filetracker, c.skillTracker, workingDir, c.cfg.Config().Options.SkillsPaths...),
+		tools.NewWriteTool(c.lspManager, c.permissions, c.history, c.filetracker, workingDir),
 	)
 
 	// Add LSP tools if user has configured LSPs or auto_lsp is enabled (nil or true).
@@ -1124,7 +1140,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 		}
 	}
 
-	for _, tool := range tools.GetMCPTools(c.permissions, c.cfg, c.cfg.WorkingDir()) {
+	for _, tool := range tools.GetMCPTools(c.permissions, c.cfg, workingDir) {
 		if agent.AllowedMCP == nil {
 			// No MCP restrictions
 			filteredTools = append(filteredTools, tool)
@@ -1577,7 +1593,7 @@ func (c *coordinator) UpdateModels(ctx context.Context) error {
 		return errCoderAgentNotConfigured
 	}
 
-	tools, err := c.buildTools(ctx, agentCfg, false)
+	tools, err := c.buildTools(ctx, agentCfg, false, "")
 	if err != nil {
 		return err
 	}

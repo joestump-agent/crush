@@ -65,7 +65,16 @@ func newSidekickTestCoordinator(t *testing.T, env fakeEnv, baseURL string) *coor
 		nil,
 	)
 	require.NoError(t, err)
-	return coord.(*coordinator)
+	c := coord.(*coordinator)
+
+	// NewCoordinator returns while buildAgent's background goroutines
+	// (system prompt + tool build) are still reading cfg. Tests that then
+	// mutate cfg — DisableA2UI, SetupAgents, model selection — race those
+	// reads under -race. Production callers serialize via readyWg.Wait()
+	// before the first run; do the same here so construction settles
+	// before the test touches shared config.
+	require.NoError(t, c.readyWg.Wait())
+	return c
 }
 
 // newSidekickSSEServer serves a minimal OpenAI-compatible streaming chat
