@@ -60,14 +60,14 @@ func TestBuildToolsRootsToolchainAtWorkingDir(t *testing.T) {
 	}
 
 	// Scoped to the workspace: the glob tool finds the sentinel.
-	scoped, err := coord.buildTools(t.Context(), agentCfg, true, workspace)
+	scoped, err := coord.buildTools(t.Context(), agentCfg, true, workspace, nil)
 	require.NoError(t, err)
 	require.Contains(t, runGlob(t, findTool(t, scoped, tools.GlobToolName), "sentinel-*.txt"), sentinel)
 
 	// Unset working dir: the toolchain roots at the main tree, which has
 	// no sentinel — proving the default path is unchanged.
 	require.NotEqual(t, workspace, coord.cfg.WorkingDir())
-	def, err := coord.buildTools(t.Context(), agentCfg, true, "")
+	def, err := coord.buildTools(t.Context(), agentCfg, true, "", nil)
 	require.NoError(t, err)
 	require.NotContains(t, runGlob(t, findTool(t, def, tools.GlobToolName), "sentinel-*.txt"), sentinel)
 }

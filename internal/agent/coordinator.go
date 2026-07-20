@@ -199,6 +199,10 @@ type coordinator struct {
 	// has no workspace root (e.g. some test harnesses), in which case the
 	// tool reports dispatch unavailable rather than panicking.
 	dispatchRegistry *dispatch.Registry
+	// dispatchProgress streams dispatched agents' todo progress to the
+	// Sidekick dashboard (#65). Each dispatch registers its ephemeral
+	// session with it for the duration of the run.
+	dispatchProgress *dispatchProgress
 
 	readyWg errgroup.Group
 }
@@ -249,6 +253,9 @@ func NewCoordinator(
 			dispatch.NewGitBackend(cfg.WorkingDir()),
 		),
 	}
+	// Dispatched agents stream their todo progress to the Sidekick
+	// dashboard via the same broker the sidekick_update tool feeds (#65).
+	c.dispatchProgress = newDispatchProgress(dashboardSink{dashboard: c.sidekickDashboard})
 
 	agentCfg, ok := cfg.Config().Agents[config.AgentCoder]
 	if !ok {
@@ -725,7 +732,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		if err := mcp.WaitForInit(ctx); err != nil {
 			return err
 		}
-		tools, err := c.buildTools(ctx, agent, isSubAgent, workingDir)
+		tools, err := c.buildTools(ctx, agent, isSubAgent, workingDir, nil)
 		if err != nil {
 			return err
 		}
@@ -1059,9 +1066,17 @@ func (c *coordinator) sidekickSession(ctx context.Context) (string, error) {
 // existing callers are unchanged. A dispatched agent passes its isolated
 // workspace path here, which is the whole isolation boundary — the tools
 // resolve their paths against the workspace rather than the main tree.
-func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubAgent bool, workingDir string) ([]fantasy.AgentTool, error) {
+func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubAgent bool, workingDir string, sessions session.Service) ([]fantasy.AgentTool, error) {
 	if workingDir == "" {
 		workingDir = c.cfg.WorkingDir()
+	}
+	// sessions roots the todos tool's store. A dispatched agent passes its
+	// own ephemeral store so its todos persist there (and stream from
+	// there, #65) instead of vanishing against the main store, which has
+	// no record of the dispatch's session. Empty falls back to the main
+	// store, unchanged for every existing caller.
+	if sessions == nil {
+		sessions = c.sessions
 	}
 	var allTools []fantasy.AgentTool
 	if slices.Contains(agent.AllowedTools, AgentToolName) {
@@ -1133,7 +1148,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 		tools.NewGrepTool(workingDir, c.cfg.Config().Tools.Grep),
 		tools.NewLsTool(c.permissions, workingDir, c.cfg.Config().Tools.Ls),
 		tools.NewSourcegraphTool(nil),
-		tools.NewTodosTool(c.sessions),
+		tools.NewTodosTool(sessions),
 		tools.NewViewTool(c.lspManager, c.permissions, c.filetracker, c.skillTracker, workingDir, c.cfg.Config().Options.SkillsPaths...),
 		tools.NewWriteTool(c.lspManager, c.permissions, c.history, c.filetracker, workingDir),
 	)
@@ -1613,7 +1628,7 @@ func (c *coordinator) UpdateModels(ctx context.Context) error {
 		return errCoderAgentNotConfigured
 	}
 
-	tools, err := c.buildTools(ctx, agentCfg, false, "")
+	tools, err := c.buildTools(ctx, agentCfg, false, "", nil)
 	if err != nil {
 		return err
 	}
