@@ -15,10 +15,10 @@ var (
 	defaultOutputModes = []string{"text/plain"}
 )
 
-// skillTag is the single tag applied to every derived A2A skill. AgentSkill.Tags
-// is a required (non-omitempty) field, and Crush skills have no native tag
-// concept, so a stable marker keeps the card spec-valid without inventing
-// per-skill taxonomy.
+// skillTag is the single tag applied to every derived A2A skill.
+// AgentSkill.Tags is a required (non-omitempty) field, and Crush skills have
+// no native tag concept, so a stable marker keeps the card spec-valid
+// without inventing per-skill taxonomy.
 const skillTag = "crush-skill"
 
 // CardParams are the inputs needed to describe a dispatched worktree agent as

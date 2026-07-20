@@ -2,7 +2,9 @@ package a2a
 
 import (
 	"context"
+	"errors"
 	"iter"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -66,12 +68,12 @@ func NewExecutor(runner Runner, sessionID string, opts ...Option) *Executor {
 
 var _ a2asrv.AgentExecutor = (*Executor)(nil)
 
-// Execute runs one dispatched agent turn. It announces the task submitted (for
-// a new task), emits Working, invokes the SessionAgent, then emits the diff
-// artifact (if any) and a terminal Completed status carrying the agent's text
-// output. A run error maps to a Failed status with the error surfaced; per the
-// AgentExecutor contract, failures after work has begun are reported as events,
-// not as a returned error.
+// Execute runs one dispatched agent turn. It announces the task submitted
+// (for a new task), emits Working, invokes the SessionAgent, then emits the
+// diff artifact (if any) and a terminal Completed status carrying the agent's
+// text output. A run error maps to a Failed status with the error surfaced;
+// per the AgentExecutor contract, failures after work has begun are reported
+// as events, not as a returned error.
 func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
 		// A message that referenced no existing task starts a new one:
@@ -82,16 +84,43 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			}
 		}
 
+		// A message with no text carries nothing to run — SessionAgent.Run
+		// would bounce it as an empty prompt — so reject the task without
+		// starting a turn. Rejected is the terminal state for "was not
+		// started"; Failed is reserved for work that began and broke.
+		prompt := messageText(execCtx.Message)
+		if prompt == "" {
+			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateRejected,
+				agentMessage(execCtx, "message has no text to run")), nil)
+			return
+		}
+
 		if !yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateWorking, nil), nil) {
 			return
 		}
 
 		result, err := e.runner.Run(ctx, agent.SessionAgentCall{
 			SessionID: e.sessionID,
-			Prompt:    messageText(execCtx.Message),
+			Prompt:    prompt,
 		})
-		if err != nil {
-			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed, errorMessage(err)), nil)
+		switch {
+		case errors.Is(err, context.Canceled):
+			// The run was canceled — by this executor's Cancel, which
+			// emits the terminal Canceled status itself. A Failed status
+			// here would race it.
+			return
+		case err != nil:
+			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
+				agentMessage(execCtx, err.Error())), nil)
+			return
+		case result == nil:
+			// Run returns (nil, nil) without doing any work when the
+			// session is busy (the prompt was silently queued behind the
+			// active turn) or a cancel landed during dispatch. No turn ran
+			// on behalf of this task, so completing it would misreport;
+			// fail it and let the caller retry against an idle session.
+			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
+				agentMessage(execCtx, "agent session did not start a turn (busy or canceled)")), nil)
 			return
 		}
 
@@ -103,7 +132,8 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			}
 		}
 
-		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted, resultMessage(result)), nil)
+		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted,
+			agentMessage(execCtx, result.Response.Content.Text())), nil)
 	}
 }
 
@@ -116,13 +146,39 @@ func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) 
 	}
 }
 
-// GitDiff returns a [DiffFunc] that captures the uncommitted diff of the git
-// worktree rooted at dir (`git -C dir diff`), the dispatched agent's work
-// product. A non-zero git exit or missing repo surfaces as an error, which the
+// GitDiff returns a [DiffFunc] that captures the full uncommitted state of
+// the git worktree rooted at dir — staged and unstaged changes to tracked
+// files plus untracked files — as one unified diff against HEAD, the
+// dispatched agent's work product. Everything is staged into a throwaway
+// temporary index so the worktree's real index is never touched. A git
+// failure, missing repo, or unborn HEAD surfaces as an error, which the
 // executor treats as "no artifact" rather than a run failure.
 func GitDiff(dir string) DiffFunc {
 	return func(ctx context.Context) (string, error) {
-		out, err := exec.CommandContext(ctx, "git", "-C", dir, "diff").Output()
+		tmp, err := os.CreateTemp("", "crush-a2a-index-")
+		if err != nil {
+			return "", err
+		}
+		tmp.Close()
+		defer os.Remove(tmp.Name())
+
+		env := append(os.Environ(), "GIT_INDEX_FILE="+tmp.Name())
+		git := func(args ...string) *exec.Cmd {
+			cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+			cmd.Env = env
+			return cmd
+		}
+
+		// Seed the temp index from HEAD, stage the entire worktree into it
+		// (respecting .gitignore, so untracked files are included), and
+		// diff that against HEAD.
+		if err := git("read-tree", "HEAD").Run(); err != nil {
+			return "", err
+		}
+		if err := git("add", "-A").Run(); err != nil {
+			return "", err
+		}
+		out, err := git("diff", "--cached", "HEAD").Output()
 		if err != nil {
 			return "", err
 		}
@@ -151,18 +207,8 @@ func messageText(msg *a2aspec.Message) string {
 	return b.String()
 }
 
-// resultMessage wraps a run's text output as an agent-role A2A message for the
-// terminal status update. A nil result yields an empty message.
-func resultMessage(result *fantasy.AgentResult) *a2aspec.Message {
-	var text string
-	if result != nil {
-		text = result.Response.Content.Text()
-	}
-	return a2aspec.NewMessage(a2aspec.MessageRoleAgent, a2aspec.NewTextPart(text))
-}
-
-// errorMessage wraps a run error as an agent-role A2A message for the failed
-// status update.
-func errorMessage(err error) *a2aspec.Message {
-	return a2aspec.NewMessage(a2aspec.MessageRoleAgent, a2aspec.NewTextPart(err.Error()))
+// agentMessage wraps text as an agent-role A2A message stamped with the
+// task's IDs, for terminal status-update payloads.
+func agentMessage(info a2aspec.TaskInfoProvider, text string) *a2aspec.Message {
+	return a2aspec.NewMessageForTask(a2aspec.MessageRoleAgent, info, a2aspec.NewTextPart(text))
 }
