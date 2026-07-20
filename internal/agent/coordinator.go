@@ -26,6 +26,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/discover"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/filetracker"
 	"github.com/charmbracelet/crush/internal/history"
@@ -96,6 +97,11 @@ type Coordinator interface {
 	BeginAccepted(sessionID string) *AcceptedRun
 	Cancel(sessionID string)
 	CancelAll()
+	// CleanupDispatches tears down every isolated workspace provisioned
+	// by the dispatch_agent tool (#64), removing worktrees and their
+	// branches. Called on shutdown so an abandoned dispatch never leaves
+	// an orphaned worktree behind.
+	CleanupDispatches(ctx context.Context) error
 	IsSessionBusy(sessionID string) bool
 	IsBusy() bool
 	QueuedPrompts(sessionID string) int
@@ -188,6 +194,12 @@ type coordinator struct {
 	activeSkills []*skills.Skill // Post-filter: active skills only.
 	skillTracker *skills.Tracker
 
+	// dispatchRegistry provisions and tracks the isolated workspaces the
+	// dispatch_agent tool (#64) runs agents in. Nil when the coordinator
+	// has no workspace root (e.g. some test harnesses), in which case the
+	// tool reports dispatch unavailable rather than panicking.
+	dispatchRegistry *dispatch.Registry
+
 	readyWg errgroup.Group
 }
 
@@ -232,6 +244,10 @@ func NewCoordinator(
 		activeSkills:      activeSkills,
 		skillTracker:      skillTracker,
 		sidekickDashboard: pubsub.NewBroker[tools.SidekickSurface](),
+		dispatchRegistry: dispatch.NewRegistry(
+			filepath.Join(cfg.WorkingDir(), ".crush", "dispatch"),
+			dispatch.NewGitBackend(cfg.WorkingDir()),
+		),
 	}
 
 	agentCfg, ok := cfg.Config().Agents[config.AgentCoder]
@@ -1054,6 +1070,10 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 			return nil, err
 		}
 		allTools = append(allTools, agentTool)
+	}
+
+	if slices.Contains(agent.AllowedTools, DispatchAgentToolName) {
+		allTools = append(allTools, c.dispatchAgentTool())
 	}
 
 	if slices.Contains(agent.AllowedTools, tools.AgenticFetchToolName) {

@@ -703,6 +703,16 @@ func (app *App) Shutdown() {
 		shell.GetBackgroundShellManager().KillAll(shutdownCtx)
 	})
 
+	// Sweep any isolated dispatch workspaces (git worktrees) so an
+	// abandoned dispatch never leaves an orphaned worktree or branch.
+	if app.AgentCoordinator != nil {
+		wg.Go(func() {
+			if err := app.AgentCoordinator.CleanupDispatches(shutdownCtx); err != nil {
+				slog.Error("Failed to clean up dispatch workspaces on shutdown", "error", err)
+			}
+		})
+	}
+
 	// Close herdr client to stop its background writer.
 	app.herdrClient.Close()
 
