@@ -784,6 +784,16 @@ func quickStyle(o quickStyleOpts) Styles {
 	// Sidebar
 	s.Sidebar.SessionTitle = lipgloss.NewStyle().Foreground(o.fgMoreSubtle)
 	s.Sidebar.WorkingDir = lipgloss.NewStyle().Foreground(o.fgMoreSubtle)
+	s.Sidebar.TabActive = lipgloss.NewStyle().Foreground(o.fgBase).Bold(true)
+	s.Sidebar.TabInactive = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
+	s.Sidebar.TabBadge = lipgloss.NewStyle().Foreground(o.secondary)
+	s.Sidebar.TabPlaceholder = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
+	s.Sidebar.SidekickUser = lipgloss.NewStyle().Foreground(o.fgBase).Bold(true)
+	s.Sidebar.SidekickAssistant = lipgloss.NewStyle().Foreground(o.fgMoreSubtle)
+	s.Sidebar.SidekickTool = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
+	s.Sidebar.SidekickThinking = lipgloss.NewStyle().Foreground(o.fgMostSubtle).Italic(true)
+	s.Sidebar.SidekickError = lipgloss.NewStyle().Foreground(o.error)
+	s.Sidebar.SidekickFooter = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
 
 	// ModelInfo
 	s.ModelInfo.Icon = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
@@ -871,6 +881,14 @@ func quickStyle(o quickStyleOpts) Styles {
 	s.Messages.ThinkingTruncationHint = muted
 	s.Messages.ThinkingFooterTitle = muted
 	s.Messages.ThinkingFooterDuration = subtle
+
+	// A2UI surface container. a2tea renders its chrome with terminal
+	// defaults, so a subtle themed frame makes surfaces read as part of
+	// the chat (like the thinking box) rather than plain output.
+	s.Messages.A2UISurface = base.
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(o.bgMostVisible).
+		Padding(0, 1)
 
 	// Text selection.
 	s.TextSelection = lipgloss.NewStyle().Foreground(o.onPrimary).Background(o.primary)

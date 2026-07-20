@@ -197,8 +197,20 @@ type Styles struct {
 
 	// Sidebar
 	Sidebar struct {
-		SessionTitle lipgloss.Style // Current session title at top of sidebar
-		WorkingDir   lipgloss.Style // Working directory path (PrettyPath)
+		SessionTitle   lipgloss.Style // Current session title at top of sidebar
+		WorkingDir     lipgloss.Style // Working directory path (PrettyPath)
+		TabActive      lipgloss.Style // Active tab label in the sidebar tab bar
+		TabInactive    lipgloss.Style // Inactive tab label in the sidebar tab bar
+		TabBadge       lipgloss.Style // Unread badge (● N) on the Sidekick tab
+		TabPlaceholder lipgloss.Style // Placeholder text for empty tab content
+
+		// Sidekick chat panel (message list + input + footer).
+		SidekickUser      lipgloss.Style // User prompt lines ("> ..." marker included)
+		SidekickAssistant lipgloss.Style // Assistant response text
+		SidekickTool      lipgloss.Style // Compact tool-call lines (⚙ bash)
+		SidekickThinking  lipgloss.Style // "Thinking…" indicator while a run streams
+		SidekickError     lipgloss.Style // Inline error line when a run fails
+		SidekickFooter    lipgloss.Style // Footer: active model + tool state
 	}
 
 	// ModelInfo (model name, provider, reasoning, token/cost summary)
@@ -288,6 +300,9 @@ type Styles struct {
 		ChannelInfoSender    lipgloss.Style // Sender name in channel metadata line
 		ChannelInfoProvider  lipgloss.Style // "via <channel>" text
 		ChannelInfoTimestamp lipgloss.Style // "at <timestamp>" text
+
+		// A2UISurface - themed container around rendered A2UI surfaces
+		A2UISurface lipgloss.Style
 	}
 
 	// Tool - styles for tool call rendering

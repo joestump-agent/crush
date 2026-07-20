@@ -13,10 +13,13 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/backend"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -82,6 +85,21 @@ func (s *runCoordinator) Summarize(context.Context, string) error {
 func (s *runCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (s *runCoordinator) UpdateModels(context.Context) error            { return nil }
 func (s *runCoordinator) GenerateTitle(context.Context, string, string) {}
+func (s *runCoordinator) RunSidekick(context.Context, string) (*fantasy.AgentResult, error) {
+	return nil, nil
+}
+
+func (s *runCoordinator) Sidekick() *agent.EphemeralAgent     { return nil }
+func (s *runCoordinator) CancelSidekick()                     {}
+func (s *runCoordinator) IsSidekickBusy() bool                { return false }
+func (s *runCoordinator) ClearSidekick(context.Context) error { return nil }
+func (s *runCoordinator) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
+	return nil
+}
+
+func (s *runCoordinator) SidekickModel() config.SelectedModel { return config.SelectedModel{} }
+
+func (s *runCoordinator) SetSidekickModel(config.SelectedModel) error { return nil }
 
 func (s *runCoordinator) capturedCtx() context.Context {
 	s.mu.Lock()

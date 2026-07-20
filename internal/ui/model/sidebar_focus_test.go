@@ -29,15 +29,33 @@ func newSidebarTestUI() *UI {
 	}
 }
 
-// TestTabSidebarGoesToEditor exercises the real handleKeyPressMsg to verify
-// that Tab from the sidebar returns focus to the editor.
-func TestTabSidebarGoesToEditor(t *testing.T) {
+// TestTabSidebarCyclesTabs exercises the real handleKeyPressMsg to verify
+// that Tab while the sidebar is focused cycles the sidebar tabs
+// (Info → Sidekick → Info) and keeps focus on the sidebar.
+func TestTabSidebarCyclesTabs(t *testing.T) {
 	t.Parallel()
 	m := newSidebarTestUI()
 	m.focus = uiFocusSidebar
 	m.keyMap.Tab = key.NewBinding(key.WithKeys("tab"))
+	require.Equal(t, sidebarTabInfo, m.sidebarTab)
 
 	m.handleKeyPressMsg(tea.KeyPressMsg{Code: tea.KeyTab, Text: "tab"})
+	require.Equal(t, uiFocusSidebar, m.focus, "Tab must keep focus on the sidebar")
+	require.Equal(t, sidebarTabSidekick, m.sidebarTab)
+
+	m.handleKeyPressMsg(tea.KeyPressMsg{Code: tea.KeyTab, Text: "tab"})
+	require.Equal(t, uiFocusSidebar, m.focus)
+	require.Equal(t, sidebarTabInfo, m.sidebarTab, "Tab must wrap back to the Info tab")
+}
+
+// TestEscSidebarGoesToEditor exercises the real handleKeyPressMsg to verify
+// that Esc from the sidebar returns focus to the editor.
+func TestEscSidebarGoesToEditor(t *testing.T) {
+	t.Parallel()
+	m := newSidebarTestUI()
+	m.focus = uiFocusSidebar
+
+	m.handleKeyPressMsg(tea.KeyPressMsg{Code: tea.KeyEscape})
 	require.Equal(t, uiFocusEditor, m.focus)
 }
 
