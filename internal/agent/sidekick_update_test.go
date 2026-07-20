@@ -35,12 +35,12 @@ func TestSidekickUpdateToolWiring(t *testing.T) {
 	}
 
 	// Main coder agent gets the tool.
-	built, err := coord.buildTools(t.Context(), agentCfg, false)
+	built, err := coord.buildTools(t.Context(), agentCfg, false, "")
 	require.NoError(t, err)
 	require.Contains(t, toolNames(built), tools.SidekickUpdateToolName)
 
 	// Sub-agents never do, even with the tool allowed.
-	built, err = coord.buildTools(t.Context(), agentCfg, true)
+	built, err = coord.buildTools(t.Context(), agentCfg, true, "")
 	require.NoError(t, err)
 	require.NotContains(t, toolNames(built), tools.SidekickUpdateToolName)
 
@@ -53,7 +53,7 @@ func TestSidekickUpdateToolWiring(t *testing.T) {
 
 	// Disabling A2UI removes the push channel: the payload is A2UI.
 	coord.cfg.Config().Options.DisableA2UI = true
-	built, err = coord.buildTools(t.Context(), agentCfg, false)
+	built, err = coord.buildTools(t.Context(), agentCfg, false, "")
 	require.NoError(t, err)
 	require.NotContains(t, toolNames(built), tools.SidekickUpdateToolName)
 }
@@ -86,7 +86,7 @@ func TestSidekickDashboardSubscribeDeliversToolPushes(t *testing.T) {
 	require.NotNil(t, sub)
 
 	agentCfg := config.Agent{ID: config.AgentCoder, AllowedTools: []string{tools.SidekickUpdateToolName}}
-	built, err := coord.buildTools(t.Context(), agentCfg, false)
+	built, err := coord.buildTools(t.Context(), agentCfg, false, "")
 	require.NoError(t, err)
 	require.Len(t, built, 1)
 
