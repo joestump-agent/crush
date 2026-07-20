@@ -214,6 +214,7 @@ func (c *scriptedCoordinator) CancelAll() {
 	}
 }
 
+func (c *scriptedCoordinator) CleanupDispatches(context.Context) error       { return nil }
 func (c *scriptedCoordinator) IsBusy() bool                                  { return false }
 func (c *scriptedCoordinator) IsSessionBusy(string) bool                     { return false }
 func (c *scriptedCoordinator) QueuedPrompts(string) int                      { return 0 }
