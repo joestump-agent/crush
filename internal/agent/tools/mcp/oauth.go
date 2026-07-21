@@ -112,7 +112,39 @@ func (s *tokenStore) save(serverURL string, t mcptoken) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(s.path, b, 0o600)
+	writeFileAtomic(s.path, b, 0o600)
+}
+
+// writeFileAtomic writes data to path via a temp file in the same directory
+// followed by an os.Rename, so the target file on disk is either the
+// previous contents or the new contents — never a partial write. A crash
+// mid-write in os.WriteFile would truncate the token file for EVERY server
+// (the corrupt-file load path degrades to "no tokens", forcing a browser
+// re-auth for all of them). The temp file lives in the same directory
+// because rename is only atomic across the same filesystem. The temp file
+// is removed on any error so a failed write does not litter the directory.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		cleanup()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return
+	}
+	if err := os.Chmod(tmpName, mode); err != nil {
+		cleanup()
+		return
+	}
+	_ = os.Rename(tmpName, path)
 }
 
 // mcpOAuthHandler implements auth.OAuthHandler for MCP HTTP servers.
@@ -388,7 +420,14 @@ func (h *mcpOAuthHandler) discoverEndpoints(ctx context.Context, serverURL strin
 // handler goroutine forever on the full channel, which then wedged
 // srv.Shutdown (it waits for active handlers) and leaked the whole
 // authorization flow.
-func callbackHandler(resultCh chan auth.AuthorizationResult, errCh chan error) http.HandlerFunc {
+//
+// expectedState is the state value the SDK baked into the authorization URL.
+// When non-empty, a callback whose state parameter does not match is
+// rejected with 400 and reported on errCh without consuming the result
+// slot, so a stray prefetch or browser refresh with the wrong state cannot
+// crowd out the legitimate callback. When empty, state validation is
+// skipped (defensive backward-compat for a malformed authorization URL).
+func callbackHandler(expectedState string, resultCh chan auth.AuthorizationResult, errCh chan error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		if codeErr := q.Get("error"); codeErr != "" {
@@ -413,12 +452,34 @@ func callbackHandler(resultCh chan auth.AuthorizationResult, errCh chan error) h
 			}
 			return
 		}
+		if expectedState != "" && state != expectedState {
+			http.Error(w, "state mismatch", http.StatusBadRequest)
+			select {
+			case errCh <- fmt.Errorf("callback state mismatch: expected %q, got %q", expectedState, state):
+			default:
+			}
+			return
+		}
 		fmt.Fprint(w, "Authorization successful. You can close this tab and return to Crush.")
 		select {
 		case resultCh <- auth.AuthorizationResult{Code: code, State: state}:
 		default:
 		}
 	}
+}
+
+// stateFromAuthURL extracts the OAuth state parameter from the authorization
+// URL the SDK builds. The SDK generates a random state and bakes it into
+// the URL via cfg.AuthCodeURL(state, ...); the authorization server echoes
+// it back on the callback redirect. We validate the echoed state against
+// this value so a stray request with the wrong state cannot crowd out the
+// legitimate callback. Returns "" if the URL is malformed or has no state.
+func stateFromAuthURL(authURL string) string {
+	u, err := url.Parse(authURL)
+	if err != nil {
+		return ""
+	}
+	return u.Query().Get("state")
 }
 
 // openBrowserAndCapture opens the authorization URL in the user's browser
@@ -429,8 +490,15 @@ func openBrowserAndCapture(ctx context.Context, authURL string, ln net.Listener,
 	resultCh := make(chan auth.AuthorizationResult, 1)
 	errCh := make(chan error, 1)
 
+	// Echo the SDK-generated state through to the callback handler so a
+	// stray /callback hit (browser refresh, prefetcher) with the wrong
+	// state cannot crowd out the legitimate callback. PKCE already
+	// prevents code injection at the token exchange; this is cheap
+	// defense in depth and makes the duplicate-hit path deterministic.
+	expectedState := stateFromAuthURL(authURL)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", callbackHandler(resultCh, errCh))
+	mux.HandleFunc("/callback", callbackHandler(expectedState, resultCh, errCh))
 
 	srv := &http.Server{Handler: mux}
 	go srv.Serve(ln)
