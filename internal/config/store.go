@@ -255,7 +255,7 @@ func (s *ConfigStore) atomicWrite(scope Scope, fn func(current []byte) ([]byte, 
 		return err
 	}
 
-	return atomicWriteFile(path, newData, 0o600)
+	return AtomicWriteFile(path, newData, 0o600)
 }
 
 // configPath returns the file path for the given scope.
