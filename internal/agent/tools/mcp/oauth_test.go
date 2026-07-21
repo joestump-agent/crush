@@ -310,27 +310,25 @@ func TestCallbackHandler_RejectsStateMismatch(t *testing.T) {
 	errCh := make(chan error, 1)
 	handler := callbackHandler("expected-state", resultCh, errCh)
 
-	// Wrong state: must NOT deliver a result, must report an error, must
-	// respond with a non-2xx so the browser surfaces the failure.
+	// Wrong state: must respond 400, must NOT deliver a result, and must NOT
+	// signal errCh. errCh is terminal for openBrowserAndCapture's select, so
+	// a wrong-state hit that reported there would abort the whole flow — the
+	// opposite of "cannot crowd out the legitimate callback". It is dropped.
 	rec := httptest.NewRecorder()
 	handler(rec, httptest.NewRequest("GET", "/callback?code=abc&state=wrong-state", nil))
 
 	require.Equal(t, http.StatusBadRequest, rec.Code,
 		"state mismatch should respond with 400 Bad Request")
-	select {
-	case err := <-errCh:
-		require.Contains(t, err.Error(), "state",
-			"state mismatch should be reported on errCh")
-	case <-time.After(time.Second):
-		t.Fatal("state mismatch did not deliver an error to errCh")
-	}
 	require.Empty(t, resultCh, "state mismatch must not deliver a result")
+	require.Empty(t, errCh, "state mismatch must not signal errCh (that would abort the flow)")
 
-	// A subsequent legitimate callback must still go through — the bad hit
-	// did not consume the slot.
+	// The legitimate callback that follows must still win the result slot —
+	// the stray hit neither consumed it nor tore the flow down.
 	handler(httptest.NewRecorder(),
 		httptest.NewRequest("GET", "/callback?code=abc&state=expected-state", nil))
-	require.Len(t, resultCh, 1, "legitimate callback after a bad one must still deliver")
+	require.Len(t, resultCh, 1, "legitimate callback after a stray must still deliver")
+	got := <-resultCh
+	require.Equal(t, "abc", got.Code)
 }
 
 // TestCallbackHandler_RejectsMissingState covers the unhappy path where the
@@ -347,6 +345,7 @@ func TestCallbackHandler_RejectsMissingState(t *testing.T) {
 
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Empty(t, resultCh, "missing state must not deliver a result")
+	require.Empty(t, errCh, "missing state must not signal errCh (that would abort the flow)")
 }
 
 // TestCallbackHandler_EmptyExpectedStateSkipsValidation covers the backward-
@@ -367,32 +366,30 @@ func TestCallbackHandler_EmptyExpectedStateSkipsValidation(t *testing.T) {
 	require.Equal(t, "abc", got.Code)
 }
 
-// TestCallbackHandler_StateErrorDoesNotBlock pins that a rejected (bad-state)
-// callback cannot wedge the flow by filling errCh the way the old resultCh
-// send could. errCh is capacity-1 and the send is non-blocking; a second
-// bad hit must return immediately.
-func TestCallbackHandler_StateErrorDoesNotBlock(t *testing.T) {
+// TestCallbackHandler_RepeatedStateMismatchDropsCleanly pins that stray
+// wrong-state callbacks are dropped (400) without ever signaling resultCh or
+// errCh — so no number of them can consume the result slot or abort the flow
+// via errCh — and a later legitimate callback still succeeds.
+func TestCallbackHandler_RepeatedStateMismatchDropsCleanly(t *testing.T) {
 	t.Parallel()
 	resultCh := make(chan auth.AuthorizationResult, 1)
 	errCh := make(chan error, 1)
 	handler := callbackHandler("expected", resultCh, errCh)
 
-	hit := func() {
-		handler(httptest.NewRecorder(),
-			httptest.NewRequest("GET", "/callback?code=abc&state=wrong", nil))
+	for range 3 {
+		rec := httptest.NewRecorder()
+		handler(rec, httptest.NewRequest("GET", "/callback?code=abc&state=wrong", nil))
+		require.Equal(t, http.StatusBadRequest, rec.Code)
 	}
+	require.Empty(t, resultCh, "stray wrong-state hits must not deliver a result")
+	require.Empty(t, errCh, "stray wrong-state hits must not signal errCh")
 
-	hit() // fills errCh
-	done := make(chan struct{})
-	go func() {
-		hit() // duplicate bad hit — must not block
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("duplicate bad-state callback blocked")
-	}
+	// The legitimate callback still wins after any number of strays.
+	handler(httptest.NewRecorder(),
+		httptest.NewRequest("GET", "/callback?code=real&state=expected", nil))
+	require.Len(t, resultCh, 1)
+	got := <-resultCh
+	require.Equal(t, "real", got.Code)
 }
 
 // TestStateFromAuthURL covers the helper that pulls the OAuth state out of
@@ -521,8 +518,9 @@ func TestTokenStore_SaveLeavesNoTempFile(t *testing.T) {
 }
 
 // isLikelyTempFile reports whether a filename looks like an intermediate
-// temp file used during an atomic write (e.g. ".tokens.json.tmp" or
-// "tokens.json-12345.tmp"). The final token file itself is NOT a temp file.
+// temp file used during an atomic write. config.AtomicWriteFile names them
+// "<base>.<random>.tmp" (e.g. "tokens.json.123456.tmp"); the ".tmp-" form is
+// also matched defensively. The final token file itself is NOT a temp file.
 func isLikelyTempFile(name string) bool {
 	return strings.HasSuffix(name, ".tmp") ||
 		strings.Contains(name, ".tmp-")

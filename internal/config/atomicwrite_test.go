@@ -14,7 +14,7 @@ func TestAtomicWriteFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.json")
 
-	require.NoError(t, atomicWriteFile(path, []byte(`{"key":"value"}`), 0o600))
+	require.NoError(t, AtomicWriteFile(path, []byte(`{"key":"value"}`), 0o600))
 
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
@@ -35,7 +35,7 @@ func TestAtomicWriteFile_PermissionsApplied(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.json")
 
-	require.NoError(t, atomicWriteFile(path, []byte(`{}`), 0o600))
+	require.NoError(t, AtomicWriteFile(path, []byte(`{}`), 0o600))
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)

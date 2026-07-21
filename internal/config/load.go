@@ -974,7 +974,7 @@ func migrateDisableNotifications() {
 			if !gjson.Get(string(data), "options.notification_style").Exists() {
 				updated, err := sjson.Set(string(data), "options.notification_style", "disabled")
 				if err == nil {
-					if err := atomicWriteFile(dataConfig, []byte(updated), 0o600); err != nil {
+					if err := AtomicWriteFile(dataConfig, []byte(updated), 0o600); err != nil {
 						slog.Warn("Failed to migrate disable_notifications to notification_style", "error", err)
 					} else {
 						slog.Info("Migrated disable_notifications: true to notification_style: disabled")
@@ -995,7 +995,7 @@ func migrateDisableNotifications() {
 			slog.Warn("Failed to remove deprecated disable_notifications field", "path", path, "error", err)
 			continue
 		}
-		if err := atomicWriteFile(path, []byte(updated), 0o600); err != nil {
+		if err := AtomicWriteFile(path, []byte(updated), 0o600); err != nil {
 			slog.Warn("Failed to write migrated config", "path", path, "error", err)
 		}
 	}

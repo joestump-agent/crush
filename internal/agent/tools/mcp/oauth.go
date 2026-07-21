@@ -112,39 +112,15 @@ func (s *tokenStore) save(serverURL string, t mcptoken) {
 	if err != nil {
 		return
 	}
-	writeFileAtomic(s.path, b, 0o600)
-}
-
-// writeFileAtomic writes data to path via a temp file in the same directory
-// followed by an os.Rename, so the target file on disk is either the
-// previous contents or the new contents — never a partial write. A crash
-// mid-write in os.WriteFile would truncate the token file for EVERY server
-// (the corrupt-file load path degrades to "no tokens", forcing a browser
-// re-auth for all of them). The temp file lives in the same directory
-// because rename is only atomic across the same filesystem. The temp file
-// is removed on any error so a failed write does not litter the directory.
-func writeFileAtomic(path string, data []byte, mode os.FileMode) {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return
+	// Persist atomically (temp file + rename) so a crash mid-write can't
+	// truncate the token file for EVERY server at once — the corrupt-file
+	// load path degrades to "no tokens", which would force a browser
+	// re-auth for all of them. Reuses the shared writer in internal/config.
+	// A persist failure is logged, not fatal: tokens are regenerable via
+	// re-auth, but a silently unwritable config dir is worth surfacing.
+	if err := config.AtomicWriteFile(s.path, b, 0o600); err != nil {
+		slog.Warn("failed to persist MCP OAuth tokens", "path", s.path, "err", err)
 	}
-	tmpName := tmp.Name()
-	cleanup := func() { _ = os.Remove(tmpName) }
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		cleanup()
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		cleanup()
-		return
-	}
-	if err := os.Chmod(tmpName, mode); err != nil {
-		cleanup()
-		return
-	}
-	_ = os.Rename(tmpName, path)
 }
 
 // mcpOAuthHandler implements auth.OAuthHandler for MCP HTTP servers.
@@ -423,10 +399,11 @@ func (h *mcpOAuthHandler) discoverEndpoints(ctx context.Context, serverURL strin
 //
 // expectedState is the state value the SDK baked into the authorization URL.
 // When non-empty, a callback whose state parameter does not match is
-// rejected with 400 and reported on errCh without consuming the result
-// slot, so a stray prefetch or browser refresh with the wrong state cannot
-// crowd out the legitimate callback. When empty, state validation is
-// skipped (defensive backward-compat for a malformed authorization URL).
+// rejected with 400 and dropped — it consumes neither the result slot nor
+// errCh — so a stray prefetch or browser refresh with the wrong state
+// cannot crowd out or abort the legitimate callback, which can still win
+// the resultCh race. When empty, state validation is skipped (defensive
+// backward-compat for a malformed authorization URL).
 func callbackHandler(expectedState string, resultCh chan auth.AuthorizationResult, errCh chan error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -453,11 +430,16 @@ func callbackHandler(expectedState string, resultCh chan auth.AuthorizationResul
 			return
 		}
 		if expectedState != "" && state != expectedState {
+			// Reject the mismatched callback but do NOT report it on
+			// errCh. errCh is a terminal signal for openBrowserAndCapture's
+			// select (a delivery there returns an error and tears the flow
+			// down), so sending here would let a single stray wrong-state
+			// GET abort an in-flight legitimate authorization. Dropping it
+			// (400 + return) leaves resultCh untouched so the real callback
+			// can still win the race — which is the whole point of
+			// validating state. A run where no valid callback ever arrives
+			// is still bounded by the caller's context.
 			http.Error(w, "state mismatch", http.StatusBadRequest)
-			select {
-			case errCh <- fmt.Errorf("callback state mismatch: expected %q, got %q", expectedState, state):
-			default:
-			}
 			return
 		}
 		fmt.Fprint(w, "Authorization successful. You can close this tab and return to Crush.")
