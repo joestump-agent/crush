@@ -53,7 +53,7 @@ func (b *Backend) routeChannelMessage(ev mcptools.Event) {
 		if _, declared := cfg.MCP[ev.Name]; !declared {
 			continue
 		}
-		if !mcptools.ChannelEnabled(ws.Cfg.Overrides().EnabledChannels, ev.Name) {
+		if !mcptools.ChannelEnabled(ws.Cfg.Overrides().EnabledChannels, ev.Name) && !cfg.MCP[ev.Name].ChannelEnabled {
 			continue
 		}
 		b.injectChannelMessage(ws, ev.Name, ev.ChannelMessage)

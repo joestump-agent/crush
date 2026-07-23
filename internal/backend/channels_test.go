@@ -287,3 +287,66 @@ func TestRouteChannelMessage_PrefersViewedSession(t *testing.T) {
 	}
 	ws.runWG.Wait()
 }
+
+// TestRouteChannelMessage_ConfigEnabled verifies that a server with
+// channel_enabled: true in crush.json receives channel pushes without
+// needing --channels on the CLI.
+func TestRouteChannelMessage_ConfigEnabled(t *testing.T) {
+	xdgIsolated(t)
+	b, _ := newTestBackend(t)
+
+	coord := newRecordingCoordinator()
+
+	// Build a workspace whose MCP config sets channel_enabled: true on
+	// the server, but does NOT set any override (no --channels).
+	wd := t.TempDir()
+	cfgJSON, err := json.Marshal(map[string]any{
+		"mcp": map[string]any{
+			"webhook": map[string]any{
+				"type":            "http",
+				"url":             "http://127.0.0.1:0/mcp",
+				"channel_enabled": true,
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(wd, "crush.json"), cfgJSON, 0o644))
+
+	cfg, err := config.Init(wd, "", false)
+	require.NoError(t, err)
+	// Deliberately do NOT set cfg.Overrides().EnabledChannels.
+
+	ws := &Workspace{
+		ID:           uuid.New().String(),
+		Path:         wd,
+		Cfg:          cfg,
+		resolvedPath: wd,
+		clients:      make(map[string]*clientState),
+		shutdownFn:   func() {},
+	}
+	ws.App = &app.App{
+		AgentCoordinator: coord,
+		Sessions:         &fullFakeSessions{fakeChannelSessions: &fakeChannelSessions{listed: []session.Session{{ID: "recent"}}}},
+	}
+	ws.ctx, ws.cancel = context.WithCancel(b.ctx)
+	b.mu.Lock()
+	b.workspaces.Set(ws.ID, ws)
+	b.pathIndex[ws.resolvedPath] = ws.ID
+	b.mu.Unlock()
+
+	const content = `<channel source="webhook">config-enabled push</channel>`
+	b.routeChannelMessage(mcptools.Event{
+		Type:           mcptools.EventChannelMessage,
+		Name:           "webhook",
+		ChannelMessage: content,
+	})
+
+	select {
+	case run := <-coord.runs:
+		require.Equal(t, "recent", run[0])
+		require.Equal(t, content, run[1])
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the config-enabled workspace to receive the channel push")
+	}
+	ws.runWG.Wait()
+}

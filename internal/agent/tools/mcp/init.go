@@ -282,7 +282,7 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 	updateState(name, StateStarting, nil, nil, Counts{})
 
 	// createSession handles its own timeout internally.
-	session, err := createSession(ctx, name, m, resolver, ChannelEnabled(cfg.Overrides().EnabledChannels, name))
+	session, err := createSession(ctx, name, m, resolver, m.ChannelEnabled || ChannelEnabled(cfg.Overrides().EnabledChannels, name))
 	if err != nil {
 		return err
 	}
