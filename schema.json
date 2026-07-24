@@ -352,6 +352,11 @@
           "type": "object",
           "description": "HTTP headers for HTTP/SSE MCP servers"
         },
+        "channel_enabled": {
+          "type": "boolean",
+          "description": "Enable this MCP server as a channel (equivalent to --channels)",
+          "default": false
+        },
         "channel_reply": {
           "$ref": "#/$defs/MCPChannelReply",
           "description": "Automatically route replies for turns originating from this channel back through one of the server's tools"
@@ -596,6 +601,23 @@
         "disable_a2ui": {
           "type": "boolean",
           "description": "Disable the A2UI prompt section that invites the model to emit renderable \u003ca2ui-json\u003e UI surfaces in chat",
+          "default": false
+        },
+        "allowed_commands": {
+          "items": {
+            "type": "string",
+            "examples": [
+              "ssh",
+              "curl",
+              "scp"
+            ]
+          },
+          "type": "array",
+          "description": "List of commands to allow that are normally banned. Only affects the exact-command block list; package-manager argument blocks (e.g. 'apt install') are unaffected. Allowed commands still require permission approval."
+        },
+        "allow_all_commands": {
+          "type": "boolean",
+          "description": "Remove all command restrictions from the bash tool",
           "default": false
         }
       },

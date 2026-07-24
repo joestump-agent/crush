@@ -282,7 +282,7 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 	updateState(name, StateStarting, nil, nil, Counts{})
 
 	// createSession handles its own timeout internally.
-	session, err := createSession(ctx, name, m, resolver, ChannelEnabled(cfg.Overrides().EnabledChannels, name))
+	session, err := createSession(ctx, name, m, resolver, ChannelOptIn(m, cfg.Overrides().EnabledChannels, name))
 	if err != nil {
 		return err
 	}
@@ -367,7 +367,7 @@ func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string)
 	// only that session is closed and deregistered.
 	updateState(name, StateError, maybeTimeoutErr(err, timeout), sess, state.Counts)
 
-	fresh, err := createSession(ctx, name, m, cfg.Resolver(), ChannelEnabled(cfg.Overrides().EnabledChannels, name))
+	fresh, err := createSession(ctx, name, m, cfg.Resolver(), ChannelOptIn(m, cfg.Overrides().EnabledChannels, name))
 	if err != nil {
 		return nil, err
 	}
@@ -535,8 +535,9 @@ func createSession(ctx context.Context, name string, m config.MCPConfig, resolve
 	slog.Debug("MCP client initialized", "name", name)
 
 	// Open the channel gate only for a server that both declares the
-	// claude/channel capability and was opted in via --channels. Listed in MCP
-	// config is not enough; this enforces the "listed is not enabled" model.
+	// claude/channel capability and was opted in — via --channels or
+	// channel_enabled in config. Merely listing a server under mcp is not
+	// enough; this enforces the "listed is not enabled" model.
 	isChannel := channelOptIn && hasChannelCapability(session.InitializeResult())
 	if isChannel {
 		channelGate.Store(true)
