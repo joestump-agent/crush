@@ -535,8 +535,9 @@ func createSession(ctx context.Context, name string, m config.MCPConfig, resolve
 	slog.Debug("MCP client initialized", "name", name)
 
 	// Open the channel gate only for a server that both declares the
-	// claude/channel capability and was opted in via --channels. Listed in MCP
-	// config is not enough; this enforces the "listed is not enabled" model.
+	// claude/channel capability and was opted in — via --channels or
+	// channel_enabled in config. Merely listing a server under mcp is not
+	// enough; this enforces the "listed is not enabled" model.
 	isChannel := channelOptIn && hasChannelCapability(session.InitializeResult())
 	if isChannel {
 		channelGate.Store(true)

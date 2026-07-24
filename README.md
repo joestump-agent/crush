@@ -435,14 +435,32 @@ build failed on main: https://ci.example.com/run/1234
 ```
 
 Listing a channel server in `mcp` is **not** enough to enable it — pushing is
-gated behind an explicit per-session opt-in, so a server present in config
-stays silent until you ask for it:
+gated behind an explicit opt-in, so a server present in config stays silent
+until you ask for it. Opt in per launch with the `--channels` flag:
 
 ```bash
 # Enable one or more configured MCP servers as channels for this session.
 crush --channels server:webhook
 crush --channels server:webhook --channels server:signal
 ```
+
+Or persistently, with `channel_enabled` on the server's `mcp` entry — no CLI
+flag needed on each launch:
+
+```json
+{
+  "mcp": {
+    "webhook": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "channel_enabled": true
+    }
+  }
+}
+```
+
+Either source enables the channel; the server must still declare the
+`claude/channel` capability.
 
 #### Signal Setup
 
