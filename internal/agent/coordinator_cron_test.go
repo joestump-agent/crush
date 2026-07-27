@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"charm.land/fantasy"
@@ -132,6 +133,41 @@ func TestFireScheduledTask(t *testing.T) {
 	}
 	require.Error(t, c.fireScheduledTask(t.Context(), missing))
 	require.Empty(t, c.cronStore.List("session-that-does-not-exist"))
+}
+
+// A *durable* task whose session no longer exists must be dropped too.
+//
+// Previously DropSession deliberately kept durable tasks, so this task
+// survived every fire: the session lookup failed, MarkError rescheduled
+// it because it was recurring, and the next tick tried again — an error
+// logged on every fire, forever, and re-armed on each restart. The
+// comment claimed it dropped the task "rather than failing it forever",
+// which was exactly backwards for durable tasks.
+func TestFireScheduledTaskDropsDurableTaskForDeletedSession(t *testing.T) {
+	env := testEnv(t)
+
+	cfg, err := config.Init(env.workingDir, "", false)
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "scheduled_tasks.json")
+	c := &coordinator{
+		cfg:       cfg,
+		sessions:  env.sessions,
+		messages:  env.messages,
+		cronStore: scheduler.NewStore(path),
+	}
+
+	task, err := c.cronStore.Create("session-that-does-not-exist", "* * * * *", "ping", true, true)
+	require.NoError(t, err)
+	require.True(t, task.Durable)
+
+	require.Error(t, c.fireScheduledTask(t.Context(), task))
+	require.Empty(t, c.cronStore.ListAll(), "a durable task for a dead session must be dropped, not retried forever")
+
+	// And it must not come back on the next start.
+	reloaded := scheduler.NewStore(path)
+	require.NoError(t, reloaded.Load())
+	require.Empty(t, reloaded.ListAll(), "the drop must reach disk")
 }
 
 // TestScheduledTaskPrompt verifies fired prompts are wrapped with the

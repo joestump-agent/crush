@@ -235,8 +235,10 @@ const scheduledTaskPromptMarker = "[SCHEDULED TASK - AUTOMATED FIRING OF A CONFI
 // matching Claude Code's scheduler semantics.
 func (c *coordinator) fireScheduledTask(ctx context.Context, task scheduler.Task) error {
 	if _, err := c.sessions.Get(ctx, task.SessionID); err != nil {
-		// The session is gone (deleted or never persisted). Drop the
-		// task rather than failing it forever.
+		// The session is gone (deleted or never persisted), so nothing
+		// this task fires can ever land. Drop the whole session's tasks,
+		// durable ones included: leaving them behind means the scheduler
+		// retries a dead session on every fire, forever.
 		c.cronStore.DropSession(task.SessionID)
 		return fmt.Errorf("session %s for scheduled task %s no longer exists", task.SessionID, task.ID)
 	}
