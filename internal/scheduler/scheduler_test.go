@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -514,6 +515,12 @@ func TestLoadEnforcesSessionLimit(t *testing.T) {
 // The durable file can hold prompts, so it must not be world-readable.
 func TestDurableFileIsNotWorldReadable(t *testing.T) {
 	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		// Windows has no Unix permission bits: os.Chmod there only
+		// toggles the read-only attribute, and Stat reports 0666.
+		t.Skip("permission bits are not meaningful on Windows")
+	}
 
 	path := filepath.Join(t.TempDir(), "scheduled_tasks.json")
 	store := NewStore(path)
