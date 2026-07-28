@@ -10,10 +10,13 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/backend"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -53,6 +56,21 @@ func (s *stubCoordinator) Summarize(context.Context, string) error {
 func (s *stubCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (s *stubCoordinator) UpdateModels(context.Context) error            { return nil }
 func (s *stubCoordinator) GenerateTitle(context.Context, string, string) {}
+func (s *stubCoordinator) RunSidekick(context.Context, string) (*fantasy.AgentResult, error) {
+	return nil, nil
+}
+
+func (s *stubCoordinator) Sidekick() *agent.EphemeralAgent     { return nil }
+func (s *stubCoordinator) CancelSidekick()                     {}
+func (s *stubCoordinator) IsSidekickBusy() bool                { return false }
+func (s *stubCoordinator) ClearSidekick(context.Context) error { return nil }
+func (s *stubCoordinator) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
+	return nil
+}
+
+func (s *stubCoordinator) SidekickModel() config.SelectedModel { return config.SelectedModel{} }
+
+func (s *stubCoordinator) SetSidekickModel(config.SelectedModel) error { return nil }
 
 // stubSessions is a minimal session.Service that returns a fixed list
 // (and supports Get by ID). All other methods return zero values; the

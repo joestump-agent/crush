@@ -65,10 +65,16 @@ const (
 	onboardingModelInputPlaceholder = "Find your fave"
 	largeModelInputPlaceholder      = "Choose a model for large, complex tasks"
 	smallModelInputPlaceholder      = "Choose a model for small, simple tasks"
+	sidekickModelInputPlaceholder   = "Choose a model for the Sidekick"
 )
 
 // ModelsID is the identifier for the model selection dialog.
 const ModelsID = "models"
+
+// SidekickModelsID is the identifier for the Sidekick-scoped model
+// selection dialog (#54). A distinct ID keeps it from ever being
+// confused with — or brought to front as — the main model picker.
+const SidekickModelsID = "sidekick_models"
 
 const defaultModelsDialogMaxWidth = 73
 
@@ -76,6 +82,15 @@ const defaultModelsDialogMaxWidth = 73
 type Models struct {
 	com          *common.Common
 	isOnboarding bool
+
+	// forSidekick scopes the dialog to the Sidekick session (#54): the
+	// selection is applied only to the Sidekick agent (never persisted,
+	// never touching cfg.Models), the large/small radio is hidden, and
+	// the recent-models group is skipped so no config writes happen.
+	forSidekick bool
+	// sidekickCurrent is the Sidekick's active selection, used to
+	// preselect the matching list item in sidekick mode.
+	sidekickCurrent config.SelectedModel
 
 	modelType ModelType
 	providers []catwalk.Provider
@@ -99,10 +114,23 @@ var _ Dialog = (*Models)(nil)
 
 // NewModels creates a new Models dialog.
 func NewModels(com *common.Common, isOnboarding bool) (*Models, error) {
+	return newModels(com, isOnboarding, false, config.SelectedModel{})
+}
+
+// NewSidekickModels creates a model selection dialog scoped to the
+// Sidekick session (#54). current is the Sidekick's active selection,
+// used to preselect its list item.
+func NewSidekickModels(com *common.Common, current config.SelectedModel) (*Models, error) {
+	return newModels(com, false, true, current)
+}
+
+func newModels(com *common.Common, isOnboarding, forSidekick bool, current config.SelectedModel) (*Models, error) {
 	t := com.Styles
 	m := &Models{}
 	m.com = com
 	m.isOnboarding = isOnboarding
+	m.forSidekick = forSidekick
+	m.sidekickCurrent = current
 
 	help := help.New()
 	help.Styles = t.DialogHelpStyles()
@@ -163,6 +191,9 @@ func NewModels(com *common.Common, isOnboarding bool) (*Models, error) {
 
 // ID implements Dialog.
 func (m *Models) ID() string {
+	if m.forSidekick {
+		return SidekickModelsID
+	}
 	return ModelsID
 }
 
@@ -200,18 +231,21 @@ func (m *Models) HandleMsg(msg tea.Msg) Action {
 				break
 			}
 
-			isEdit := key.Matches(msg, m.keyMap.Edit)
+			// The Sidekick picker never drives re-authentication:
+			// its selection is session-scoped only (#54).
+			isEdit := key.Matches(msg, m.keyMap.Edit) && !m.forSidekick
 
 			return ActionSelectModel{
 				Provider:       modelItem.prov,
 				Model:          modelItem.SelectedModel(),
 				ModelType:      modelItem.SelectedModelType(),
 				ReAuthenticate: isEdit,
+				ForSidekick:    m.forSidekick,
 			}
 		case key.Matches(msg, m.keyMap.Reload):
 			return ActionReloadModelDiscovery{}
 		case key.Matches(msg, m.keyMap.Tab):
-			if m.isOnboarding {
+			if m.isOnboarding || m.forSidekick {
 				break
 			}
 			if m.modelType == ModelTypeLarge {
@@ -283,6 +317,11 @@ func (m *Models) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 	rc := NewRenderContext(t, width)
 	rc.Title = "Switch Model"
 	rc.TitleInfo = m.modelTypeRadioView()
+	if m.forSidekick {
+		// One selection, one scope: no large/small radio (#54).
+		rc.Title = "Sidekick Model"
+		rc.TitleInfo = ""
+	}
 
 	if m.isOnboarding {
 		titleText := t.Dialog.PrimaryText.Render("To start, let's choose a provider and model.")
@@ -325,6 +364,16 @@ func (m *Models) ShortHelp() []key.Binding {
 			m.keyMap.Select,
 		}
 	}
+	if m.forSidekick {
+		// No large/small toggle and no re-auth editing in the
+		// Sidekick-scoped picker (#54).
+		return []key.Binding{
+			m.keyMap.UpDown,
+			m.keyMap.Select,
+			m.keyMap.Reload,
+			m.keyMap.Close,
+		}
+	}
 	h := []key.Binding{
 		m.keyMap.UpDown,
 		m.keyMap.Tab,
@@ -365,6 +414,14 @@ func (m *Models) setProviderItems() error {
 	selectedType := m.modelType.Config()
 	currentModel := cfg.Models[selectedType]
 	recentItems := cfg.RecentModels[selectedType]
+	if m.forSidekick {
+		// Sidekick scope (#54): preselect the Sidekick's own active
+		// model and skip the recently-used group — it is backed by (and
+		// can write to) the persisted config, which the session-scoped
+		// picker must never touch.
+		currentModel = m.sidekickCurrent
+		recentItems = nil
+	}
 
 	// Track providers already added to avoid duplicates
 	addedProviders := make(map[string]bool)
@@ -424,6 +481,12 @@ func (m *Models) setProviderItems() error {
 
 		providerConfig, providerConfigured := cfg.Providers.Get(providerID)
 		if providerConfigured && providerConfig.Disable {
+			continue
+		}
+		if m.forSidekick && !providerConfigured {
+			// The Sidekick picker is session-scoped and cannot run the
+			// provider auth flow, so only offer providers that are
+			// already usable (#54).
 			continue
 		}
 
@@ -509,7 +572,9 @@ func (m *Models) setProviderItems() error {
 	}
 
 	// Update placeholder based on model type
-	if !m.isOnboarding {
+	if m.forSidekick {
+		m.input.Placeholder = sidekickModelInputPlaceholder
+	} else if !m.isOnboarding {
 		m.input.Placeholder = m.modelType.Placeholder()
 	}
 
