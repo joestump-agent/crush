@@ -4823,6 +4823,17 @@ func (m *UI) handlePasteMsg(msg tea.PasteMsg) tea.Cmd {
 		return nil
 	}
 
+	// When the pasted content is empty or whitespace-only, the clipboard
+	// likely holds a non-text format (e.g. an image copied from Preview on
+	// macOS). On macOS, terminal emulators intercept CMD+V and send the
+	// clipboard's text via bracketed paste; if the clipboard has an image
+	// instead of text, the resulting PasteMsg is empty. Fall back to reading
+	// image data from the native clipboard so the paste is not silently
+	// swallowed. (GitHub issue #197)
+	if strings.TrimSpace(msg.Content) == "" {
+		return m.pasteImageFromClipboard
+	}
+
 	if hasPasteExceededThreshold(msg) {
 		return func() tea.Msg {
 			content := []byte(msg.Content)
