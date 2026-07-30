@@ -170,7 +170,7 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 	}
 	skillTracker := skills.NewTracker(activeSkills)
 
-	cronStore := scheduler.NewStore(filepath.Join(cfg.Config().Options.DataDirectory, "scheduled_tasks.json"))
+	cronStore := scheduler.NewStore(filepath.Join(opts.Config.Config().Options.DataDirectory, "scheduled_tasks.json"))
 	if err := cronStore.Load(); err != nil {
 		slog.Error("Failed to load scheduled tasks", "error", err)
 	}
