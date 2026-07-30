@@ -98,6 +98,24 @@ func TestFormatCronTime(t *testing.T) {
 	}
 }
 
+func TestCronCalendarDaysAcrossDSTSpringForward(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Skipf("timezone database unavailable: %v", err)
+	}
+
+	// 2026-03-08 is the US spring-forward day: the midnight-to-midnight
+	// gap to 2026-03-09 is only 23 wall-clock hours, so hours/24 would
+	// truncate tomorrow to "0 days away" and a week out to 6.
+	transition := time.Date(2026, time.March, 8, 9, 0, 0, 0, loc)
+	require.Equal(t, 1, cronCalendarDays(transition, time.Date(2026, time.March, 9, 15, 4, 0, 0, loc)))
+	require.Equal(t, 7, cronCalendarDays(transition, time.Date(2026, time.March, 15, 9, 0, 0, 0, loc)))
+	require.Equal(t, -1, cronCalendarDays(transition, time.Date(2026, time.March, 7, 9, 0, 0, 0, loc)))
+	require.Equal(t, 0, cronCalendarDays(transition, time.Date(2026, time.March, 8, 23, 59, 0, 0, loc)))
+}
+
 func TestCronTasksFromResultSortsBySoonestFire(t *testing.T) {
 	t.Parallel()
 

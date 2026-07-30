@@ -371,9 +371,7 @@ func formatCronTime(t, now time.Time) string {
 	t = t.Local()
 	now = now.Local()
 
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	day := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
-	days := int(day.Sub(today).Hours() / 24)
+	days := cronCalendarDays(now, t)
 
 	switch {
 	case days == 0:
@@ -387,4 +385,15 @@ func formatCronTime(t, now time.Time) string {
 	default:
 		return t.Format("2006-01-02 15:04")
 	}
+}
+
+// cronCalendarDays returns the number of calendar days from a's date to
+// b's date, ignoring clock times. The midnights are compared in UTC so
+// the count is unaffected by DST transitions between them: dividing
+// wall-clock hours by 24 undercounts across spring-forward, where a
+// midnight-to-midnight gap is only 23 hours.
+func cronCalendarDays(a, b time.Time) int {
+	from := time.Date(a.Year(), a.Month(), a.Day(), 0, 0, 0, 0, time.UTC)
+	to := time.Date(b.Year(), b.Month(), b.Day(), 0, 0, 0, 0, time.UTC)
+	return int(to.Sub(from).Hours() / 24)
 }
