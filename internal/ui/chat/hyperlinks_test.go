@@ -5,6 +5,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/ui/styles"
+	"github.com/charmbracelet/crush/internal/ui/util"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 )
@@ -205,4 +206,58 @@ func TestUserMessageItemHyperlinkClick(t *testing.T) {
 	handled, cmd = item.HandleMouseClickCmd(ansi.MouseLeft, MessageLeftPaddingTotal, sp.row+1)
 	require.False(t, handled)
 	require.Nil(t, cmd)
+}
+
+// TestOpenURLBlocksNonHTTP is the regression guard for the scheme gate:
+// markdown link targets come from untrusted model- and web-derived
+// content, and a plain click has no modifier-click friction, so file://,
+// javascript:, and custom scheme handlers must never reach the OS.
+func TestOpenURLBlocksNonHTTP(t *testing.T) {
+	t.Parallel()
+
+	blocked := []string{
+		"file:///etc/passwd",
+		"javascript:alert(1)",
+		"vscode://malicious/payload",
+		"ftp://example.com/file",
+	}
+	for _, url := range blocked {
+		msg := openURL(url)()
+		info, ok := msg.(util.InfoMsg)
+		require.True(t, ok, "blocked URL must produce an info toast, got %T", msg)
+		require.Contains(t, info.Msg, "Blocked non-http link",
+			"non-http URL %q must be refused, not opened", url)
+	}
+}
+
+// TestNonHTTPMarkdownLinkProducesSpanButDoesNotOpen locks in the full
+// attack path: a malicious markdown link still renders as a clickable
+// span (glamour emits OSC 8 for any target), but clicking it runs the
+// gate and yields a blocked toast rather than a browser open.
+func TestNonHTTPMarkdownLinkProducesSpanButDoesNotOpen(t *testing.T) {
+	t.Parallel()
+
+	sty := styles.CharmtonePantera()
+	msg := &message.Message{
+		ID:   "evil-1",
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "[click me](file:///etc/passwd)"},
+			message.Finish{Reason: message.FinishReasonEndTurn, Time: testFinishTime},
+		},
+	}
+	item := NewAssistantMessageItem(&sty, msg).(*AssistantMessageItem)
+	item.RawRender(60)
+	require.NotEmpty(t, item.hyperlinks, "glamour must still index the malicious link span")
+	require.Equal(t, "file:///etc/passwd", item.hyperlinks[0].url)
+
+	sp := item.hyperlinks[0]
+	handled, cmd := item.HandleMouseClickCmd(ansi.MouseLeft,
+		(sp.colStart+sp.colEnd)/2+MessageLeftPaddingTotal, sp.row)
+	require.True(t, handled, "click on the span is still handled (it shows the block toast)")
+	require.NotNil(t, cmd)
+
+	info, ok := cmd().(util.InfoMsg)
+	require.True(t, ok, "blocked click must produce an info toast, got %T", cmd())
+	require.Contains(t, info.Msg, "Blocked non-http link: file")
 }

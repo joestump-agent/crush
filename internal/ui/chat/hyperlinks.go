@@ -135,8 +135,22 @@ func spanAt(spans []hyperlinkSpan, row, col int) string {
 // mouse event to the application once mouse reporting is enabled, so the
 // terminal's own link-click handling (and its modifier-click affordances)
 // never fires inside the TUI.
+//
+// Only http(s) URLs are opened. Markdown link targets come from
+// untrusted model- and web-derived content, and a plain (unmodified)
+// click has none of the friction a terminal's modifier-click affords, so
+// an ungated browser.OpenURL would hand file://, javascript:, and custom
+// scheme handlers (vscode://, deep links) straight to the OS. Non-http
+// targets are refused with a toast instead.
 func openURL(url string) tea.Cmd {
 	return func() tea.Msg {
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			scheme := url
+			if i := strings.Index(url, ":"); i >= 0 {
+				scheme = url[:i]
+			}
+			return util.ReportInfo("Blocked non-http link: " + scheme)()
+		}
 		if err := browser.OpenURL(url); err != nil {
 			return util.ReportError(err)()
 		}
