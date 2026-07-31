@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/list"
 	"github.com/charmbracelet/crush/internal/ui/styles"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // skillInvocation represents the XML structure for a loaded skill.
@@ -42,6 +43,12 @@ type UserMessageItem struct {
 	attachments *attachments.Renderer
 	message     *message.Message
 	sty         *styles.Styles
+
+	// hyperlinks holds the OSC 8 hyperlink spans found in the last
+	// rendered content, so a plain click on a link opens it in the
+	// browser (terminals defer link clicks to the app under mouse
+	// reporting; see parseHyperlinkSpans).
+	hyperlinks []hyperlinkSpan
 }
 
 // NewUserMessageItem creates a new UserMessageItem.
@@ -71,6 +78,7 @@ func (m *UserMessageItem) RawRender(width int) string {
 	content, height, ok := m.getCachedRender(cappedWidth)
 	// cache hit
 	if ok {
+		m.hyperlinks = parseHyperlinkSpans(content)
 		return m.renderHighlighted(content, cappedWidth, height)
 	}
 
@@ -81,6 +89,7 @@ func (m *UserMessageItem) RawRender(width int) string {
 		content = m.renderSkillInvocation(msgContent, cappedWidth)
 		height = lipgloss.Height(content)
 		m.setCachedRender(content, cappedWidth, height)
+		m.hyperlinks = parseHyperlinkSpans(content)
 		return m.renderHighlighted(content, cappedWidth, height)
 	}
 
@@ -89,6 +98,7 @@ func (m *UserMessageItem) RawRender(width int) string {
 		content = m.renderChannelMessage(msgContent, cappedWidth)
 		height = lipgloss.Height(content)
 		m.setCachedRender(content, cappedWidth, height)
+		m.hyperlinks = parseHyperlinkSpans(content)
 		return m.renderHighlighted(content, cappedWidth, height)
 	}
 
@@ -116,6 +126,7 @@ func (m *UserMessageItem) RawRender(width int) string {
 
 	height = lipgloss.Height(content)
 	m.setCachedRender(content, cappedWidth, height)
+	m.hyperlinks = parseHyperlinkSpans(content)
 	return m.renderHighlighted(content, cappedWidth, height)
 }
 
@@ -237,6 +248,20 @@ func (m *UserMessageItem) HandleKeyEvent(key tea.KeyMsg) (bool, tea.Cmd) {
 	if k := key.String(); k == "c" || k == "y" {
 		text := m.message.Content().Text
 		return true, common.CopyToClipboard(text, "Message copied to clipboard")
+	}
+	return false, nil
+}
+
+// HandleMouseClickCmd implements [list.MouseClickCommandable]. A plain
+// click on a hyperlink span opens the URL in the system browser; all
+// other clicks fall through unhandled (user messages have no expansion
+// behavior, and terminals never see the click under mouse reporting).
+func (m *UserMessageItem) HandleMouseClickCmd(btn ansi.MouseButton, x, y int) (bool, tea.Cmd) {
+	if btn != ansi.MouseLeft {
+		return false, nil
+	}
+	if url := spanAt(m.hyperlinks, y, x-MessageLeftPaddingTotal); url != "" {
+		return true, openURL(url)
 	}
 	return false, nil
 }
