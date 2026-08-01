@@ -302,6 +302,23 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 	}
 
 	updatePrompts(name, prompts)
+
+	// Fetch resources and templates eagerly so the status display reflects
+	// the real count from the first connection, not a stale zero.  Both
+	// helpers are no-ops when the server doesn't advertise the resources
+	// capability, and gracefully handle "method not found".
+	resources, err := getResources(ctx, session)
+	if err != nil {
+		slog.Warn("Error listing resources", "name", name, "error", err)
+	}
+	templates, err := getResourceTemplates(ctx, session)
+	if err != nil {
+		slog.Warn("MCP server does not support resources/templates/list", "name", name, "error", err)
+		templates = nil
+	}
+	resourceCount := updateResources(name, resources)
+	templateCount := updateResourceTemplates(name, templates)
+
 	// A repeated init (e.g. enable called twice) must not overwrite a live
 	// session without closing it — that leaks the child process and pipes.
 	if old, ok := sessions.Take(name); ok && old != session {
@@ -310,8 +327,9 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 	sessions.Set(name, session)
 
 	updateState(name, StateConnected, nil, session, Counts{
-		Tools:   toolCount,
-		Prompts: len(prompts),
+		Tools:     toolCount,
+		Prompts:   len(prompts),
+		Resources: resourceCount + templateCount,
 	})
 
 	return nil
