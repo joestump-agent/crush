@@ -61,10 +61,11 @@ const (
 
 // SkillState represents the latest discovery status of a skill file.
 type SkillState struct {
-	Name  string
-	Path  string
-	State DiscoveryState
-	Err   error
+	Name   string
+	Path   string
+	Source SourceType
+	State  DiscoveryState
+	Err    error
 }
 
 // Event is published when skill discovery completes.
@@ -226,10 +227,11 @@ func DiscoverWithStates(paths []string) ([]*Skill, []*SkillState) {
 	addState := func(name, path string, state DiscoveryState, err error) {
 		mu.Lock()
 		states = append(states, &SkillState{
-			Name:  name,
-			Path:  path,
-			State: state,
-			Err:   err,
+			Name:   name,
+			Path:   path,
+			Source: sourceFromPath(path, paths),
+			State:  state,
+			Err:    err,
 		})
 		mu.Unlock()
 	}
@@ -292,6 +294,13 @@ func DiscoverWithStates(paths []string) ([]*Skill, []*SkillState) {
 	})
 
 	return skills, states
+}
+
+// sourceFromPath determines the source type of a skill file. Since
+// DiscoverWithStates only discovers from user-configured paths (not project
+// paths, which are handled separately), all discovered skills are SourceUser.
+func sourceFromPath(filePath string, discoveryPaths []string) SourceType {
+	return SourceUser
 }
 
 // ToPromptXML generates XML for injection into the system prompt.
