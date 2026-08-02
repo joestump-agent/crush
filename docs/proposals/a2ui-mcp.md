@@ -3,16 +3,38 @@
 Status: draft, for discussion. Companion doc: `docs/proposals/styling-layers.md`
 in a2tea, which specifies the renderer-side style token work this depends on.
 
-Current state (feat/a2ui): the coder prompt advertises the A2UI v0.9 basic
-catalog, assistant output is scanned for `<a2ui-json>` blocks
+Current state (feat/a2ui, as of d27f8d231): the coder prompt advertises the
+A2UI v0.9 basic catalog, assistant output is scanned for `<a2ui-json>` blocks
 (`internal/ui/chat/a2ui.go`), surfaces render inline via a2tea with focus/key
 routing, and button presses retire the surface and become a new agent turn
-(`A2UISubmissionPrompt` → `sendMessage`). Surfaces render monochrome inside the
-themed `Messages.A2UISurface` container.
+(`A2UISubmissionPrompt` → `sendMessage`). A first cut of the §1 theme bridge
+has **landed**: `syncA2UISurfaces` builds each surface with
+`render.WithStyles(a2uiThemeStyles(a.sty))`, crush no longer wraps surfaces in
+its own `Messages.A2UISurface` frame (a2tea's `CardBorder` box is the only
+border), and surfaces are no longer monochrome. See §1 for where the landed
+implementation diverges from the plan below.
 
 Four expansion threads, in rough priority order.
 
 ## 1. Theme bridge: Crush palette → a2tea styles
+
+**Status: partially landed (d27f8d231), differently than proposed.** What
+shipped is an ad-hoc `a2uiThemeStyles` helper in `internal/ui/chat/a2ui.go`
+that derives `render.Styles` per surface build by borrowing existing style
+groups — `CardBorder` from the old `Messages.A2UISurface` border color,
+`Heading`/`Subheading`/`Button` from the working-indicator gradient colors,
+`Caption` from `Dialog.SecondaryText`, `ButtonFocused` from
+`Dialog.SelectedItem` — rather than the semantic `styles.Styles.A2UI` group
+populated in `quickStyle()` that this section proposes (so the mapping table
+below is the *plan*, not what renders today: no `ButtonPrimary`, `Label`,
+`Placeholder`, input, divider, or tab slots are mapped yet). It also landed
+without the SetStyles gating recommended below: at d27f8d231 a runtime theme
+swap left already-built surfaces drawing the old palette; the review-findings
+branch adds the interim rebuild-on-theme-swap mitigation (dropping surface
+models in `clearCache`, accepting the documented field-value loss) until
+a2tea's `Surface.SetStyles` exists. The remaining work in this section —
+semantic style group in quickstyle, the fuller slot mapping, lossless restyle
+via SetStyles — is still open.
 
 A2UI's styling layers put the *host* in charge of the final look (the web analog
 is overriding `--a2ui-*` CSS variables). Crush already has a semantic palette —
