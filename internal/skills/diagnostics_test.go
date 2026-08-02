@@ -59,7 +59,7 @@ func TestDiscoverWithStates_MissingPath(t *testing.T) {
 	t.Parallel()
 
 	// A clearly nonexistent path should not panic; it may log an error.
-	skills, _ := DiscoverWithStates([]string{"/nonexistent/crush/skills/path"})
+	skills, _ := DiscoverWithStates([]string{"/nonexistent/crush/skills/path"}, "")
 	require.Empty(t, skills)
 }
 
@@ -80,7 +80,7 @@ func TestGetLatestStates(t *testing.T) {
 		0o644,
 	))
 
-	_, states := DiscoverWithStates([]string{dir})
+	_, states := DiscoverWithStates([]string{dir}, "")
 	SetLatestStates(states)
 
 	got := GetLatestStates()

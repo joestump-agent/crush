@@ -191,7 +191,7 @@ func DiscoverFromConfig(cfg DiscoveryConfig) (allSkills, activeSkills []*Skill, 
 	userPaths := cfg.ResolvePaths()
 	if len(userPaths) > 0 {
 		var userSkills []*Skill
-		userSkills, userStates = DiscoverWithStates(userPaths)
+		userSkills, userStates = DiscoverWithStates(userPaths, cfg.WorkingDir)
 		discovered = append(discovered, userSkills...)
 	}
 
