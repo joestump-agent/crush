@@ -275,14 +275,16 @@ func TestNameLock_ConcurrentFirstUseReturnsOneMutex(t *testing.T) {
 }
 
 // TestUpdateState_ErrorClearsResources pins that both StateError teardown
-// branches clear the resources registry alongside tools and prompts — a
-// dead server must not keep advertising resources it can no longer serve.
+// branches clear the resources and resource-template registries alongside
+// tools and prompts — a dead server must not keep advertising resources
+// (or templates) it can no longer serve.
 func TestUpdateState_ErrorClearsResources(t *testing.T) {
 	const name = "test-error-clears-resources"
 	t.Cleanup(func() {
 		sessions.Del(name)
 		allTools.Del(name)
 		allResources.Del(name)
+		allResourceTemplates.Del(name)
 		states.Del(name)
 	})
 
@@ -290,18 +292,58 @@ func TestUpdateState_ErrorClearsResources(t *testing.T) {
 	sess, _ := liveSession(t, "res_tool")
 	sessions.Set(name, sess)
 	allResources.Set(name, []*Resource{{Name: "doc"}})
+	allResourceTemplates.Set(name, []*ResourceTemplate{{Name: "tmpl"}})
 
 	updateState(name, StateError, errors.New("listing broke"), sess, Counts{})
 	_, ok := allResources.Get(name)
 	require.False(t, ok, "current-session error must clear the resources registry")
+	_, ok = allResourceTemplates.Get(name)
+	require.False(t, ok, "current-session error must clear the resource-template registry")
 
 	// Branch 2: no specific session (connect failed); anything registered
 	// under the name is unusable.
 	sess2, _ := liveSession(t, "res_tool2")
 	sessions.Set(name, sess2)
 	allResources.Set(name, []*Resource{{Name: "doc2"}})
+	allResourceTemplates.Set(name, []*ResourceTemplate{{Name: "tmpl2"}})
 
 	updateState(name, StateError, errors.New("connect broke"), nil, Counts{})
 	_, ok = allResources.Get(name)
 	require.False(t, ok, "no-session error must clear the resources registry")
+	_, ok = allResourceTemplates.Get(name)
+	require.False(t, ok, "no-session error must clear the resource-template registry")
+}
+
+// TestDisableSingle_ClearsResourceTemplates pins that disabling a server
+// removes its resource templates (alongside tools, prompts, and resources)
+// from the registries — a disabled server's templates must stop appearing
+// as @-completions.
+func TestDisableSingle_ClearsResourceTemplates(t *testing.T) {
+	const name = "test-disable-clears-templates"
+	t.Cleanup(func() {
+		sessions.Del(name)
+		allTools.Del(name)
+		allResources.Del(name)
+		allResourceTemplates.Del(name)
+		states.Del(name)
+	})
+
+	cfg := config.NewTestStore(&config.Config{MCP: config.MCPs{name: {Type: config.MCPStdio}}})
+
+	sess, sessCtx := liveSession(t, "tmpl_tool")
+	sessions.Set(name, sess)
+	allResources.Set(name, []*Resource{{Name: "doc"}})
+	allResourceTemplates.Set(name, []*ResourceTemplate{{Name: "tmpl", URITemplate: "x://{id}"}})
+
+	require.NoError(t, DisableSingle(cfg, name))
+
+	require.ErrorIs(t, sessCtx.Err(), context.Canceled, "disable must close the session")
+	_, ok := allResources.Get(name)
+	require.False(t, ok, "disable must clear the resources registry")
+	_, ok = allResourceTemplates.Get(name)
+	require.False(t, ok, "disable must clear the resource-template registry")
+
+	info, ok := GetState(name)
+	require.True(t, ok)
+	require.Equal(t, StateDisabled, info.State)
 }

@@ -306,18 +306,15 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 	// Fetch resources and templates eagerly so the status display reflects
 	// the real count from the first connection, not a stale zero.  Both
 	// helpers are no-ops when the server doesn't advertise the resources
-	// capability, and gracefully handle "method not found".
-	resources, err := getResources(ctx, session)
-	if err != nil {
-		slog.Warn("Error listing resources", "name", name, "error", err)
-	}
-	templates, err := getResourceTemplates(ctx, session)
-	if err != nil {
-		slog.Warn("MCP server does not support resources/templates/list", "name", name, "error", err)
-		templates = nil
-	}
-	resourceCount := updateResources(name, resources)
-	templateCount := updateResourceTemplates(name, templates)
+	// capability, and gracefully handle "method not found". Bound the
+	// listing with the same per-server timeout createSession enforces:
+	// initClient runs on the startup critical path under the per-name
+	// lock, and a server that connects but then hangs on resources/list
+	// would otherwise stall WaitForInit indefinitely — with the bound it
+	// degrades to a warn and a zero count.
+	listCtx, cancelList := context.WithTimeout(ctx, mcpTimeout(m))
+	resourceCount := refreshSessionResources(listCtx, name, session)
+	cancelList()
 
 	// A repeated init (e.g. enable called twice) must not overwrite a live
 	// session without closing it — that leaks the child process and pipes.
@@ -329,7 +326,7 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 	updateState(name, StateConnected, nil, session, Counts{
 		Tools:     toolCount,
 		Prompts:   len(prompts),
-		Resources: resourceCount + templateCount,
+		Resources: resourceCount,
 	})
 
 	return nil
@@ -345,10 +342,11 @@ func DisableSingle(cfg *config.ConfigStore, name string) error {
 		closeSession(name, session)
 	}
 
-	// Clear tools, prompts, and resources for this MCP.
+	// Clear tools, prompts, resources, and resource templates for this MCP.
 	updateTools(cfg, name, nil)
 	updatePrompts(name, nil)
 	updateResources(name, nil)
+	updateResourceTemplates(name, nil)
 
 	// Update state to disabled.
 	updateState(name, StateDisabled, nil, nil, Counts{})
@@ -409,6 +407,13 @@ func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string)
 	updatePrompts(name, prompts)
 	counts.Prompts = len(prompts)
 
+	// The StateError transition also purged this server's resources and
+	// resource templates, but counts still carries the pre-error value.
+	// Re-fetch both on the fresh session so the registries and the status
+	// count agree with what the reconnected server actually serves,
+	// instead of advertising N resources over an empty registry.
+	counts.Resources = refreshSessionResources(ctx, name, fresh)
+
 	sessions.Set(name, fresh)
 	updateState(name, StateConnected, nil, fresh, counts)
 	return fresh, nil
@@ -458,6 +463,7 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 				allTools.Del(name)
 				updatePrompts(name, nil)
 				updateResources(name, nil)
+				updateResourceTemplates(name, nil)
 			}
 			closeSession(name, client)
 		default:
@@ -469,6 +475,7 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 			allTools.Del(name)
 			updatePrompts(name, nil)
 			updateResources(name, nil)
+			updateResourceTemplates(name, nil)
 		}
 		// Never publish a dead session on the state.
 		info.Client = nil
