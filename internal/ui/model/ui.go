@@ -747,6 +747,13 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
+	case a2uiActionResultMsg:
+		// An a2ui_action round-trip returned: update the originating
+		// surface in place (or land plain text) without an agent turn.
+		if cmd := m.handleA2UIActionResult(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
 	case userCommandsLoadedMsg:
 		m.customCommands = msg.Commands
 		dia := m.dialog.Dialog(dialog.CommandsID)
@@ -3916,11 +3923,120 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 // the surface rebuilt without an ID — in which case the submission still
 // goes out with just the button identity rather than being dropped.
 func (m *UI) handleA2UIButtonClicked(clicked a2uievent.ButtonClicked) tea.Cmd {
-	values, _ := m.chat.RetireA2UISurface(clicked.SurfaceID)
+	// A cancel/dismiss button only ever dismisses the surface locally —
+	// it never starts an agent turn nor round-trips to an MCP server.
+	// Checked first, before any provenance branch.
 	if chat.A2UIButtonIsCancel(clicked) {
+		m.chat.RetireA2UISurface(clicked.SurfaceID)
 		return nil
 	}
+	// MCP-served surface: route the interaction back to the owning server
+	// when it speaks the action round-trip, instead of starting an agent
+	// turn. The button press is itself the consent, so the a2ui_action
+	// call is not gated on permission. The surface is long-lived — it is
+	// NOT retired, and a surface payload in the response updates it in
+	// place.
+	if mcpName, ok := chat.A2UISurfaceProvenance(clicked.SurfaceID); ok && clicked.Action != nil {
+		if mcp.HasTool(mcpName, "a2ui_action") {
+			return m.runA2UIAction(mcpName, clicked)
+		}
+		// The server serves surfaces but not the action round-trip: keep
+		// today's behavior so a dumb server still works.
+	}
+	values, _ := m.chat.RetireA2UISurface(clicked.SurfaceID)
 	return m.sendMessage(chat.A2UISubmissionPrompt(clicked, values))
+}
+
+// a2uiActionResultMsg carries the outcome of an a2ui_action round-trip back
+// to the UI so the surface updates in place (or a plain-text reply lands as
+// tool output) without an agent turn.
+type a2uiActionResultMsg struct {
+	surfaceID string
+	mcpName   string
+	// surfaces holds any A2UI payloads the response embedded, applied to
+	// the surface in place. content holds plain text from the response.
+	surfaces []string
+	content  string
+	err      error
+}
+
+// runA2UIAction calls the owning server's a2ui_action tool with the
+// button's action name and the surface's resolved input values as the
+// context. The call runs off the UI goroutine; the result returns as an
+// a2uiActionResultMsg.
+func (m *UI) runA2UIAction(mcpName string, clicked a2uievent.ButtonClicked) tea.Cmd {
+	values, _ := m.chat.A2UISurfaceFieldValues(clicked.SurfaceID)
+	if values == nil {
+		values = map[string]any{}
+	}
+	args := map[string]any{
+		"name":    clicked.Action.Name,
+		"context": values,
+	}
+	surfaceID := clicked.SurfaceID
+	return func() tea.Msg {
+		res, err := m.com.Workspace.CallMCPTool(context.Background(), mcpName, "a2ui_action", args)
+		if err != nil {
+			return a2uiActionResultMsg{surfaceID: surfaceID, mcpName: mcpName, err: err}
+		}
+		out := a2uiActionResultMsg{surfaceID: surfaceID, mcpName: mcpName, content: res.Content}
+		for _, s := range res.Surfaces {
+			out.surfaces = append(out.surfaces, s.Payload)
+		}
+		return out
+	}
+}
+
+// handleA2UIActionResult applies an a2ui_action response: any A2UI payload
+// updates the originating surface in place (the surface stays live), and any
+// plain text lands as an informational note. A transport/server error is
+// surfaced as an error note — the surface is left untouched.
+func (m *UI) handleA2UIActionResult(msg a2uiActionResultMsg) tea.Cmd {
+	if msg.err != nil {
+		return util.ReportError(fmt.Errorf("A2UI action failed: %w", msg.err))
+	}
+	for _, payload := range msg.surfaces {
+		m.applyA2UIPayloadToSurface(msg.surfaceID, payload)
+	}
+	if msg.content != "" {
+		return util.ReportInfo(msg.content)
+	}
+	return nil
+}
+
+// applyA2UIPayloadToSurface scans an A2UI payload and feeds its server
+// messages into the named surface, which updates in place. A payload that
+// does not scan is reported back to the owning server as an a2ui_error when
+// it exposes that tool.
+func (m *UI) applyA2UIPayloadToSurface(surfaceID, payload string) {
+	msgs, err := chat.A2UIMessagesFromPayload(payload)
+	if err != nil {
+		m.reportA2UIError(surfaceID, "INVALID_JSON", "Failed to parse A2UI payload.")
+		return
+	}
+	if !m.chat.ApplyA2UISurfaceUpdate(surfaceID, msgs) {
+		// The surface is gone (the server may have deleted it) — nothing
+		// to update; not an error worth surfacing.
+		return
+	}
+}
+
+// reportA2UIError reports a render failure to the owning server via its
+// a2ui_error tool, when it exposes one. Otherwise the failure is only shown
+// to the user (the existing render-failure alert path).
+func (m *UI) reportA2UIError(surfaceID, code, message string) tea.Cmd {
+	mcpName, ok := chat.A2UISurfaceProvenance(surfaceID)
+	if !ok || !mcp.HasTool(mcpName, "a2ui_error") {
+		return nil
+	}
+	args := map[string]any{"code": code, "message": message, "surfaceId": surfaceID}
+	return func() tea.Msg {
+		_, err := m.com.Workspace.CallMCPTool(context.Background(), mcpName, "a2ui_error", args)
+		if err != nil {
+			return util.InfoMsg{Type: util.InfoTypeError, Msg: fmt.Sprintf("A2UI error report failed: %v", err)}
+		}
+		return nil
+	}
 }
 
 // handleChannelMessage injects a channel event pushed by an MCP server into a

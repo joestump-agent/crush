@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/clipperhouse/displaywidth"
 	"github.com/clipperhouse/uax29/v2/words"
+	a2ui "github.com/tmc/a2ui"
 )
 
 // Constants for multi-click detection.
@@ -718,6 +719,35 @@ func (m *Chat) RetireA2UISurface(surfaceID string) (map[string]any, bool) {
 		}
 	}
 	return nil, false
+}
+
+// A2UISurfaceFieldValues reads the named MCP surface's current input values,
+// for building an a2ui_action context. It reports whether a tool item held
+// the surface.
+func (m *Chat) A2UISurfaceFieldValues(surfaceID string) (map[string]any, bool) {
+	for i := range m.list.Len() {
+		item, ok := m.list.ItemAt(i).(chat.A2UISurfaceItem)
+		if !ok || !item.HasA2UISurface(surfaceID) {
+			continue
+		}
+		return item.ToolA2UIFieldValues(surfaceID), true
+	}
+	return nil, false
+}
+
+// ApplyA2UISurfaceUpdate feeds a batch of A2UI server messages back into the
+// named MCP surface (the response to an a2ui_action round-trip). It reports
+// whether a tool item held the surface.
+func (m *Chat) ApplyA2UISurfaceUpdate(surfaceID string, msgs []a2ui.ServerMessage) bool {
+	for i := range m.list.Len() {
+		item, ok := m.list.ItemAt(i).(chat.A2UISurfaceItem)
+		if !ok || !item.HasA2UISurface(surfaceID) {
+			continue
+		}
+		item.ApplyToolA2UIUpdate(surfaceID, msgs)
+		return true
+	}
+	return false
 }
 
 // ToggleExpandedSelectedItem expands the selected message item if it is expandable.

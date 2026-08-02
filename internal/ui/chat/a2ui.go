@@ -731,6 +731,24 @@ func a2uiPartSurfaceID(msgs []a2ui.ServerMessage) string {
 	return ""
 }
 
+// A2UIMessagesFromPayload converts a raw A2UI JSON payload (the body of an
+// MCP-served surface) into the server messages it encodes, so a follow-up
+// payload can be applied to a live surface. The payload is wrapped in the
+// wire tags before scanning because a2tea's scanner treats a bare JSON array
+// of messages as several separate bare objects; the tags make it one block.
+// An error means the payload could not be parsed at all.
+func A2UIMessagesFromPayload(payload string) ([]a2ui.ServerMessage, error) {
+	parts, err := a2tea.Scan(a2uiOpenTag + payload + a2uiCloseTag)
+	if err != nil {
+		return nil, err
+	}
+	var msgs []a2ui.ServerMessage
+	for _, p := range parts {
+		msgs = append(msgs, p.Messages...)
+	}
+	return msgs, nil
+}
+
 // a2uiSurfaceRetired reports whether the surface at part-index i has been
 // retired after a submission (#45). Retired surfaces still render (showing
 // their final state) but no longer receive focus or keys.

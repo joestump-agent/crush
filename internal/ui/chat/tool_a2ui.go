@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/joestump-agent/a2tea"
 	"github.com/joestump-agent/a2tea/render"
+	a2ui "github.com/tmc/a2ui"
 )
 
 // syncToolA2UISurfaces builds — or reuses — the live a2tea models for the
@@ -76,9 +77,63 @@ func (t *baseToolMessageItem) syncToolA2UISurfaces() {
 	}
 }
 
+// A2UISurfaceItem is implemented by message items that hold live MCP A2UI
+// surfaces (tool message items carrying an MCP-served payload). It lets the
+// UI model locate a surface by ID, read its input values for an a2ui_action
+// context, and feed a server's response back into the surface.
+type A2UISurfaceItem interface {
+	// HasA2UISurface reports whether the item holds the named surface.
+	HasA2UISurface(surfaceID string) bool
+	// ToolA2UIFieldValues reads the named surface's current input values.
+	ToolA2UIFieldValues(surfaceID string) map[string]any
+	// ApplyToolA2UIUpdate feeds server messages back into the named
+	// surface, reporting whether it still has renderable state.
+	ApplyToolA2UIUpdate(surfaceID string, msgs []a2ui.ServerMessage) bool
+}
+
 // hasToolA2UISurfaces reports whether this item carries live MCP surfaces.
 func (t *baseToolMessageItem) hasToolA2UISurfaces() bool {
 	return t.a2ui.hasLive()
+}
+
+// HasA2UISurface reports whether this item holds the named surface.
+func (t *baseToolMessageItem) HasA2UISurface(surfaceID string) bool {
+	return t.a2ui.findByID(surfaceID) >= 0
+}
+
+// toolA2UISurfaceByID returns the live surface model with the given A2UI
+// surface ID, or nil when this item does not hold it.
+func (t *baseToolMessageItem) toolA2UISurfaceByID(surfaceID string) render.Model {
+	idx := t.a2ui.findByID(surfaceID)
+	return t.a2ui.surfaceAt(idx)
+}
+
+// ToolA2UIFieldValues reads the named surface's current input values, for
+// building an a2ui_action context.
+func (t *baseToolMessageItem) ToolA2UIFieldValues(surfaceID string) map[string]any {
+	idx := t.a2ui.findByID(surfaceID)
+	return t.a2ui.fieldValues(idx)
+}
+
+// ApplyToolA2UIUpdate feeds a batch of A2UI server messages back into the
+// named surface (the response to an a2ui_action round-trip): the surface
+// updates in place rather than being replaced, preserving focus and edited
+// state the server did not touch. It reports whether the surface still has
+// renderable state afterward (false means the server deleted it).
+func (t *baseToolMessageItem) ApplyToolA2UIUpdate(surfaceID string, msgs []a2ui.ServerMessage) bool {
+	s := t.toolA2UISurfaceByID(surfaceID)
+	if s == nil {
+		return false
+	}
+	applier, ok := s.(interface {
+		Apply([]a2ui.ServerMessage) bool
+	})
+	if !ok {
+		return false
+	}
+	alive := applier.Apply(msgs)
+	t.Bump()
+	return alive
 }
 
 // focusToolA2UISurfaces grants focus to the first live surface and blurs the

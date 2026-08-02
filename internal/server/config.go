@@ -479,6 +479,37 @@ func (c *controllerV1) handlePostWorkspaceMCPReadResource(w http.ResponseWriter,
 	jsonEncode(w, contents)
 }
 
+// handlePostWorkspaceMCPCallTool calls a tool on an MCP server.
+//
+//	@Summary		Call MCP tool
+//	@Tags			mcp
+//	@Accept			json
+//	@Produce		json
+//	@Param			id		path		string					true	"Workspace ID"
+//	@Param			request	body		proto.MCPCallToolRequest	true	"MCP call tool request"
+//	@Success		200		{object}	object
+//	@Failure		400		{object}	proto.Error
+//	@Failure		404		{object}	proto.Error
+//	@Failure		500		{object}	proto.Error
+//	@Router			/workspaces/{id}/mcp/call-tool [post]
+func (c *controllerV1) handlePostWorkspaceMCPCallTool(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	var req proto.MCPCallToolRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		c.server.logError(r, "Failed to decode request", "error", err)
+		jsonError(w, http.StatusBadRequest, "failed to decode request")
+		return
+	}
+
+	result, err := c.backend.CallMCPTool(r.Context(), id, req.Name, req.ToolName, req.Args)
+	if err != nil {
+		c.handleError(w, r, err)
+		return
+	}
+	jsonEncode(w, result)
+}
+
 // handlePostWorkspaceMCPGetPrompt retrieves a prompt from an MCP server.
 //
 //	@Summary		Get MCP prompt
