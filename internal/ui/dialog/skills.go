@@ -230,7 +230,7 @@ func (d *Skills) skillItems() []list.FilterableItem {
 			entry := skills.CatalogEntry{
 				ID:     st.Path,
 				Name:   filepath.Base(filepath.Dir(st.Path)),
-				Source: skills.SourceProject,
+				Source: st.Source,
 			}
 			items = append(items, NewSkillItem(d.com.Styles, entry, st, false))
 			continue
@@ -242,7 +242,7 @@ func (d *Skills) skillItems() []list.FilterableItem {
 			ID:          st.Name,
 			Name:        st.Name,
 			Description: "",
-			Source:      skills.SourceProject,
+			Source:      st.Source,
 		}
 		items = append(items, NewSkillItem(d.com.Styles, entry, st, true))
 	}
