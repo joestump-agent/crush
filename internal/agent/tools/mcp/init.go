@@ -306,8 +306,15 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 	// Fetch resources and templates eagerly so the status display reflects
 	// the real count from the first connection, not a stale zero.  Both
 	// helpers are no-ops when the server doesn't advertise the resources
-	// capability, and gracefully handle "method not found".
-	resourceCount := refreshSessionResources(ctx, name, session)
+	// capability, and gracefully handle "method not found". Bound the
+	// listing with the same per-server timeout createSession enforces:
+	// initClient runs on the startup critical path under the per-name
+	// lock, and a server that connects but then hangs on resources/list
+	// would otherwise stall WaitForInit indefinitely — with the bound it
+	// degrades to a warn and a zero count.
+	listCtx, cancelList := context.WithTimeout(ctx, mcpTimeout(m))
+	resourceCount := refreshSessionResources(listCtx, name, session)
+	cancelList()
 
 	// A repeated init (e.g. enable called twice) must not overwrite a live
 	// session without closing it — that leaks the child process and pipes.
