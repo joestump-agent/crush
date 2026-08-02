@@ -345,10 +345,11 @@ func DisableSingle(cfg *config.ConfigStore, name string) error {
 		closeSession(name, session)
 	}
 
-	// Clear tools, prompts, and resources for this MCP.
+	// Clear tools, prompts, resources, and resource templates for this MCP.
 	updateTools(cfg, name, nil)
 	updatePrompts(name, nil)
 	updateResources(name, nil)
+	updateResourceTemplates(name, nil)
 
 	// Update state to disabled.
 	updateState(name, StateDisabled, nil, nil, Counts{})
@@ -458,6 +459,7 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 				allTools.Del(name)
 				updatePrompts(name, nil)
 				updateResources(name, nil)
+				updateResourceTemplates(name, nil)
 			}
 			closeSession(name, client)
 		default:
@@ -469,6 +471,7 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 			allTools.Del(name)
 			updatePrompts(name, nil)
 			updateResources(name, nil)
+			updateResourceTemplates(name, nil)
 		}
 		// Never publish a dead session on the state.
 		info.Client = nil
