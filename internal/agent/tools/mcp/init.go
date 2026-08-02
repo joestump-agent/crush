@@ -400,6 +400,13 @@ func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string)
 	updatePrompts(name, prompts)
 	counts.Prompts = len(prompts)
 
+	// The StateError transition also purged this server's resources and
+	// resource templates, but counts still carries the pre-error value.
+	// Re-fetch both on the fresh session so the registries and the status
+	// count agree with what the reconnected server actually serves,
+	// instead of advertising N resources over an empty registry.
+	counts.Resources = refreshSessionResources(ctx, name, fresh)
+
 	sessions.Set(name, fresh)
 	updateState(name, StateConnected, nil, fresh, counts)
 	return fresh, nil
