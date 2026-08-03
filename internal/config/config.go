@@ -381,7 +381,7 @@ type Options struct {
 	Progress                  *bool        `json:"progress,omitempty" jsonschema:"description=Show indeterminate progress updates during long operations,default=true"`
 	Notifications             string       `json:"notifications,omitempty" jsonschema:"description=Notification style to use. Options: auto (default)\\, native\\, osc\\, bell\\, disabled. Auto selects based on environment: native for local sessions\\, osc for SSH (with automatic OSC 99/777 detection).,enum=auto,enum=native,enum=osc,enum=bell,enum=disabled,default=auto"`
 	DisabledSkills            []string     `json:"disabled_skills,omitempty" jsonschema:"description=List of skill names to disable and hide from the agent,example=crush-config"`
-	DisableA2UI               bool         `json:"disable_a2ui,omitempty" jsonschema:"description=Disable the A2UI prompt section that invites the model to emit renderable <a2ui-json> UI surfaces in chat,default=false"`
+	DisableA2UI               bool         `json:"disable_a2ui,omitempty" jsonschema:"description=Disable A2UI entirely: drops the prompt section inviting the model to emit renderable <a2ui-json> surfaces and stops advertising the a2ui capability to MCP servers,default=false"`
 	// AllowedCommands specifies commands that should be removed from the default
 	// banned commands list, allowing the agent to execute them via the bash tool.
 	// This provides a way to selectively enable commands like "ssh" or "curl"
