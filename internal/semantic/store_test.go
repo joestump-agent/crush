@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,16 +23,17 @@ import (
 // and vec0 virtual table for testing.
 func newTestDB(t *testing.T, dim int) *sql.DB {
 	t.Helper()
+	ctx := t.Context()
 	db, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
 
-	_, err = db.Exec(`PRAGMA foreign_keys = ON`)
+	_, err = db.ExecContext(ctx, `PRAGMA foreign_keys = ON`)
 	require.NoError(t, err)
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)`)
+	_, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)`)
 	require.NoError(t, err)
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS chunks (
 			chunk_id   INTEGER PRIMARY KEY,
 			session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
@@ -47,7 +50,7 @@ func newTestDB(t *testing.T, dim int) *sql.DB {
 
 	cfg := EmbeddingConfig{Dimension: dim}
 	store := &Store{db: db, cfg: cfg}
-	require.NoError(t, store.ensureVecTable())
+	require.NoError(t, store.ensureVecTable(ctx))
 
 	return db
 }
@@ -113,9 +116,10 @@ func TestFileHashInvalidation(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("package main\nfunc Hello() {}\n"), 0o644))
 
 	hash := fileHash([]byte("package main\nfunc Hello() {}\n"))
+	ctx := t.Context()
 
 	// Insert a chunk with this hash.
-	_, err := db.Exec(`INSERT INTO chunks (path, content, file_hash, model, dim) VALUES (?, 'content', ?, 'test', 4)`, path, hash)
+	_, err := db.ExecContext(ctx, `INSERT INTO chunks (path, content, file_hash, model, dim) VALUES (?, 'content', ?, 'test', 4)`, path, hash)
 	require.NoError(t, err)
 
 	extractor := symbols.NewExtractor()
@@ -176,14 +180,15 @@ func TestSearchEmpty(t *testing.T) {
 
 func TestNewStore(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 	db, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
 	defer db.Close()
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)`)
+	_, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)`)
 	require.NoError(t, err)
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS chunks (
 			chunk_id   INTEGER PRIMARY KEY,
 			session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
@@ -199,13 +204,73 @@ func TestNewStore(t *testing.T) {
 	require.NoError(t, err)
 
 	cfg := EmbeddingConfig{Dimension: 768, Model: "test"}
-	store, err := NewStore(db, cfg)
+	store, err := NewStore(ctx, db, cfg)
 	require.NoError(t, err)
 	assert.NotNil(t, store)
 
 	// Verify vec table was created.
 	var name string
-	err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='chunk_vectors'`).Scan(&name)
+	err = db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='chunk_vectors'`).Scan(&name)
 	require.NoError(t, err)
 	assert.Equal(t, "chunk_vectors", name)
+}
+
+// TestEnsureVecTableRejectsDimensionChange guards the silent-mismatch
+// trap: CREATE VIRTUAL TABLE IF NOT EXISTS keeps whatever dimension the
+// table was first built with, so a changed embedding dimension would be
+// ignored and every later insert would mismatch it.
+func TestEnsureVecTableRejectsDimensionChange(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t, 4)
+	defer db.Close()
+
+	// Same dimension: fine.
+	ctx := t.Context()
+	same := &Store{db: db, cfg: EmbeddingConfig{Dimension: 4}}
+	require.NoError(t, same.ensureVecTable(ctx))
+
+	// Different dimension: must fail, and say what to do about it.
+	changed := &Store{db: db, cfg: EmbeddingConfig{Dimension: 8}}
+	err := changed.ensureVecTable(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dimension 4")
+	assert.Contains(t, err.Error(), "re-index")
+}
+
+// TestEmbedRejectsShortResponse pins that a response missing an entry
+// fails loudly. Callers index the returned slice positionally against
+// their chunks, so a nil hole would otherwise be stored as an empty
+// vector instead of surfacing as an error.
+func TestEmbedRejectsShortResponse(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Two inputs requested, only index 0 returned.
+		_, _ = w.Write([]byte(`{"data":[{"index":0,"embedding":[0.1,0.2,0.3,0.4]}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(EmbeddingConfig{BaseURL: srv.URL, Dimension: 4})
+	_, err := c.Embed(context.Background(), []string{"a", "b"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no vector for input 1")
+}
+
+// TestEmbedRetriedServerErrorKeepsBody is the regression test for the
+// error message going empty on a retried 5xx: the response body used to
+// be closed inside the retry loop, so the final read returned nothing.
+func TestEmbedRetriedServerErrorKeepsBody(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream exploded"}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(EmbeddingConfig{BaseURL: srv.URL, Dimension: 4})
+	_, err := c.Embed(context.Background(), []string{"a"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "upstream exploded", "the server's explanation must survive the retry")
 }

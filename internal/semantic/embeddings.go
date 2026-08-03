@@ -109,12 +109,14 @@ func (c *Client) Embed(ctx context.Context, texts []string) ([][]float32, error)
 			return nil, fmt.Errorf("embedding request failed: %w", err)
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		// Only close here when we are actually going to retry. Closing on
+		// the final attempt too would leave the error path below reading a
+		// closed body, so a retried 5xx always reported an empty message —
+		// exactly the case where the server's explanation matters most.
+		if attempt == 0 && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
 			resp.Body.Close()
-			if attempt == 0 {
-				time.Sleep(time.Second)
-				continue
-			}
+			time.Sleep(time.Second)
+			continue
 		}
 		break
 	}
@@ -143,6 +145,16 @@ func (c *Client) Embed(ctx context.Context, texts []string) ([][]float32, error)
 			return nil, fmt.Errorf("embedding dimension mismatch: got %d, want %d", len(d.Embedding), c.cfg.Dimension)
 		}
 		results[d.Index] = d.Embedding
+	}
+
+	// A short or sparse Data array leaves nil holes. Callers index this
+	// slice positionally against their inputs, so a hole would be written
+	// to storage as an empty vector rather than surfacing as an error.
+	for i, e := range results {
+		if e == nil {
+			return nil, fmt.Errorf("embedding API returned no vector for input %d (got %d embeddings for %d inputs)",
+				i, len(embResp.Data), len(texts))
+		}
 	}
 
 	return results, nil

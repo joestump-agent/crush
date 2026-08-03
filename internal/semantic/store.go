@@ -6,9 +6,12 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,18 +29,44 @@ type Store struct {
 // NewStore creates a semantic store backed by the given database. It
 // ensures the vec0 virtual table exists. The dimension must match the
 // configured embedding model.
-func NewStore(db *sql.DB, cfg EmbeddingConfig) (*Store, error) {
+func NewStore(ctx context.Context, db *sql.DB, cfg EmbeddingConfig) (*Store, error) {
 	s := &Store{db: db, cfg: cfg}
-	if err := s.ensureVecTable(); err != nil {
+	if err := s.ensureVecTable(ctx); err != nil {
 		return nil, fmt.Errorf("init vec table: %w", err)
 	}
 	return s, nil
 }
 
+// vecDimensionPattern pulls N out of an existing chunk_vectors DDL's
+// "embedding float[N]" column so a dimension change can be detected.
+var vecDimensionPattern = regexp.MustCompile(`float\[(\d+)\]`)
+
 // ensureVecTable creates the chunk_vectors virtual table if it does not
 // already exist. This cannot be done in a goose migration because vec0
 // is only available after the extension registers at runtime.
-func (s *Store) ensureVecTable() error {
+func (s *Store) ensureVecTable(ctx context.Context) error {
+	// CREATE VIRTUAL TABLE IF NOT EXISTS silently keeps whatever dimension
+	// the table was first created with, so a changed embedding dimension
+	// would be ignored and every subsequent insert would mismatch. Fail
+	// with something actionable instead.
+	var existingDDL string
+	switch err := s.db.QueryRowContext(ctx,
+		`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunk_vectors'`,
+	).Scan(&existingDDL); {
+	case err == nil:
+		if m := vecDimensionPattern.FindStringSubmatch(existingDDL); m != nil {
+			if dim, convErr := strconv.Atoi(m[1]); convErr == nil && dim != s.cfg.Dimension {
+				return fmt.Errorf(
+					"chunk_vectors was built for dimension %d but the configured embedding dimension is %d; drop the chunks and chunk_vectors tables to re-index at the new dimension",
+					dim, s.cfg.Dimension)
+			}
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		// Not created yet; the statement below makes it.
+	default:
+		return fmt.Errorf("inspect chunk_vectors: %w", err)
+	}
+
 	query := fmt.Sprintf(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(
 			chunk_id INTEGER PRIMARY KEY,
@@ -45,13 +74,13 @@ func (s *Store) ensureVecTable() error {
 			kind TEXT,
 			updated_at INTEGER
 		)`, s.cfg.Dimension)
-	_, err := s.db.Exec(query)
+	_, err := s.db.ExecContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("create chunk_vectors table: %w", err)
 	}
 
 	// Trigger to cascade deletes from chunks to chunk_vectors.
-	_, err = s.db.Exec(`
+	_, err = s.db.ExecContext(ctx, `
 		CREATE TRIGGER IF NOT EXISTS chunks_delete_cascade_vectors
 		AFTER DELETE ON chunks
 		BEGIN
@@ -97,11 +126,23 @@ func (s *Store) IndexFile(ctx context.Context, extractor *symbols.Extractor, pat
 
 	hash := fileHash(src)
 
-	// Check if any chunk for this path has the same hash.
-	var existingHash sql.NullString
+	// Skip only when the stored chunks came from the same file contents
+	// *and* the same embedding model at the same dimension. Hash alone is
+	// not enough: switching models leaves every file's hash unchanged, so
+	// the whole index would be skipped and silently keep vectors from the
+	// old model, which search then compares against new-model queries.
+	var (
+		existingHash  sql.NullString
+		existingModel string
+		existingDim   int
+	)
 	err = s.db.QueryRowContext(ctx,
-		`SELECT file_hash FROM chunks WHERE path = ? LIMIT 1`, path).Scan(&existingHash)
-	if err == nil && existingHash.Valid && existingHash.String == hash {
+		`SELECT file_hash, model, dim FROM chunks WHERE path = ? LIMIT 1`, path).
+		Scan(&existingHash, &existingModel, &existingDim)
+	if err == nil &&
+		existingHash.Valid && existingHash.String == hash &&
+		existingModel == s.cfg.Model &&
+		existingDim == s.cfg.Dimension {
 		return 0, true, nil
 	}
 
@@ -152,6 +193,11 @@ func (s *Store) IndexFile(ctx context.Context, extractor *symbols.Extractor, pat
 	embeddings, err := client.Embed(ctx, texts)
 	if err != nil {
 		return 0, false, fmt.Errorf("generate embeddings: %w", err)
+	}
+	// embeddings is indexed positionally against chunks below, so a short
+	// response would panic rather than fail.
+	if len(embeddings) != len(chunks) {
+		return 0, false, fmt.Errorf("embedding count mismatch: got %d for %d chunks", len(embeddings), len(chunks))
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
