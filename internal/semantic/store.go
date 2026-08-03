@@ -8,12 +8,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite/vec" // registers vec0 extension via init()
 
@@ -93,6 +95,21 @@ func (s *Store) ensureVecTable(ctx context.Context) error {
 	return nil
 }
 
+const (
+	// maxChunkBytes bounds a single embedding input. OpenAI-compatible
+	// embedding models cap around 8k tokens, which at the usual rule of
+	// thumb of ~4 bytes per token is about 32 KiB. Exceeding it does not
+	// degrade — the provider rejects the whole request, so one oversized
+	// chunk fails every other chunk batched alongside it.
+	maxChunkBytes = 32 * 1024
+
+	// maxFileBytes is the point past which a file is not worth indexing at
+	// all: minified bundles, lockfiles, vendored blobs and generated code.
+	// Windowing one of those yields hundreds of chunks that no natural
+	// language query will ever usefully match, at full embedding cost.
+	maxFileBytes = 1 << 20 // 1 MiB
+)
+
 // Chunk represents a piece of content ready for embedding.
 type Chunk struct {
 	SessionID sql.NullString
@@ -122,6 +139,12 @@ func (s *Store) IndexFile(ctx context.Context, extractor *symbols.Extractor, pat
 	src, err := os.ReadFile(path)
 	if err != nil {
 		return 0, false, fmt.Errorf("read file: %w", err)
+	}
+
+	if len(src) > maxFileBytes {
+		slog.Debug("Skipping oversized file for semantic indexing",
+			"path", path, "bytes", len(src), "limit", maxFileBytes)
+		return 0, true, nil
 	}
 
 	hash := fileHash(src)
@@ -179,6 +202,8 @@ func (s *Store) IndexFile(ctx context.Context, extractor *symbols.Extractor, pat
 			})
 		}
 	}
+
+	chunks = capChunkSizes(chunks)
 
 	if len(chunks) == 0 {
 		return 0, false, nil
@@ -286,6 +311,70 @@ func (s *Store) ChunkCount(ctx context.Context) (int64, error) {
 	var count int64
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunks`).Scan(&count)
 	return count, err
+}
+
+// capChunkSizes splits any chunk whose content exceeds maxChunkBytes into
+// line-aligned windows, each carrying its own line range so search results
+// still point at the right part of the file.
+//
+// The whole-file fallback is the case that needs this: a file with no
+// extractable symbols becomes one chunk holding the entire file, which for
+// anything sizeable exceeds the provider's input limit and fails the
+// request — taking every chunk batched with it down too. Windowing is also
+// exactly what "fall back to fixed-size chunking" was supposed to mean.
+func capChunkSizes(in []Chunk) []Chunk {
+	out := make([]Chunk, 0, len(in))
+	for _, c := range in {
+		if len(c.Content) <= maxChunkBytes {
+			out = append(out, c)
+			continue
+		}
+
+		lines := strings.Split(c.Content, "\n")
+		var (
+			buf   []string
+			size  int
+			start = c.StartLine
+		)
+		flush := func(endLine int) {
+			if len(buf) == 0 {
+				return
+			}
+			part := c
+			part.Content = strings.Join(buf, "\n")
+			part.StartLine = start
+			part.EndLine = endLine
+			out = append(out, part)
+			buf, size = nil, 0
+		}
+
+		for i, line := range lines {
+			// A single line past the cap — minified bundles, embedded
+			// data blobs — cannot be windowed, so truncate it.
+			if len(line) > maxChunkBytes {
+				line = truncateUTF8(line, maxChunkBytes)
+			}
+			if size+len(line)+1 > maxChunkBytes {
+				flush(c.StartLine + i - 1)
+				start = c.StartLine + i
+			}
+			buf = append(buf, line)
+			size += len(line) + 1
+		}
+		flush(c.StartLine + len(lines) - 1)
+	}
+	return out
+}
+
+// truncateUTF8 cuts s to at most limit bytes without splitting a rune.
+func truncateUTF8(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit]
 }
 
 func fileHash(data []byte) string {

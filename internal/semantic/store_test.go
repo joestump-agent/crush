@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 
@@ -273,4 +275,95 @@ func TestEmbedRetriedServerErrorKeepsBody(t *testing.T) {
 	_, err := c.Embed(context.Background(), []string{"a"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "upstream exploded", "the server's explanation must survive the retry")
+}
+
+func TestCapChunkSizesLeavesSmallChunksAlone(t *testing.T) {
+	t.Parallel()
+	in := []Chunk{{Content: "package main\nfunc A() {}", StartLine: 0, EndLine: 1}}
+	assert.Equal(t, in, capChunkSizes(in))
+}
+
+// TestCapChunkSizesWindowsOversizedContent covers the whole-file fallback:
+// a file with no extractable symbols becomes one chunk holding the entire
+// file, which past the provider's input limit fails the request — and
+// takes every chunk batched alongside it down with it.
+func TestCapChunkSizesWindowsOversizedContent(t *testing.T) {
+	t.Parallel()
+
+	// ~64 KiB across many lines: two windows' worth.
+	const line = "the quick brown fox jumps over the lazy dog and keeps going"
+	lines := make([]string, 0, 1200)
+	for i := 0; i < 1200; i++ {
+		lines = append(lines, line)
+	}
+	content := strings.Join(lines, "\n")
+	require.Greater(t, len(content), maxChunkBytes)
+
+	out := capChunkSizes([]Chunk{{
+		Path:      sql.NullString{String: "big.txt", Valid: true},
+		Content:   content,
+		StartLine: 0,
+		EndLine:   len(lines) - 1,
+	}})
+
+	require.Greater(t, len(out), 1, "oversized content must be split")
+
+	for i, c := range out {
+		assert.LessOrEqual(t, len(c.Content), maxChunkBytes, "window %d exceeds the cap", i)
+		assert.Equal(t, "big.txt", c.Path.String, "window %d lost its path", i)
+		assert.LessOrEqual(t, c.StartLine, c.EndLine)
+	}
+
+	// Windows must tile the original range contiguously, so a hit still
+	// points at the right lines.
+	assert.Equal(t, 0, out[0].StartLine)
+	assert.Equal(t, len(lines)-1, out[len(out)-1].EndLine)
+	for i := 1; i < len(out); i++ {
+		assert.Equal(t, out[i-1].EndLine+1, out[i].StartLine, "gap or overlap before window %d", i)
+	}
+
+	// Every line survives somewhere.
+	var rejoined []string
+	for _, c := range out {
+		rejoined = append(rejoined, strings.Split(c.Content, "\n")...)
+	}
+	assert.Equal(t, lines, rejoined)
+}
+
+// TestCapChunkSizesTruncatesSingleHugeLine covers minified bundles, where
+// windowing by line cannot get under the cap.
+func TestCapChunkSizesTruncatesSingleHugeLine(t *testing.T) {
+	t.Parallel()
+
+	huge := strings.Repeat("é", maxChunkBytes) // 2 bytes per rune
+	out := capChunkSizes([]Chunk{{Content: huge, StartLine: 0, EndLine: 0}})
+
+	require.Len(t, out, 1)
+	assert.LessOrEqual(t, len(out[0].Content), maxChunkBytes)
+	assert.True(t, utf8.ValidString(out[0].Content), "truncation must not split a rune")
+}
+
+func TestTruncateUTF8KeepsRunesIntact(t *testing.T) {
+	t.Parallel()
+	// "é" is two bytes, so a limit of 3 lands mid-rune.
+	assert.Equal(t, "é", truncateUTF8("éé", 3))
+	assert.Equal(t, "ab", truncateUTF8("ab", 10))
+}
+
+// TestIndexFileSkipsOversizedFiles pins the file-level guard: a minified
+// bundle or lockfile is not worth embedding at any chunk size.
+func TestIndexFileSkipsOversizedFiles(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t, 4)
+	defer db.Close()
+
+	store := &Store{db: db, cfg: EmbeddingConfig{Dimension: 4, Model: "test"}}
+
+	path := filepath.Join(t.TempDir(), "bundle.min.js")
+	require.NoError(t, os.WriteFile(path, make([]byte, maxFileBytes+1), 0o644))
+
+	indexed, skipped, err := store.IndexFile(t.Context(), symbols.NewExtractor(), path)
+	require.NoError(t, err)
+	assert.True(t, skipped, "an oversized file must be skipped, not embedded")
+	assert.Zero(t, indexed)
 }
