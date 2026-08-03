@@ -50,6 +50,7 @@ require (
 	github.com/mattn/go-isatty v0.0.24
 	github.com/modelcontextprotocol/go-sdk v1.7.0-pre.3.0.20260724080706-e761950d9795
 	github.com/nxadm/tail v1.4.11
+	github.com/odvcencio/gotreesitter v0.48.0
 	github.com/openai/openai-go/v3 v3.46.0
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
 	github.com/posthog/posthog-go v1.22.0
