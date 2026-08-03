@@ -94,6 +94,68 @@ func TestExtractFile_SymbolLineRanges(t *testing.T) {
 	}
 }
 
+// TestExtractFile_SymbolSpansWholeDefinition is the regression test for
+// symbols collapsing to a single line. These ranges exist to be chunk
+// boundaries, so a symbol must cover its body, not just the line its
+// identifier sits on — the earlier NameRange-based version reported
+// Greet as 5..5 and would have chunked away every function body.
+func TestExtractFile_SymbolSpansWholeDefinition(t *testing.T) {
+	t.Parallel()
+	ext := NewExtractor()
+	result := ext.ExtractFile("testdata/go/sample.go")
+	require.False(t, result.Fallback, "should not fallback: %s", result.Reason)
+
+	// Line numbers are 0-based; see testdata/go/sample.go.
+	want := map[string][2]int{
+		"Greet":    {5, 7},   // func Greet ... through its closing brace
+		"Add":      {10, 12}, //
+		"Multiply": {18, 21}, //
+	}
+	got := make(map[string][2]int, len(result.Symbols))
+	for _, s := range result.Symbols {
+		got[s.Name] = [2]int{s.StartLine, s.EndLine}
+	}
+	for name, lines := range want {
+		assert.Equal(t, lines, got[name], "%s should span its whole definition", name)
+	}
+}
+
+// TestExtractorReusesLanguageTools pins the per-language parser/tagger
+// cache. Building a Tagger compiles its tags query, so rebuilding one per
+// file made query compilation the dominant cost of a walk.
+func TestExtractorReusesLanguageTools(t *testing.T) {
+	t.Parallel()
+	ext := NewExtractor()
+
+	require.False(t, ext.ExtractFile("testdata/go/sample.go").Fallback)
+	first := ext.tools["go"]
+	require.NotNil(t, first, "expected a cached tagger for go")
+
+	require.False(t, ext.ExtractFile("testdata/go/sample.go").Fallback)
+	assert.Same(t, first, ext.tools["go"], "second file should reuse the cached tools")
+}
+
+// TestWalkAndExtract_HiddenRootIsWalked guards the case where the caller
+// explicitly points at a directory the skip rules would otherwise reject.
+// Skipping the root turns an intentional request into a silent no-op.
+func TestWalkAndExtract_HiddenRootIsWalked(t *testing.T) {
+	t.Parallel()
+	ext := NewExtractor()
+
+	root := filepath.Join(t.TempDir(), ".hidden-root")
+	require.NoError(t, os.MkdirAll(root, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "a.go"),
+		[]byte("package a\n\nfunc Foo() {\n\treturn\n}\n"), 0o644))
+
+	var paths []string
+	for r := range ext.WalkAndExtract(context.Background(), root) {
+		paths = append(paths, r.Path)
+	}
+
+	require.Len(t, paths, 1, "the root the caller asked for must be walked")
+	assert.Contains(t, paths[0], "a.go")
+}
+
 func TestWalkAndExtract(t *testing.T) {
 	t.Parallel()
 	ext := NewExtractor()
