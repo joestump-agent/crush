@@ -550,6 +550,7 @@ func createSession(ctx context.Context, name string, m config.MCPConfig, resolve
 				level := parseLevel(req.Params.Level)
 				slog.Log(ctx, level, "MCP log", "name", name, "logger", req.Params.Logger, "data", req.Params.Data)
 			},
+			Capabilities: a2uiSDKCapabilities(disableA2UI),
 		},
 	)
 
@@ -585,17 +586,40 @@ func createSession(ctx context.Context, name string, m config.MCPConfig, resolve
 // error.
 // this happens particularly when starting things with npx, e.g. if node can't
 // be found or some other error like that.
+// transportWrapper is implemented by every transport decorator crush layers
+// around the real transport, so diagnostics that need the underlying
+// transport (see maybeStdioErr) can reach it regardless of wrapping order.
+type transportWrapper interface {
+	unwrapTransport() mcp.Transport
+}
+
+// unwrapTransport peels every crush-owned decorator off a transport and
+// returns the innermost one.
+func unwrapTransport(transport mcp.Transport) mcp.Transport {
+	for {
+		w, ok := transport.(transportWrapper)
+		if !ok {
+			return transport
+		}
+		inner := w.unwrapTransport()
+		if inner == nil {
+			return transport
+		}
+		transport = inner
+	}
+}
+
 func maybeStdioErr(err error, transport mcp.Transport) error {
 	if !errors.Is(err, io.EOF) {
 		return err
 	}
-	// Every transport is wrapped in a channelTransport before Connect; the
-	// stdio transport we're probing for is the inner one. Without this unwrap
-	// the assertion below never matches and stdio startup failures report a
-	// bare EOF instead of the child's actual output.
-	if cw, ok := transport.(*channelTransport); ok {
-		transport = cw.inner
-	}
+	// Transports are wrapped in one or more decorators before Connect (the
+	// channel gate, the A2UI capability injector); the stdio transport we're
+	// probing for is the innermost one. Unwrap all of them — without this the
+	// assertion below never matches and stdio startup failures report a bare
+	// EOF instead of the child's actual output. Every wrapper must implement
+	// unwrapTransport or it will hide this diagnostic again.
+	transport = unwrapTransport(transport)
 	ct, ok := transport.(*mcp.CommandTransport)
 	if !ok {
 		return err

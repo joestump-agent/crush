@@ -234,3 +234,6 @@ func (c *channelConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 		}
 	}
 }
+
+// unwrapTransport implements [transportWrapper].
+func (t *channelTransport) unwrapTransport() mcp.Transport { return t.inner }

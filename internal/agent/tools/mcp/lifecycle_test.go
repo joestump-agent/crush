@@ -246,6 +246,24 @@ func TestMaybeStdioErr_UnwrapsChannelTransport(t *testing.T) {
 		"stdio diagnostics should surface the child's output through the channelTransport wrapper")
 }
 
+// TestMaybeStdioErr_UnwrapsEveryWrapper pins the diagnostics fix against the
+// ACTUAL wrapper stack createSession builds, not a hand-rolled single layer.
+// A new decorator added on top (the A2UI capability injector was the first)
+// must not hide the child's stderr behind a bare EOF — which is exactly what
+// happened when a2uiInitTransport was layered outside channelTransport and
+// the old single-level unwrap stopped matching.
+func TestMaybeStdioErr_UnwrapsEveryWrapper(t *testing.T) {
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", "echo boom-diagnostic >&2; exit 3")
+	var transport mcp.Transport = &mcp.CommandTransport{Command: cmd}
+	// Same order as createSession: channel gate first, then A2UI.
+	transport = &channelTransport{inner: transport, name: "t", gate: &atomic.Bool{}}
+	transport = &a2uiInitTransport{inner: transport}
+
+	got := maybeStdioErr(io.EOF, transport)
+	require.ErrorContains(t, got, "boom-diagnostic",
+		"stdio diagnostics must survive every transport decorator")
+}
+
 // TestNameLock_ConcurrentFirstUseReturnsOneMutex pins that the per-name
 // lifecycle lock is minted atomically: racing first-use callers must all
 // receive the same mutex, or the serialization the whole lifecycle relies
