@@ -374,11 +374,56 @@ func TestMaybeStdioErr_UnwrapsChannelTransport(t *testing.T) {
 		"the re-executed child's stderr must surface in the error")
 }
 
-// TestUpdateState_ErrorClearsResources pins that StateError teardown clears the
-// resources and resource-template registries alongside tools and prompts — a
-// dead server must not keep advertising resources (or templates) it can no
-// longer serve. Both entry shapes are covered: the registered session itself
-// erroring, and an error with no session at all (connect failed).
+// TestMaybeStdioErr_UnwrapsEveryWrapper pins the diagnostics fix against the
+// ACTUAL wrapper stack createSession builds, not a hand-rolled single layer.
+// A new decorator added on top (the A2UI capability injector was the first)
+// must not hide the child's stderr behind a bare EOF — which is exactly what
+// happened when a2uiInitTransport was layered outside channelTransport and
+// the old single-level unwrap stopped matching.
+func TestMaybeStdioErr_UnwrapsEveryWrapper(t *testing.T) {
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", "echo boom-diagnostic >&2; exit 3")
+	var transport mcp.Transport = &mcp.CommandTransport{Command: cmd}
+	// Same order as createSession: channel gate first, then A2UI.
+	transport = &channelTransport{inner: transport, name: "t", gate: newChannelGate()}
+	transport = &a2uiInitTransport{inner: transport}
+
+	got := maybeStdioErr(io.EOF, transport)
+	require.ErrorContains(t, got, "boom-diagnostic",
+		"stdio diagnostics must survive every transport decorator")
+}
+
+// TestNameLock_ConcurrentFirstUseReturnsOneMutex pins that the per-name
+// lifecycle lock is minted atomically: racing first-use callers must all
+// receive the same mutex, or the serialization the whole lifecycle relies
+// on silently degrades to per-caller locks.
+func TestNameLock_ConcurrentFirstUseReturnsOneMutex(t *testing.T) {
+	const name = "test-name-lock-race"
+	t.Cleanup(func() { delete(renewMus, name) })
+
+	const n = 32
+	locks := make([]*sync.Mutex, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			locks[i] = renewLock(name)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 1; i < n; i++ {
+		require.Same(t, locks[0], locks[i], "all callers must share one lifecycle mutex")
+	}
+}
+
+// TestUpdateState_ErrorClearsResources pins that both StateError teardown
+// branches clear the resources and resource-template registries alongside
+// tools and prompts — a dead server must not keep advertising resources
+// (or templates) it can no longer serve.
 func TestUpdateState_ErrorClearsResources(t *testing.T) {
 	const name = "test-error-clears-resources"
 	t.Cleanup(func() {

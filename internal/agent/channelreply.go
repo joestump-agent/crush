@@ -148,6 +148,9 @@ func (a *sessionAgent) sendChannelReply(ctx context.Context, call SessionAgentCa
 	// racing this send must not lose the reply.
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), channelReplyTimeout)
 	defer cancel()
+	// A channel reply goes back out over the channel, not to a chat UI, so
+	// crush cannot render a surface for it and must not claim it can.
+	sendCtx = mcp.WithA2UICapable(sendCtx, false)
 	if _, err := mcp.RunTool(sendCtx, a.cfg, call.Channel, tool, string(input)); err != nil {
 		slog.Error("Channel reply failed", "channel", call.Channel, "tool", tool, "error", err)
 		return
