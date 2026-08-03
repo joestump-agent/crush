@@ -43,6 +43,12 @@ func NewSemanticSearchTool(store *semantic.Store, client *semantic.Client) fanta
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to generate query embedding: %v", err)), nil
 			}
+			// Embed guarantees one vector per input on success, but a
+			// panic here would take down the whole tool call rather than
+			// returning an error the agent can react to.
+			if len(embeddings) == 0 {
+				return fantasy.NewTextErrorResponse("Embedding provider returned no vector for the query."), nil
+			}
 
 			results, err := store.Search(ctx, embeddings[0], limit)
 			if err != nil {
