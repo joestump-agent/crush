@@ -15,12 +15,14 @@ import (
 
 func newCompletionBackspaceUI() *UI {
 	com := common.DefaultCommon(&slashCommandWorkspace{ready: true})
+	ta := textarea.New()
+	ta.Focus()
 	return &UI{
 		com:      com,
 		dialog:   dialog.NewOverlay(),
 		status:   NewStatus(com, nil),
 		chat:     NewChat(com, config.ScrollbarDefault),
-		textarea: textarea.New(),
+		textarea: ta,
 		attachments: attachments.New(
 			attachments.NewRenderer(
 				lipgloss.NewStyle(), lipgloss.NewStyle(),
@@ -44,11 +46,9 @@ func TestAtomicBackspaceDeletesEntireCompletion(t *testing.T) {
 
 	m := newCompletionBackspaceUI()
 
-	// Simulate what insertCompletionText does: set the text and record
-	// the range.
-	m.textarea.SetValue("hello @path/to/file.go ")
-	m.lastCompletionStart = 6 // index of '@'
-	m.lastCompletionEnd = 23  // end of inserted text + trailing space
+	// Go through the real insertion path so the recorded range and text
+	// cannot drift from what the implementation actually writes.
+	insertTestCompletion(t, m, "hello ", "@path/to/file.go")
 
 	// Press backspace — should delete the entire completion.
 	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
@@ -70,9 +70,7 @@ func TestAtomicBackspaceInvalidatedByTyping(t *testing.T) {
 
 	m := newCompletionBackspaceUI()
 
-	m.textarea.SetValue("hello @path/to/file.go ")
-	m.lastCompletionStart = 6
-	m.lastCompletionEnd = 23
+	insertTestCompletion(t, m, "hello ", "@path/to/file.go")
 
 	// Type a character — should invalidate the range.
 	m.Update(tea.KeyPressMsg{Code: 'x'})
@@ -90,9 +88,7 @@ func TestAtomicBackspaceInvalidatedByTextChange(t *testing.T) {
 
 	m := newCompletionBackspaceUI()
 
-	m.textarea.SetValue("hello @path/to/file.go ")
-	m.lastCompletionStart = 6
-	m.lastCompletionEnd = 23
+	insertTestCompletion(t, m, "hello ", "@path/to/file.go")
 
 	// Simulate text changing (e.g. user pasted or deleted something).
 	m.textarea.SetValue("hello @path/to/file.go extra")
@@ -107,5 +103,49 @@ func TestAtomicBackspaceInvalidatedByTextChange(t *testing.T) {
 	}
 	if m.lastCompletionEnd != 0 {
 		t.Fatal("expected lastCompletionEnd to be cleared after invalidated backspace")
+	}
+}
+
+// insertTestCompletion drives the real completion-insert path: it seeds
+// the prompt with prefix, points the completion machinery at the end of
+// it, and inserts text exactly as selecting from the popup would.
+func insertTestCompletion(t *testing.T, m *UI, prefix, text string) {
+	t.Helper()
+	m.textarea.SetValue(prefix)
+	m.completionsStartIndex = len(prefix)
+	if !m.insertCompletionText(text) {
+		t.Fatalf("insertCompletionText(%q) failed", text)
+	}
+	if got, want := m.textarea.Value(), prefix+text+" "; got != want {
+		t.Fatalf("setup produced %q, want %q", got, want)
+	}
+}
+
+// TestAtomicBackspaceIgnoresStaleRangeOfEqualLength is the regression
+// test for the range being trusted on length alone. Recalling a history
+// entry replaces the whole value; if it happens to be the same length as
+// the completion that preceded it, a backspace would have cut an
+// unrelated span out of the middle of it.
+func TestAtomicBackspaceIgnoresStaleRangeOfEqualLength(t *testing.T) {
+	t.Parallel()
+
+	m := newCompletionBackspaceUI()
+	insertTestCompletion(t, m, "hello ", "@path/to/file.go")
+
+	// Same length, entirely different content — as a history recall would be.
+	stale := "totally different promp"
+	if len(stale) != len(m.textarea.Value()) {
+		t.Fatalf("test needs an equal-length replacement: %d vs %d", len(stale), len(m.textarea.Value()))
+	}
+	m.textarea.SetValue(stale)
+	m.textarea.MoveToEnd() // history recall leaves the cursor at the end
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+
+	if got := m.textarea.Value(); got != "totally different prom" {
+		t.Fatalf("expected a normal single-character backspace, got %q", got)
+	}
+	if m.lastCompletionEnd != 0 {
+		t.Fatal("expected the stale range to be cleared")
 	}
 }
