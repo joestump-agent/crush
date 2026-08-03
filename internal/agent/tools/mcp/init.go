@@ -282,7 +282,7 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 	updateState(name, StateStarting, nil, nil, Counts{})
 
 	// createSession handles its own timeout internally.
-	session, err := createSession(ctx, name, m, resolver, ChannelEnabled(cfg.Overrides().EnabledChannels, name))
+	session, err := createSession(ctx, name, m, resolver, ChannelEnabled(cfg.Overrides().EnabledChannels, name), cfg.Config().Options.DisableA2UI)
 	if err != nil {
 		return err
 	}
@@ -383,7 +383,7 @@ func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string)
 	// only that session is closed and deregistered.
 	updateState(name, StateError, maybeTimeoutErr(err, timeout), sess, state.Counts)
 
-	fresh, err := createSession(ctx, name, m, cfg.Resolver(), ChannelEnabled(cfg.Overrides().EnabledChannels, name))
+	fresh, err := createSession(ctx, name, m, cfg.Resolver(), ChannelEnabled(cfg.Overrides().EnabledChannels, name), cfg.Config().Options.DisableA2UI)
 	if err != nil {
 		return nil, err
 	}
@@ -493,7 +493,7 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 	})
 }
 
-func createSession(ctx context.Context, name string, m config.MCPConfig, resolver config.VariableResolver, channelOptIn bool) (*ClientSession, error) {
+func createSession(ctx context.Context, name string, m config.MCPConfig, resolver config.VariableResolver, channelOptIn bool, disableA2UI bool) (*ClientSession, error) {
 	timeout := mcpTimeout(m)
 	mcpCtx, cancel := context.WithCancel(ctx)
 	cancelTimer := time.AfterFunc(timeout, cancel)
@@ -513,6 +513,13 @@ func createSession(ctx context.Context, name string, m config.MCPConfig, resolve
 	// so a non-channel or non-enabled server can never inject content.
 	channelGate := &atomic.Bool{}
 	transport = &channelTransport{inner: transport, name: name, gate: channelGate}
+
+	// Advertise A2UI support in the initialize handshake so an A2UI-over-MCP
+	// server knows it can send surfaces. A host that won't render A2UI must
+	// not claim the capability.
+	if !disableA2UI {
+		transport = &a2uiInitTransport{inner: transport}
+	}
 
 	client := mcp.NewClient(
 		&mcp.Implementation{
