@@ -21,6 +21,7 @@ func (t *baseToolMessageItem) syncToolA2UISurfaces() {
 	if t.result == nil || t.result.Metadata == "" {
 		t.a2ui.surfaces = nil
 		t.a2ui.surfaceIDs = nil
+		t.a2ui.surfaceOwners = nil
 		t.surfaceScanned = false
 		return
 	}
@@ -28,6 +29,7 @@ func (t *baseToolMessageItem) syncToolA2UISurfaces() {
 	if err := json.Unmarshal([]byte(t.result.Metadata), &meta); err != nil || len(meta.A2UISurfaces) == 0 {
 		t.a2ui.surfaces = nil
 		t.a2ui.surfaceIDs = nil
+		t.a2ui.surfaceOwners = nil
 		t.surfaceScanned = false
 		return
 	}
@@ -37,6 +39,7 @@ func (t *baseToolMessageItem) syncToolA2UISurfaces() {
 	}
 	var surfaces []render.Model
 	var ids []string
+	var owners []string
 	failed := 0
 	for i, surfJSON := range meta.A2UISurfaces {
 		parts, err := a2tea.Scan(surfJSON)
@@ -55,10 +58,17 @@ func (t *baseToolMessageItem) syncToolA2UISurfaces() {
 			id := builtIDs[j]
 			ids = append(ids, id)
 			// Provenance is parallel to A2UISurfaces; a missing or short
-			// slice (older persisted results) means unknown origin.
+			// slice (older persisted results) means unknown origin. It is
+			// recorded per surface on the item — the round-trip resolves
+			// through that, so two servers sharing a surface ID stay
+			// distinct — and mirrored into the global registry for callers
+			// that only hold an ID.
+			owner := ""
 			if i < len(meta.MCPSurfaceProvenance) {
-				registerA2UISurfaceProvenance(id, meta.MCPSurfaceProvenance[i])
+				owner = meta.MCPSurfaceProvenance[i]
+				registerA2UISurfaceProvenance(id, owner)
 			}
+			owners = append(owners, owner)
 		}
 		// A payload that scanned but drew nothing (unsupported components,
 		// bare data-model update) failed just like a scan error: the model
@@ -69,6 +79,7 @@ func (t *baseToolMessageItem) syncToolA2UISurfaces() {
 	}
 	t.a2ui.surfaces = surfaces
 	t.a2ui.surfaceIDs = ids
+	t.a2ui.surfaceOwners = owners
 	t.surfaceBuildFailed = failed
 	t.surfaceSrcHash = h
 	t.surfaceScanned = true
@@ -84,6 +95,14 @@ func (t *baseToolMessageItem) syncToolA2UISurfaces() {
 type A2UISurfaceItem interface {
 	// HasA2UISurface reports whether the item holds the named surface.
 	HasA2UISurface(surfaceID string) bool
+	// A2UISurfaceIsFocused reports whether the item holds the named surface
+	// AND that surface currently has keyboard focus. Surface IDs are only
+	// unique within a server, so two items can hold the same ID; the
+	// focused one is the one the user is actually interacting with.
+	A2UISurfaceIsFocused(surfaceID string) bool
+	// A2UISurfaceOwner returns the MCP server that served the named
+	// surface, and whether one is known.
+	A2UISurfaceOwner(surfaceID string) (string, bool)
 	// ToolA2UIFieldValues reads the named surface's current input values.
 	ToolA2UIFieldValues(surfaceID string) map[string]any
 	// ApplyToolA2UIUpdate feeds server messages back into the named
@@ -101,11 +120,16 @@ func (t *baseToolMessageItem) HasA2UISurface(surfaceID string) bool {
 	return t.a2ui.findByID(surfaceID) >= 0
 }
 
-// toolA2UISurfaceByID returns the live surface model with the given A2UI
-// surface ID, or nil when this item does not hold it.
-func (t *baseToolMessageItem) toolA2UISurfaceByID(surfaceID string) render.Model {
+// A2UISurfaceIsFocused reports whether this item holds the named surface and
+// that surface currently has keyboard focus.
+func (t *baseToolMessageItem) A2UISurfaceIsFocused(surfaceID string) bool {
 	idx := t.a2ui.findByID(surfaceID)
-	return t.a2ui.surfaceAt(idx)
+	return idx >= 0 && idx == t.a2ui.focusedIndex()
+}
+
+// A2UISurfaceOwner returns the MCP server that served the named surface.
+func (t *baseToolMessageItem) A2UISurfaceOwner(surfaceID string) (string, bool) {
+	return t.a2ui.ownerFor(t.a2ui.findByID(surfaceID))
 }
 
 // ToolA2UIFieldValues reads the named surface's current input values, for
@@ -121,7 +145,8 @@ func (t *baseToolMessageItem) ToolA2UIFieldValues(surfaceID string) map[string]a
 // state the server did not touch. It reports whether the surface still has
 // renderable state afterward (false means the server deleted it).
 func (t *baseToolMessageItem) ApplyToolA2UIUpdate(surfaceID string, msgs []a2ui.ServerMessage) bool {
-	s := t.toolA2UISurfaceByID(surfaceID)
+	idx := t.a2ui.findByID(surfaceID)
+	s := t.a2ui.surfaceAt(idx)
 	if s == nil {
 		return false
 	}
@@ -132,6 +157,15 @@ func (t *baseToolMessageItem) ApplyToolA2UIUpdate(surfaceID string, msgs []a2ui.
 		return false
 	}
 	alive := applier.Apply(msgs)
+	if !alive {
+		// The server deleted the surface. Release the model so it stops
+		// claiming focus and swallowing keys for something that draws
+		// nothing, and re-focus whatever is left.
+		t.a2ui.drop(idx)
+		if t.isFocused() {
+			t.focusToolA2UISurfaces()
+		}
+	}
 	t.Bump()
 	return alive
 }

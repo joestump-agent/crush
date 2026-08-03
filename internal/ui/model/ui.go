@@ -3936,14 +3936,30 @@ func (m *UI) handleA2UIButtonClicked(clicked a2uievent.ButtonClicked) tea.Cmd {
 	// call is not gated on permission. The surface is long-lived — it is
 	// NOT retired, and a surface payload in the response updates it in
 	// place.
-	if mcpName, ok := chat.A2UISurfaceProvenance(clicked.SurfaceID); ok && clicked.Action != nil {
+	// Provenance resolves through the item that owns the surface, falling
+	// back to the global surfaceID-keyed registry only when no live item
+	// claims it: surface IDs are server-scoped (typically "default"), so two
+	// servers would otherwise clobber each other in that registry and route
+	// one another's clicks.
+	mcpName, isMCP := m.chat.A2UISurfaceOwner(clicked.SurfaceID)
+	if !isMCP {
+		mcpName, isMCP = chat.A2UISurfaceProvenance(clicked.SurfaceID)
+	}
+	if isMCP && clicked.Action != nil {
 		if mcp.HasTool(mcpName, "a2ui_action") {
 			return m.runA2UIAction(mcpName, clicked)
 		}
 		// The server serves surfaces but not the action round-trip: keep
 		// today's behavior so a dumb server still works.
 	}
-	values, _ := m.chat.RetireA2UISurface(clicked.SurfaceID)
+	// RetireA2UISurface only matches assistant items, so an MCP surface's
+	// values must be read from the tool item that holds it — otherwise the
+	// fallback submits the button identity with everything the user typed
+	// silently dropped.
+	values, ok := m.chat.RetireA2UISurface(clicked.SurfaceID)
+	if !ok {
+		values, _ = m.chat.A2UISurfaceFieldValues(clicked.SurfaceID)
+	}
 	return m.sendMessage(chat.A2UISubmissionPrompt(clicked, values))
 }
 
@@ -3995,37 +4011,75 @@ func (m *UI) handleA2UIActionResult(msg a2uiActionResultMsg) tea.Cmd {
 	if msg.err != nil {
 		return util.ReportError(fmt.Errorf("A2UI action failed: %w", msg.err))
 	}
+	var cmds []tea.Cmd
 	for _, payload := range msg.surfaces {
-		m.applyA2UIPayloadToSurface(msg.surfaceID, payload)
+		if cmd := m.applyA2UIPayloadToSurface(msg.mcpName, msg.surfaceID, payload); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 	if msg.content != "" {
-		return util.ReportInfo(msg.content)
+		cmds = append(cmds, util.ReportInfo(msg.content))
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
+// applyA2UIPayloadToSurface scans an A2UI payload and feeds its server
+// messages into the surface the payload targets, which updates in place. A
+// payload that does not scan, or that targets a surface nothing holds, is
+// reported back to the owning server as an a2ui_error when it exposes that
+// tool. clickedID is the surface the interaction came from — the fallback
+// target for a payload that declares no surface of its own — and mcpName is
+// the server that sent it, which is who any error is reported to.
+func (m *UI) applyA2UIPayloadToSurface(mcpName, clickedID, payload string) tea.Cmd {
+	msgs, err := chat.A2UIMessagesFromPayload(payload)
+	if err != nil {
+		return m.reportA2UIError(mcpName, clickedID, "INVALID_JSON",
+			"Failed to parse A2UI payload.")
+	}
+	if len(msgs) == 0 {
+		// The payload parsed but carried no server messages — it scanned
+		// as prose, not A2UI. Applying it would be a silent no-op, which
+		// looks to the user like a dead button.
+		return m.reportA2UIError(mcpName, clickedID, "INVALID_PAYLOAD",
+			"Payload carried no A2UI server messages.")
+	}
+	// Honor the surface the payload itself declares: a server may answer an
+	// action by updating a sibling surface, not the clicked one. Forcing
+	// every payload onto the clicked ID would corrupt that surface instead.
+	target := chat.A2UIMessagesSurfaceID(msgs)
+	if target == "" {
+		target = clickedID
+	}
+	if !m.chat.ApplyA2UISurfaceUpdate(target, msgs) {
+		// Either nothing holds that surface, or the server just deleted
+		// it. A delete is the expected end of a surface's life; a payload
+		// aimed at a surface we never had is a real mismatch worth
+		// reporting back.
+		if !chat.A2UIMessagesDeleteSurface(msgs) {
+			return m.reportA2UIError(mcpName, target, "SURFACE_NOT_FOUND",
+				fmt.Sprintf("No live surface %q to apply the payload to.", target))
+		}
 	}
 	return nil
 }
 
-// applyA2UIPayloadToSurface scans an A2UI payload and feeds its server
-// messages into the named surface, which updates in place. A payload that
-// does not scan is reported back to the owning server as an a2ui_error when
-// it exposes that tool.
-func (m *UI) applyA2UIPayloadToSurface(surfaceID, payload string) {
-	msgs, err := chat.A2UIMessagesFromPayload(payload)
-	if err != nil {
-		m.reportA2UIError(surfaceID, "INVALID_JSON", "Failed to parse A2UI payload.")
-		return
+// reportA2UIError reports a render failure to mcpName via its a2ui_error
+// tool, when it exposes one. Otherwise the failure is only shown to the user
+// (the existing render-failure alert path). mcpName may be empty when the
+// caller only holds a surface ID, in which case the owner is resolved from
+// the surface — item-scoped first, same as the action path, because the
+// global registry is keyed by surface ID alone and two servers sharing an ID
+// clobber each other there.
+func (m *UI) reportA2UIError(mcpName, surfaceID, code, message string) tea.Cmd {
+	ok := mcpName != ""
+	if !ok {
+		if mcpName, ok = m.chat.A2UISurfaceOwner(surfaceID); !ok {
+			mcpName, ok = chat.A2UISurfaceProvenance(surfaceID)
+		}
 	}
-	if !m.chat.ApplyA2UISurfaceUpdate(surfaceID, msgs) {
-		// The surface is gone (the server may have deleted it) — nothing
-		// to update; not an error worth surfacing.
-		return
-	}
-}
-
-// reportA2UIError reports a render failure to the owning server via its
-// a2ui_error tool, when it exposes one. Otherwise the failure is only shown
-// to the user (the existing render-failure alert path).
-func (m *UI) reportA2UIError(surfaceID, code, message string) tea.Cmd {
-	mcpName, ok := chat.A2UISurfaceProvenance(surfaceID)
 	if !ok || !mcp.HasTool(mcpName, "a2ui_error") {
 		return nil
 	}

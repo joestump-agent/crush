@@ -479,7 +479,19 @@ func (c *controllerV1) handlePostWorkspaceMCPReadResource(w http.ResponseWriter,
 	jsonEncode(w, contents)
 }
 
-// handlePostWorkspaceMCPCallTool calls a tool on an MCP server.
+// a2uiCallableTools is the allow-list this route will invoke. The route
+// exists solely for the A2UI surface round-trip, which is not gated on the
+// agent's permission system (a button press is its own consent). Accepting an
+// arbitrary tool name here would turn it into remote execution of any tool on
+// any configured MCP server — file writes, shell-backed tools, network calls —
+// with no permission prompt at all.
+var a2uiCallableTools = map[string]bool{
+	"a2ui_action": true,
+	"a2ui_error":  true,
+}
+
+// handlePostWorkspaceMCPCallTool calls a tool on an MCP server. Only the A2UI
+// round-trip tools are callable; see [a2uiCallableTools].
 //
 //	@Summary		Call MCP tool
 //	@Tags			mcp
@@ -489,6 +501,7 @@ func (c *controllerV1) handlePostWorkspaceMCPReadResource(w http.ResponseWriter,
 //	@Param			request	body		proto.MCPCallToolRequest	true	"MCP call tool request"
 //	@Success		200		{object}	object
 //	@Failure		400		{object}	proto.Error
+//	@Failure		403		{object}	proto.Error
 //	@Failure		404		{object}	proto.Error
 //	@Failure		500		{object}	proto.Error
 //	@Router			/workspaces/{id}/mcp/call-tool [post]
@@ -499,6 +512,12 @@ func (c *controllerV1) handlePostWorkspaceMCPCallTool(w http.ResponseWriter, r *
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		c.server.logError(r, "Failed to decode request", "error", err)
 		jsonError(w, http.StatusBadRequest, "failed to decode request")
+		return
+	}
+
+	if !a2uiCallableTools[req.ToolName] {
+		c.server.logError(r, "Rejected non-A2UI MCP tool call", "tool", req.ToolName)
+		jsonError(w, http.StatusForbidden, "only the A2UI round-trip tools may be called over this route")
 		return
 	}
 
