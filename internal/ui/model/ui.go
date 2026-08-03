@@ -4800,6 +4800,9 @@ func (m *UI) handleSlashCommand(value string) (tea.Cmd, bool) {
 		}, true
 
 	default:
+		if strings.HasPrefix(value, "/search ") {
+			return util.ReportWarn("Semantic search is not yet configured. Add an embedding provider to crush.json to enable /search."), true
+		}
 		return nil, false
 	}
 }
