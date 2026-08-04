@@ -4377,6 +4377,10 @@ func (m *UI) attachMCPPrompt(name, mcpName, promptID string, args map[string]str
 	if !m.insertCompletionText(token) {
 		return nil
 	}
+	// Key the attachment by the qualified name — what the attachment's
+	// FilePath is set to below — so backspacing the token takes this chip
+	// with it and no other.
+	m.lastCompletionFilePath = name
 	heightCmd := m.handleTextareaHeightChange(prevHeight)
 
 	argCount := len(args)

@@ -101,3 +101,27 @@ func TestAttachMCPPromptWithArguments(t *testing.T) {
 	require.Equal(t, 2, m.attachments.List()[0].PromptArgCount,
 		"the chip needs the argument count")
 }
+
+// TestAtomicBackspaceRemovesPromptChip pins that the prompt token behaves
+// like an @file mention on backspace: deleting the token takes its chip with
+// it, so the resolved body stops being sent along with a message that no
+// longer refers to it.
+func TestAtomicBackspaceRemovesPromptChip(t *testing.T) {
+	t.Parallel()
+
+	ws := &promptWorkspace{body: "body"}
+	ws.ready = true
+	m := newCompletionBackspaceUIWith(ws)
+	m.textarea.SetValue("do /")
+	m.completionsStartIndex = len("do ")
+
+	runPromptCmd(t, m, m.attachMCPPrompt("gitea:review", "gitea", "review",
+		map[string]string{"id": "42"}))
+	require.Len(t, m.attachments.List(), 1)
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+
+	require.Equal(t, "do ", m.textarea.Value(), "the whole token goes at once")
+	require.Empty(t, m.attachments.List(),
+		"the chip must go with the token that referenced it")
+}
