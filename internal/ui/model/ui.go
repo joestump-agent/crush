@@ -23,7 +23,6 @@ import (
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/spinner"
-	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/lipgloss/v2"
@@ -58,6 +57,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/logo"
 	"github.com/charmbracelet/crush/internal/ui/notification"
 	"github.com/charmbracelet/crush/internal/ui/styles"
+	"github.com/charmbracelet/crush/internal/ui/textarea"
 	"github.com/charmbracelet/crush/internal/ui/util"
 	"github.com/charmbracelet/crush/internal/version"
 	"github.com/charmbracelet/crush/internal/workspace"
@@ -297,6 +297,10 @@ type UI struct {
 	lastCompletionEnd   int
 	lastCompletionText  string
 
+	// promptHighlighter styles @file and /skill tokens inline as the user
+	// types. Installed on the textarea via SetHighlighter.
+	promptHighlighter *promptHighlighter
+
 	// Chat components
 	chat *Chat
 
@@ -409,6 +413,12 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 	ta.MaxHeight = TextareaMaxHeight
 	ta.Focus()
 
+	promptHL := newPromptHighlighter(
+		com.Styles.Editor.TokenFile,
+		com.Styles.Editor.TokenSkill,
+	)
+	ta.SetHighlighter(promptHL)
+
 	scrollbarMode := config.ScrollbarDefault
 	if cfg := com.Config(); cfg.Options.TUI != nil && cfg.Options.TUI.Scrollbar != "" {
 		scrollbarMode = cfg.Options.TUI.Scrollbar
@@ -458,6 +468,7 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 		completions:         comp,
 		attachments:         attachments,
 		todoSpinner:         todoSpinner,
+		promptHighlighter:   promptHL,
 		lspStates:           make(map[string]workspace.LSPClientInfo),
 		mcpStates:           make(map[string]mcp.ClientInfo),
 		notifyBackend:       notification.NoopBackend{},
@@ -466,6 +477,7 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 		continueLastSession: continueLast,
 		skillStates:         skills.GetLatestStates(),
 	}
+	ui.refreshSkillNames()
 
 	status := NewStatus(com, ui)
 
@@ -815,6 +827,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case userCommandsLoadedMsg:
 		m.customCommands = msg.Commands
 		m.skillCatalog = msg.SkillEntries
+		m.refreshSkillNames()
 		dia := m.dialog.Dialog(dialog.CommandsID)
 		if dia == nil {
 			break
@@ -947,6 +960,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lspStates = m.com.Workspace.LSPGetStates()
 	case pubsub.Event[skills.Event]:
 		m.skillStates = msg.Payload.States
+		m.refreshSkillNames()
 		// Discovery states carry no descriptions and no override/disable
 		// resolution, so re-read the catalog too: a ctrl+r reload in the
 		// skills dialog must move both the command palette and the '/'
@@ -4219,6 +4233,19 @@ func (m *UI) renderEditorView(width int) string {
 	var attachmentsView string
 	if len(m.attachments.List()) > 0 {
 		attachmentsView = m.attachments.Render(width)
+	}
+	// Retokenize @file and /skill tokens on every render. The scan is
+	// linear in prompt length and render happens every frame anyway, so
+	// this is the single seam that stays correct for every value-mutation
+	// path (typing, paste, history, completion inserts). Bang mode is a
+	// shell prompt — its slashes are paths, not skills — so tokens are
+	// suppressed there.
+	if m.promptHighlighter != nil {
+		if m.bangMode {
+			m.promptHighlighter.Rescan("")
+		} else {
+			m.promptHighlighter.Rescan(m.textarea.Value())
+		}
 	}
 	return strings.Join([]string{
 		attachmentsView,
