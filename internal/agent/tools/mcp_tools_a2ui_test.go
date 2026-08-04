@@ -48,8 +48,14 @@ func TestSplitMCPToolResult(t *testing.T) {
 		require.Contains(t, content, testA2UIPayload)
 	})
 
-	t.Run("user-only payload stays hidden when not diverting", func(t *testing.T) {
+	t.Run("user-only payload reaches the model when nothing renders it", func(t *testing.T) {
 		t.Parallel()
+		// divert=false means no chat UI is consuming this turn's surfaces —
+		// a channel-originated turn, a headless `crush run`, or disable_a2ui.
+		// The ["user"] annotation means "the user can already see this", and
+		// here they cannot see anything: the model's reply is the only path
+		// back to them. Withholding the payload left the tool result empty
+		// and the agent replying with nothing at all.
 		userOnly := surface
 		userOnly.AssistantVisible = false
 		content, meta := splitMCPToolResult(mcp.ToolResult{
@@ -59,7 +65,26 @@ func TestSplitMCPToolResult(t *testing.T) {
 		}, "recipe", false)
 
 		require.Empty(t, meta.A2UISurfaces)
-		require.Equal(t, "fallback text", content)
+		require.Contains(t, content, "fallback text")
+		require.Contains(t, content, testA2UIPayload,
+			"a user-audience payload must fold back to the model when no UI renders it")
+	})
+
+	t.Run("user-only surface with no fallback text is not an empty result", func(t *testing.T) {
+		t.Parallel()
+		// The pathological shape: the tool's ONLY content is a ["user"]
+		// surface. On a channel turn this used to produce a completely
+		// empty tool result.
+		userOnly := surface
+		userOnly.AssistantVisible = false
+		content, _ := splitMCPToolResult(mcp.ToolResult{
+			Type:     "text",
+			Content:  "",
+			Surfaces: []mcp.A2UISurface{userOnly},
+		}, "recipe", false)
+
+		require.NotEmpty(t, content, "the model must not be handed an empty tool result")
+		require.Contains(t, content, testA2UIPayload)
 	})
 
 	t.Run("surface without fallback text still gets a placeholder", func(t *testing.T) {

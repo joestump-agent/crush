@@ -178,15 +178,20 @@ func (m *Tool) Run(ctx context.Context, params fantasy.ToolCall) (fantasy.ToolRe
 // <a2ui-json> tags on ReadMCPResourceResponseMetadata, with a single-line
 // placeholder left for the model so it cannot echo the JSON back and
 // double-render the surface. When divert is false the raw payload is folded
-// back into the model-facing content (except payloads the server annotated
-// for the user only — hiding those from the model is the annotation's whole
-// point), so the model can still relay or summarize the data.
+// back into the model-facing content, so the model can still relay or
+// summarize the data.
 //
-// The audience annotation decides each surface's path (see a2uiAudience):
-// a ["user"]-only payload renders but never reaches the model; an
-// ["assistant"]-only payload reaches the model but is never rendered; an
-// empty audience does both (renders, and folds back to the model when no
-// chat UI is consuming it) — the established default.
+// The audience annotation decides each surface's path (see a2uiAudience),
+// but only among renderers that actually exist: a ["user"]-only payload
+// renders and is withheld from the model; an ["assistant"]-only payload
+// reaches the model but is never rendered; an empty audience does both.
+//
+// The ["user"] case is conditional on something rendering it. The
+// annotation means "the user can already see this, don't repeat it" — so
+// when divert is false nothing renders the surface, the user sees nothing,
+// and the model is their only path to it. Withholding the payload there
+// leaves a channel-originated turn with an empty tool result and the agent
+// replying with nothing or a hallucinated summary.
 func splitMCPToolResult(result mcp.ToolResult, mcpName string, divert bool) (string, ReadMCPResourceResponseMetadata) {
 	var metadata ReadMCPResourceResponseMetadata
 	content := result.Content
@@ -206,8 +211,16 @@ func splitMCPToolResult(result mcp.ToolResult, mcpName string, divert bool) (str
 			appendToContent(A2UISurfacePlaceholderPrefix + uri + " from MCP server " + mcpName + " — the user can already see it; do not repeat or echo its JSON payload]")
 			continue
 		}
-		// Not rendered: either divert is off (no chat UI) or the surface is
-		// ["assistant"]-only. It reaches the model only when assistant-visible.
+		if !divert {
+			// Nothing will render this surface — the turn came in over a
+			// channel, it is a headless run, or the deployment disabled
+			// surfaces. The model is the user's only path to the payload,
+			// so fold it back whatever the audience says.
+			appendToContent(surface.Payload)
+			continue
+		}
+		// A chat UI is rendering this turn's surfaces, but not this one:
+		// it is ["assistant"]-only. It reaches the model alone.
 		if !surface.AssistantVisible {
 			continue
 		}

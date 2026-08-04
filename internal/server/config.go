@@ -603,6 +603,7 @@ func (c *controllerV1) handleGetWorkspaceMCPStates(w http.ResponseWriter, r *htt
 			ResourceCount: v.Counts.Resources,
 			ConnectedAt:   v.ConnectedAt,
 			Channel:       v.Channel,
+			A2UITools:     v.A2UITools,
 		}
 	}
 	jsonEncode(w, result)

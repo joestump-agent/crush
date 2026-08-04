@@ -700,6 +700,7 @@ func (w *ClientWorkspace) MCPGetStates() map[string]mcp.ClientInfo {
 			},
 			ConnectedAt: v.ConnectedAt,
 			Channel:     v.Channel,
+			A2UITools:   v.A2UITools,
 		}
 	}
 	return result

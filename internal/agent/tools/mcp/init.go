@@ -198,6 +198,20 @@ type ClientInfo struct {
 	// Channel reports whether this server is an active channel, for the MCP
 	// list marker and the channels dialog.
 	Channel bool
+	// A2UITools lists the a2ui_* tools this server exposes. It rides on the
+	// state rather than being read from the tool registry via HasTool
+	// because the registry only exists in the process that owns the MCP
+	// sessions: a client/server TUI has an empty one, so a HasTool gate
+	// there is permanently false and the surface round-trip it guards can
+	// never fire. Only the a2ui_* subset is carried — the UI asks nothing
+	// else, and a full tool list would put every server's whole catalog on
+	// the wire on every state change.
+	A2UITools []string
+}
+
+// ServesA2UITool reports whether the server exposes the named a2ui_* tool.
+func (c ClientInfo) ServesA2UITool(toolName string) bool {
+	return slices.Contains(c.A2UITools, toolName)
 }
 
 // SubscribeEvents returns a channel for MCP events, including channel-message
@@ -511,7 +525,7 @@ func connectAndRegister(ctx context.Context, cfg *config.ConfigStore, name strin
 	// would otherwise stall WaitForInit indefinitely — with the bound it
 	// degrades to a warn and a zero count.
 	listCtx, cancelList := context.WithTimeout(ctx, mcpTimeout(m))
-	resourceCount := refreshSessionResources(listCtx, name, session)
+	resourceCount, _ := refreshSessionResources(listCtx, name, session)
 	cancelList()
 
 	// A repeated init must not overwrite a live session without closing it —
@@ -633,7 +647,18 @@ func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string)
 	// Re-fetch both on the fresh session so the registries and the status
 	// count agree with what the reconnected server actually serves,
 	// instead of advertising N resources over an empty registry.
-	counts.Resources = refreshSessionResources(ctx, name, newSess)
+	//
+	// A listing failure here is fatal, exactly as it is for tools and
+	// prompts above: this is a renewal of a session we already refused
+	// once, so handing the caller a server that reports StateConnected
+	// with an empty resource registry hides the breakage behind a healthy
+	// status while every '@' completion for it silently disappears.
+	counts.Resources, err = refreshSessionResources(ctx, name, newSess)
+	if err != nil {
+		updateState(name, StateError, err, nil, Counts{})
+		closeSession(name, newSess)
+		return nil, err
+	}
 
 	sessions.Set(name, newSess)
 	updateState(name, StateConnected, nil, newSess, counts)
@@ -670,6 +695,9 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 		// Channel marks a server that is an active channel, for the MCP list
 		// marker and the channels dialog.
 		Channel: client != nil && client.channel,
+		// Snapshot the a2ui_* capability alongside the counts so a remote
+		// client learns it without reading this process's tool registry.
+		A2UITools: a2uiToolNames(name),
 	}
 	switch state {
 	case StateConnected:
