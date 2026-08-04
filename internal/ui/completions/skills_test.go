@@ -18,7 +18,7 @@ func TestSetSkillItemsOpensWithSkills(t *testing.T) {
 	c.SetSkillItems([]SkillCompletionValue{
 		{Name: "code-review", Path: "/skills/code-review/SKILL.md"},
 		{Name: "commit", Path: "/skills/commit/SKILL.md"},
-	})
+	}, nil)
 
 	require.True(t, c.IsOpen())
 	require.Len(t, c.filtered, 2)
@@ -35,7 +35,7 @@ func TestSkillCompletionFilter(t *testing.T) {
 		{Name: "code-review"},
 		{Name: "commit"},
 		{Name: "coder"},
-	})
+	}, nil)
 
 	c.Filter("cod")
 
@@ -53,7 +53,7 @@ func TestSkillDescriptionShownAndSearchable(t *testing.T) {
 	c.SetSkillItems([]SkillCompletionValue{
 		{Name: "skill-creator", Description: "Use for naming skills\nand writing frontmatter."},
 		{Name: "commit", Description: "Write a conventional commit."},
-	})
+	}, nil)
 
 	first, ok := c.filtered[0].(*CompletionItem)
 	require.True(t, ok)
@@ -79,7 +79,7 @@ func TestSkillDescriptionTruncatedToPopupWidth(t *testing.T) {
 	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems([]SkillCompletionValue{
 		{Name: "commit", Description: strings.Repeat("long ", 200)},
-	})
+	}, nil)
 
 	first, ok := c.filtered[0].(*CompletionItem)
 	require.True(t, ok)
@@ -94,7 +94,7 @@ func TestSkillDescriptionDroppedWhenNameEatsTheRow(t *testing.T) {
 	// bare rather than as a row of ellipsis.
 	long := strings.Repeat("a", maxWidth)
 	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
-	c.SetSkillItems([]SkillCompletionValue{{Name: long, Description: "does things"}})
+	c.SetSkillItems([]SkillCompletionValue{{Name: long, Description: "does things"}}, nil)
 
 	first, ok := c.filtered[0].(*CompletionItem)
 	require.True(t, ok)
@@ -108,7 +108,7 @@ func TestSelectCurrentReturnsSkillSelectionMsg(t *testing.T) {
 	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems([]SkillCompletionValue{
 		{Name: "commit", Path: "/skills/commit/SKILL.md"},
-	})
+	}, nil)
 
 	msg := c.selectCurrent(false)
 	sel, ok := msg.(SelectionMsg[SkillCompletionValue])
@@ -123,7 +123,7 @@ func TestSelectCurrentSkillKeepOpen(t *testing.T) {
 	t.Parallel()
 
 	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
-	c.SetSkillItems([]SkillCompletionValue{{Name: "commit"}})
+	c.SetSkillItems([]SkillCompletionValue{{Name: "commit"}}, nil)
 
 	msg := c.selectCurrent(true)
 	sel, ok := msg.(SelectionMsg[SkillCompletionValue])
@@ -136,7 +136,7 @@ func TestSetSkillItemsEmpty(t *testing.T) {
 	t.Parallel()
 
 	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
-	c.SetSkillItems(nil)
+	c.SetSkillItems(nil, nil)
 
 	require.True(t, c.IsOpen())
 	require.False(t, c.HasItems())
@@ -155,4 +155,81 @@ func TestSkillItemsDoNotAffectFileSelectionDispatch(t *testing.T) {
 	sel, ok := msg.(SelectionMsg[FileCompletionValue])
 	require.True(t, ok, "expected SelectionMsg[FileCompletionValue], got %T", msg)
 	require.Equal(t, "foo.go", sel.Value.Path)
+}
+
+// TestSetSkillItemsIncludesPrompts pins that MCP prompts share the "/" popup
+// with skills and are findable by name and description, the same way skills
+// are.
+func TestSetSkillItemsIncludesPrompts(t *testing.T) {
+	t.Parallel()
+
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c.SetSkillItems(
+		[]SkillCompletionValue{{Name: "code-review", Description: "Review a diff."}},
+		[]PromptCompletionValue{
+			{Name: "gitea:review", Description: "Review a pull request.", MCPName: "gitea", PromptID: "review"},
+			{Name: "cairn:run_capture", Description: "Capture a run.", MCPName: "cairn", PromptID: "run_capture"},
+		},
+	)
+	require.True(t, c.HasItems())
+
+	// Server-qualified, so a server name narrows to that server's prompts.
+	c.Filter("gitea:")
+	require.True(t, c.HasItems(), "a server prefix must match its prompts")
+
+	// Descriptions are part of the filter text for prompts too.
+	c.Filter("capture")
+	require.True(t, c.HasItems(), "a prompt must be findable by its description")
+
+	// Skills still work alongside them.
+	c.Filter("code-rev")
+	require.True(t, c.HasItems(), "skills must remain in the popup")
+}
+
+// TestSetSkillItemsPromptsOnly covers a config with MCP prompts but no
+// skills: the popup must still open rather than treating "no skills" as
+// "nothing to offer".
+func TestSetSkillItemsPromptsOnly(t *testing.T) {
+	t.Parallel()
+
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c.SetSkillItems(nil, []PromptCompletionValue{
+		{Name: "gitea:review", MCPName: "gitea", PromptID: "review"},
+	})
+	require.True(t, c.HasItems())
+}
+
+// TestSelectCurrentReturnsPromptSelection is the test whose absence let the
+// whole feature ship inert: selectCurrent had no PromptCompletionValue case,
+// so pressing enter on a prompt row returned nil, the model's type switch
+// matched nothing, and the insertion path was dead code. Every other test
+// stopped at SetSkillItems/Filter and never pressed enter.
+func TestSelectCurrentReturnsPromptSelection(t *testing.T) {
+	t.Parallel()
+
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c.SetSkillItems(nil, []PromptCompletionValue{
+		{Name: "gitea:review", MCPName: "gitea", PromptID: "review"},
+	})
+
+	msg := c.selectCurrent(false)
+	sel, ok := msg.(SelectionMsg[PromptCompletionValue])
+	require.True(t, ok, "selecting a prompt must produce a prompt selection, got %T", msg)
+	require.Equal(t, "gitea:review", sel.Value.Name)
+	require.Equal(t, "gitea", sel.Value.MCPName)
+	require.Equal(t, "review", sel.Value.PromptID)
+}
+
+// TestSelectCurrentStillReturnsSkillSelection is the control: adding prompts
+// must not have displaced skills from the same popup.
+func TestSelectCurrentStillReturnsSkillSelection(t *testing.T) {
+	t.Parallel()
+
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c.SetSkillItems([]SkillCompletionValue{{Name: "code-review"}}, nil)
+
+	msg := c.selectCurrent(false)
+	sel, ok := msg.(SelectionMsg[SkillCompletionValue])
+	require.True(t, ok, "got %T", msg)
+	require.Equal(t, "code-review", sel.Value.Name)
 }

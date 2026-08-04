@@ -297,6 +297,18 @@ type UI struct {
 	lastCompletionEnd      int
 	lastCompletionText     string
 	lastCompletionFilePath string // non-empty when the last completion attached a file
+	// promptAttachSeq makes each MCP prompt attachment's key unique, so
+	// inserting one prompt twice yields two independently removable chips.
+	promptAttachSeq int
+	// pendingPromptTrigger is the "/query" text still sitting in the editor
+	// while the arguments dialog is open. Cancelling the dialog takes it
+	// back out; without that the query lingers and — since prompt names
+	// validate "/" tokens — renders as a perfectly good prompt token with
+	// no body behind it.
+	pendingPromptTrigger struct {
+		start int
+		text  string
+	}
 
 	// promptHighlighter styles @file and /skill tokens inline as the user
 	// types. Installed on the textarea via SetHighlighter.
@@ -448,6 +460,7 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 			com.Styles.Attachments.Image,
 			com.Styles.Attachments.Text,
 			com.Styles.Attachments.Skill,
+			com.Styles.Attachments.Prompt,
 			com.Styles.Attachments.Remove,
 		),
 		attachments.Keymap{
@@ -853,8 +866,17 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.openMCPAuthDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case promptResolveFailedMsg:
+		m.removePromptToken(msg.start, msg.text)
+		if msg.err != nil {
+			cmds = append(cmds, util.ReportError(fmt.Errorf(
+				"could not resolve /%s: %w", msg.name, msg.err)))
+		}
 	case mcpPromptsLoadedMsg:
 		m.mcpPrompts = msg.Prompts
+		// Prompt names validate "/" tokens in the editor just as skill names
+		// do, so the known-name set has to move when the prompts do.
+		m.refreshSkillNames()
 		dia := m.dialog.Dialog(dialog.CommandsID)
 		if dia == nil {
 			break
@@ -1876,6 +1898,14 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 
 		m.dialog.CloseFrontDialog()
 
+		// A cancelled prompt-arguments dialog leaves the "/query" the user
+		// typed behind. Nothing was attached, so take it back out rather
+		// than leave a token that looks resolved.
+		if m.pendingPromptTrigger.text != "" {
+			m.removePromptToken(m.pendingPromptTrigger.start, m.pendingPromptTrigger.text)
+			m.pendingPromptTrigger.text = ""
+		}
+
 		if isOnboarding {
 			if cmd := m.openModelsDialog(); cmd != nil {
 				cmds = append(cmds, cmd)
@@ -2151,6 +2181,13 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 	case dialog.ActionAttachSkill:
 		m.dialog.CloseFrontDialog()
 		cmds = append(cmds, m.attachSkill(msg.ID, msg.Name))
+	case dialog.ActionInsertMCPPrompt:
+		m.dialog.CloseFrontDialog()
+		// Restore the splice point the popup was closed with; the insertion
+		// replaces the trigger text, so it is no longer pending.
+		m.completionsStartIndex = msg.StartIndex
+		m.pendingPromptTrigger.text = ""
+		cmds = append(cmds, m.attachMCPPrompt(msg.Name, msg.MCPName, msg.PromptID, msg.Args))
 	case dialog.ActionRunMCPPrompt:
 		if len(msg.Arguments) > 0 && msg.Args == nil {
 			m.dialog.CloseFrontDialog()
@@ -2527,6 +2564,11 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 					switch msg := msg.(type) {
 					case completions.SelectionMsg[completions.SkillCompletionValue]:
 						cmds = append(cmds, m.insertSkillCompletion(msg.Value))
+						if !msg.KeepOpen {
+							m.closeCompletions()
+						}
+					case completions.SelectionMsg[completions.PromptCompletionValue]:
+						cmds = append(cmds, m.insertMCPPromptCompletion(msg.Value))
 						if !msg.KeepOpen {
 							m.closeCompletions()
 						}
@@ -4012,11 +4054,12 @@ func wordCanBeSkillToken(word string) bool {
 
 func (m *UI) openSkillCompletions(startIndex int) {
 	values := m.skillCompletionValues()
-	if len(values) == 0 {
+	prompts := m.promptCompletionValues()
+	if len(values) == 0 && len(prompts) == 0 {
 		// An open-but-empty popup still consumes enter and the arrow keys,
-		// so a user with no skills configured could not submit a prompt
+		// so a user with nothing configured could not submit a prompt
 		// containing a '/'. Unlike '@' there is nothing to wait on here —
-		// no skills means no popup.
+		// nothing to offer means no popup.
 		return
 	}
 
@@ -4025,7 +4068,44 @@ func (m *UI) openSkillCompletions(startIndex int) {
 	m.completionsQuery = ""
 	m.completionsStartIndex = startIndex
 	m.completionsPositionStart = m.completionsPosition()
-	m.completions.SetSkillItems(values)
+	m.completions.SetSkillItems(values, prompts)
+}
+
+// promptCompletionValues turns the loaded MCP prompts into popup items.
+//
+// Names are server-qualified ("gitea:review"), which is both how
+// commands.LoadMCPPrompts already keys them and the only form that can be
+// unambiguous: prompt names are unique per server, so two servers may each
+// expose "review". Skills are not qualified — Crush skill names come
+// straight from SKILL.md frontmatter and there is no namespace to qualify
+// them with.
+func (m *UI) promptCompletionValues() []completions.PromptCompletionValue {
+	values := make([]completions.PromptCompletionValue, 0, len(m.mcpPrompts))
+	for _, p := range m.mcpPrompts {
+		if p.ClientID == "" || p.PromptID == "" {
+			continue
+		}
+		args := make([]completions.PromptArgument, 0, len(p.Arguments))
+		for _, a := range p.Arguments {
+			args = append(args, completions.PromptArgument{
+				ID:          a.ID,
+				Title:       a.Title,
+				Description: a.Description,
+				Required:    a.Required,
+			})
+		}
+		values = append(values, completions.PromptCompletionValue{
+			Name:        p.ClientID + ":" + p.PromptID,
+			Description: cmp.Or(p.Description, p.Title),
+			MCPName:     p.ClientID,
+			PromptID:    p.PromptID,
+			Arguments:   args,
+		})
+	}
+	slices.SortFunc(values, func(a, b completions.PromptCompletionValue) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return values
 }
 
 // insertCompletionText replaces the @query in the textarea with the given text.
@@ -4267,6 +4347,170 @@ func (m *UI) insertSkillCompletion(skill completions.SkillCompletionValue) tea.C
 	return m.handleTextareaHeightChange(prevHeight)
 }
 
+// insertMCPPromptCompletion handles picking an MCP prompt from the "/" popup.
+//
+// Prompts that declare arguments open the arguments dialog first; the
+// insertion happens once the values come back, via promptArgsResolvedMsg.
+func (m *UI) insertMCPPromptCompletion(p completions.PromptCompletionValue) tea.Cmd {
+	if len(p.Arguments) == 0 {
+		return m.attachMCPPrompt(p.Name, p.MCPName, p.PromptID, nil)
+	}
+	args := make([]commands.Argument, 0, len(p.Arguments))
+	for _, a := range p.Arguments {
+		args = append(args, commands.Argument{
+			ID:          a.ID,
+			Title:       cmp.Or(a.Title, a.ID),
+			Description: a.Description,
+			Required:    a.Required,
+		})
+	}
+	// Capture the splice point before the popup closes: closeCompletions
+	// zeroes completionsStartIndex, and the insertion does not happen until
+	// the dialog resolves. Without carrying it on the action, the token was
+	// spliced at index 0 and ate everything before the trigger.
+	startIndex := m.completionsStartIndex
+	m.pendingPromptTrigger.start = startIndex
+	m.pendingPromptTrigger.text = m.textareaWord()
+	m.closeCompletions()
+	m.dialog.OpenDialog(dialog.NewArguments(m.com, "/"+p.Name, p.Description, args,
+		dialog.ActionInsertMCPPrompt{
+			Name:       p.Name,
+			MCPName:    p.MCPName,
+			PromptID:   p.PromptID,
+			Arguments:  args,
+			StartIndex: startIndex,
+		}))
+	return nil
+}
+
+// promptTokenValue renders one argument value for the inline token.
+//
+// Values come from free-text dialog inputs, so they can contain anything.
+// Whitespace is the one thing the token grammar cannot carry —
+// ScanPromptTokens ends a token at the first space — so it is percent-encoded
+// rather than dropped: the value stays readable and the token stays a single
+// highlighted, atomically-deletable unit.
+func promptTokenValue(v string) string {
+	var b strings.Builder
+	for _, r := range v {
+		switch r {
+		case ' ':
+			b.WriteString("%20")
+		case '\t':
+			b.WriteString("%09")
+		case '\n':
+			b.WriteString("%0A")
+		case '\r':
+			b.WriteString("%0D")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// attachMCPPrompt resolves the prompt against its server and attaches the
+// result.
+//
+// The resolved body becomes an attachment rather than text spliced into the
+// editor: prompt templates run long, and dropping one into the prompt area
+// would bury whatever the user was writing. The editor keeps a compact
+// "/server:prompt(arg=value)" token — space-free, so it stays one highlighted
+// unit and one atomic backspace removes it — while the body rides along as an
+// attachment the model receives, exactly like an @file mention.
+func (m *UI) attachMCPPrompt(name, mcpName, promptID string, args map[string]string) tea.Cmd {
+	// The dialog returns every declared argument, blank ones included. A
+	// blank optional is "not supplied": it must not reach the server, must
+	// not appear in the token, and must not be counted on the chip.
+	supplied := make(map[string]string, len(args))
+	for k, v := range args {
+		if strings.TrimSpace(v) != "" {
+			supplied[k] = v
+		}
+	}
+
+	token := "/" + name
+	if len(supplied) > 0 {
+		keys := make([]string, 0, len(supplied))
+		for k := range supplied {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, k+"="+promptTokenValue(supplied[k]))
+		}
+		token += "(" + strings.Join(parts, ",") + ")"
+	}
+
+	prevHeight := m.textarea.Height()
+	if !m.insertCompletionText(token) {
+		return nil
+	}
+	// Key the attachment uniquely per insertion. Keying by the prompt name
+	// alone made RemoveByFilePath's first-match delete remove the wrong
+	// entry when the same prompt was inserted twice — dropping one body
+	// while its token was still in the editor.
+	m.promptAttachSeq++
+	attachKey := fmt.Sprintf("%s#%d", name, m.promptAttachSeq)
+	m.lastCompletionFilePath = attachKey
+	heightCmd := m.handleTextareaHeightChange(prevHeight)
+
+	argCount := len(supplied)
+	insertedText := m.lastCompletionText
+	insertedStart := m.lastCompletionStart
+	promptCmd := func() tea.Msg {
+		body, err := m.com.Workspace.GetMCPPrompt(mcpName, promptID, supplied)
+		if err != nil || body == "" {
+			if err != nil {
+				slog.Warn("Failed to resolve MCP prompt", "prompt", name, "error", err)
+			}
+			// Roll the token back. Leaving it stranded would send the model
+			// the literal "/server:prompt(...)" text with none of the body
+			// behind it — a silently degraded turn rather than a blocked one.
+			return promptResolveFailedMsg{
+				name:  name,
+				start: insertedStart,
+				text:  insertedText,
+				err:   err,
+			}
+		}
+		return message.Attachment{
+			FilePath:       attachKey,
+			FileName:       "/" + name,
+			MimeType:       "text/markdown",
+			Content:        []byte(body),
+			Kind:           message.AttachmentKindMCPPrompt,
+			PromptArgCount: argCount,
+		}
+	}
+	return tea.Batch(heightCmd, promptCmd)
+}
+
+// promptResolveFailedMsg asks the editor to take back a prompt token whose
+// body could not be resolved.
+type promptResolveFailedMsg struct {
+	name  string
+	start int
+	text  string
+	err   error
+}
+
+// removePromptToken deletes a previously inserted prompt token, provided the
+// editor still holds exactly that run at exactly that offset. Anything else
+// means the user has since edited around it, and silently cutting text out of
+// the middle of their prompt would be worse than leaving the token.
+func (m *UI) removePromptToken(start int, text string) {
+	value := m.textarea.Value()
+	end := start + len(text)
+	if start < 0 || end > len(value) || value[start:end] != text {
+		return
+	}
+	m.textarea.SetValue(value[:start] + value[end:])
+	m.textarea.MoveToEnd()
+	m.clearCompletionRange()
+}
+
 // completionsPosition returns the X and Y position for the completions popup.
 func (m *UI) completionsPosition() image.Point {
 	cur := m.textarea.Cursor()
@@ -4461,6 +4705,7 @@ func (m *UI) refreshStyles() {
 		t.Attachments.Image,
 		t.Attachments.Text,
 		t.Attachments.Skill,
+		t.Attachments.Prompt,
 		t.Attachments.Remove,
 	)
 	m.todoSpinner.Style = t.Pills.TodoSpinner

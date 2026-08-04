@@ -8,6 +8,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/ui/styles"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -19,6 +20,7 @@ func newTestRenderer() *Renderer {
 		sty.Attachments.Image,
 		sty.Attachments.Text,
 		sty.Attachments.Skill,
+		sty.Attachments.Prompt,
 		sty.Attachments.Remove,
 	)
 }
@@ -447,4 +449,172 @@ func TestRemoveByFilePath(t *testing.T) {
 		a.RemoveByFilePath("a.go")
 		require.Empty(t, a.List())
 	})
+}
+
+// TestChipSpecForMCPPrompt pins the prompt chip's label rule: the full prompt
+// name, never truncated, plus how many arguments it carries. The name is what
+// distinguishes two prompts from the same server, so truncating it the way
+// filenames are truncated would make them ambiguous.
+func TestChipSpecForMCPPrompt(t *testing.T) {
+	t.Parallel()
+
+	r := newTestRenderer()
+
+	t.Run("full name is kept past the filename budget", func(t *testing.T) {
+		t.Parallel()
+		spec := r.chipSpecFor(message.Attachment{
+			Kind:           message.AttachmentKindMCPPrompt,
+			FileName:       "/gitea:some-very-long-prompt-name",
+			PromptArgCount: 2,
+		})
+		require.Equal(t, "/gitea:some-very-long-prompt-name (2 args)", spec.label)
+		require.NotContains(t, spec.label, "…", "a prompt name must not be truncated")
+	})
+
+	t.Run("singular for one argument", func(t *testing.T) {
+		t.Parallel()
+		spec := r.chipSpecFor(message.Attachment{
+			Kind:           message.AttachmentKindMCPPrompt,
+			FileName:       "/cairn:run",
+			PromptArgCount: 1,
+		})
+		require.Equal(t, "/cairn:run (1 arg)", spec.label)
+	})
+
+	t.Run("no suffix when the prompt takes no arguments", func(t *testing.T) {
+		t.Parallel()
+		spec := r.chipSpecFor(message.Attachment{
+			Kind:     message.AttachmentKindMCPPrompt,
+			FileName: "/cairn:run",
+		})
+		require.Equal(t, "/cairn:run", spec.label)
+	})
+
+	t.Run("a path-shaped argument value is not eaten by filepath.Base", func(t *testing.T) {
+		t.Parallel()
+		// File chips call filepath.Base, which would cut "gitea:review" out
+		// of a label ending in a slash-bearing value. Prompt labels must not
+		// go through it.
+		spec := r.chipSpecFor(message.Attachment{
+			Kind:           message.AttachmentKindMCPPrompt,
+			FileName:       "/gitea:review",
+			PromptArgCount: 1,
+		})
+		require.Equal(t, "/gitea:review (1 arg)", spec.label)
+	})
+}
+
+// TestChipSpecForFileKeepsTruncation pins that the file rule is unchanged:
+// basename only, truncated to the shared budget.
+func TestChipSpecForFileKeepsTruncation(t *testing.T) {
+	t.Parallel()
+
+	r := newTestRenderer()
+	spec := r.chipSpecFor(message.Attachment{
+		FileName: "/some/deep/path/a-very-long-file-name.go",
+		MimeType: "text/plain",
+	})
+	require.Contains(t, spec.label, "…")
+	require.NotContains(t, spec.label, "/", "file chips show the basename only")
+}
+
+// TestRenderVariableWidthChipsDoNotOverflow pins the layout change. The fit
+// cutoff used to divide the available width by one nominal chip width, which
+// silently assumed every chip was the same size; a prompt chip is not.
+func TestRenderVariableWidthChipsDoNotOverflow(t *testing.T) {
+	t.Parallel()
+
+	atts := []message.Attachment{
+		{Kind: message.AttachmentKindMCPPrompt, FileName: "/gitea:a-long-prompt-name", PromptArgCount: 3},
+		{Kind: message.AttachmentKindMCPPrompt, FileName: "/cairn:another-long-one", PromptArgCount: 2},
+		{FileName: "main.go", MimeType: "text/plain"},
+		{FileName: "other.go", MimeType: "text/plain"},
+	}
+
+	t.Run("row never exceeds the width it was given", func(t *testing.T) {
+		t.Parallel()
+		// Sweep widths, including ones too narrow for even the first chip.
+		for _, width := range []int{10, 20, 40, 60, 80, 120, 200} {
+			out := newTestRenderer().Render(atts, false, true, width)
+			require.LessOrEqual(t, lipgloss.Width(out), width,
+				"width %d: the chip row must not render wider than its space", width)
+		}
+	})
+
+	t.Run("chips that do not fit are reported, not dropped", func(t *testing.T) {
+		t.Parallel()
+		// Wide enough for some but not all of them.
+		out := newTestRenderer().Render(atts, false, true, 80)
+		require.Contains(t, ansi.Strip(out), "more…")
+	})
+
+	t.Run("everything fits when there is room", func(t *testing.T) {
+		t.Parallel()
+		out := newTestRenderer().Render(atts, false, true, 300)
+		stripped := ansi.Strip(out)
+		require.NotContains(t, stripped, "more…")
+		require.Contains(t, stripped, "/gitea:a-long-prompt-name (3 args)",
+			"a prompt name must survive intact when there is room")
+	})
+}
+
+// TestRenderNarrowRowKeepsRemoveButtonAndBounds pins the two failures the
+// untruncated prompt label introduced.
+//
+// Prompt labels are deliberately not capped at maxFilename, so a long one
+// could overrun the row: the trailing ✕ was truncated away by the row-level
+// backstop while r.bounds still claimed a hit region there, and clicking the
+// resulting blank space silently deleted an attachment. The overflow marker
+// disappeared the same way, so extra attachments went unreported.
+func TestRenderNarrowRowKeepsRemoveButtonAndBounds(t *testing.T) {
+	t.Parallel()
+
+	atts := []message.Attachment{
+		{
+			Kind:           message.AttachmentKindMCPPrompt,
+			FileName:       "/stumpcloud-ansible:deploy_production_playbook",
+			PromptArgCount: 3,
+		},
+		{FileName: "main.go", MimeType: "text/plain"},
+	}
+
+	for _, width := range []int{20, 27, 28, 30, 40, 60} {
+		r := newTestRenderer()
+		out := r.Render(atts, false, true, width)
+		stripped := ansi.Strip(out)
+
+		require.LessOrEqual(t, lipgloss.Width(out), width,
+			"width %d: row must not overflow", width)
+
+		// Every recorded hit region must sit inside what was actually drawn,
+		// or a click lands on a button that is not there.
+		for _, b := range r.bounds {
+			require.LessOrEqual(t, b.removeEnd, lipgloss.Width(out),
+				"width %d: hit region %v extends past the drawn row %q",
+				width, b, stripped)
+		}
+	}
+}
+
+// TestHitTestRemoveDoesNotMatchTruncatedButton is the click-level form of the
+// same bug: no hit region may survive for a button the user cannot see.
+func TestHitTestRemoveDoesNotMatchTruncatedButton(t *testing.T) {
+	t.Parallel()
+
+	atts := []message.Attachment{{
+		Kind:           message.AttachmentKindMCPPrompt,
+		FileName:       "/gitea:review",
+		PromptArgCount: 1,
+	}}
+
+	for _, width := range []int{27, 28} {
+		r := newTestRenderer()
+		out := r.Render(atts, false, true, width)
+		drawn := lipgloss.Width(out)
+		for x := drawn; x < drawn+4; x++ {
+			require.Equal(t, -1, r.HitTestRemove(atts, x),
+				"width %d: x=%d is past the drawn row but hit-tests as a remove button",
+				width, x)
+		}
+	}
 }

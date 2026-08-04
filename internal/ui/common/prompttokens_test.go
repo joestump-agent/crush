@@ -75,3 +75,44 @@ func TestIsPromptSkillPrefixEmptyName(t *testing.T) {
 	require.False(t, IsPromptSkillPrefix(""))
 	require.True(t, IsPromptSkillPrefix("com"))
 }
+
+// TestScanPromptTokensPromptWithArguments pins that an MCP prompt token
+// highlights with its arguments attached.
+//
+// The token carries its arguments inline — "/gitea:review(id=42)" — and
+// IsPromptSkillPrefix asks whether the token is a prefix of a known name. A
+// name with arguments appended is longer than the name, so without stripping
+// the parenthesised tail the argument-bearing form never validates and the
+// whole token renders as unstyled prose.
+func TestScanPromptTokensPromptWithArguments(t *testing.T) {
+	SetPromptSkillNames([]string{"gitea:review", "code-review"})
+	t.Cleanup(func() { SetPromptSkillNames(nil) })
+
+	for _, tc := range []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"bare prompt name", "do /gitea:review", true},
+		{"with one argument", "do /gitea:review(id=42)", true},
+		{"argument value containing a slash", "do /gitea:review(repo=stump.wtf/crush)", true},
+		{"several arguments", "do /gitea:review(id=42,repo=a/b)", true},
+		{"partially typed", "do /gitea:rev", true},
+		{"unknown prompt is left alone", "do /nope:thing(id=1)", false},
+		{"an ordinary path is left alone", "read /tmp/out.log", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			toks := ScanPromptTokens([]rune(tc.line))
+			var gotSkill bool
+			for _, tok := range toks {
+				if tok.Kind == PromptTokenSkill {
+					gotSkill = true
+					// The whole token, arguments included, is one span.
+					require.Equal(t, len([]rune(tc.line)), tok.End,
+						"the token must run to the end of the word")
+				}
+			}
+			require.Equal(t, tc.want, gotSkill)
+		})
+	}
+}

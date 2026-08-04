@@ -181,6 +181,25 @@ type (
 
 // ActionCmd represents an action that carries a [tea.Cmd] to be passed to the
 // Bubble Tea program loop.
+// ActionInsertMCPPrompt is a message to attach an MCP prompt to the prompt
+// currently being composed, rather than running it as a whole turn the way
+// ActionRunMCPPrompt does. It is produced by the inline "/" completion, where
+// the user is mid-sentence and the prompt is one ingredient of their message.
+type ActionInsertMCPPrompt struct {
+	// Name is the server-qualified "server:prompt" form shown in the editor.
+	Name     string
+	MCPName  string
+	PromptID string
+	// Arguments the prompt declares; Args is what the user supplied.
+	Arguments []commands.Argument
+	Args      map[string]string
+	// StartIndex is where the token replaces the trigger text in the
+	// editor. It travels on the action because the completions popup — and
+	// with it the model's own start index — is closed before this dialog
+	// opens.
+	StartIndex int
+}
+
 type ActionCmd struct {
 	Cmd tea.Cmd
 }

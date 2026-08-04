@@ -84,6 +84,7 @@ func TestUserMessageItem_MutatorsBumpVersion(t *testing.T) {
 		sty.Attachments.Image,
 		sty.Attachments.Text,
 		sty.Attachments.Skill,
+		sty.Attachments.Prompt,
 		sty.Attachments.Remove,
 	)
 	msg := &message.Message{
@@ -256,6 +257,7 @@ func TestUserMessageItem_FinishedAlwaysTrue(t *testing.T) {
 		sty.Attachments.Image,
 		sty.Attachments.Text,
 		sty.Attachments.Skill,
+		sty.Attachments.Prompt,
 		sty.Attachments.Remove,
 	)
 	msg := &message.Message{

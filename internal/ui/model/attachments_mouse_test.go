@@ -31,6 +31,7 @@ func newAttachmentClickTestUI(t *testing.T) (*UI, int) {
 		sty.Image,
 		sty.Text,
 		sty.Skill,
+		sty.Prompt,
 		sty.Remove,
 	)
 	u.attachments = attachments.New(renderer, attachments.Keymap{})

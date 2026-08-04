@@ -1559,7 +1559,7 @@ func (a *sessionAgent) createUserMessage(ctx context.Context, call SessionAgentC
 	parts := []message.ContentPart{message.TextContent{Text: call.Prompt}}
 	var attachmentParts []message.ContentPart
 	for _, attachment := range call.Attachments {
-		attachmentParts = append(attachmentParts, message.BinaryContent{Path: attachment.FilePath, MIMEType: attachment.MimeType, Data: attachment.Content})
+		attachmentParts = append(attachmentParts, message.BinaryContent{Path: attachment.FilePath, MIMEType: attachment.MimeType, Data: attachment.Content, Kind: attachment.Kind, PromptArgCount: attachment.PromptArgCount})
 	}
 	parts = append(parts, attachmentParts...)
 	msg, err := a.messages.Create(ctx, call.SessionID, message.CreateMessageParams{

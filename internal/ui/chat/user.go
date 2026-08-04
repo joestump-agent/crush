@@ -267,8 +267,10 @@ func (m *UserMessageItem) renderAttachments(width int) string {
 	var attachments []message.Attachment
 	for _, at := range m.message.BinaryContent() {
 		attachments = append(attachments, message.Attachment{
-			FileName: at.Path,
-			MimeType: at.MIMEType,
+			FileName:       at.Path,
+			MimeType:       at.MIMEType,
+			Kind:           at.Kind,
+			PromptArgCount: at.PromptArgCount,
 		})
 	}
 	// This message is already posted, so the attachment can't be removed;

@@ -82,14 +82,20 @@ func (h *promptHighlighter) tokenStyle(kind common.PromptTokenKind) lipgloss.Sty
 	return h.fileStyle
 }
 
-// skillNames returns the names of the skills a /token may refer to. It
-// shares skillCompletionValues' source of truth — the effective catalog,
-// falling back to discovery states before the first catalog load — so a
-// token highlights exactly when the popup would have offered it.
+// skillNames returns the names a /token may refer to: skills and MCP
+// prompts alike. It shares the popup's sources of truth — the effective
+// skill catalog and the loaded MCP prompts — so a token highlights exactly
+// when the popup would have offered it. A prompt that is offered but not
+// registered here renders as unstyled prose, which reads as "this did not
+// take" even though the attachment went through.
 func (m *UI) skillNames() []string {
-	values := m.skillCompletionValues()
-	names := make([]string, 0, len(values))
-	for _, v := range values {
+	skills := m.skillCompletionValues()
+	prompts := m.promptCompletionValues()
+	names := make([]string, 0, len(skills)+len(prompts))
+	for _, v := range skills {
+		names = append(names, v.Name)
+	}
+	for _, v := range prompts {
 		names = append(names, v.Name)
 	}
 	return names

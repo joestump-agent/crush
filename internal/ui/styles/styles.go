@@ -46,9 +46,13 @@ const (
 	CronOneShotIcon   string = "•"
 	CronDeletedIcon   string = "✕"
 
-	ImageIcon  string = "▣"
-	TextIcon   string = "≡"
-	SkillIcon  string = "▲"
+	ImageIcon string = "▣"
+	TextIcon  string = "≡"
+	SkillIcon string = "▲"
+	// PromptIcon marks a resolved MCP prompt. Single-width and geometric to
+	// match the icons above: an emoji here would be double-width and
+	// colour-rendered, breaking both the row's look and its width math.
+	PromptIcon string = "◈"
 	RemoveIcon string = "✕"
 
 	ScrollbarThumb string = "┃"
@@ -601,6 +605,7 @@ type Styles struct {
 		Image    lipgloss.Style
 		Text     lipgloss.Style
 		Skill    lipgloss.Style
+		Prompt   lipgloss.Style
 		Remove   lipgloss.Style
 		Deleting lipgloss.Style
 	}
