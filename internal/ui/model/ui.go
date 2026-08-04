@@ -534,6 +534,14 @@ func (m *UI) Init() tea.Cmd {
 	}
 	// load the user commands async
 	cmds = append(cmds, m.loadCustomCommands())
+	// Load MCP prompts async. Without this they are only ever picked up
+	// from an mcp.EventStateChanged, which servers publish as they connect
+	// — normally before this model is subscribed to the bus. The event is
+	// then missed and m.mcpPrompts stays nil for the whole session, so the
+	// commands dialog hides its MCP Prompts category outright
+	// (commandsRadioView renders nothing when there are no user commands
+	// and no prompts) and every server's prompts are unreachable.
+	cmds = append(cmds, m.loadMCPrompts)
 	// load prompt history async
 	cmds = append(cmds, m.loadPromptHistory())
 	// load initial LSP state
