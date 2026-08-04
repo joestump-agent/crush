@@ -856,6 +856,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case mcpPromptsLoadedMsg:
 		m.mcpPrompts = msg.Prompts
+		// Prompt names validate "/" tokens in the editor just as skill names
+		// do, so the known-name set has to move when the prompts do.
+		m.refreshSkillNames()
 		dia := m.dialog.Dialog(dialog.CommandsID)
 		if dia == nil {
 			break
