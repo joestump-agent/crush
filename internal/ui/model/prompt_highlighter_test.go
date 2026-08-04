@@ -3,8 +3,10 @@ package model
 import (
 	"testing"
 
+	"charm.land/bubbles/v2/spinner"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/internal/ui/attachments"
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/stretchr/testify/require"
 )
@@ -142,4 +144,45 @@ func TestSkillNamesFromCatalog(t *testing.T) {
 		},
 	}
 	require.Equal(t, []string{"alpha", "commit"}, m.skillNames())
+}
+
+// TestRefreshStylesRepushesHighlighterStyles pins the highlighter into
+// refreshStyles' invariant: every subcomponent that copies style values at
+// construction gets them re-pushed on a theme change.
+//
+// promptHighlighter is built once in New() from Editor.TokenFile/TokenSkill
+// and holds value copies, so without the re-push the editor kept drawing
+// tokens in the previous theme's colours while the posted message — which
+// reads the styles live — drew them in the new one, leaving the same token
+// two different colours above and below the editor.
+func TestRefreshStylesRepushesHighlighterStyles(t *testing.T) {
+	t.Parallel()
+
+	m := newSkillCompletionUI()
+	m.header = newHeader(m.com)
+	m.todoSpinner = spinner.New()
+	// refreshStyles pushes into every subcomponent, so they all have to be
+	// real for it to run at all.
+	sty := m.com.Styles
+	m.attachments = attachments.New(attachments.NewRenderer(
+		sty.Attachments.Normal,
+		sty.Attachments.Deleting,
+		sty.Attachments.Image,
+		sty.Attachments.Text,
+		sty.Attachments.Skill,
+		sty.Attachments.Remove,
+	), attachments.Keymap{})
+	m.promptHighlighter = newPromptHighlighter(
+		lipgloss.NewStyle().Foreground(lipgloss.Color("1")),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("2")),
+	)
+
+	// Swap in a theme whose token styles differ from the ones above.
+	want := m.com.Styles.Editor.TokenFile
+	m.refreshStyles()
+
+	require.Equal(t, want, m.promptHighlighter.fileStyle,
+		"a theme change must re-push the file-token style")
+	require.Equal(t, m.com.Styles.Editor.TokenSkill, m.promptHighlighter.skillStyle,
+		"a theme change must re-push the skill-token style")
 }

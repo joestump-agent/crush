@@ -30,6 +30,20 @@ func newPromptHighlighter(fileStyle, skillStyle lipgloss.Style) *promptHighlight
 	}
 }
 
+// SetStyles re-pushes the token styles after a theme change.
+//
+// The styles are value copies taken at construction, so without this the
+// editor keeps drawing @file and /skill tokens in the old theme's colours
+// while the posted message — which reads the styles live — draws them in the
+// new one, and the same token appears in two colours above and below the
+// editor. The cached ranges hold offsets only and stay valid.
+func (h *promptHighlighter) SetStyles(fileStyle, skillStyle lipgloss.Style) {
+	h.fileStyle = fileStyle
+	h.skillStyle = skillStyle
+	// The cached ranges carry the old styles, so retokenize on next use.
+	h.lines = nil
+}
+
 // Rescan retokenizes the full prompt value. Called whenever the textarea
 // value changes; cheap (linear scan) and keeps Highlight a pure lookup.
 func (h *promptHighlighter) Rescan(value string) {

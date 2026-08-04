@@ -2,7 +2,7 @@ package textarea
 
 import (
 	"charm.land/lipgloss/v2"
-	rw "github.com/mattn/go-runewidth"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // LineHighlighter is an optional hook that applies per-token styling to
@@ -103,10 +103,17 @@ func toStyleRanges(seg []rune, ranges []lipgloss.Range, base lipgloss.Style) []l
 }
 
 // runeDisplayWidth returns the total display width of runes.
+//
+// It must measure the same way lipgloss.StyleRanges resolves the cell
+// offsets it is handed — that goes through ansi.Cut, which segments by
+// grapheme cluster. Summing per-rune widths instead disagrees on every
+// cluster built from more than one rune: an emoji with a skin-tone modifier
+// scores 4 rather than 2, a ZWJ family 7 rather than 2, and the token
+// highlight lands that many cells to the right of the token it belongs to.
+// internal/ui/AGENTS.md requires the x/ansi package for exactly this, and
+// the posted-message path (ui/chat/prompt_tokens.go) already uses
+// ansi.StringWidth — measuring differently here made the same text render
+// differently above and below the editor.
 func runeDisplayWidth(r []rune) int {
-	w := 0
-	for _, ru := range r {
-		w += rw.RuneWidth(ru)
-	}
-	return w
+	return ansi.StringWidth(string(r))
 }
