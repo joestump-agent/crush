@@ -388,3 +388,63 @@ func TestHandleClick_EmptyListIgnored(t *testing.T) {
 	handled := m.HandleClick(5)
 	require.False(t, handled)
 }
+
+// TestRemoveByFilePath pins the semantics the atomic-backspace caller in
+// internal/ui/model depends on: exactly one attachment goes, chosen by path,
+// and anything else on the toolbar is left alone.
+func TestRemoveByFilePath(t *testing.T) {
+	t.Parallel()
+
+	newList := func(paths ...string) *Attachments {
+		a := New(nil, Keymap{})
+		for _, p := range paths {
+			a.list = append(a.list, message.Attachment{FilePath: p, FileName: p})
+		}
+		return a
+	}
+	paths := func(a *Attachments) []string {
+		var out []string
+		for _, at := range a.List() {
+			out = append(out, at.FilePath)
+		}
+		return out
+	}
+
+	t.Run("removes the matching attachment", func(t *testing.T) {
+		t.Parallel()
+		a := newList("a.go", "b.go", "c.go")
+		a.RemoveByFilePath("b.go")
+		require.Equal(t, []string{"a.go", "c.go"}, paths(a))
+	})
+
+	t.Run("no match leaves the list untouched", func(t *testing.T) {
+		t.Parallel()
+		a := newList("a.go", "b.go")
+		a.RemoveByFilePath("nope.go")
+		require.Equal(t, []string{"a.go", "b.go"}, paths(a))
+	})
+
+	t.Run("removes only the first of duplicate paths", func(t *testing.T) {
+		t.Parallel()
+		// Duplicates should not arise from the completion path (fileCmd
+		// dedupes), but the method is exported: removing every match would
+		// silently drop an attachment the caller still expects to hold.
+		a := newList("dup.go", "dup.go")
+		a.RemoveByFilePath("dup.go")
+		require.Equal(t, []string{"dup.go"}, paths(a))
+	})
+
+	t.Run("empty path matches nothing on a normal list", func(t *testing.T) {
+		t.Parallel()
+		a := newList("a.go")
+		a.RemoveByFilePath("")
+		require.Equal(t, []string{"a.go"}, paths(a))
+	})
+
+	t.Run("empty list is a no-op", func(t *testing.T) {
+		t.Parallel()
+		a := newList()
+		a.RemoveByFilePath("a.go")
+		require.Empty(t, a.List())
+	})
+}
