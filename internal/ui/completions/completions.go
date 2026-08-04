@@ -490,6 +490,11 @@ func (c *Completions) selectCurrent(keepOpen bool) tea.Msg {
 			Value:    item,
 			KeepOpen: keepOpen,
 		}
+	case PromptCompletionValue:
+		return SelectionMsg[PromptCompletionValue]{
+			Value:    item,
+			KeepOpen: keepOpen,
+		}
 	default:
 		return nil
 	}

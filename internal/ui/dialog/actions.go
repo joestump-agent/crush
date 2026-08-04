@@ -193,6 +193,11 @@ type ActionInsertMCPPrompt struct {
 	// Arguments the prompt declares; Args is what the user supplied.
 	Arguments []commands.Argument
 	Args      map[string]string
+	// StartIndex is where the token replaces the trigger text in the
+	// editor. It travels on the action because the completions popup — and
+	// with it the model's own start index — is closed before this dialog
+	// opens.
+	StartIndex int
 }
 
 type ActionCmd struct {

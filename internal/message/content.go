@@ -87,6 +87,14 @@ type BinaryContent struct {
 	Path     string
 	MIMEType string
 	Data     []byte
+	// Kind and PromptArgCount carry an attachment's presentation identity
+	// across the message boundary. Without them a chip loses what it is the
+	// moment the message is sent: the transcript rebuilds attachments from
+	// these parts, and MIMEType alone cannot distinguish an MCP prompt from
+	// any other text attachment. Both are omitempty and zero-valued for
+	// ordinary files, so existing persisted messages decode unchanged.
+	Kind           AttachmentKind `json:",omitempty"`
+	PromptArgCount int            `json:",omitempty"`
 }
 
 func (bc BinaryContent) String(p catwalk.InferenceProvider) string {

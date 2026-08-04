@@ -198,3 +198,38 @@ func TestSetSkillItemsPromptsOnly(t *testing.T) {
 	})
 	require.True(t, c.HasItems())
 }
+
+// TestSelectCurrentReturnsPromptSelection is the test whose absence let the
+// whole feature ship inert: selectCurrent had no PromptCompletionValue case,
+// so pressing enter on a prompt row returned nil, the model's type switch
+// matched nothing, and the insertion path was dead code. Every other test
+// stopped at SetSkillItems/Filter and never pressed enter.
+func TestSelectCurrentReturnsPromptSelection(t *testing.T) {
+	t.Parallel()
+
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c.SetSkillItems(nil, []PromptCompletionValue{
+		{Name: "gitea:review", MCPName: "gitea", PromptID: "review"},
+	})
+
+	msg := c.selectCurrent(false)
+	sel, ok := msg.(SelectionMsg[PromptCompletionValue])
+	require.True(t, ok, "selecting a prompt must produce a prompt selection, got %T", msg)
+	require.Equal(t, "gitea:review", sel.Value.Name)
+	require.Equal(t, "gitea", sel.Value.MCPName)
+	require.Equal(t, "review", sel.Value.PromptID)
+}
+
+// TestSelectCurrentStillReturnsSkillSelection is the control: adding prompts
+// must not have displaced skills from the same popup.
+func TestSelectCurrentStillReturnsSkillSelection(t *testing.T) {
+	t.Parallel()
+
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c.SetSkillItems([]SkillCompletionValue{{Name: "code-review"}}, nil)
+
+	msg := c.selectCurrent(false)
+	sel, ok := msg.(SelectionMsg[SkillCompletionValue])
+	require.True(t, ok, "got %T", msg)
+	require.Equal(t, "code-review", sel.Value.Name)
+}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -185,6 +186,15 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting, showRemove
 			// attachments render with their chip backgrounds touching.
 			nameStyle = nameStyle.MarginRight(1)
 		}
+		// Bound the label to the room actually left. Prompt labels are
+		// deliberately not capped at maxFilename, so without this a single
+		// long one overruns the row and the trailing ✕ — and the overflow
+		// marker — get eaten by the row-level truncation below, leaving
+		// click regions pointing at cells that no longer show a button.
+		budget := width - offset - lipgloss.Width(iconStr) - trailWidth(r, deleting, showRemove, removeStr, i)
+		if budget > 0 && ansi.StringWidth(filename) > budget {
+			filename = ansi.Truncate(filename, budget, "…")
+		}
 		nameStr := nameStyle.Render(filename)
 
 		chipW := lipgloss.Width(iconStr) + lipgloss.Width(nameStr)
@@ -194,20 +204,18 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting, showRemove
 		// reliable cutoff is a running total. Reserve room for the
 		// "N more…" marker whenever anything would be left over, and always
 		// emit at least one chip however narrow the editor is.
-		trailW := 0
-		switch {
-		case deleting:
-			trailW = lipgloss.Width(r.deletingStyle.Render(fmt.Sprintf("%d", i)))
-		case showRemove:
-			trailW = lipgloss.Width(removeStr)
-		}
+		trailW := trailWidth(r, deleting, showRemove, removeStr, i)
 		reserve := 0
 		if i < len(attachments)-1 {
 			reserve = maxItemWidth
 		}
-		if i > 0 && offset+chipW+trailW+reserve > width {
-			chips = append(chips, lipgloss.NewStyle().Width(maxItemWidth).
-				Render(fmt.Sprintf("%d more…", len(attachments)-i)))
+		if offset+chipW+trailW+reserve > width {
+			// Nothing more fits. Report the remainder if there is room for
+			// the marker; otherwise stop silently rather than overflow.
+			if offset+maxItemWidth <= width {
+				chips = append(chips, lipgloss.NewStyle().Width(maxItemWidth).
+					Render(fmt.Sprintf("%d more…", len(attachments)-i)))
+			}
 			break
 		}
 
@@ -248,6 +256,19 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting, showRemove
 		out = ansi.Truncate(out, width, "…")
 	}
 	return out
+}
+
+// trailWidth is the width of whatever follows a chip's label: the delete-mode
+// numeral, the remove button, or nothing.
+func trailWidth(r *Renderer, deleting, showRemove bool, removeStr string, i int) int {
+	switch {
+	case deleting:
+		return lipgloss.Width(r.deletingStyle.Render(fmt.Sprintf("%d", i)))
+	case showRemove:
+		return lipgloss.Width(removeStr)
+	default:
+		return 0
+	}
 }
 
 // HitTestRemove returns the index of the attachment whose remove button
@@ -313,12 +334,31 @@ func fileChip(r *Renderer, a message.Attachment) chipSpec {
 // token in the editor, where there is room; the chip carries only how many
 // there are.
 func mcpPromptChip(r *Renderer, a message.Attachment) chipSpec {
-	label := a.FileName
+	label := promptChipName(a.FileName)
 	if a.PromptArgCount > 0 {
 		label = fmt.Sprintf("%s (%d %s)", label, a.PromptArgCount,
 			plural(a.PromptArgCount, "arg", "args"))
 	}
 	return chipSpec{icon: r.promptStyle, label: label}
+}
+
+// promptChipName normalizes what the chip shows for a prompt.
+//
+// In the composer the label is already "/server:prompt". A posted message
+// rebuilds its attachments from the stored part, which carries only the
+// removal key — "server:prompt#3", made unique per insertion — so the
+// trailing counter comes off and the leading slash goes back on. Doing it
+// here keeps every prompt-specific presentation rule in one place.
+func promptChipName(name string) string {
+	if i := strings.LastIndexByte(name, '#'); i > 0 {
+		if _, err := strconv.Atoi(name[i+1:]); err == nil {
+			name = name[:i]
+		}
+	}
+	if !strings.HasPrefix(name, "/") {
+		name = "/" + name
+	}
+	return name
 }
 
 func plural(n int, one, many string) string {

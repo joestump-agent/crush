@@ -557,3 +557,64 @@ func TestRenderVariableWidthChipsDoNotOverflow(t *testing.T) {
 			"a prompt name must survive intact when there is room")
 	})
 }
+
+// TestRenderNarrowRowKeepsRemoveButtonAndBounds pins the two failures the
+// untruncated prompt label introduced.
+//
+// Prompt labels are deliberately not capped at maxFilename, so a long one
+// could overrun the row: the trailing ✕ was truncated away by the row-level
+// backstop while r.bounds still claimed a hit region there, and clicking the
+// resulting blank space silently deleted an attachment. The overflow marker
+// disappeared the same way, so extra attachments went unreported.
+func TestRenderNarrowRowKeepsRemoveButtonAndBounds(t *testing.T) {
+	t.Parallel()
+
+	atts := []message.Attachment{
+		{
+			Kind:           message.AttachmentKindMCPPrompt,
+			FileName:       "/stumpcloud-ansible:deploy_production_playbook",
+			PromptArgCount: 3,
+		},
+		{FileName: "main.go", MimeType: "text/plain"},
+	}
+
+	for _, width := range []int{20, 27, 28, 30, 40, 60} {
+		r := newTestRenderer()
+		out := r.Render(atts, false, true, width)
+		stripped := ansi.Strip(out)
+
+		require.LessOrEqual(t, lipgloss.Width(out), width,
+			"width %d: row must not overflow", width)
+
+		// Every recorded hit region must sit inside what was actually drawn,
+		// or a click lands on a button that is not there.
+		for _, b := range r.bounds {
+			require.LessOrEqual(t, b.removeEnd, lipgloss.Width(out),
+				"width %d: hit region %v extends past the drawn row %q",
+				width, b, stripped)
+		}
+	}
+}
+
+// TestHitTestRemoveDoesNotMatchTruncatedButton is the click-level form of the
+// same bug: no hit region may survive for a button the user cannot see.
+func TestHitTestRemoveDoesNotMatchTruncatedButton(t *testing.T) {
+	t.Parallel()
+
+	atts := []message.Attachment{{
+		Kind:           message.AttachmentKindMCPPrompt,
+		FileName:       "/gitea:review",
+		PromptArgCount: 1,
+	}}
+
+	for _, width := range []int{27, 28} {
+		r := newTestRenderer()
+		out := r.Render(atts, false, true, width)
+		drawn := lipgloss.Width(out)
+		for x := drawn; x < drawn+4; x++ {
+			require.Equal(t, -1, r.HitTestRemove(atts, x),
+				"width %d: x=%d is past the drawn row but hit-tests as a remove button",
+				width, x)
+		}
+	}
+}
