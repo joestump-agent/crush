@@ -39,6 +39,10 @@ type A2UISurface struct {
 	Payload string
 	// URI is the embedded resource's URI, for display/diagnostics.
 	URI string
+	// RenderForUser reports whether the payload should be rendered for the
+	// user. False only when the audience is ["assistant"] alone: the spec's
+	// verbalization contract renders for every audience except that one.
+	RenderForUser bool
 	// AssistantVisible reports whether the server annotated the payload
 	// for the LLM as well as the user (empty audience or one containing
 	// "assistant"). An audience of ["user"] alone hides the raw JSON from
@@ -63,6 +67,31 @@ var allTools = csync.NewMap[string, []*Tool]()
 // Tools returns all available MCP tools.
 func Tools() iter.Seq2[string, []*Tool] {
 	return allTools.Seq2()
+}
+
+// HasTool reports whether the named MCP server currently exposes a tool with
+// the given name. It backs the A2UI action round-trip: a server that serves
+// interactive surfaces may also expose the a2ui_action / a2ui_error tools
+// the client round-trips interactions through, and the client needs to know
+// before it commits to that path.
+func HasTool(name, toolName string) bool {
+	tools, ok := allTools.Get(name)
+	if !ok {
+		return false
+	}
+	return slices.ContainsFunc(tools, func(t *Tool) bool { return t.Name == toolName })
+}
+
+// SetToolsForTest installs the given tool names for an MCP server in the
+// shared registry and returns a cleanup that removes them. It exists for
+// tests outside this package that need HasTool to observe a server's tools.
+func SetToolsForTest(name string, toolNames ...string) func() {
+	tools := make([]*Tool, len(toolNames))
+	for i, n := range toolNames {
+		tools[i] = &Tool{Name: n}
+	}
+	allTools.Set(name, tools)
+	return func() { allTools.Del(name) }
 }
 
 // RunTool runs an MCP tool with the given input parameters.
@@ -126,10 +155,12 @@ func extractToolResult(result *mcp.CallToolResult) ToolResult {
 					payload = string(content.Resource.Blob)
 				}
 				if payload != "" {
+					render, assistantVisible := a2uiAudience(content.Annotations)
 					surfaces = append(surfaces, A2UISurface{
 						Payload:          payload,
 						URI:              content.Resource.URI,
-						AssistantVisible: a2uiAssistantVisible(content.Annotations),
+						RenderForUser:    render,
+						AssistantVisible: assistantVisible,
 					})
 				}
 				continue
@@ -171,16 +202,22 @@ func extractToolResult(result *mcp.CallToolResult) ToolResult {
 	}
 }
 
-// a2uiAssistantVisible reports whether an A2UI embedded resource's audience
-// annotations leave the payload visible to the LLM. Per the A2UI-over-MCP
-// verbalization contract: an empty audience is visible to both user and
-// assistant; an audience of ["user"] alone renders for the user but hides
-// the raw JSON from the model.
-func a2uiAssistantVisible(annotations *mcp.Annotations) bool {
+// a2uiAudience resolves an A2UI embedded resource's audience annotations
+// into the spec's verbalization contract:
+//
+//	audience (empty)      → render for the user, visible to the model
+//	["user"]              → render for the user, hidden from the model
+//	["assistant"]         → visible to the model, NOT rendered
+//	["user","assistant"]  → both
+//
+// It returns (renderForUser, assistantVisible).
+func a2uiAudience(annotations *mcp.Annotations) (bool, bool) {
 	if annotations == nil || len(annotations.Audience) == 0 {
-		return true
+		return true, true
 	}
-	return slices.Contains(annotations.Audience, mcp.Role("assistant"))
+	forUser := slices.Contains(annotations.Audience, mcp.Role("user"))
+	forAssistant := slices.Contains(annotations.Audience, mcp.Role("assistant"))
+	return forUser, forAssistant
 }
 
 // RefreshTools gets the updated list of tools from the MCP and updates the

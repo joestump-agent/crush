@@ -15,8 +15,8 @@ import (
 // renderable surface hold nil.
 //
 // Assistant surfaces stream and rebuild as deltas arrive, so the assistant
-// item keys its models by source hash and retires them on first submission
-// . MCP tool-result surfaces are long-lived app UIs: they build once
+// item keys its models by source hash and retires them on first
+// submission. MCP tool-result surfaces are long-lived app UIs: they build once
 // from a fixed payload, are never retired on interaction, and feed a button
 // back to the owning server. The host carries the shared state and
 // behavior both kinds need; the items own their lifecycle.
@@ -28,8 +28,33 @@ type a2uiSurfaceHost struct {
 	// part has no renderable surface), so a ButtonClicked event's
 	// SurfaceID can be routed back to the model that emitted it.
 	surfaceIDs []string
+	// surfaceOwners holds the MCP server that served each entry (empty for
+	// chat-scanned surfaces). It is the item-scoped provenance the action
+	// round-trip resolves through, so two servers using the same surface ID
+	// cannot route each other's clicks.
+	surfaceOwners []string
 	// sty themes the surfaces with the crush palette.
 	sty *styles.Styles
+}
+
+// ownerFor returns the MCP server that served the surface at index i, and
+// whether one is known.
+func (h *a2uiSurfaceHost) ownerFor(i int) (string, bool) {
+	if i < 0 || i >= len(h.surfaceOwners) {
+		return "", false
+	}
+	name := h.surfaceOwners[i]
+	return name, name != ""
+}
+
+// drop releases the surface at index i, which the server deleted. The entry
+// is kept (indexes stay parallel to surfaceIDs) but nils out, so hasLive and
+// findByID stop reporting it and it can no longer take focus or keys.
+func (h *a2uiSurfaceHost) drop(i int) {
+	if i < 0 || i >= len(h.surfaces) {
+		return
+	}
+	h.surfaces[i] = nil
 }
 
 // buildSurfaces renders each part's messages into a live a2tea model,
@@ -152,11 +177,14 @@ func (h *a2uiSurfaceHost) blurAll() {
 // --- MCP surface provenance registry ---
 
 // a2uiMCPProvenance maps a rendered A2UI surface ID to the MCP server that
-// served it, so a later interaction event (button press, render failure) can
-// route back to the owning server as an a2ui_action / a2ui_error tool call
-// . Entries live for the process lifetime: surface IDs are
+// served it, so a later interaction event (button press, render failure)
+// can route back to the owning server as an a2ui_action / a2ui_error tool
+// call. Entries live for the process lifetime: surface IDs are
 // server-scoped (typically "default"), so re-rendering a surface from the
-// same server simply overwrites the same key.
+// same server simply overwrites the same key. Two servers emitting the SAME
+// surface ID would clobber each other here — the action round-trip should
+// resolve provenance through the owning item before falling back to this
+// registry.
 var a2uiMCPProvenance = csync.NewMap[string, string]()
 
 // registerA2UISurfaceProvenance records that surfaceID came from mcpName.

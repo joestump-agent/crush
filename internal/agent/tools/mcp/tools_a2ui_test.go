@@ -55,6 +55,8 @@ func TestRunTool_A2UISurfaceExtraction(t *testing.T) {
 	t.Parallel()
 
 	t.Run("embedded A2UI resource becomes a surface, not text", func(t *testing.T) {
+		t.Parallel()
+
 		sess := liveA2UIToolSession(t, "get_card", []mcp.Content{
 			&mcp.TextContent{Text: "Your recipe card"},
 			&mcp.EmbeddedResource{
@@ -76,6 +78,8 @@ func TestRunTool_A2UISurfaceExtraction(t *testing.T) {
 	})
 
 	t.Run("legacy MIME spelling is recognized", func(t *testing.T) {
+		t.Parallel()
+
 		sess := liveA2UIToolSession(t, "get_card", []mcp.Content{
 			&mcp.EmbeddedResource{
 				Resource: &mcp.ResourceContents{
@@ -90,6 +94,8 @@ func TestRunTool_A2UISurfaceExtraction(t *testing.T) {
 	})
 
 	t.Run("user-only audience hides the payload from the model", func(t *testing.T) {
+		t.Parallel()
+
 		sess := liveA2UIToolSession(t, "get_card", []mcp.Content{
 			&mcp.EmbeddedResource{
 				Resource: &mcp.ResourceContents{
@@ -103,9 +109,29 @@ func TestRunTool_A2UISurfaceExtraction(t *testing.T) {
 		res := runToolWithSession(t, sess, "get_card")
 		require.Len(t, res.Surfaces, 1)
 		require.False(t, res.Surfaces[0].AssistantVisible)
+		require.True(t, res.Surfaces[0].RenderForUser, "user audience still renders")
+	})
+
+	t.Run("assistant-only audience is visible to the model but not rendered", func(t *testing.T) {
+		sess := liveA2UIToolSession(t, "get_card", []mcp.Content{
+			&mcp.EmbeddedResource{
+				Resource: &mcp.ResourceContents{
+					URI:      "a2ui://card",
+					MIMEType: A2UIJSONMIMEType,
+					Text:     testA2UIToolPayload,
+				},
+				Annotations: &mcp.Annotations{Audience: []mcp.Role{"assistant"}},
+			},
+		})
+		res := runToolWithSession(t, sess, "get_card")
+		require.Len(t, res.Surfaces, 1)
+		require.True(t, res.Surfaces[0].AssistantVisible)
+		require.False(t, res.Surfaces[0].RenderForUser, "assistant-only audience must not render")
 	})
 
 	t.Run("blob-delivered surface is normalized to text", func(t *testing.T) {
+		t.Parallel()
+
 		sess := liveA2UIToolSession(t, "get_card", []mcp.Content{
 			&mcp.EmbeddedResource{
 				Resource: &mcp.ResourceContents{
@@ -121,6 +147,8 @@ func TestRunTool_A2UISurfaceExtraction(t *testing.T) {
 	})
 
 	t.Run("non-A2UI embedded resource stays in the text", func(t *testing.T) {
+		t.Parallel()
+
 		sess := liveA2UIToolSession(t, "get_doc", []mcp.Content{
 			&mcp.EmbeddedResource{
 				Resource: &mcp.ResourceContents{
