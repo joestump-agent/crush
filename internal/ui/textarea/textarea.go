@@ -642,6 +642,30 @@ func (m Model) ByteOffset() int {
 	return off
 }
 
+// SetCursorByteOffset places the cursor at a byte offset into Value(), the
+// inverse of [Model.ByteOffset]. An offset past the end clamps to the end.
+func (m *Model) SetCursorByteOffset(off int) {
+	if off < 0 {
+		off = 0
+	}
+	var seen int
+	for row, line := range m.value {
+		lineLen := len(string(line))
+		if off <= seen+lineLen {
+			m.row = row
+			m.col = len([]rune(string(line)[:off-seen]))
+			m.SetCursorColumn(m.col)
+			// Every other cursor mover repositions the viewport; without
+			// it the cursor can end up scrolled out of sight after a
+			// deletion in a long prompt.
+			m.repositionView()
+			return
+		}
+		seen += lineLen + 1 // +1 for the joining newline
+	}
+	m.MoveToEnd()
+}
+
 // Length returns the number of characters currently in the text input.
 func (m *Model) Length() int {
 	var l int
