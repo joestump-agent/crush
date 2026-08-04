@@ -297,6 +297,11 @@ type UI struct {
 	lastCompletionEnd      int
 	lastCompletionText     string
 	lastCompletionFilePath string // non-empty when the last completion attached a file
+	// mentionAttachments holds the FilePath of every attachment that came
+	// from a token in the prompt, so the reconciliation below only ever
+	// removes attachments a token is responsible for. A pasted image or a
+	// dropped file has no token and must survive any amount of editing.
+	mentionAttachments map[string]string
 	// promptAttachSeq makes each MCP prompt attachment's key unique, so
 	// inserting one prompt twice yields two independently removable chips.
 	promptAttachSeq int
@@ -2721,6 +2726,33 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 					break
 				}
 
+				// Token backspace: a token the editor draws as one
+				// highlighted unit deletes as one unit whenever the cursor
+				// sits at its end. This is deliberately independent of the
+				// insertion record below, which is armed by a completion and
+				// disarmed by the next keystroke — so without this, coming
+				// back to a mention after typing anything else deleted it a
+				// character at a time despite still rendering as one chip.
+				if msg.Code == tea.KeyBackspace && !m.bangMode {
+					if start, ok := m.tokenEndingAtCursor(); ok {
+						prevHeight := m.textarea.Height()
+						val := m.textarea.Value()
+						cur := m.textarea.ByteOffset()
+						m.textarea.SetValue(val[:start] + val[cur:])
+						m.textarea.SetCursorByteOffset(start)
+						m.clearCompletionRange()
+						m.syncMentionAttachments()
+						if cmd := m.handleTextareaHeightChange(prevHeight); cmd != nil {
+							cmds = append(cmds, cmd)
+						}
+						m.updateHistoryDraft(val)
+						if m.completionsOpen {
+							m.closeCompletions()
+						}
+						return tea.Batch(cmds...)
+					}
+				}
+
 				// Atomic backspace: delete the entire last-inserted
 				// completion text (file path, resource name) in one go
 				// instead of character by character. Only fires when
@@ -2857,6 +2889,12 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 
 				// Any text modification becomes the current draft.
 				m.updateHistoryDraft(curValue)
+
+				// An edit may have removed or changed a token that owns an
+				// attachment. Reconcile after every keystroke rather than
+				// only on the atomic-delete path, so a mention taken apart
+				// character by character takes its chip with it.
+				m.syncMentionAttachments()
 
 				// After updating textarea, check if we need to filter completions.
 				// Skip filtering on the initial trigger keystroke since items
@@ -4193,6 +4231,94 @@ func promptMentions(value, target string) bool {
 	return false
 }
 
+// trackMentionAttachment records that key's attachment is owned by token in
+// the prompt, so syncMentionAttachments can drop it once the token is gone.
+func (m *UI) trackMentionAttachment(key, token string) {
+	if m.mentionAttachments == nil {
+		m.mentionAttachments = map[string]string{}
+	}
+	m.mentionAttachments[key] = token
+}
+
+// syncMentionAttachments removes attachments whose token is no longer in the
+// prompt.
+//
+// Removal used to hang off the atomic-backspace path alone, so it only fired
+// in the instant after an insertion. Delete the mention any other way — one
+// character at a time, or by editing it into something else — and the chip
+// stayed, sending the file to the model with nothing in the message referring
+// to it. Reconciling against the prompt's actual tokens covers every edit
+// path, and consulting mentionAttachments keeps it from touching anything a
+// token never put there.
+func (m *UI) syncMentionAttachments() {
+	if len(m.mentionAttachments) == 0 {
+		return
+	}
+	live := m.promptTokenTexts()
+	for key, token := range m.mentionAttachments {
+		if live[token] {
+			continue
+		}
+		m.attachments.RemoveByFilePath(key)
+		delete(m.mentionAttachments, key)
+		// The dedupe record has to go with it, or re-mentioning the file
+		// silently attaches nothing.
+		if absPath, err := filepath.Abs(strings.TrimPrefix(token, "@")); err == nil {
+			m.sessionFileReads = slices.DeleteFunc(m.sessionFileReads, func(p string) bool {
+				return p == absPath
+			})
+		}
+	}
+}
+
+// promptTokenTexts is the set of token strings currently in the prompt.
+func (m *UI) promptTokenTexts() map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(m.textarea.Value(), "\n") {
+		runes := []rune(line)
+		for _, tok := range common.ScanPromptTokens(runes) {
+			out[string(runes[tok.Start:tok.End])] = true
+		}
+	}
+	return out
+}
+
+// tokenEndingAtCursor reports the byte offset where the prompt token under
+// the cursor begins, when the cursor sits exactly at that token's end.
+//
+// This is what makes a highlighted token delete as a unit: the editor draws
+// "@path", "/skill" and "/server:prompt(a=b)" as single chips, so backspacing
+// into one has to take the whole thing. Anywhere else — mid-word, after a
+// trailing space, on ordinary prose — it reports false and backspace behaves
+// normally.
+func (m *UI) tokenEndingAtCursor() (int, bool) {
+	cur := m.textarea.ByteOffset()
+	if cur <= 0 {
+		return 0, false
+	}
+	value := m.textarea.Value()
+	if cur > len(value) {
+		return 0, false
+	}
+	// Tokens never span lines, so work within the cursor's line and convert
+	// the line-relative rune offsets ScanPromptTokens reports back to byte
+	// offsets in the whole value.
+	lineStart := strings.LastIndexByte(value[:cur], '\n') + 1
+	lineEnd := len(value)
+	if i := strings.IndexByte(value[cur:], '\n'); i >= 0 {
+		lineEnd = cur + i
+	}
+	line := []rune(value[lineStart:lineEnd])
+	for _, tok := range common.ScanPromptTokens(line) {
+		startByte := lineStart + len(string(line[:tok.Start]))
+		endByte := lineStart + len(string(line[:tok.End]))
+		if endByte == cur {
+			return startByte, true
+		}
+	}
+	return 0, false
+}
+
 // clearCompletionRange forgets the last inserted completion, so a later
 // backspace deletes one character like any other.
 func (m *UI) clearCompletionRange() {
@@ -4210,6 +4336,7 @@ func (m *UI) insertFileCompletion(path string) tea.Cmd {
 		return nil
 	}
 	m.lastCompletionFilePath = path
+	m.trackMentionAttachment(path, "@"+path)
 	heightCmd := m.handleTextareaHeightChange(prevHeight)
 
 	fileCmd := func() tea.Msg {
@@ -4292,6 +4419,7 @@ func (m *UI) insertMCPResourceCompletion(item completions.ResourceCompletionValu
 	// human-readable title. Without it, backspacing an MCP resource mention
 	// removed the text and left the chip behind.
 	m.lastCompletionFilePath = item.URI
+	m.trackMentionAttachment(item.URI, insertText)
 
 	resourceCmd := func() tea.Msg {
 		contents, err := m.com.Workspace.ReadMCPResource(
@@ -4454,6 +4582,7 @@ func (m *UI) attachMCPPrompt(name, mcpName, promptID string, args map[string]str
 	m.promptAttachSeq++
 	attachKey := fmt.Sprintf("%s#%d", name, m.promptAttachSeq)
 	m.lastCompletionFilePath = attachKey
+	m.trackMentionAttachment(attachKey, token)
 	heightCmd := m.handleTextareaHeightChange(prevHeight)
 
 	argCount := len(supplied)
