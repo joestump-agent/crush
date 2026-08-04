@@ -655,6 +655,10 @@ func (m *Model) SetCursorByteOffset(off int) {
 			m.row = row
 			m.col = len([]rune(string(line)[:off-seen]))
 			m.SetCursorColumn(m.col)
+			// Every other cursor mover repositions the viewport; without
+			// it the cursor can end up scrolled out of sight after a
+			// deletion in a long prompt.
+			m.repositionView()
 			return
 		}
 		seen += lineLen + 1 // +1 for the joining newline

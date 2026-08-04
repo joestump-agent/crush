@@ -297,11 +297,16 @@ type UI struct {
 	lastCompletionEnd      int
 	lastCompletionText     string
 	lastCompletionFilePath string // non-empty when the last completion attached a file
-	// mentionAttachments holds the FilePath of every attachment that came
-	// from a token in the prompt, so the reconciliation below only ever
-	// removes attachments a token is responsible for. A pasted image or a
-	// dropped file has no token and must survive any amount of editing.
+	// mentionAttachments maps a token in the prompt to the attachment it
+	// owns, so deleting the token can take the attachment with it. Only
+	// tokens put entries here, so a pasted image or a dropped file — which
+	// has no token — is never touched.
 	mentionAttachments map[string]string
+	// discardedMentions holds attachment keys whose token was deleted before
+	// the (asynchronous) read that produces the attachment came back. The
+	// attachment is dropped on arrival rather than landing as an orphan chip
+	// with nothing in the prompt referring to it.
+	discardedMentions map[string]bool
 	// promptAttachSeq makes each MCP prompt attachment's key unique, so
 	// inserting one prompt twice yields two independently removable chips.
 	promptAttachSeq int
@@ -1479,6 +1484,14 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// at this point this can only handle [message.Attachment] message, and we
 	// should return all cmds anyway.
+	//
+	// A read that finishes after its mention was deleted is dropped: the
+	// chip would otherwise appear with nothing in the prompt referring to
+	// it, and no later edit could remove it.
+	if att, ok := msg.(message.Attachment); ok && m.discardedMentions[att.FilePath] {
+		delete(m.discardedMentions, att.FilePath)
+		return m, tea.Batch(cmds...)
+	}
 	_ = m.attachments.Update(msg)
 	return m, tea.Batch(cmds...)
 }
@@ -2652,6 +2665,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 
 				attachments := m.attachments.List()
 				m.attachments.Reset()
+				m.resetMentionTracking()
 				if len(value) == 0 && !message.ContainsTextAttachment(attachments) {
 					return nil
 				}
@@ -2733,15 +2747,21 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				// disarmed by the next keystroke — so without this, coming
 				// back to a mention after typing anything else deleted it a
 				// character at a time despite still rendering as one chip.
-				if msg.Code == tea.KeyBackspace && !m.bangMode {
+				// Not while the completions popup is open: there the "token"
+				// is the query the user is still typing, and eating the whole
+				// thing on one backspace — plus closing the popup — makes a
+				// single typo cost the entire mention, with no undo to get it
+				// back.
+				if msg.Code == tea.KeyBackspace && !m.bangMode && !m.completionsOpen {
 					if start, ok := m.tokenEndingAtCursor(); ok {
+						deleted := m.tokenTextAt(start)
 						prevHeight := m.textarea.Height()
 						val := m.textarea.Value()
 						cur := m.textarea.ByteOffset()
 						m.textarea.SetValue(val[:start] + val[cur:])
 						m.textarea.SetCursorByteOffset(start)
 						m.clearCompletionRange()
-						m.syncMentionAttachments()
+						m.dropMentionAttachment(deleted)
 						if cmd := m.handleTextareaHeightChange(prevHeight); cmd != nil {
 							cmds = append(cmds, cmd)
 						}
@@ -2889,12 +2909,6 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 
 				// Any text modification becomes the current draft.
 				m.updateHistoryDraft(curValue)
-
-				// An edit may have removed or changed a token that owns an
-				// attachment. Reconcile after every keystroke rather than
-				// only on the atomic-delete path, so a mention taken apart
-				// character by character takes its chip with it.
-				m.syncMentionAttachments()
 
 				// After updating textarea, check if we need to filter completions.
 				// Skip filtering on the initial trigger keystroke since items
@@ -4231,59 +4245,91 @@ func promptMentions(value, target string) bool {
 	return false
 }
 
-// trackMentionAttachment records that key's attachment is owned by token in
-// the prompt, so syncMentionAttachments can drop it once the token is gone.
+// trackMentionAttachment records which attachment a token in the prompt owns,
+// so deleting that token can take the attachment with it.
 func (m *UI) trackMentionAttachment(key, token string) {
 	if m.mentionAttachments == nil {
 		m.mentionAttachments = map[string]string{}
 	}
-	m.mentionAttachments[key] = token
+	m.mentionAttachments[token] = key
 }
 
-// syncMentionAttachments removes attachments whose token is no longer in the
-// prompt.
+// dropMentionAttachment removes the attachment owned by a token that has just
+// been deleted from the prompt.
 //
-// Removal used to hang off the atomic-backspace path alone, so it only fired
-// in the instant after an insertion. Delete the mention any other way — one
-// character at a time, or by editing it into something else — and the chip
-// stayed, sending the file to the model with nothing in the message referring
-// to it. Reconciling against the prompt's actual tokens covers every edit
-// path, and consulting mentionAttachments keeps it from touching anything a
-// token never put there.
-func (m *UI) syncMentionAttachments() {
-	if len(m.mentionAttachments) == 0 {
+// This is driven by the deletion itself rather than by reconciling the whole
+// prompt after every keystroke. Reconciling looks more thorough and is much
+// worse: an attachment's identity would have to be recoverable from the
+// prompt text, and it often is not. A path or resource title containing a
+// space does not tokenize back to what was inserted, editing an MCP prompt's
+// arguments changes the token, and the tokenizer's known-name set is re-primed
+// asynchronously when MCP servers reload — each of which made a live
+// attachment disappear mid-composition while its mention sat on screen.
+// Acting only where the token is known to have gone can miss a removal, which
+// is a visible chip the user can delete; the alternative silently drops data
+// the user believes they attached.
+func (m *UI) dropMentionAttachment(token string) {
+	if token == "" {
 		return
 	}
-	live := m.promptTokenTexts()
-	for key, token := range m.mentionAttachments {
-		if live[token] {
-			continue
-		}
-		m.attachments.RemoveByFilePath(key)
-		delete(m.mentionAttachments, key)
-		// The dedupe record has to go with it, or re-mentioning the file
-		// silently attaches nothing.
-		if absPath, err := filepath.Abs(strings.TrimPrefix(token, "@")); err == nil {
-			m.sessionFileReads = slices.DeleteFunc(m.sessionFileReads, func(p string) bool {
-				return p == absPath
-			})
-		}
+	key, ok := m.mentionAttachments[token]
+	if !ok {
+		return
+	}
+	// A repeat mention shares one attachment (fileCmd dedupes), so it only
+	// goes when nothing left in the prompt still names it.
+	if slices.Contains(m.promptTokenTexts(), token) {
+		return
+	}
+	m.attachments.RemoveByFilePath(key)
+	delete(m.mentionAttachments, token)
+	// A late-arriving read for a mention that is already gone would land as
+	// an orphan chip with nothing referring to it.
+	if m.discardedMentions == nil {
+		m.discardedMentions = map[string]bool{}
+	}
+	m.discardedMentions[key] = true
+	// The dedupe record has to go too, or re-mentioning the file silently
+	// attaches nothing.
+	if absPath, err := filepath.Abs(strings.TrimPrefix(token, "@")); err == nil {
+		m.sessionFileReads = slices.DeleteFunc(m.sessionFileReads, func(p string) bool {
+			return p == absPath
+		})
 	}
 }
 
-// promptTokenTexts is the set of token strings currently in the prompt.
-func (m *UI) promptTokenTexts() map[string]bool {
-	out := map[string]bool{}
+// resetMentionTracking forgets every token/attachment association. Called
+// when the prompt's attachments are cleared — on send, and on a new session —
+// so a stale entry cannot claim an attachment added later by another path.
+func (m *UI) resetMentionTracking() {
+	m.mentionAttachments = nil
+	m.discardedMentions = nil
+}
+
+// promptTokenTexts is the list of token strings currently in the prompt.
+func (m *UI) promptTokenTexts() []string {
+	var out []string
 	for _, line := range strings.Split(m.textarea.Value(), "\n") {
 		runes := []rune(line)
 		for _, tok := range common.ScanPromptTokens(runes) {
-			out[string(runes[tok.Start:tok.End])] = true
+			out = append(out, string(runes[tok.Start:tok.End]))
 		}
 	}
 	return out
 }
 
-// tokenEndingAtCursor reports the byte offset where the prompt token under
+// tokenTextAt returns the token beginning at the given byte offset and ending
+// at the cursor.
+func (m *UI) tokenTextAt(start int) string {
+	value := m.textarea.Value()
+	cur := m.textarea.ByteOffset()
+	if start < 0 || cur > len(value) || start >= cur {
+		return ""
+	}
+	return value[start:cur]
+}
+
+// tokenEndingAtCursor reports the byte offset where the prompt token under// tokenEndingAtCursor reports the byte offset where the prompt token under
 // the cursor begins, when the cursor sits exactly at that token's end.
 //
 // This is what makes a highlighted token delete as a unit: the editor draws
@@ -5776,6 +5822,7 @@ func (m *UI) newSession() tea.Cmd {
 	m.sidebarScroll = 0
 	m.sessionFiles = nil
 	m.sessionFileReads = nil
+	m.resetMentionTracking()
 	m.setState(uiLanding, uiFocusEditor)
 	m.textarea.Focus()
 	m.chat.Blur()

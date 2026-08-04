@@ -3,13 +3,13 @@ package model
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/ui/common"
+	"github.com/charmbracelet/crush/internal/ui/completions"
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,7 +95,7 @@ func TestBackspaceLeavesOrdinaryTextAlone(t *testing.T) {
 // something else — ends up with a chip whose mention no longer exists. The
 // file is then still sent to the model with nothing in the message referring
 // to it.
-func TestDeletingMentionCharByCharRemovesAttachment(t *testing.T) {
+func TestBackspacingMentionRemovesAttachment(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -108,26 +108,92 @@ func TestDeletingMentionCharByCharRemovesAttachment(t *testing.T) {
 	runInsertCmdForTest(t, m, m.insertFileCompletion(path))
 	require.Len(t, m.attachments.List(), 1, "precondition: the mention attached the file")
 
-	// Trim the mention one character at a time, the way a user editing the
-	// middle of their prompt would, and press a key after each edit. The
-	// attachment must not outlive the mention becoming incomplete.
-	full := m.textarea.Value()
+	// Cold prompt: no completion armed, exactly as after typing something
+	// else and coming back to it.
 	m.clearCompletionRange()
-	for cut := 1; cut <= 3; cut++ {
-		m.textarea.SetValue(strings.TrimSuffix(full, " ")[:len(strings.TrimSuffix(full, " "))-cut])
-		m.textarea.MoveToEnd()
-		m.clearCompletionRange()
-		m.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
-	}
+	m.textarea.SetValue("read @" + path)
+	m.textarea.MoveToEnd()
 
+	backspace(m)
+
+	require.Equal(t, "read ", m.textarea.Value())
 	require.Empty(t, m.attachments.List(),
-		"an attachment whose mention is no longer intact must not still be sent")
+		"deleting the mention must take its attachment with it")
 }
 
-// TestEditingMentionIntoSomethingElseRemovesAttachment is the same rule
-// reached by a different edit: the mention is not deleted but changed, so it
-// no longer refers to the attached file.
-func TestEditingMentionIntoSomethingElseRemovesAttachment(t *testing.T) {
+// TestRepeatMentionKeepsAttachmentUntilLastGoes pins the dedupe case: one
+// attachment serves both mentions, so it only goes when the last one does.
+func TestRepeatMentionKeepsAttachmentUntilLastGoes(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dup.go")
+	require.NoError(t, os.WriteFile(path, []byte("package main\n"), 0o644))
+
+	m := newCompletionBackspaceUI()
+	m.textarea.SetValue("read @")
+	m.completionsStartIndex = len("read ")
+	runInsertCmdForTest(t, m, m.insertFileCompletion(path))
+	require.Len(t, m.attachments.List(), 1)
+
+	// Two mentions of the same file, one attachment between them.
+	m.clearCompletionRange()
+	m.textarea.SetValue("read @" + path + " and @" + path)
+	m.textarea.MoveToEnd()
+
+	backspace(m)
+	require.Len(t, m.attachments.List(), 1,
+		"one mention still names the file, so its attachment stays")
+
+	// Remove the survivor too.
+	m.textarea.SetValue("read @" + path)
+	m.textarea.MoveToEnd()
+	m.clearCompletionRange()
+	backspace(m)
+	require.Empty(t, m.attachments.List())
+}
+
+// TestLateAttachmentForDeletedMentionIsDropped pins the async case: a read
+// that finishes after its mention was deleted must not land as an orphan chip
+// with nothing in the prompt referring to it, and which no later edit could
+// remove.
+func TestLateAttachmentForDeletedMentionIsDropped(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "slow.go")
+	require.NoError(t, os.WriteFile(path, []byte("package main\n"), 0o644))
+
+	m := newCompletionBackspaceUI()
+	m.textarea.SetValue("read @")
+	m.completionsStartIndex = len("read ")
+	cmd := m.insertFileCompletion(path) // deliberately left undrained
+
+	// Delete the mention before the read comes back.
+	m.clearCompletionRange()
+	m.textarea.SetValue("read @" + path)
+	m.textarea.MoveToEnd()
+	backspace(m)
+	require.Equal(t, "read ", m.textarea.Value())
+
+	// Now let the read land.
+	runInsertCmdForTest(t, m, cmd)
+
+	require.Empty(t, m.attachments.List(),
+		"an attachment whose mention is already gone must not appear")
+}
+
+// TestEditingMentionLeavesAttachment pins a deliberate limitation.
+//
+// Removal is driven by deleting the token, not by reconciling the prompt
+// after every keystroke. Reconciling cannot be done reliably — a path or
+// resource title containing a space does not tokenize back to what was
+// inserted, editing an MCP prompt's arguments changes the token, and the
+// tokenizer's name set is re-primed asynchronously when MCP servers reload —
+// and each of those made a live attachment vanish mid-composition. Erring
+// toward keeping the attachment leaves a visible chip the user can delete;
+// erring the other way silently drops data they believe they attached.
+func TestEditingMentionLeavesAttachment(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -145,8 +211,8 @@ func TestEditingMentionIntoSomethingElseRemovesAttachment(t *testing.T) {
 	m.textarea.MoveToEnd()
 	backspace(m)
 
-	require.Empty(t, m.attachments.List(),
-		"the attachment's mention is gone, so the attachment must go too")
+	require.Len(t, m.attachments.List(), 1,
+		"the chip stays and is removable by hand rather than being dropped silently")
 }
 
 // TestUnrelatedAttachmentsSurviveEditing pins the guard rail: attachments that
@@ -190,8 +256,41 @@ func runInsertCmdForTest(t *testing.T, m *UI, cmd tea.Cmd) {
 			return
 		}
 		if att, ok := msg.(message.Attachment); ok {
-			m.attachments.Update(att)
+			// Through Update, not straight into the toolbar: the drop rule
+			// for a mention that is already gone lives on that path, and a
+			// helper that bypasses it would test nothing.
+			m.Update(att)
 		}
 	}
 	run(cmd)
+}
+
+// TestBackspaceWhileCompletingDeletesOneChar pins that the whole-token rule
+// stands down while the completions popup is open.
+//
+// Every "@word" tokenizes, including the query the user is still typing, so
+// without this guard one backspace to fix a typo ate the entire mention and
+// closed the popup — and the textarea has no undo to get it back.
+func TestBackspaceWhileCompletingDeletesOneChar(t *testing.T) {
+	t.Parallel()
+
+	m := newCompletionBackspaceUI()
+	m.textarea.SetValue("look at @int")
+	m.textarea.MoveToEnd()
+	m.clearCompletionRange()
+	// The popup is filtering, as it would be while typing a mention.
+	m.completions = completions.New(
+		m.com.Styles.Completions.Normal,
+		m.com.Styles.Completions.Focused,
+		m.com.Styles.Completions.Match,
+	)
+	m.completionsOpen = true
+	m.completionsTrigger = completions.TriggerFile
+	m.completionsStartIndex = len("look at ")
+
+	backspace(m)
+
+	require.Equal(t, "look at @in", m.textarea.Value(),
+		"a backspace mid-query must delete one character, not the whole query")
+	require.True(t, m.completionsOpen, "the popup must stay open")
 }
