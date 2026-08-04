@@ -1060,6 +1060,7 @@ func quickStyle(o quickStyleOpts) Styles {
 	s.Attachments.Image = attachmentIconStyle.SetString(ImageIcon)
 	s.Attachments.Text = attachmentIconStyle.SetString(TextIcon)
 	s.Attachments.Skill = attachmentIconStyle.SetString(SkillIcon)
+	s.Attachments.Prompt = attachmentIconStyle.SetString(PromptIcon)
 	s.Attachments.Normal = base.Padding(0, 1).Background(o.fgMoreSubtle).Foreground(o.fgBase)
 	// Remove and Deleting share the same slot on the right side of a chip
 	// and must keep the same geometry so toggling delete-mode doesn't

@@ -448,6 +448,7 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 			com.Styles.Attachments.Image,
 			com.Styles.Attachments.Text,
 			com.Styles.Attachments.Skill,
+			com.Styles.Attachments.Prompt,
 			com.Styles.Attachments.Remove,
 		),
 		attachments.Keymap{
@@ -4461,6 +4462,7 @@ func (m *UI) refreshStyles() {
 		t.Attachments.Image,
 		t.Attachments.Text,
 		t.Attachments.Skill,
+		t.Attachments.Prompt,
 		t.Attachments.Remove,
 	)
 	m.todoSpinner.Style = t.Pills.TodoSpinner

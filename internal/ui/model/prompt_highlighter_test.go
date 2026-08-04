@@ -170,6 +170,7 @@ func TestRefreshStylesRepushesHighlighterStyles(t *testing.T) {
 		sty.Attachments.Image,
 		sty.Attachments.Text,
 		sty.Attachments.Skill,
+		sty.Attachments.Prompt,
 		sty.Attachments.Remove,
 	), attachments.Keymap{})
 	m.promptHighlighter = newPromptHighlighter(

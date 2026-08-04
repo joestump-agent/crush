@@ -34,6 +34,7 @@ func newCompletionBackspaceUI() *UI {
 				lipgloss.NewStyle(), lipgloss.NewStyle(),
 				lipgloss.NewStyle(), lipgloss.NewStyle(),
 				lipgloss.NewStyle(), lipgloss.NewStyle(),
+				lipgloss.NewStyle(),
 			),
 			attachments.Keymap{},
 		),

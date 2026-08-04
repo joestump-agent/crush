@@ -2,7 +2,6 @@ package attachments
 
 import (
 	"fmt"
-	"math"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -111,29 +110,31 @@ func (m *Attachments) Render(width int) string {
 // styles in place.
 func (m *Attachments) Renderer() *Renderer { return m.renderer }
 
-func NewRenderer(normalStyle, deletingStyle, imageStyle, textStyle, skillStyle, removeStyle lipgloss.Style) *Renderer {
+func NewRenderer(normalStyle, deletingStyle, imageStyle, textStyle, skillStyle, promptStyle, removeStyle lipgloss.Style) *Renderer {
 	return &Renderer{
 		normalStyle:   normalStyle,
 		textStyle:     textStyle,
 		imageStyle:    imageStyle,
 		skillStyle:    skillStyle,
+		promptStyle:   promptStyle,
 		removeStyle:   removeStyle,
 		deletingStyle: deletingStyle,
 	}
 }
 
 // SetStyles updates the renderer styles in place.
-func (r *Renderer) SetStyles(normalStyle, deletingStyle, imageStyle, textStyle, skillStyle, removeStyle lipgloss.Style) {
+func (r *Renderer) SetStyles(normalStyle, deletingStyle, imageStyle, textStyle, skillStyle, promptStyle, removeStyle lipgloss.Style) {
 	r.normalStyle = normalStyle
 	r.textStyle = textStyle
 	r.imageStyle = imageStyle
 	r.skillStyle = skillStyle
+	r.promptStyle = promptStyle
 	r.removeStyle = removeStyle
 	r.deletingStyle = deletingStyle
 }
 
 type Renderer struct {
-	normalStyle, textStyle, imageStyle, skillStyle, removeStyle, deletingStyle lipgloss.Style
+	normalStyle, textStyle, imageStyle, skillStyle, promptStyle, removeStyle, deletingStyle lipgloss.Style
 	// bounds stores the X-coordinate ranges of each chip's remove
 	// button from the most recent Render call, for mouse hit-testing.
 	bounds []chipBounds
@@ -162,18 +163,19 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting, showRemove
 	if showRemove {
 		removeReserve = removeStr
 	}
+	// A nominal chip width, used only to size the trailing "N more…" marker
+	// and to reserve room for it. Individual chips are measured as they are
+	// built: chip labels are no longer a uniform width (a prompt chip shows
+	// its full name plus an argument count), so a single width cannot decide
+	// how many fit.
 	maxItemWidth := lipgloss.Width(r.imageStyle.String() + r.normalStyle.Render(strings.Repeat("x", maxFilename)) + removeReserve)
-	fits := int(math.Floor(float64(width)/float64(maxItemWidth))) - 1
 
 	var offset int
 	for i, att := range attachments {
-		filename := filepath.Base(att.FileName)
-		// Truncate if needed.
-		if ansi.StringWidth(filename) > maxFilename {
-			filename = ansi.Truncate(filename, maxFilename, "…")
-		}
+		spec := r.chipSpecFor(att)
+		filename := spec.label
 
-		iconStr := r.icon(att).String()
+		iconStr := spec.icon.String()
 		nameStyle := r.normalStyle
 		if !showRemove {
 			// Without a remove button there is nothing to carry the
@@ -185,8 +187,31 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting, showRemove
 		}
 		nameStr := nameStyle.Render(filename)
 
-		chips = append(chips, iconStr, nameStr)
 		chipW := lipgloss.Width(iconStr) + lipgloss.Width(nameStr)
+
+		// Measure the whole chip, trailing element included, before
+		// committing to it. Chip widths vary by kind now, so the only
+		// reliable cutoff is a running total. Reserve room for the
+		// "N more…" marker whenever anything would be left over, and always
+		// emit at least one chip however narrow the editor is.
+		trailW := 0
+		switch {
+		case deleting:
+			trailW = lipgloss.Width(r.deletingStyle.Render(fmt.Sprintf("%d", i)))
+		case showRemove:
+			trailW = lipgloss.Width(removeStr)
+		}
+		reserve := 0
+		if i < len(attachments)-1 {
+			reserve = maxItemWidth
+		}
+		if i > 0 && offset+chipW+trailW+reserve > width {
+			chips = append(chips, lipgloss.NewStyle().Width(maxItemWidth).
+				Render(fmt.Sprintf("%d more…", len(attachments)-i)))
+			break
+		}
+
+		chips = append(chips, iconStr, nameStr)
 
 		switch {
 		case deleting:
@@ -210,14 +235,19 @@ func (r *Renderer) Render(attachments []message.Attachment, deleting, showRemove
 		default:
 			offset += chipW
 		}
-
-		if i == fits && len(attachments) > i {
-			chips = append(chips, lipgloss.NewStyle().Width(maxItemWidth).Render(fmt.Sprintf("%d more…", len(attachments)-fits)))
-			break
-		}
 	}
 
-	return lipgloss.JoinHorizontal(lipgloss.Left, chips...)
+	out := lipgloss.JoinHorizontal(lipgloss.Left, chips...)
+	// Final guarantee. At least one chip is always drawn, however narrow the
+	// editor, and a prompt chip's label is deliberately not truncated to the
+	// filename budget — so a single wide chip in a narrow editor can still
+	// exceed the space, and the caller lays this row out expecting it not to.
+	// Truncating here bounds that case without imposing a budget on labels
+	// in the ordinary case, where the running total above already fits them.
+	if lipgloss.Width(out) > width {
+		out = ansi.Truncate(out, width, "…")
+	}
+	return out
 }
 
 // HitTestRemove returns the index of the attachment whose remove button
@@ -229,6 +259,50 @@ func (r *Renderer) HitTestRemove(_ []message.Attachment, x int) int {
 		}
 	}
 	return -1
+}
+
+// chipSpec is what one chip shows, decoupled from how it is laid out.
+// Building a spec is the only thing a new attachment kind has to define: the
+// layout below measures whatever label it produces, so a kind is free to be
+// wider or narrower than a filename without the fit math or the remove-button
+// hit regions going wrong.
+type chipSpec struct {
+	icon  lipgloss.Style
+	label string
+}
+
+// chipSpecFor decides how an attachment presents. Adding a chip type means
+// adding a case here and a label rule — nothing else in this file changes.
+func (r *Renderer) chipSpecFor(a message.Attachment) chipSpec {
+	switch a.Kind {
+	case message.AttachmentKindMCPPrompt:
+		// The full prompt name is the point of the chip — "/gitea:foo…"
+		// would leave two prompts from the same server indistinguishable —
+		// so it is never truncated. The argument values live in the prompt
+		// token in the editor, where there is room; the chip carries only
+		// how many there are.
+		label := a.FileName
+		if a.PromptArgCount > 0 {
+			label = fmt.Sprintf("%s (%d %s)", label, a.PromptArgCount,
+				plural(a.PromptArgCount, "arg", "args"))
+		}
+		return chipSpec{icon: r.promptStyle, label: label}
+	default:
+		// File-shaped attachments keep the historical rule: basename only,
+		// truncated to a uniform budget so a row of them stays tidy.
+		label := filepath.Base(a.FileName)
+		if ansi.StringWidth(label) > maxFilename {
+			label = ansi.Truncate(label, maxFilename, "…")
+		}
+		return chipSpec{icon: r.icon(a), label: label}
+	}
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 func (r *Renderer) icon(a message.Attachment) lipgloss.Style {
