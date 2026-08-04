@@ -27,6 +27,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/agent/notify"
 	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
@@ -3916,15 +3917,27 @@ func (m *UI) insertFileCompletion(path string) tea.Cmd {
 }
 
 // insertMCPResourceCompletion inserts the selected resource into the textarea,
-// replacing the @query, and adds the resource as an attachment.
+// replacing the @query, and adds the resource as an attachment. An unexpanded
+// resource template is only inserted as text: its URI still carries RFC 6570
+// placeholders ("cairn://run/{id}"), so reading it now would send the literal
+// braces to the server and fail — the read happens once someone (user or
+// agent) has substituted real values.
 func (m *UI) insertMCPResourceCompletion(item completions.ResourceCompletionValue) tea.Cmd {
 	displayText := cmp.Or(item.Title, item.URI)
+	if item.IsTemplate() {
+		// Insert the raw template URI, not the title: the placeholders are
+		// the point — they show what needs filling in.
+		displayText = item.URI
+	}
 
 	prevHeight := m.textarea.Height()
 	if !m.insertCompletionText(displayText) {
 		return nil
 	}
 	heightCmd := m.handleTextareaHeightChange(prevHeight)
+	if item.IsTemplate() {
+		return heightCmd
+	}
 
 	resourceCmd := func() tea.Msg {
 		contents, err := m.com.Workspace.ReadMCPResource(
@@ -4228,6 +4241,12 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 
 	// Capture session ID to avoid race with main goroutine updating m.session.
 	sessionID := m.session.ID
+	// The turn's content width hint: tools that read width-sensitive remote
+	// content (A2UI surfaces with server-pre-rendered bar geometry) get the
+	// surface card's interior width so the server sizes its rows to fill
+	// the card. The chat package owns the computation — it must track the
+	// real render chain, not constants copied here.
+	contentWidth := chat.ToolA2UISurfaceWidth(m.layout.main.Dx())
 	// Optimistically mark the agent busy: the prompt we are about to submit
 	// either starts a run or is enqueued behind one. This keeps esc pressed
 	// right after enter routing to cancelAgent instead of reading a stale
@@ -4243,7 +4262,7 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 		// been accepted (HTTP 202) or synchronously with a validation
 		// or transport error. Run failures and cancellation surface
 		// through SSE-derived events, not this return value.
-		err := m.com.Workspace.AgentRun(context.Background(), sessionID, content, attachments...)
+		err := m.com.Workspace.AgentRun(agent.WithContentWidth(context.Background(), contentWidth), sessionID, content, attachments...)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			return util.InfoMsg{
 				Type: util.InfoTypeError,
