@@ -174,3 +174,53 @@ func TestViewHighlighterTokenSurvivesWrap(t *testing.T) {
 	}
 	require.True(t, strings.Contains(highlighted, "\x1b["), "expected ANSI styling in output")
 }
+
+// TestRuneDisplayWidthMatchesGraphemeSegmentation pins the measurement
+// contract with lipgloss.StyleRanges.
+//
+// StyleRanges resolves the cell offsets it is handed with ansi.Cut, which
+// segments by grapheme cluster. Summing per-rune widths disagrees on every
+// cluster built from more than one rune, and the highlight then lands that
+// many cells right of its token.
+func TestRuneDisplayWidthMatchesGraphemeSegmentation(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		in   string
+	}{
+		{"ascii", "hello"},
+		{"cjk double width", "日本語"},
+		{"emoji with skin tone modifier", "👍🏽"},
+		{"zwj family", "👨‍👩‍👧"},
+		{"emoji then token", "👍🏽 @file.go"},
+	} {
+		require.Equal(t, ansi.StringWidth(tc.in), runeDisplayWidth([]rune(tc.in)),
+			"width of %s must match grapheme-cluster segmentation", tc.name)
+	}
+}
+
+// TestHighlightRangesLandOnTokenAfterEmoji is the user-visible form of the
+// bug: with per-rune widths the styled span started two cells past the '@'.
+func TestHighlightRangesLandOnTokenAfterEmoji(t *testing.T) {
+	t.Parallel()
+
+	// "👍🏽 @file.go" — the token starts after a 2-cell grapheme and a space,
+	// so at cell 3. Per-rune summing put it at 5.
+	const line = "👍🏽 @file.go"
+	runes := []rune(line)
+	at := indexOfRune(runes, '@')
+	require.Positive(t, at)
+
+	require.Equal(t, 3, runeDisplayWidth(runes[:at]),
+		"the token must start at the cell ansi.Cut would land on")
+}
+
+func indexOfRune(rs []rune, target rune) int {
+	for i, r := range rs {
+		if r == target {
+			return i
+		}
+	}
+	return -1
+}

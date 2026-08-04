@@ -2734,7 +2734,18 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				// (see the Editor.Commands binding above), so here we only
 				// fire when the textarea already has content and '/' begins
 				// a new word.
-				if msg.String() == "/" && !m.completionsOpen && !m.bangMode {
+				//
+				// curIdx is the length of the value, not the cursor, and
+				// insertCompletionText splices at completionsStartIndex and
+				// then MoveToEnd()s — so opening the popup with the cursor
+				// anywhere but the end would append the chosen skill to the
+				// end of the prompt and strand the '/' the user typed where
+				// the cursor actually was. Requiring the two to agree keeps
+				// the index honest; the '@' trigger above has the same
+				// end-of-value assumption, and #250's atomic backspace
+				// depends on it as well.
+				if msg.String() == "/" && !m.completionsOpen && !m.bangMode &&
+					m.textarea.ByteOffset() == curIdx {
 					if curIdx > 0 && isWhitespace(curValue[curIdx-1]) {
 						m.openSkillCompletions(curIdx)
 					}
@@ -2795,11 +2806,36 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 					} else {
 						// Extract current word and filter.
 						word := m.textareaWord()
-						if strings.HasPrefix(word, string(m.completionsTrigger)) {
+						switch {
+						case !strings.HasPrefix(word, string(m.completionsTrigger)):
+							m.closeCompletions()
+						case m.completionsTrigger == completions.TriggerSkill &&
+							!wordCanBeSkillToken(word):
+							// '/' also begins every absolute path, and the
+							// trigger cannot tell the two apart from the
+							// slash alone. A second separator settles it:
+							// skill names never contain one, so the user is
+							// typing a path and the popup must get out of
+							// the way.
+							m.closeCompletions()
+						default:
 							m.completionsQuery = word[1:]
 							m.completions.Filter(m.completionsQuery)
-						} else if m.completionsOpen {
-							m.closeCompletions()
+							// An open popup with nothing in it still swallows
+							// enter and the arrow keys — the prompt cannot be
+							// submitted until the user finds escape. Nothing
+							// is drawn in that state either, so there is no
+							// hint as to what is eating the key.
+							//
+							// Only the skill popup is closed on an empty
+							// filter: its items are installed synchronously
+							// by SetSkillItems, so empty really means "no
+							// match". The file popup loads asynchronously and
+							// is legitimately empty until the walk returns.
+							if m.completionsTrigger == completions.TriggerSkill &&
+								!m.completions.HasItems() {
+								m.closeCompletions()
+							}
 						}
 					}
 				}
@@ -3936,6 +3972,18 @@ func (m *UI) skillCompletionValues() []completions.SkillCompletionValue {
 // openSkillCompletions opens the completions popup in skill mode at the
 // given trigger index. Skills are already in memory, so no async load is
 // needed.
+// wordCanBeSkillToken reports whether word — the token beginning at the '/'
+// that opened the skill popup — can still be a skill reference.
+//
+// '/' opens both a skill token and every absolute path, and at the moment it
+// is typed the two are indistinguishable. They diverge on the next
+// separator: a skill name is a single segment (plugin skills qualify with a
+// colon, as in "sdd:plan"), so a second '/' means the user is typing a path
+// like /tmp/out.log and the popup must stop claiming their keystrokes.
+func wordCanBeSkillToken(word string) bool {
+	return !strings.Contains(strings.TrimPrefix(word, "/"), "/")
+}
+
 func (m *UI) openSkillCompletions(startIndex int) {
 	values := m.skillCompletionValues()
 	if len(values) == 0 {
@@ -4295,6 +4343,12 @@ func (m *UI) refreshStyles() {
 		m.cacheSidebarLogo(m.layout.sidebar.Dx())
 	}
 	m.textarea.SetStyles(t.Editor.Textarea)
+	// The highlighter copies its styles at construction, so it needs the
+	// same re-push every other value-copying subcomponent here gets.
+	if m.promptHighlighter != nil {
+		m.promptHighlighter.SetStyles(t.Editor.TokenFile, t.Editor.TokenSkill)
+		m.promptHighlighter.Rescan(m.textarea.Value())
+	}
 	m.completions.SetStyles(t.Completions.Normal, t.Completions.Focused, t.Completions.Match)
 	m.attachments.Renderer().SetStyles(
 		t.Attachments.Normal,

@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/attachments"
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/completions"
+	"github.com/charmbracelet/crush/internal/ui/dialog"
 	"github.com/stretchr/testify/require"
 )
 
@@ -231,4 +232,121 @@ func TestCompletionItemsLoadedAppliesInFileMode(t *testing.T) {
 
 	m.completions.Filter("foo")
 	require.True(t, m.completions.HasItems())
+}
+
+// typeInto drives a literal string through the real key-press path, so the
+// completion trigger and its filter run exactly as they do for a user.
+func typeInto(m *UI, s string) {
+	if m.dialog == nil {
+		m.dialog = dialog.NewOverlay()
+	}
+	m.textarea.Focus()
+	for _, r := range s {
+		code := r
+		if r == ' ' {
+			code = tea.KeySpace
+		}
+		m.handleKeyPressMsg(tea.KeyPressMsg{Code: code, Text: string(r)})
+	}
+}
+
+// TestSkillTriggerIgnoresAbsolutePaths pins that typing an ordinary absolute
+// path does not leave the skill popup holding the prompt hostage.
+//
+// '/' opens both a skill token and every absolute path. The popup used to
+// stay open for the whole path token: with no fuzzy match it drew nothing
+// yet still consumed enter, so the prompt could not be submitted and there
+// was no visible hint as to what was eating the key; with a match, enter
+// replaced the entire path with the skill name.
+func TestSkillTriggerIgnoresAbsolutePaths(t *testing.T) {
+	t.Parallel()
+
+	m := newSkillCompletionUI()
+	m.skillStates = []*skills.SkillState{
+		{Name: "commit", Path: "/skills/commit/SKILL.md", State: skills.StateNormal},
+	}
+
+	typeInto(m, "read /tmp/out.log")
+
+	require.Equal(t, "read /tmp/out.log", m.textarea.Value(),
+		"the path must survive verbatim")
+	require.False(t, m.completionsOpen,
+		"a path token must not leave the skill popup open to swallow enter")
+}
+
+// TestSkillTriggerClosesWhenNothingMatches pins that a '/'-token matching no
+// skill closes the popup rather than sitting open and empty. An open-but-
+// empty popup renders nothing yet still consumes enter and the arrows.
+func TestSkillTriggerClosesWhenNothingMatches(t *testing.T) {
+	t.Parallel()
+
+	m := newSkillCompletionUI()
+	m.skillStates = []*skills.SkillState{
+		{Name: "commit", Path: "/skills/commit/SKILL.md", State: skills.StateNormal},
+	}
+
+	typeInto(m, "do /zzzz")
+
+	require.False(t, m.completionsOpen,
+		"no match must close the popup so enter reaches the prompt")
+}
+
+// TestSkillTriggerOpensOnRealSkillToken is the positive control for the two
+// tests above: the popup must still open and filter for a genuine token.
+func TestSkillTriggerOpensOnRealSkillToken(t *testing.T) {
+	t.Parallel()
+
+	m := newSkillCompletionUI()
+	m.skillStates = []*skills.SkillState{
+		{Name: "commit", Path: "/skills/commit/SKILL.md", State: skills.StateNormal},
+	}
+
+	typeInto(m, "please /com")
+
+	require.True(t, m.completionsOpen, "a real skill token must open the popup")
+	require.Equal(t, completions.TriggerSkill, m.completionsTrigger)
+	require.True(t, m.completions.HasItems())
+}
+
+// TestSkillTriggerSkippedWhenCursorNotAtEnd pins the index invariant.
+//
+// completionsStartIndex is taken from len(value), and insertCompletionText
+// splices there and then MoveToEnd()s, so opening the popup with the cursor
+// elsewhere appended the chosen skill to the end of the prompt and stranded
+// the typed '/' where the cursor actually was.
+func TestSkillTriggerSkippedWhenCursorNotAtEnd(t *testing.T) {
+	t.Parallel()
+
+	m := newSkillCompletionUI()
+	m.skillStates = []*skills.SkillState{
+		{Name: "commit", Path: "/skills/commit/SKILL.md", State: skills.StateNormal},
+	}
+	m.dialog = dialog.NewOverlay()
+	m.textarea.SetValue("review this file ")
+	m.textarea.SetCursorColumn(0)
+	require.NotEqual(t, len(m.textarea.Value()), m.textarea.ByteOffset(),
+		"precondition: the cursor must not be at the end")
+
+	m.handleKeyPressMsg(tea.KeyPressMsg{Code: '/', Text: "/"})
+
+	require.False(t, m.completionsOpen,
+		"the popup must not open when its start index would be wrong")
+}
+
+func TestWordCanBeSkillToken(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		word string
+		want bool
+	}{
+		{"/", true},
+		{"/commit", true},
+		{"/sdd:plan", true}, // plugin skills qualify with a colon
+		{"/tmp/", false},    // a path the moment the second slash lands
+		{"/tmp/out.log", false},
+		{"/usr/local/bin", false},
+	} {
+		require.Equal(t, tc.want, wordCanBeSkillToken(tc.word), "word %q", tc.word)
+	}
 }

@@ -625,6 +625,23 @@ func (m Model) Value() string {
 	return strings.TrimSuffix(v.String(), "\n")
 }
 
+// ByteOffset returns the cursor's position as a byte offset into Value().
+//
+// Callers that slice Value() around the cursor need this rather than
+// Column(), which counts runes within the current row only. Value() joins
+// the rows with "\n", so the offset is every preceding row plus its
+// separator, then the current row up to the cursor.
+func (m Model) ByteOffset() int {
+	var off int
+	for i, row := range m.value {
+		if i == m.row {
+			return off + len(string(row[:min(m.col, len(row))]))
+		}
+		off += len(string(row)) + 1 // +1 for the joining newline
+	}
+	return off
+}
+
 // Length returns the number of characters currently in the text input.
 func (m *Model) Length() int {
 	var l int
