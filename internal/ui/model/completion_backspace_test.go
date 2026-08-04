@@ -16,11 +16,18 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/completions"
 	"github.com/charmbracelet/crush/internal/ui/dialog"
 	"github.com/charmbracelet/crush/internal/ui/textarea"
+	"github.com/charmbracelet/crush/internal/workspace"
 	"github.com/stretchr/testify/require"
 )
 
 func newCompletionBackspaceUI() *UI {
-	com := common.DefaultCommon(&slashCommandWorkspace{ready: true})
+	return newCompletionBackspaceUIWith(&slashCommandWorkspace{ready: true})
+}
+
+// newCompletionBackspaceUIWith is newCompletionBackspaceUI over a caller-
+// supplied workspace, for tests that need to observe workspace calls.
+func newCompletionBackspaceUIWith(ws workspace.Workspace) *UI {
+	com := common.DefaultCommon(ws)
 	ta := textarea.New()
 	ta.Focus()
 	return &UI{

@@ -231,33 +231,15 @@ const minSkillDetailWidth = 12
 // item's text, so the fuzzy filter matches it too: typing "/pdf" finds a
 // skill described as "extract text from PDFs" even if it is named
 // "document-tools".
-func (c *Completions) SetSkillItems(skills []SkillCompletionValue) {
-	items := make([]list.FilterableItem, 0, len(skills))
+func (c *Completions) SetSkillItems(skills []SkillCompletionValue, prompts []PromptCompletionValue) {
+	items := make([]list.FilterableItem, 0, len(skills)+len(prompts))
+	// Prompts lead: they are server-qualified, so they cannot collide with a
+	// skill name, and a user who typed "/gitea:" wants them first.
+	for _, prompt := range prompts {
+		items = append(items, c.completionRow("/"+prompt.Name, prompt.Description, prompt))
+	}
 	for _, skill := range skills {
-		name := "/" + skill.Name
-		text := name
-		detailStart := -1
-		if desc := flattenSkillDescription(skill.Description); desc != "" {
-			// maxWidth is the popup's hard cap and renderItem reserves a
-			// cell of padding on each side, so that is the real budget the
-			// name and description share.
-			budget := maxWidth - 2 - ansi.StringWidth(name) - len(skillDetailSeparator)
-			if budget >= minSkillDetailWidth {
-				detailStart = len(name)
-				text = name + skillDetailSeparator + ansi.Truncate(desc, budget, "…")
-			}
-		}
-		item := NewCompletionItem(
-			text,
-			skill,
-			c.normalStyle,
-			c.focusedStyle,
-			c.matchStyle,
-		)
-		if detailStart >= 0 {
-			item = item.withDetail(detailStart, name)
-		}
-		items = append(items, item)
+		items = append(items, c.completionRow("/"+skill.Name, skill.Description, skill))
 	}
 
 	c.open = true
@@ -275,6 +257,30 @@ func (c *Completions) SetSkillItems(skills []SkillCompletionValue) {
 	c.list.ScrollToSelected()
 
 	c.updateSize()
+}
+
+// completionRow builds one "/name - description" row. The description is
+// part of the item's text so the fuzzy filter matches it too: typing "/pdf"
+// finds a skill described as "extract text from PDFs" even if it is named
+// "document-tools", and the same holds for an MCP prompt's description.
+func (c *Completions) completionRow(name, description string, value any) list.FilterableItem {
+	text := name
+	detailStart := -1
+	if desc := flattenSkillDescription(description); desc != "" {
+		// maxWidth is the popup's hard cap and renderItem reserves a cell of
+		// padding on each side, so that is the real budget the name and
+		// description share.
+		budget := maxWidth - 2 - ansi.StringWidth(name) - len(skillDetailSeparator)
+		if budget >= minSkillDetailWidth {
+			detailStart = len(name)
+			text = name + skillDetailSeparator + ansi.Truncate(desc, budget, "…")
+		}
+	}
+	item := NewCompletionItem(text, value, c.normalStyle, c.focusedStyle, c.matchStyle)
+	if detailStart >= 0 {
+		item = item.withDetail(detailStart, name)
+	}
+	return item
 }
 
 // Close closes the completions popup.

@@ -271,31 +271,54 @@ type chipSpec struct {
 	label string
 }
 
-// chipSpecFor decides how an attachment presents. Adding a chip type means
-// adding a case here and a label rule — nothing else in this file changes.
+// chipRenderer turns one attachment into the chip that represents it.
+type chipRenderer func(*Renderer, message.Attachment) chipSpec
+
+// chipRenderers is the registry of chip presentations, keyed by attachment
+// kind. Adding a chip type means adding an entry here and the function it
+// points at — nothing in the layout, the fit math, or the hit-testing needs
+// to know the kind exists.
+//
+// A kind with no entry falls back to fileChip, so an attachment produced by
+// an older client, or by code that never set Kind, still renders sensibly
+// rather than blank.
+var chipRenderers = map[message.AttachmentKind]chipRenderer{
+	message.AttachmentKindFile:      fileChip,
+	message.AttachmentKindMCPPrompt: mcpPromptChip,
+}
+
 func (r *Renderer) chipSpecFor(a message.Attachment) chipSpec {
-	switch a.Kind {
-	case message.AttachmentKindMCPPrompt:
-		// The full prompt name is the point of the chip — "/gitea:foo…"
-		// would leave two prompts from the same server indistinguishable —
-		// so it is never truncated. The argument values live in the prompt
-		// token in the editor, where there is room; the chip carries only
-		// how many there are.
-		label := a.FileName
-		if a.PromptArgCount > 0 {
-			label = fmt.Sprintf("%s (%d %s)", label, a.PromptArgCount,
-				plural(a.PromptArgCount, "arg", "args"))
-		}
-		return chipSpec{icon: r.promptStyle, label: label}
-	default:
-		// File-shaped attachments keep the historical rule: basename only,
-		// truncated to a uniform budget so a row of them stays tidy.
-		label := filepath.Base(a.FileName)
-		if ansi.StringWidth(label) > maxFilename {
-			label = ansi.Truncate(label, maxFilename, "…")
-		}
-		return chipSpec{icon: r.icon(a), label: label}
+	render, ok := chipRenderers[a.Kind]
+	if !ok {
+		render = fileChip
 	}
+	return render(r, a)
+}
+
+// fileChip presents anything file-shaped: the basename only, truncated to a
+// uniform budget so a row of them stays tidy, with the icon chosen by MIME
+// type. MIME sniffing lives here rather than in the dispatch above, because
+// it can only distinguish file-ish things from each other.
+func fileChip(r *Renderer, a message.Attachment) chipSpec {
+	label := filepath.Base(a.FileName)
+	if ansi.StringWidth(label) > maxFilename {
+		label = ansi.Truncate(label, maxFilename, "…")
+	}
+	return chipSpec{icon: r.icon(a), label: label}
+}
+
+// mcpPromptChip presents a resolved MCP prompt. The full prompt name is the
+// point — "/gitea:foo…" would leave two prompts from the same server
+// indistinguishable — so it is never truncated. Argument values live in the
+// token in the editor, where there is room; the chip carries only how many
+// there are.
+func mcpPromptChip(r *Renderer, a message.Attachment) chipSpec {
+	label := a.FileName
+	if a.PromptArgCount > 0 {
+		label = fmt.Sprintf("%s (%d %s)", label, a.PromptArgCount,
+			plural(a.PromptArgCount, "arg", "args"))
+	}
+	return chipSpec{icon: r.promptStyle, label: label}
 }
 
 func plural(n int, one, many string) string {

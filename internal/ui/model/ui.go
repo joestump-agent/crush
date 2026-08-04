@@ -2152,6 +2152,9 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 	case dialog.ActionAttachSkill:
 		m.dialog.CloseFrontDialog()
 		cmds = append(cmds, m.attachSkill(msg.ID, msg.Name))
+	case dialog.ActionInsertMCPPrompt:
+		m.dialog.CloseFrontDialog()
+		cmds = append(cmds, m.attachMCPPrompt(msg.Name, msg.MCPName, msg.PromptID, msg.Args))
 	case dialog.ActionRunMCPPrompt:
 		if len(msg.Arguments) > 0 && msg.Args == nil {
 			m.dialog.CloseFrontDialog()
@@ -2528,6 +2531,11 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 					switch msg := msg.(type) {
 					case completions.SelectionMsg[completions.SkillCompletionValue]:
 						cmds = append(cmds, m.insertSkillCompletion(msg.Value))
+						if !msg.KeepOpen {
+							m.closeCompletions()
+						}
+					case completions.SelectionMsg[completions.PromptCompletionValue]:
+						cmds = append(cmds, m.insertMCPPromptCompletion(msg.Value))
 						if !msg.KeepOpen {
 							m.closeCompletions()
 						}
@@ -4013,11 +4021,12 @@ func wordCanBeSkillToken(word string) bool {
 
 func (m *UI) openSkillCompletions(startIndex int) {
 	values := m.skillCompletionValues()
-	if len(values) == 0 {
+	prompts := m.promptCompletionValues()
+	if len(values) == 0 && len(prompts) == 0 {
 		// An open-but-empty popup still consumes enter and the arrow keys,
-		// so a user with no skills configured could not submit a prompt
+		// so a user with nothing configured could not submit a prompt
 		// containing a '/'. Unlike '@' there is nothing to wait on here —
-		// no skills means no popup.
+		// nothing to offer means no popup.
 		return
 	}
 
@@ -4026,7 +4035,44 @@ func (m *UI) openSkillCompletions(startIndex int) {
 	m.completionsQuery = ""
 	m.completionsStartIndex = startIndex
 	m.completionsPositionStart = m.completionsPosition()
-	m.completions.SetSkillItems(values)
+	m.completions.SetSkillItems(values, prompts)
+}
+
+// promptCompletionValues turns the loaded MCP prompts into popup items.
+//
+// Names are server-qualified ("gitea:review"), which is both how
+// commands.LoadMCPPrompts already keys them and the only form that can be
+// unambiguous: prompt names are unique per server, so two servers may each
+// expose "review". Skills are not qualified — Crush skill names come
+// straight from SKILL.md frontmatter and there is no namespace to qualify
+// them with.
+func (m *UI) promptCompletionValues() []completions.PromptCompletionValue {
+	values := make([]completions.PromptCompletionValue, 0, len(m.mcpPrompts))
+	for _, p := range m.mcpPrompts {
+		if p.ClientID == "" || p.PromptID == "" {
+			continue
+		}
+		args := make([]completions.PromptArgument, 0, len(p.Arguments))
+		for _, a := range p.Arguments {
+			args = append(args, completions.PromptArgument{
+				ID:          a.ID,
+				Title:       a.Title,
+				Description: a.Description,
+				Required:    a.Required,
+			})
+		}
+		values = append(values, completions.PromptCompletionValue{
+			Name:        p.ClientID + ":" + p.PromptID,
+			Description: cmp.Or(p.Description, p.Title),
+			MCPName:     p.ClientID,
+			PromptID:    p.PromptID,
+			Arguments:   args,
+		})
+	}
+	slices.SortFunc(values, func(a, b completions.PromptCompletionValue) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return values
 }
 
 // insertCompletionText replaces the @query in the textarea with the given text.
@@ -4266,6 +4312,96 @@ func (m *UI) insertSkillCompletion(skill completions.SkillCompletionValue) tea.C
 		return nil
 	}
 	return m.handleTextareaHeightChange(prevHeight)
+}
+
+// insertMCPPromptCompletion handles picking an MCP prompt from the "/" popup.
+//
+// Prompts that declare arguments open the arguments dialog first; the
+// insertion happens once the values come back, via promptArgsResolvedMsg.
+func (m *UI) insertMCPPromptCompletion(p completions.PromptCompletionValue) tea.Cmd {
+	if len(p.Arguments) == 0 {
+		return m.attachMCPPrompt(p.Name, p.MCPName, p.PromptID, nil)
+	}
+	args := make([]commands.Argument, 0, len(p.Arguments))
+	for _, a := range p.Arguments {
+		args = append(args, commands.Argument{
+			ID:          a.ID,
+			Title:       cmp.Or(a.Title, a.ID),
+			Description: a.Description,
+			Required:    a.Required,
+		})
+	}
+	m.closeCompletions()
+	m.dialog.OpenDialog(dialog.NewArguments(m.com, "/"+p.Name, p.Description, args,
+		dialog.ActionInsertMCPPrompt{
+			Name:      p.Name,
+			MCPName:   p.MCPName,
+			PromptID:  p.PromptID,
+			Arguments: args,
+		}))
+	return nil
+}
+
+// attachMCPPrompt resolves the prompt against its server and attaches the
+// result.
+//
+// The resolved body becomes an attachment rather than text spliced into the
+// editor: prompt templates run long, and dropping one into the prompt area
+// would bury whatever the user was writing. The editor keeps a compact
+// "/server:prompt(arg=value)" token — space-free, so it stays one highlighted
+// unit and one atomic backspace removes it — while the body rides along as an
+// attachment the model receives, exactly like an @file mention.
+func (m *UI) attachMCPPrompt(name, mcpName, promptID string, args map[string]string) tea.Cmd {
+	token := "/" + name
+	if len(args) > 0 {
+		keys := make([]string, 0, len(args))
+		for k := range args {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			if args[k] != "" {
+				parts = append(parts, k+"="+args[k])
+			}
+		}
+		if len(parts) > 0 {
+			// No spaces: ScanPromptTokens ends a token at the first one, so a
+			// spaced form would highlight only the name and leave the
+			// arguments rendering as loose prose.
+			token += "(" + strings.Join(parts, ",") + ")"
+		}
+	}
+
+	prevHeight := m.textarea.Height()
+	if !m.insertCompletionText(token) {
+		return nil
+	}
+	heightCmd := m.handleTextareaHeightChange(prevHeight)
+
+	argCount := len(args)
+	promptCmd := func() tea.Msg {
+		body, err := m.com.Workspace.GetMCPPrompt(mcpName, promptID, args)
+		if err != nil {
+			slog.Warn("Failed to resolve MCP prompt", "prompt", name, "error", err)
+			return util.InfoMsg{
+				Type: util.InfoTypeError,
+				Msg:  fmt.Sprintf("Could not resolve /%s: %v", name, err),
+			}
+		}
+		if body == "" {
+			return nil
+		}
+		return message.Attachment{
+			FilePath:       name,
+			FileName:       "/" + name,
+			MimeType:       "text/markdown",
+			Content:        []byte(body),
+			Kind:           message.AttachmentKindMCPPrompt,
+			PromptArgCount: argCount,
+		}
+	}
+	return tea.Batch(heightCmd, promptCmd)
 }
 
 // completionsPosition returns the X and Y position for the completions popup.

@@ -34,6 +34,31 @@ type SkillCompletionValue struct {
 	Path        string
 }
 
+// PromptCompletionValue represents an MCP prompt offered by the "/" popup
+// alongside skills.
+//
+// Name is the server-qualified "server:prompt" form. Prompt names are only
+// unique within a server, so the qualifier is the name as far as the editor
+// is concerned — two servers may both expose "review".
+type PromptCompletionValue struct {
+	Name        string
+	Description string
+	// MCPName and PromptID are the unqualified halves, for the call that
+	// resolves the prompt.
+	MCPName  string
+	PromptID string
+	// Arguments the prompt declares, in the order the server listed them.
+	Arguments []PromptArgument
+}
+
+// PromptArgument mirrors the argument metadata an MCP prompt declares.
+type PromptArgument struct {
+	ID          string
+	Title       string
+	Description string
+	Required    bool
+}
+
 // IsTemplate reports whether the completion's URI is an unexpanded RFC 6570
 // URI template (it still contains a "{expression}") rather than a concrete,
 // readable resource URI. Templates come from resources/templates/list and
