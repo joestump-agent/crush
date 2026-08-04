@@ -293,9 +293,10 @@ type UI struct {
 	// is only honoured while the textarea still holds it, so a whole-value
 	// replacement (history recall, paste) cannot make a stale range point
 	// at unrelated text that happens to be the same length.
-	lastCompletionStart int
-	lastCompletionEnd   int
-	lastCompletionText  string
+	lastCompletionStart    int
+	lastCompletionEnd      int
+	lastCompletionText     string
+	lastCompletionFilePath string // non-empty when the last completion attached a file
 
 	// promptHighlighter styles @file and /skill tokens inline as the user
 	// types. Installed on the textarea via SetHighlighter.
@@ -2694,6 +2695,10 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 						prevHeight := m.textarea.Height()
 						m.textarea.SetValue(val[:m.lastCompletionStart])
 						m.textarea.MoveToEnd()
+						// Remove the attachment that was added alongside
+						// this @file mention, so the chip disappears with
+						// the text.
+						m.dropCompletionAttachment(val[:m.lastCompletionStart])
 						m.clearCompletionRange()
 						// Deleting a wrapped completion changes the editor's
 						// height, and the deletion is a draft edit like any
@@ -2724,7 +2729,20 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				curIdx := len(curValue)
 
 				// Trigger file completions on @.
-				if msg.String() == "@" && !m.completionsOpen {
+				//
+				// Bang mode is excluded for the same reason the '/' trigger
+				// and the highlighter exclude it: the line is a shell
+				// command, and a mention inserts a literal '@' the shell
+				// would pass through to the program (`cat @main.go`).
+				//
+				// The cursor must also be at the end of the value, because
+				// curIdx above is the value length rather than the cursor and
+				// insertCompletionText splices at completionsStartIndex then
+				// MoveToEnd()s — opening the popup with the cursor elsewhere
+				// strands the typed '@' and appends the mention at the end.
+				// Same guard the '/' trigger uses below.
+				if msg.String() == "@" && !m.completionsOpen && !m.bangMode &&
+					m.textarea.ByteOffset() == curIdx {
 					// Only show if beginning of prompt or after whitespace.
 					if curIdx == 0 || (curIdx > 0 && isWhitespace(curValue[curIdx-1])) {
 						m.completionsOpen = true
@@ -4031,7 +4049,68 @@ func (m *UI) insertCompletionText(text string) bool {
 	m.lastCompletionText = text + " "
 	m.lastCompletionStart = m.completionsStartIndex
 	m.lastCompletionEnd = m.completionsStartIndex + len(m.lastCompletionText)
+	// The attached path belongs to the run recorded above, so it is reset
+	// here with the rest of the range and re-set by the callers that
+	// actually attach something. Without this it survives into the next
+	// completion: inserting @file.go and then /skill left the file's path
+	// attached to the skill's range, so backspacing the skill removed the
+	// unrelated file's chip.
+	m.lastCompletionFilePath = ""
 	return true
+}
+
+// dropCompletionAttachment removes the attachment that the just-deleted
+// completion put on the prompt, given the prompt text that survives the
+// deletion.
+//
+// Two guards make this safe, both of which the naive "remove by path" version
+// got wrong:
+//
+// Repeat mentions share one attachment. insertFileCompletion's fileCmd
+// dedupes on sessionFileReads, so mentioning the same file twice creates a
+// single attachment owned, in effect, by the first mention. Removing on the
+// second backspace deleted that shared attachment while its first mention was
+// still sitting in the prompt — the chip vanished and the file was silently
+// never sent. So the attachment only goes when nothing left in the prompt
+// still mentions it.
+//
+// Removing it must also roll back the dedupe entry, or the file becomes
+// un-attachable: re-mentioning it hits sessionFileReads, returns nil, and the
+// user gets a mention with no attachment and no indication anything is wrong.
+func (m *UI) dropCompletionAttachment(remaining string) {
+	path := m.lastCompletionFilePath
+	if path == "" {
+		return
+	}
+	if promptMentions(remaining, path) {
+		return
+	}
+	m.attachments.RemoveByFilePath(path)
+	if absPath, err := filepath.Abs(path); err == nil {
+		m.sessionFileReads = slices.DeleteFunc(m.sessionFileReads, func(p string) bool {
+			return p == absPath
+		})
+	}
+}
+
+// promptMentions reports whether value still carries an "@target" token.
+// Matching goes through the same tokenizer that highlights mentions, so what
+// counts as a live mention here is exactly what the user sees highlighted.
+func promptMentions(value, target string) bool {
+	// ScanPromptTokens works a line at a time and reports rune offsets, so
+	// slice the rune view of each line rather than the byte string.
+	for _, line := range strings.Split(value, "\n") {
+		runes := []rune(line)
+		for _, tok := range common.ScanPromptTokens(runes) {
+			if tok.Kind != common.PromptTokenFile {
+				continue
+			}
+			if string(runes[tok.Start+1:tok.End]) == target {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // clearCompletionRange forgets the last inserted completion, so a later
@@ -4040,15 +4119,17 @@ func (m *UI) clearCompletionRange() {
 	m.lastCompletionStart = 0
 	m.lastCompletionEnd = 0
 	m.lastCompletionText = ""
+	m.lastCompletionFilePath = ""
 }
 
 // insertFileCompletion inserts the selected file path into the textarea,
 // replacing the @query, and adds the file as an attachment.
 func (m *UI) insertFileCompletion(path string) tea.Cmd {
 	prevHeight := m.textarea.Height()
-	if !m.insertCompletionText(path) {
+	if !m.insertCompletionText("@" + path) {
 		return nil
 	}
+	m.lastCompletionFilePath = path
 	heightCmd := m.handleTextareaHeightChange(prevHeight)
 
 	fileCmd := func() tea.Msg {
@@ -4108,13 +4189,29 @@ func (m *UI) insertMCPResourceCompletion(item completions.ResourceCompletionValu
 	}
 
 	prevHeight := m.textarea.Height()
-	if !m.insertCompletionText(displayText) {
+	// Only prefix '@' when the text can actually read back as one mention.
+	// ScanPromptTokens ends a token at the first space, so "@Daily Report
+	// 2026" highlights as a mention of a file called "Daily" followed by
+	// loose prose, and the model sees the same. A template URI is not a
+	// path at all — "@cairn://run/{id}" invites the model to resolve
+	// something that does not exist. Both keep the bare text they had
+	// before mentions were prefixed.
+	insertText := displayText
+	if !item.IsTemplate() && !strings.ContainsAny(displayText, " \t") {
+		insertText = "@" + displayText
+	}
+	if !m.insertCompletionText(insertText) {
 		return nil
 	}
 	heightCmd := m.handleTextareaHeightChange(prevHeight)
 	if item.IsTemplate() {
 		return heightCmd
 	}
+	// The attachment this completion is about to add is keyed by the
+	// resource URI, so record that — not displayText, which may be the
+	// human-readable title. Without it, backspacing an MCP resource mention
+	// removed the text and left the chip behind.
+	m.lastCompletionFilePath = item.URI
 
 	resourceCmd := func() tea.Msg {
 		contents, err := m.com.Workspace.ReadMCPResource(
