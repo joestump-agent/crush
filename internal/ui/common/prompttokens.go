@@ -64,11 +64,13 @@ func IsPromptSkillPrefix(name string) bool {
 
 // promptTokenName reduces a "/" token's body to the name to validate.
 //
-// An MCP prompt carries its arguments in the token itself —
-// "/gitea:review(id=42)" — so the parenthesised tail has to come off before
+// Older drafts of the MCP prompt completion carried the arguments in the
+// token itself — "/gitea:review(id=42)" — and a posted message from one of
+// those drafts still does, so the parenthesised tail has to come off before
 // matching. Without this the argument-bearing form never validates:
-// IsPromptSkillPrefix asks whether the token is a prefix of a known name, and
-// a name with arguments appended is longer than the name, not a prefix of it.
+// IsPromptSkillPrefix asks whether the token is a prefix of a known name,
+// and a name with arguments appended is longer than the name, not a prefix
+// of it.
 func promptTokenName(body string) string {
 	if i := strings.IndexByte(body, '('); i >= 0 {
 		return body[:i]
