@@ -135,6 +135,12 @@ type Coordinator interface {
 	// subscribe to its private session/message stores and cancel runs.
 	// Nil when the sidekick agent is not configured.
 	Sidekick() *EphemeralAgent
+	// SidekickDashboardSubscribe subscribes to agent-pushed Sidekick
+	// dashboard surfaces (the main coder agent's sidekick_update tool,
+	// #57). This is deterministic routing for the panel's pinned
+	// dashboard slot (#56): the payload travels on its own broker and
+	// never enters any message stream.
+	SidekickDashboardSubscribe(ctx context.Context) <-chan pubsub.Event[tools.SidekickSurface]
 }
 
 type coordinator struct {
@@ -167,6 +173,9 @@ type coordinator struct {
 	// prompts run in, created on first RunSidekick so consecutive
 	// prompts share conversation context.
 	sidekickSessionID string
+	// sidekickDashboard fans agent-pushed dashboard surfaces (the
+	// sidekick_update tool, #57) out to UI subscribers (#56).
+	sidekickDashboard *pubsub.Broker[tools.SidekickSurface]
 
 	// Skills discovery results (session-start snapshot).
 	allSkills    []*skills.Skill // Pre-filter: all discovered after dedup.
@@ -214,22 +223,23 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 	}
 
 	c := &coordinator{
-		cfg:          opts.Config,
-		sessions:     opts.Sessions,
-		messages:     opts.Messages,
-		permissions:  opts.Permissions,
-		questions:    opts.Questions,
-		history:      opts.History,
-		filetracker:  opts.FileTracker,
-		lspManager:   opts.LSPManager,
-		notify:       opts.Notify,
-		runComplete:  opts.RunComplete,
-		agents:       make(map[string]SessionAgent),
-		cronStore:    cronStore,
-		allSkills:    allSkills,
-		activeSkills: activeSkills,
-		skillTracker: skillTracker,
-		interactive:  opts.Interactive,
+		cfg:               opts.Config,
+		sessions:          opts.Sessions,
+		messages:          opts.Messages,
+		permissions:       opts.Permissions,
+		questions:         opts.Questions,
+		history:           opts.History,
+		filetracker:       opts.FileTracker,
+		lspManager:        opts.LSPManager,
+		notify:            opts.Notify,
+		runComplete:       opts.RunComplete,
+		agents:            make(map[string]SessionAgent),
+		cronStore:         cronStore,
+		allSkills:         allSkills,
+		activeSkills:      activeSkills,
+		skillTracker:      skillTracker,
+		sidekickDashboard: pubsub.NewBroker[tools.SidekickSurface](),
+		interactive:       opts.Interactive,
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]
@@ -243,6 +253,11 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 	promptOpts := []prompt.Option{prompt.WithWorkingDir(c.cfg.WorkingDir())}
 	if !c.cfg.Config().Options.DisableA2UI {
 		promptOpts = append(promptOpts, prompt.WithA2UI())
+		// The dashboard push channel (#57) exists only when a Sidekick
+		// panel is configured to render it; the guidance follows the tool.
+		if _, ok := cfg.Config().Agents[config.AgentSidekick]; ok {
+			promptOpts = append(promptOpts, prompt.WithSidekickUpdate())
+		}
 	}
 	prompt, err := coderPrompt(promptOpts...)
 	if err != nil {
@@ -927,6 +942,11 @@ func (c *coordinator) Sidekick() *EphemeralAgent {
 	return c.sidekickAgent
 }
 
+// SidekickDashboardSubscribe implements Coordinator.
+func (c *coordinator) SidekickDashboardSubscribe(ctx context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
+	return c.sidekickDashboard.Subscribe(ctx)
+}
+
 // CancelSidekick implements Coordinator.
 func (c *coordinator) CancelSidekick() {
 	if c.sidekickAgent == nil {
@@ -1018,6 +1038,15 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	var hookRunner *hooks.Runner
 	if preToolHooks := c.cfg.Config().Hooks[hooks.EventPreToolUse]; len(preToolHooks) > 0 {
 		hookRunner = hooks.NewRunner(preToolHooks, c.cfg.WorkingDir(), c.cfg.WorkingDir())
+	}
+
+	// The Sidekick dashboard push channel (#57): main coder agent only —
+	// never sub-agents, never the Sidekick itself — and only when a
+	// Sidekick panel is configured to render it and A2UI is enabled.
+	if !isSubAgent && !c.cfg.Config().Options.DisableA2UI {
+		if _, ok := c.cfg.Config().Agents[config.AgentSidekick]; ok {
+			allTools = append(allTools, tools.NewSidekickUpdateTool(c.sidekickDashboard))
+		}
 	}
 
 	allTools = append(

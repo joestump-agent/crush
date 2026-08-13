@@ -9,6 +9,7 @@ import (
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -44,6 +45,14 @@ type (
 	sidekickRunFinishedMsg struct {
 		err error
 	}
+
+	// sidekickDashboardMsg carries one agent-pushed dashboard surface
+	// from the sidekick_update tool's broker (#57). A dedicated type
+	// keeps the routing deterministic: dashboard pushes can never be
+	// confused with chat traffic.
+	sidekickDashboardMsg struct {
+		event pubsub.Event[agenttools.SidekickSurface]
+	}
 )
 
 // sidekickState is the Sidekick chat panel: an ephemeral conversation
@@ -73,6 +82,18 @@ type sidekickState struct {
 	// events is the subscription to the Sidekick's private message
 	// broker; nil until the first successful subscribe.
 	events <-chan pubsub.Event[message.Message]
+
+	// dashboard is the last surface the main agent pushed via the
+	// sidekick_update tool (#57), as <a2ui-json>-wrapped content for the
+	// shared render pipeline. It renders pinned at the top of the panel
+	// (#56); each push replaces it in place. Empty when nothing is
+	// pinned. It persists after the agent's turn ends, until the next
+	// main-agent prompt, a /clear, or an explicit dismiss.
+	dashboard string
+
+	// dashboardEvents is the subscription to the dashboard push broker;
+	// nil until the first successful subscribe.
+	dashboardEvents <-chan pubsub.Event[agenttools.SidekickSurface]
 }
 
 // messageIndex returns the index of the message with the given ID, or -1.
@@ -145,6 +166,63 @@ func (m *UI) awaitSidekickEvent() tea.Cmd {
 	}
 }
 
+// subscribeSidekickDashboard starts listening for agent-pushed dashboard
+// surfaces (the main agent's sidekick_update tool, #57). Safe to call
+// repeatedly: it is a no-op once subscribed, when the workspace cannot
+// deliver dashboard pushes, or in struct-literal test UIs without a
+// workspace. Unlike the chat-stream subscription this one must be live
+// without any user action — pushes arrive while the user works in the
+// main chat — so it is attempted at Init and retried from the main
+// prompt path until the agent is ready.
+func (m *UI) subscribeSidekickDashboard() tea.Cmd {
+	if m.sidekick.dashboardEvents != nil {
+		return nil
+	}
+	if m.com == nil || m.com.Workspace == nil {
+		return nil
+	}
+	ch := m.com.Workspace.SidekickDashboardSubscribe(context.Background())
+	if ch == nil {
+		return nil
+	}
+	m.sidekick.dashboardEvents = ch
+	return m.awaitSidekickDashboardEvent()
+}
+
+// awaitSidekickDashboardEvent returns a command that blocks on the next
+// dashboard push. The handler re-issues it to keep the stream draining.
+func (m *UI) awaitSidekickDashboardEvent() tea.Cmd {
+	ch := m.sidekick.dashboardEvents
+	if ch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return sidekickDashboardMsg{event: ev}
+	}
+}
+
+// applySidekickDashboard folds one dashboard push into the panel:
+// replace-in-place (a new surface always supersedes the previous one, so
+// rapid live updates within a turn never stack) and an unread bump so
+// the tab badge lights up while the panel is hidden (#52).
+func (m *UI) applySidekickDashboard(ev pubsub.Event[agenttools.SidekickSurface]) {
+	if ev.Payload.Content == "" {
+		return
+	}
+	m.sidekick.dashboard = ev.Payload.Content
+	m.bumpSidekickUnread()
+}
+
+// dismissSidekickDashboard drops the pinned dashboard surface (bound to
+// a key in the Sidekick pane). The agent's next push re-pins it.
+func (m *UI) dismissSidekickDashboard() {
+	m.sidekick.dashboard = ""
+}
+
 // applySidekickEvent folds one Sidekick message event into the panel's
 // conversation mirror.
 func (m *UI) applySidekickEvent(ev pubsub.Event[message.Message]) {
@@ -191,6 +269,8 @@ func (m *UI) handleSidekickKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch {
 	case key.Matches(msg, m.keyMap.Tab):
 		m.cycleSidebarTab()
+	case key.Matches(msg, m.keyMap.SidekickDismiss):
+		m.dismissSidekickDashboard()
 	case key.Matches(msg, m.keyMap.Editor.Newline):
 		m.sidekick.input.InsertRune('\n')
 	case key.Matches(msg, m.keyMap.Editor.SendMessage):
@@ -262,14 +342,16 @@ func (m *UI) submitSidekickPrompt() tea.Cmd {
 }
 
 // clearSidekickConversation implements /clear: the panel forgets the
-// conversation immediately and the workspace destroys the ephemeral
-// session (canceling any in-flight run) so the next prompt starts fresh.
+// conversation (and the pinned dashboard, #56) immediately and the
+// workspace destroys the ephemeral session (canceling any in-flight run)
+// so the next prompt starts fresh.
 func (m *UI) clearSidekickConversation() tea.Cmd {
 	sk := &m.sidekick
 	sk.msgs = nil
 	sk.errText = ""
 	sk.busy = false
 	sk.scrollback = 0
+	sk.dashboard = ""
 
 	ws := m.com.Workspace
 	if ws == nil || !ws.SidekickAvailable() {
@@ -312,12 +394,37 @@ func (m *UI) renderSidekickPanel(width, height int) string {
 	footer := m.renderSidekickFooter(width)
 
 	listHeight := height - lipgloss.Height(input) - lipgloss.Height(footer) - 2
-	parts := make([]string, 0, 5)
+	parts := make([]string, 0, 7)
+	// The dashboard slot is pinned at the top (#56): it never scrolls
+	// with the conversation, and the chat flows below it.
+	if dash := m.renderSidekickDashboard(width, listHeight); dash != "" {
+		parts = append(parts, dash, "")
+		listHeight -= lipgloss.Height(dash) + 1
+	}
 	if listHeight > 0 {
 		parts = append(parts, m.renderSidekickMessages(width, listHeight), "")
 	}
 	parts = append(parts, input, "", footer)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// renderSidekickDashboard renders the pinned agent-pushed dashboard
+// surface through the shared a2tea pipeline at panel (sidebar) width,
+// capped to maxHeight so the prompt input and footer always stay on
+// screen. Returns "" when nothing is pinned.
+func (m *UI) renderSidekickDashboard(width, maxHeight int) string {
+	sk := &m.sidekick
+	if sk.dashboard == "" || width <= 0 || maxHeight <= 0 {
+		return ""
+	}
+	t := m.com.Styles
+	out, ok := chat.RenderA2UIInline(t, sk.dashboard, width, true)
+	if !ok {
+		// The tool validates payloads before publishing, so this is a
+		// defensive fallback: show the content rather than nothing.
+		out = t.Sidebar.SidekickAssistant.Width(width).Render(strings.TrimSpace(sk.dashboard))
+	}
+	return lipgloss.NewStyle().MaxWidth(width).MaxHeight(maxHeight).Render(out)
 }
 
 // renderSidekickMessages renders the conversation bottom-aligned into

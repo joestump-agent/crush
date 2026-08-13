@@ -59,7 +59,7 @@ func (m *UI) focusSidekick() tea.Cmd {
 	m.focusSidebar()
 	m.setSidebarTab(sidebarTabSidekick)
 	m.ensureSidekickInput()
-	return tea.Batch(m.sidekick.input.Focus(), m.subscribeSidekick())
+	return tea.Batch(m.sidekick.input.Focus(), m.subscribeSidekick(), m.subscribeSidekickDashboard())
 }
 
 // sidekickTabInView reports whether the Sidekick tab is currently being
