@@ -205,6 +205,66 @@ func (s *ConfigStore) KnownProviders() []catwalk.Provider {
 	return s.knownProviders
 }
 
+// RefetchHyperProvider re-fetches the Hyper provider catalog from the
+// remote API and updates the in-memory known providers list and config.
+// This is called after OAuth authentication completes so the latest
+// models are available without restarting.
+func (s *ConfigStore) RefetchHyperProvider(ctx context.Context) error {
+	// Build a fresh client that reads the API key from the live config,
+	// not the stale snapshot captured at startup. The syncer's original
+	// client closes over the startup config and would send an expired
+	// token after OAuth re-authentication.
+	freshClient := realHyperClient{
+		baseURL:    hyperp.BaseURL(),
+		resolveKey: func() string { return resolveHyperAPIKey(s.Config()) },
+	}
+	hyperSyncer.SetClient(freshClient)
+
+	hyperProvider, err := hyperSyncer.Refetch(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to refetch Hyper provider: %w", err)
+	}
+	if hyperProvider.ID == "" {
+		return nil
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// Replace or insert the Hyper entry in knownProviders.
+	found := false
+	for i, p := range s.knownProviders {
+		if string(p.ID) == string(hyperProvider.ID) {
+			s.knownProviders[i] = hyperProvider
+			found = true
+			break
+		}
+	}
+	if !found {
+		s.knownProviders = append([]catwalk.Provider{hyperProvider}, s.knownProviders...)
+	}
+
+	// Update the Hyper provider config with the refreshed model list
+	// and endpoint. Use cloneForWrite so readers always see a consistent
+	// snapshot (the store's contract forbids in-place config mutation).
+	nc := s.config.cloneForWrite()
+	if pc, ok := nc.Providers.Get(string(hyperProvider.ID)); ok {
+		pc.Models = hyperProvider.Models
+		if hyperProvider.APIEndpoint != "" {
+			pc.BaseURL = hyperProvider.APIEndpoint
+		}
+		nc.Providers.Set(string(hyperProvider.ID), pc)
+	}
+	s.setConfig(nc)
+
+	// Also update the memoized provider list so callers of
+	// config.Providers() (e.g. the models dialog) see fresh data.
+	UpdateProviderInList(hyperProvider)
+
+	s.SetupAgents()
+	return nil
+}
+
 // SetupAgents configures the coder and task agents on the config.
 func (s *ConfigStore) SetupAgents() {
 	s.Config().SetupAgents()
@@ -564,33 +624,40 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 	if exists {
 		setKeyOrToken()
 		cfg.Providers.Set(providerID, providerConfig)
-		return nil
-	}
-
-	var foundProvider *catwalk.Provider
-	for _, p := range s.knownProviders {
-		if string(p.ID) == providerID {
-			foundProvider = &p
-			break
-		}
-	}
-
-	if foundProvider != nil {
-		providerConfig = ProviderConfig{
-			ID:           providerID,
-			Name:         foundProvider.Name,
-			BaseURL:      foundProvider.APIEndpoint,
-			Type:         foundProvider.Type,
-			Disable:      false,
-			ExtraHeaders: make(map[string]string),
-			ExtraParams:  make(map[string]string),
-			Models:       foundProvider.Models,
-		}
-		setKeyOrToken()
 	} else {
-		return fmt.Errorf("provider with ID %s not found in known providers", providerID)
+		var foundProvider *catwalk.Provider
+		for _, p := range s.knownProviders {
+			if string(p.ID) == providerID {
+				foundProvider = &p
+				break
+			}
+		}
+
+		if foundProvider != nil {
+			providerConfig = ProviderConfig{
+				ID:           providerID,
+				Name:         foundProvider.Name,
+				BaseURL:      foundProvider.APIEndpoint,
+				Type:         foundProvider.Type,
+				Disable:      false,
+				ExtraHeaders: make(map[string]string),
+				ExtraParams:  make(map[string]string),
+				Models:       foundProvider.Models,
+			}
+			setKeyOrToken()
+		} else {
+			return fmt.Errorf("provider with ID %s not found in known providers", providerID)
+		}
+		cfg.Providers.Set(providerID, providerConfig)
 	}
-	cfg.Providers.Set(providerID, providerConfig)
+
+	// After authenticating with Hyper, re-fetch the provider catalog so
+	// the latest models are available without restarting.
+	if providerID == "hyper" {
+		if refetchErr := s.RefetchHyperProvider(context.Background()); refetchErr != nil {
+			slog.Warn("Failed to refetch Hyper provider after auth", "error", refetchErr)
+		}
+	}
 	return nil
 }
 
@@ -946,6 +1013,7 @@ func NewTestStore(cfg *Config, loadedPaths ...string) *ConfigStore {
 	return &ConfigStore{
 		config:      cfg,
 		loadedPaths: loadedPaths,
+		resolver:    NewShellVariableResolver(env.New()),
 	}
 }
 
@@ -1141,7 +1209,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	migrateDisableNotifications()
 
 	configPaths := lookupConfigs(s.workingDir)
-	cfg, loadedPaths, err := loadFromConfigPaths(configPaths)
+	cfg, loadedPaths, err := loadFromConfigPaths(ctx, configPaths)
 	if err != nil {
 		return fmt.Errorf("failed to reload config: %w", err)
 	}
@@ -1174,6 +1242,17 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		return fmt.Errorf("invalid hook configuration on reload: %w", err)
 	}
 
+	// Save current state for potential rollback BEFORE configureProviders,
+	// which may write to disk via RemoveConfigField (e.g. removing stale
+	// OAuth providers). Capturing after would snapshot a config that has
+	// already been mutated, and the rollback would restore corrupted state.
+	oldConfig := s.Config()
+	oldLoadedPaths := s.loadedPaths
+	oldResolver := s.resolver
+	oldKnownProviders := s.knownProviders
+	oldOverrides := s.overrides
+	oldWorkspacePath := s.workspacePath
+
 	// Preserve runtime overrides
 	overrides := s.overrides
 
@@ -1187,22 +1266,22 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	// Reconfigure providers
 	env := env.New()
 	resolver := NewShellVariableResolver(env)
+
+	// Apply top-level env vars before configuring providers so variables
+	// like AWS_PROFILE are visible to the AWS SDK credential chain.
+	cfg.applyEnv(resolver)
+
 	providers, err := Providers(cfg)
 	if err != nil {
-		return fmt.Errorf("failed to load providers during reload: %w", err)
+		if len(providers) == 0 {
+			return fmt.Errorf("failed to load providers during reload: %w", err)
+		}
+		slog.Warn("Reload continuing with the previously known providers", "error", err)
 	}
 
 	if err := cfg.configureProviders(ctx, s, env, resolver, providers); err != nil {
 		return fmt.Errorf("failed to configure providers during reload: %w", err)
 	}
-
-	// Save current state for potential rollback
-	oldConfig := s.Config()
-	oldLoadedPaths := s.loadedPaths
-	oldResolver := s.resolver
-	oldKnownProviders := s.knownProviders
-	oldOverrides := s.overrides
-	oldWorkspacePath := s.workspacePath
 
 	// Update store state BEFORE running model/agent setup (so they see new config)
 	s.setConfig(cfg)
@@ -1238,8 +1317,10 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		return setupErr
 	}
 
-	// Rebuild staleness tracking
-	s.captureStalenessSnapshot(loadedPaths)
+	// Rebuild staleness tracking. Track every discovered config path, not
+	// just the ones that loaded, so a config file created after this reload
+	// is detected as a change on the next staleness check.
+	s.captureStalenessSnapshot(append(slices.Clone(configPaths), loadedPaths...))
 
 	return nil
 }

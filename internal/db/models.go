@@ -8,6 +8,19 @@ import (
 	"database/sql"
 )
 
+type Chunk struct {
+	ChunkID   int64          `json:"chunk_id"`
+	SessionID sql.NullString `json:"session_id"`
+	Path      sql.NullString `json:"path"`
+	Symbol    sql.NullString `json:"symbol"`
+	StartLine sql.NullInt64  `json:"start_line"`
+	EndLine   sql.NullInt64  `json:"end_line"`
+	Content   string         `json:"content"`
+	FileHash  sql.NullString `json:"file_hash"`
+	Model     string         `json:"model"`
+	Dim       int64          `json:"dim"`
+}
+
 type File struct {
 	ID        string `json:"id"`
 	SessionID string `json:"session_id"`

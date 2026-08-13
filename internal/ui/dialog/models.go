@@ -3,6 +3,7 @@ package dialog
 import (
 	"cmp"
 	"fmt"
+	"log/slog"
 	"slices"
 
 	"charm.land/bubbles/v2/help"
@@ -147,10 +148,15 @@ func NewModels(com *common.Common, isOnboarding bool) (*Models, error) {
 	)
 	m.keyMap.Close = CloseKey
 
+	// A stale catalog must not keep this dialog from opening: it is the
+	// only way for the user to choose a model.
 	var err error
 	m.providers, err = config.Providers(m.com.Config())
 	if err != nil {
-		return nil, fmt.Errorf("failed to get providers: %w", err)
+		if len(m.providers) == 0 {
+			return nil, fmt.Errorf("failed to get providers: %w", err)
+		}
+		slog.Warn("Listing the previously known providers", "error", err)
 	}
 
 	if err := m.setProviderItems(); err != nil {
@@ -358,7 +364,7 @@ func (m *Models) setProviderItems() error {
 
 	// Get a list of known providers to compare against
 	knownProviders, err := config.Providers(cfg)
-	if err != nil {
+	if err != nil && len(knownProviders) == 0 {
 		return fmt.Errorf("failed to get providers: %w", err)
 	}
 
