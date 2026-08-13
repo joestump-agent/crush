@@ -31,7 +31,7 @@ func newTestCommands(t *testing.T) *Commands {
 		Workspace: &testCommandsWorkspace{cfg: cfg},
 		Styles:    &s,
 	}
-	c, err := NewCommands(com, "", false, false, false, nil, nil)
+	c, err := NewCommands(com, "", false, false, false, false, nil, nil)
 	require.NoError(t, err)
 	return c
 }
