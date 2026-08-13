@@ -29,8 +29,6 @@ type KeyMap struct {
 		Tab            key.Binding
 		Details        key.Binding
 		TogglePills    key.Binding
-		PillLeft       key.Binding
-		PillRight      key.Binding
 		Down           key.Binding
 		Up             key.Binding
 		UpDown         key.Binding
@@ -69,6 +67,14 @@ type KeyMap struct {
 	Sessions   key.Binding
 	Tab        key.Binding
 	ToggleYolo key.Binding
+	Sidekick   key.Binding
+	// SidekickDismiss drops the pinned dashboard surface; only active
+	// while the Sidekick pane is focused.
+	SidekickDismiss key.Binding
+	// SidekickFocusSurface toggles keyboard focus between the Sidekick
+	// prompt input and the pinned dashboard surface; only active while
+	// the Sidekick pane is focused.
+	SidekickFocusSurface key.Binding
 }
 
 func DefaultKeyMap() KeyMap {
@@ -104,6 +110,18 @@ func DefaultKeyMap() KeyMap {
 		ToggleYolo: key.NewBinding(
 			key.WithKeys("ctrl+y"),
 			key.WithHelp("ctrl+y", "toggle yolo"),
+		),
+		Sidekick: key.NewBinding(
+			key.WithKeys("ctrl+a"),
+			key.WithHelp("ctrl+a", "sidekick"),
+		),
+		SidekickDismiss: key.NewBinding(
+			key.WithKeys("ctrl+x"),
+			key.WithHelp("ctrl+x", "dismiss dashboard"),
+		),
+		SidekickFocusSurface: key.NewBinding(
+			key.WithKeys("shift+tab"),
+			key.WithHelp("shift+tab", "focus dashboard"),
 		),
 	}
 
@@ -180,14 +198,6 @@ func DefaultKeyMap() KeyMap {
 	km.Chat.TogglePills = key.NewBinding(
 		key.WithKeys("ctrl+t", "ctrl+space"),
 		key.WithHelp("ctrl+t", "toggle tasks"),
-	)
-	km.Chat.PillLeft = key.NewBinding(
-		key.WithKeys("left"),
-		key.WithHelp("←/→", "switch section"),
-	)
-	km.Chat.PillRight = key.NewBinding(
-		key.WithKeys("right"),
-		key.WithHelp("←/→", "switch section"),
 	)
 
 	km.Chat.Down = key.NewBinding(

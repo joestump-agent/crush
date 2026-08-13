@@ -139,7 +139,14 @@ func (m *UI) scrollSidebarOnWheel(msg common.CoalescedWheelMsg) bool {
 		return false
 	}
 	if lines := int(msg.DeltaY); lines != 0 {
-		m.sidebarScroll = max(0, m.sidebarScroll+lines)
+		if m.sidebarTab == sidebarTabSidekick {
+			// The Sidekick list is bottom-anchored: wheel-up grows the
+			// scrollback, wheel-down returns toward the live tail. The
+			// upper bound is clamped at render time.
+			m.sidekick.scrollback = max(0, m.sidekick.scrollback-lines)
+		} else {
+			m.sidebarScroll = max(0, m.sidebarScroll+lines)
+		}
 	}
 	return true
 }
@@ -200,6 +207,14 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 
 	focused := m.focus == uiFocusSidebar
 
+	// The tab bar ([Info] [Sidekick]) sits above all tab content.
+	tabBar := m.renderSidebarTabBar(contentWidth)
+
+	if m.sidebarTab == sidebarTabSidekick {
+		m.drawSidekickTab(scr, area, tabBar, contentWidth, height)
+		return
+	}
+
 	title := t.Sidebar.SessionTitle.Width(contentWidth).MaxHeight(2).Render(m.session.Title)
 	cwd := common.PrettyPath(t, m.com.Workspace.WorkingDir(), contentWidth)
 	sidebarLogo := m.sidebarLogo
@@ -209,6 +224,8 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 		})
 	}
 	blocks := []string{
+		tabBar,
+		"",
 		sidebarLogo,
 		title,
 		"",

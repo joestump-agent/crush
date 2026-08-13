@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/agent/notify"
+	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
@@ -111,6 +112,12 @@ func (w *countingWorkspace) LSPGetStates() map[string]workspace.LSPClientInfo {
 func (w *countingWorkspace) LSPGetDiagnosticCounts(name string) lsp.DiagnosticCounts {
 	w.lspDiagCalls++
 	return w.lspDiags[name]
+}
+
+// sendMessage retires the Sidekick dashboard and retries its
+// subscription on every prompt; report it unavailable here.
+func (w *countingWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
+	return nil
 }
 
 func (w *countingWorkspace) ListMessages(context.Context, string) ([]message.Message, error) {

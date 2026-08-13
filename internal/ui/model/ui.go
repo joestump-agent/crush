@@ -299,11 +299,14 @@ type UI struct {
 	lastCompletionEnd      int
 	lastCompletionText     string
 	lastCompletionFilePath string // non-empty when the last completion attached a file
-	// mentionAttachments maps a token in the prompt to the attachment it
-	// owns, so deleting the token can take the attachment with it. Only
-	// tokens put entries here, so a pasted image or a dropped file — which
-	// has no token — is never touched.
-	mentionAttachments map[string]string
+	// mentionAttachments maps a token in the prompt to the attachments it
+	// owns, so deleting the token can take the attachment with it. The
+	// value is a list because the same token text can appear more than
+	// once: two insertions of "/server:prompt" differ only in their
+	// resolved bodies, so each gets its own entry here and a backspace
+	// pops exactly one. Only tokens put entries here, so a pasted image
+	// or a dropped file — which has no token — is never touched.
+	mentionAttachments map[string][]string
 	// discardedMentions holds attachment keys whose token was deleted before
 	// the (asynchronous) read that produces the attachment came back. The
 	// attachment is dropped on arrival rather than landing as an orphan chip
@@ -382,9 +385,8 @@ type UI struct {
 	detailsOpen bool
 
 	// pills state
-	pillsExpanded      bool
-	pillsAutoExpanded  bool
-	focusedPillSection pillSection
+	pillsExpanded     bool
+	pillsAutoExpanded bool
 	// promptQueue / promptQueueItems mirror the session's queued prompts.
 	// They are event-driven with a TTL backstop, fetched off-thread by
 	// dispatchPromptQueueRefresh (see workspace_cache.go); promptQueue is
@@ -422,6 +424,16 @@ type UI struct {
 	// cronTasks holds the scheduled tasks for the current session,
 	// refreshed on session load and after cron tool results.
 	cronTasks []scheduler.Task
+
+	// sidebarTab is the active sidebar tab ([Info] [Sidekick]);
+	// sidekickUnread counts agent-pushed Sidekick content not yet viewed
+	// (rendered as a ● N badge on the tab, cleared when the tab is viewed).
+	sidebarTab     sidebarTab
+	sidekickUnread int
+
+	// sidekick is the Sidekick tab's chat panel state (see sidekick.go).
+	// Fully independent of the main agent's busy/queue plumbing.
+	sidekick sidekickState
 
 	// Todo spinner
 	todoSpinner    spinner.Model
@@ -614,6 +626,18 @@ func (m *UI) Init() tea.Cmd {
 		cmds = append(cmds, cmd)
 	}
 	cmds = append(cmds, m.checkPendingMCPAuth())
+	// Start draining the Sidekick's private message stream (no-op when
+	// the Sidekick is unavailable; retried lazily on tab activation).
+	if cmd := m.subscribeSidekick(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	// Start draining agent-pushed dashboard surfaces (#56/#57). Unlike
+	// the chat stream this must be live without any user action —
+	// pushes arrive while the user works in the main chat — so it is
+	// also retried from sendMessage until the agent is ready.
+	if cmd := m.subscribeSidekickDashboard(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -788,6 +812,23 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.notifyWindowFocused = false
 	case pubsub.Event[notify.Notification]:
 		if cmd := m.handleAgentNotification(msg.Payload); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case sidekickEventMsg:
+		// Sidekick traffic arrives on its own message type so it can
+		// never leak into the main chat's session/message handling.
+		m.applySidekickEvent(msg.event)
+		if cmd := m.awaitSidekickEvent(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case sidekickRunFinishedMsg:
+		m.handleSidekickRunFinished(msg.err)
+	case sidekickDashboardMsg:
+		// Deterministic dashboard routing (#56): pushes from the main
+		// agent's sidekick_update tool replace the pinned surface in
+		// place and never touch any chat stream.
+		m.applySidekickDashboard(msg.event)
+		if cmd := m.awaitSidekickDashboardEvent(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 	case busyStateMsg:
@@ -1447,14 +1488,22 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, util.ReportInfo("No new models found"))
 			break
 		}
-		// Refresh the models dialog in place if it's still open.
-		if d := m.dialog.Dialog(dialog.ModelsID); d != nil {
-			if md, ok := d.(*dialog.Models); ok {
-				if err := md.ReloadItems(); err != nil {
-					cmds = append(cmds, util.ReportError(err))
-					break
+		// Refresh the models dialog in place if it's still open. The
+		// Sidekick-scoped picker shares the same list machinery (#54).
+		var reloadErr error
+		for _, id := range []string{dialog.ModelsID, dialog.SidekickModelsID} {
+			if d := m.dialog.Dialog(id); d != nil {
+				if md, ok := d.(*dialog.Models); ok {
+					if err := md.ReloadItems(); err != nil {
+						reloadErr = err
+						break
+					}
 				}
 			}
+		}
+		if reloadErr != nil {
+			cmds = append(cmds, util.ReportError(reloadErr))
+			break
 		}
 		label := "models"
 		if msg.added == 1 {
@@ -2462,9 +2511,45 @@ func (m *UI) restoreModelFromSession(msgs []message.Message) tea.Cmd {
 	})
 }
 
+// handleSelectSidekickModel applies a selection made in the
+// Sidekick-scoped model picker (#54). Strictly session-scoped: the
+// choice goes through the workspace to the Sidekick agent only — the
+// main coder agent's model selection (cfg.Models) is never touched and
+// nothing is persisted to crush.json.
+func (m *UI) handleSelectSidekickModel(msg dialog.ActionSelectModel) tea.Cmd {
+	m.dialog.CloseDialog(dialog.SidekickModelsID)
+
+	cfg := m.com.Config()
+	if cfg == nil {
+		return util.ReportError(errors.New("configuration not found"))
+	}
+	ws := m.com.Workspace
+	if ws == nil || !ws.SidekickAvailable() {
+		return util.ReportWarn("Sidekick is not available in this workspace")
+	}
+	if _, ok := cfg.Providers.Get(msg.Model.Provider); !ok {
+		return util.ReportWarn("Provider is not configured — set it up in the main model picker first")
+	}
+	if err := ws.SidekickSetModel(msg.Model); err != nil {
+		return util.ReportError(err)
+	}
+
+	name := msg.Model.Model
+	if catwalkModel := cfg.GetModel(msg.Model.Provider, msg.Model.Model); catwalkModel != nil && catwalkModel.Name != "" {
+		name = catwalkModel.Name
+	}
+	return util.ReportInfo("Sidekick model changed to " + name)
+}
+
 // handleSelectModel performs the model selection after any provider
 // pre-checks (such as a silent Hyper OAuth refresh) have completed.
 func (m *UI) handleSelectModel(msg dialog.ActionSelectModel) tea.Cmd {
+	if msg.ForSidekick {
+		// Sidekick-scoped selection (#54): never flows into the
+		// config-mutating path below.
+		return m.handleSelectSidekickModel(msg)
+	}
+
 	var cmds []tea.Cmd
 
 	// we ignore dialogs with the oauth id as they need to be able to be dismissed
@@ -2645,20 +2730,6 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				}
 				return true
 			}
-		case key.Matches(msg, m.keyMap.Chat.PillLeft):
-			if m.state == uiChat && m.hasSession() && m.pillsExpanded && m.focus != uiFocusEditor {
-				if cmd := m.switchPillSection(-1); cmd != nil {
-					cmds = append(cmds, cmd)
-				}
-				return true
-			}
-		case key.Matches(msg, m.keyMap.Chat.PillRight):
-			if m.state == uiChat && m.hasSession() && m.pillsExpanded && m.focus != uiFocusEditor {
-				if cmd := m.switchPillSection(1); cmd != nil {
-					cmds = append(cmds, cmd)
-				}
-				return true
-			}
 		case key.Matches(msg, m.keyMap.Suspend):
 			if m.isAgentBusy() {
 				cmds = append(cmds, util.ReportWarn("Agent is busy, please wait..."))
@@ -2723,6 +2794,29 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			if m.activeInline.HeightChanged() {
 				m.updateLayoutAndSize()
 			}
+		}
+		return tea.Batch(cmds...)
+	}
+
+	// Ctrl+A jumps straight to the Sidekick tab from anywhere (editor, main,
+	// or sidebar focus). Only meaningful where the sidebar is drawn: chat
+	// state with a session, non-compact layout.
+	if key.Matches(msg, m.keyMap.Sidekick) {
+		if m.state == uiChat && m.hasSession() && !m.isCompact {
+			if cmd := m.focusSidekick(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			return tea.Batch(cmds...)
+		}
+	}
+
+	// Esc inside the Sidekick pane acts on the Sidekick only: cancel its
+	// streaming run or hand focus back to the editor. It must run before
+	// the main-agent cancel check below so Sidekick activity can never
+	// trigger — or be blocked by — the main agent's busy state.
+	if key.Matches(msg, m.keyMap.Chat.Cancel) && m.sidekickPaneFocused() {
+		if cmd := m.handleSidekickEscape(); cmd != nil {
+			cmds = append(cmds, cmd)
 		}
 		return tea.Batch(cmds...)
 	}
@@ -3131,16 +3225,27 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				}
 			}
 		case uiFocusSidebar:
-			// The sidebar is currently a read-only status panel, so it only
-			// handles focus/scroll keys and intentionally does NOT fall through
-			// to handleGlobalKeys — every other key is inert while it's focused.
-			// When the interactive secondary-agent sidebar lands, route its keys
-			// here (and add `default: handleGlobalKeys(msg)` to keep global keys
-			// working, mirroring the editor/main cases). handleGlobalKeys already
-			// gates commands/models/help for sidebar focus, so those stay inert
-			// unless you also un-hide them from the sidebar help (#114).
+			// The Sidekick tab hosts an interactive chat panel: its keys
+			// (Enter submits, text feeds the prompt) route there. The Info
+			// tab remains a read-only status panel that only handles
+			// tab-cycling/focus/scroll keys. Neither falls through to
+			// handleGlobalKeys — every other key is inert while the sidebar
+			// is focused (see TestSidebarSuppressesGlobalKeys and #114); on
+			// the Sidekick tab unmatched keys are consumed by the textarea.
+			if m.sidekickTabInView() {
+				cmds = append(cmds, m.handleSidekickKey(msg))
+				break
+			}
 			switch {
-			case key.Matches(msg, m.keyMap.Tab), key.Matches(msg, m.keyMap.Editor.Escape):
+			case key.Matches(msg, m.keyMap.Tab):
+				m.cycleSidebarTab()
+				if m.sidekickTabInView() {
+					// Landed on the Sidekick tab: focus its prompt and
+					// make sure the event streams are being drained.
+					m.ensureSidekickInput()
+					cmds = append(cmds, m.sidekick.input.Focus(), m.subscribeSidekick(), m.subscribeSidekickDashboard())
+				}
+			case key.Matches(msg, m.keyMap.Editor.Escape):
 				m.focus = uiFocusEditor
 				cmds = append(cmds, m.textarea.Focus())
 			case key.Matches(msg, m.keyMap.Chat.Up):
@@ -3501,6 +3606,11 @@ func (m *UI) ShortHelp() []key.Binding {
 
 		isSidebar := m.focus == uiFocusSidebar
 
+		if isSidebar {
+			// While the sidebar is focused, Tab cycles its tabs instead of
+			// moving focus.
+			tab.SetHelp("tab", "switch tab")
+		}
 		commonBinds := []key.Binding{tab}
 		if !isSidebar {
 			commonBinds = append(commonBinds, commands, k.Models)
@@ -3522,9 +3632,6 @@ func (m *UI) ShortHelp() []key.Binding {
 				k.Chat.PageDown,
 				k.Chat.Copy,
 			)
-			if m.pillsExpanded && hasIncompleteTodos(m.session.Todos) && m.promptQueue > 0 {
-				binds = append(binds, k.Chat.PillLeft)
-			}
 		case uiFocusSidebar:
 			esc := k.Editor.Escape
 			esc.SetHelp("esc", "back to editor")
@@ -3602,9 +3709,17 @@ func (m *UI) FullHelp() [][]key.Binding {
 
 		isSidebar := m.focus == uiFocusSidebar
 
+		if isSidebar {
+			// While the sidebar is focused, Tab cycles its tabs instead of
+			// moving focus.
+			tab.SetHelp("tab", "switch tab")
+		}
 		mainBinds = append(
 			mainBinds,
 			tab,
+			// ctrl+a jumps to the Sidekick tab from any focus, so it is
+			// advertised regardless of which panel is focused.
+			k.Sidekick,
 		)
 		if !isSidebar {
 			// The sidebar key handler only routes focus/scroll keys, so
@@ -3675,9 +3790,6 @@ func (m *UI) FullHelp() [][]key.Binding {
 					k.Chat.ClearHighlight,
 				},
 			)
-			if m.pillsExpanded && hasIncompleteTodos(m.session.Todos) && m.promptQueue > 0 {
-				binds = append(binds, []key.Binding{k.Chat.PillLeft})
-			}
 		}
 	default:
 		if m.session == nil {
@@ -4418,12 +4530,15 @@ func promptMentions(value, target string) bool {
 }
 
 // trackMentionAttachment records which attachment a token in the prompt owns,
-// so deleting that token can take the attachment with it.
+// so deleting that token can take the attachment with it. A token that
+// already has an entry (the same prompt inserted twice, the same file
+// mentioned twice) appends rather than overwrites, so each occurrence can be
+// removed independently.
 func (m *UI) trackMentionAttachment(key, token string) {
 	if m.mentionAttachments == nil {
-		m.mentionAttachments = map[string]string{}
+		m.mentionAttachments = map[string][]string{}
 	}
-	m.mentionAttachments[token] = key
+	m.mentionAttachments[token] = append(m.mentionAttachments[token], key)
 }
 
 // dropMentionAttachment removes the attachment owned by a token that has just
@@ -4433,10 +4548,10 @@ func (m *UI) trackMentionAttachment(key, token string) {
 // prompt after every keystroke. Reconciling looks more thorough and is much
 // worse: an attachment's identity would have to be recoverable from the
 // prompt text, and it often is not. A path or resource title containing a
-// space does not tokenize back to what was inserted, editing an MCP prompt's
-// arguments changes the token, and the tokenizer's known-name set is re-primed
-// asynchronously when MCP servers reload — each of which made a live
-// attachment disappear mid-composition while its mention sat on screen.
+// space does not tokenize back to what was inserted, and the tokenizer's
+// known-name set is re-primed asynchronously when MCP servers reload — each
+// of which made a live attachment disappear mid-composition while its
+// mention sat on screen.
 // Acting only where the token is known to have gone can miss a removal, which
 // is a visible chip the user can delete; the alternative silently drops data
 // the user believes they attached.
@@ -4444,8 +4559,8 @@ func (m *UI) dropMentionAttachment(token string) {
 	if token == "" {
 		return
 	}
-	key, ok := m.mentionAttachments[token]
-	if !ok {
+	keys, ok := m.mentionAttachments[token]
+	if !ok || len(keys) == 0 {
 		return
 	}
 	// A repeat mention shares one attachment (fileCmd dedupes), so it only
@@ -4453,8 +4568,18 @@ func (m *UI) dropMentionAttachment(token string) {
 	if slices.Contains(m.promptTokenTexts(), token) {
 		return
 	}
+	// The token is gone. Drop one tracking entry and remove its attachment;
+	// if more entries remain (a duplicate token was deleted earlier and the
+	// rest of the prompt was edited away in the meantime), they go too, so
+	// no orphan chip survives its token.
+	key := keys[len(keys)-1]
+	keys = keys[:len(keys)-1]
+	if len(keys) == 0 {
+		delete(m.mentionAttachments, token)
+	} else {
+		m.mentionAttachments[token] = keys
+	}
 	m.attachments.RemoveByFilePath(key)
-	delete(m.mentionAttachments, token)
 	// A late-arriving read for a mention that is already gone would land as
 	// an orphan chip with nothing referring to it.
 	if m.discardedMentions == nil {
@@ -4729,45 +4854,22 @@ func (m *UI) insertMCPPromptCompletion(p completions.PromptCompletionValue) tea.
 	return nil
 }
 
-// promptTokenValue renders one argument value for the inline token.
-//
-// Values come from free-text dialog inputs, so they can contain anything.
-// Whitespace is the one thing the token grammar cannot carry —
-// ScanPromptTokens ends a token at the first space — so it is percent-encoded
-// rather than dropped: the value stays readable and the token stays a single
-// highlighted, atomically-deletable unit.
-func promptTokenValue(v string) string {
-	var b strings.Builder
-	for _, r := range v {
-		switch r {
-		case ' ':
-			b.WriteString("%20")
-		case '\t':
-			b.WriteString("%09")
-		case '\n':
-			b.WriteString("%0A")
-		case '\r':
-			b.WriteString("%0D")
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
 // attachMCPPrompt resolves the prompt against its server and attaches the
 // result.
 //
 // The resolved body becomes an attachment rather than text spliced into the
 // editor: prompt templates run long, and dropping one into the prompt area
 // would bury whatever the user was writing. The editor keeps a compact
-// "/server:prompt(arg=value)" token — space-free, so it stays one highlighted
-// unit and one atomic backspace removes it — while the body rides along as an
-// attachment the model receives, exactly like an @file mention.
+// "/server:prompt" token — argument values stay out of it, so a long value
+// cannot wrap the token across lines and no escaping scheme leaks into what
+// the user reads — while the body rides along as an attachment the model
+// receives, exactly like an @file mention. The chip under the composer
+// carries the argument count, which is the only piece of argument
+// information the composer needs to show.
 func (m *UI) attachMCPPrompt(name, mcpName, promptID string, args map[string]string) tea.Cmd {
 	// The dialog returns every declared argument, blank ones included. A
-	// blank optional is "not supplied": it must not reach the server, must
-	// not appear in the token, and must not be counted on the chip.
+	// blank optional is "not supplied": it must not reach the server and
+	// must not be counted on the chip.
 	supplied := make(map[string]string, len(args))
 	for k, v := range args {
 		if strings.TrimSpace(v) != "" {
@@ -4776,18 +4878,6 @@ func (m *UI) attachMCPPrompt(name, mcpName, promptID string, args map[string]str
 	}
 
 	token := "/" + name
-	if len(supplied) > 0 {
-		keys := make([]string, 0, len(supplied))
-		for k := range supplied {
-			keys = append(keys, k)
-		}
-		slices.Sort(keys)
-		parts := make([]string, 0, len(keys))
-		for _, k := range keys {
-			parts = append(parts, k+"="+promptTokenValue(supplied[k]))
-		}
-		token += "(" + strings.Join(parts, ",") + ")"
-	}
 
 	prevHeight := m.textarea.Height()
 	if !m.insertCompletionText(token) {
@@ -4942,10 +5032,15 @@ func (m *UI) CurrentSession() *session.Session {
 }
 
 // focusSidebar moves focus to the sidebar panel, blurring the editor and chat.
+// When the Sidekick tab is showing, the cursor lands in its prompt input.
 func (m *UI) focusSidebar() {
 	m.focus = uiFocusSidebar
 	m.textarea.Blur()
 	m.chat.Blur()
+	if m.sidekickTabInView() {
+		m.ensureSidekickInput()
+		m.sidekick.input.Focus()
+	}
 	m.updateLayoutAndSize()
 }
 
@@ -5141,6 +5236,17 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 		return nil
 	})
 
+	// A new main-agent turn retires the previous turn's Sidekick
+	// dashboard (#56): the pinned surface persists only until the next
+	// prompt. The subscription is also (re)attempted here in case the
+	// agent was not ready at Init.
+	if cmd := m.dismissSidekickDashboard(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	if cmd := m.subscribeSidekickDashboard(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+
 	// Capture session ID to avoid race with main goroutine updating m.session.
 	sessionID := m.session.ID
 	// The turn's content width hint: tools that read width-sensitive remote
@@ -5192,6 +5298,20 @@ func (m *UI) handleA2UIButtonClicked(clicked a2uievent.ButtonClicked) tea.Cmd {
 	// A cancel/dismiss button only ever dismisses the surface locally —
 	// it never starts an agent turn nor round-trips to an MCP server.
 	// Checked first, before any provenance branch.
+
+	// The Sidekick dashboard slot hosts a live surface too (#56): when the
+	// event came from it (it holds focus and the surface ID matches), the
+	// submission still goes to the MAIN agent — the dashboard is the main
+	// agent's push channel — with focus stepping back to the Sidekick
+	// prompt. A cancel unpins the dashboard outright.
+	if values, ok := m.retireSidekickDashboardSurface(clicked.SurfaceID); ok {
+		refocus := m.focusSidekickInput()
+		if chat.A2UIButtonIsCancel(clicked) {
+			_ = m.dismissSidekickDashboard()
+			return refocus
+		}
+		return tea.Batch(refocus, m.sendMessage(chat.A2UISubmissionPrompt(clicked, values)))
+	}
 	if chat.A2UIButtonIsCancel(clicked) {
 		m.chat.RetireA2UISurface(clicked.SurfaceID)
 		return nil
@@ -5667,6 +5787,30 @@ func (m *UI) openModelsDialog() tea.Cmd {
 	return nil
 }
 
+// openSidekickModelsDialog opens the Sidekick-scoped model picker
+// (#54). Selections made here apply to the Sidekick session only.
+func (m *UI) openSidekickModelsDialog() tea.Cmd {
+	if m.dialog.ContainsDialog(dialog.SidekickModelsID) {
+		// Bring to front
+		m.dialog.BringToFront(dialog.SidekickModelsID)
+		return nil
+	}
+
+	ws := m.com.Workspace
+	if ws == nil || !ws.SidekickAvailable() {
+		return util.ReportWarn("Sidekick is not available in this workspace")
+	}
+
+	modelsDialog, err := dialog.NewSidekickModels(m.com, ws.SidekickModel())
+	if err != nil {
+		return util.ReportError(err)
+	}
+
+	m.dialog.OpenDialog(modelsDialog)
+
+	return nil
+}
+
 // openCommandsDialog opens the commands dialog.
 func (m *UI) openCommandsDialog() tea.Cmd {
 	if m.dialog.ContainsDialog(dialog.CommandsID) {
@@ -5682,8 +5826,9 @@ func (m *UI) openCommandsDialog() tea.Cmd {
 	}
 	hasTodos := hasSession && hasIncompleteTodos(m.session.Todos)
 	hasQueue := m.promptQueue > 0
+	hasCron := len(m.cronTasks) > 0
 
-	commands, err := dialog.NewCommands(m.com, sessionID, hasSession, hasTodos, hasQueue, m.customCommands, m.mcpPrompts)
+	commands, err := dialog.NewCommands(m.com, sessionID, hasSession, hasTodos, hasQueue, hasCron, m.customCommands, m.mcpPrompts)
 	if err != nil {
 		return util.ReportError(err)
 	}

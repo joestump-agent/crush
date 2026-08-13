@@ -848,6 +848,16 @@ func quickStyle(o quickStyleOpts) Styles {
 	// Sidebar
 	s.Sidebar.SessionTitle = lipgloss.NewStyle().Foreground(o.fgMoreSubtle)
 	s.Sidebar.WorkingDir = lipgloss.NewStyle().Foreground(o.fgMoreSubtle)
+	s.Sidebar.TabActive = lipgloss.NewStyle().Foreground(o.fgBase).Bold(true)
+	s.Sidebar.TabInactive = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
+	s.Sidebar.TabBadge = lipgloss.NewStyle().Foreground(o.secondary)
+	s.Sidebar.TabPlaceholder = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
+	s.Sidebar.SidekickUser = lipgloss.NewStyle().Foreground(o.fgBase).Bold(true)
+	s.Sidebar.SidekickAssistant = lipgloss.NewStyle().Foreground(o.fgMoreSubtle)
+	s.Sidebar.SidekickTool = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
+	s.Sidebar.SidekickThinking = lipgloss.NewStyle().Foreground(o.fgMostSubtle).Italic(true)
+	s.Sidebar.SidekickError = lipgloss.NewStyle().Foreground(o.error)
+	s.Sidebar.SidekickFooter = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
 
 	// ModelInfo
 	s.ModelInfo.Icon = lipgloss.NewStyle().Foreground(o.fgMostSubtle)
@@ -1073,7 +1083,10 @@ func quickStyle(o quickStyleOpts) Styles {
 	// Pills styles
 	s.Pills.Base = base.Padding(0, 1)
 	s.Pills.Focused = base.Padding(0, 1).BorderStyle(lipgloss.RoundedBorder()).BorderForeground(o.bgMostVisible)
-	s.Pills.QueueItemPrefix = lipgloss.NewStyle().Foreground(o.fgMoreSubtle).SetString("  •")
+	// No leading pad: these lists stack under the same pills row as the todo
+	// list, which starts at column 0.
+	s.Pills.QueueItemPrefix = lipgloss.NewStyle().Foreground(o.fgMoreSubtle).SetString("•")
+	s.Pills.CronItemPrefix = lipgloss.NewStyle().Foreground(o.fgMoreSubtle).SetString("⏰")
 	s.Pills.QueueItemText = lipgloss.NewStyle().Foreground(o.fgMoreSubtle)
 	s.Pills.QueueLabel = lipgloss.NewStyle().Foreground(o.fgBase)
 	s.Pills.QueueIconBase = lipgloss.NewStyle().Foreground(o.fgBase)
