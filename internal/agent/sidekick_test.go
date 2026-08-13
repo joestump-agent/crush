@@ -53,19 +53,26 @@ func newSidekickTestCoordinator(t *testing.T, env fakeEnv, baseURL string) *coor
 
 	coord, err := NewCoordinator(
 		t.Context(),
-		cfg,
-		env.sessions,
-		env.messages,
-		env.permissions,
-		env.history,
-		*env.filetracker,
-		nil,
-		nil,
-		nil,
-		nil,
+		CoordinatorOptions{
+			Config:      cfg,
+			Sessions:    env.sessions,
+			Messages:    env.messages,
+			Permissions: env.permissions,
+			History:     env.history,
+			FileTracker: *env.filetracker,
+		},
 	)
 	require.NoError(t, err)
-	return coord.(*coordinator)
+
+	c := coord.(*coordinator)
+	// NewCoordinator builds the system prompt and the initial tool list in
+	// readyWg goroutines that read the config. Tests mutate that same
+	// config afterwards (SetupAgents, Options.DisableA2UI), so drain those
+	// reads before handing the coordinator over — otherwise the test body
+	// races the constructor under -race. Production gates every turn on the
+	// same Wait, so this only pulls that barrier forward.
+	require.NoError(t, c.readyWg.Wait())
+	return c
 }
 
 // newSidekickSSEServer serves a minimal OpenAI-compatible streaming chat
@@ -201,14 +208,14 @@ func TestSidekickBusyIsolation(t *testing.T) {
 	main := coord.currentAgent.(*sessionAgent)
 
 	// Sidekick busy -> coordinator (main agent) not busy.
-	sidekick.activeRequests.Set(sid, func() {})
+	sidekick.activeRequests.Set(sid, &activeCancel{cancel: func() {}})
 	require.True(t, coord.Sidekick().IsSessionBusy(sid))
 	require.False(t, coord.IsSessionBusy(sid))
 	require.False(t, coord.IsBusy())
 	sidekick.activeRequests.Del(sid)
 
 	// Main agent busy -> sidekick not busy.
-	main.activeRequests.Set(sid, func() {})
+	main.activeRequests.Set(sid, &activeCancel{cancel: func() {}})
 	require.True(t, coord.IsSessionBusy(sid))
 	require.False(t, coord.Sidekick().IsSessionBusy(sid))
 	require.False(t, coord.Sidekick().IsBusy())
@@ -236,7 +243,7 @@ func TestRunSidekickBusyRejects(t *testing.T) {
 	require.NoError(t, err)
 
 	sidekick := coord.Sidekick().SessionAgent.(*sessionAgent)
-	sidekick.activeRequests.Set(coord.sidekickSessionID, func() {})
+	sidekick.activeRequests.Set(coord.sidekickSessionID, &activeCancel{cancel: func() {}})
 	defer sidekick.activeRequests.Del(coord.sidekickSessionID)
 
 	_, err = coord.RunSidekick(context.WithoutCancel(t.Context()), "while busy")
@@ -301,7 +308,7 @@ func TestIsSidekickBusy(t *testing.T) {
 
 	require.False(t, coord.IsSidekickBusy())
 	sidekick := coord.Sidekick().SessionAgent.(*sessionAgent)
-	sidekick.activeRequests.Set("sk", func() {})
+	sidekick.activeRequests.Set("sk", &activeCancel{cancel: func() {}})
 	require.True(t, coord.IsSidekickBusy())
 	require.False(t, coord.IsBusy(), "sidekick busy must not leak into the main agent")
 	sidekick.activeRequests.Del("sk")

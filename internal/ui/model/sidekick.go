@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"charm.land/bubbles/v2/key"
-	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
@@ -15,6 +14,7 @@ import (
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/ui/chat"
 	"github.com/charmbracelet/crush/internal/ui/styles"
+	internaltextarea "github.com/charmbracelet/crush/internal/ui/textarea"
 	"github.com/charmbracelet/crush/internal/ui/util"
 	"github.com/joestump-agent/a2tea/render"
 )
@@ -67,7 +67,7 @@ type (
 type sidekickState struct {
 	// input is the prompt textarea. Lazily constructed by
 	// ensureSidekickInput so struct-literal test UIs stay cheap.
-	input       textarea.Model
+	input       internaltextarea.Model
 	initialized bool
 
 	// msgs mirrors the Sidekick's ephemeral conversation, oldest first,
@@ -137,7 +137,7 @@ func (m *UI) ensureSidekickInput() {
 	if m.sidekick.initialized {
 		return
 	}
-	ta := textarea.New()
+	ta := internaltextarea.New()
 	if m.com != nil && m.com.Styles != nil {
 		ta.SetStyles(m.com.Styles.Editor.Textarea)
 	}

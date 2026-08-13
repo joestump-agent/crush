@@ -15,8 +15,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"time"
 	"sync"
+	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
@@ -273,7 +273,7 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		promptOpts = append(promptOpts, prompt.WithA2UI())
 		// The dashboard push channel (#57) exists only when a Sidekick
 		// panel is configured to render it; the guidance follows the tool.
-		if _, ok := cfg.Config().Agents[config.AgentSidekick]; ok {
+		if _, ok := c.cfg.Config().Agents[config.AgentSidekick]; ok {
 			promptOpts = append(promptOpts, prompt.WithSidekickUpdate())
 		}
 	}
@@ -294,7 +294,7 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 
 	// The Sidekick is optional: legacy configs without the agent entry
 	// simply run without one.
-	if sidekickCfg, ok := cfg.Config().Agents[config.AgentSidekick]; ok {
+	if sidekickCfg, ok := c.cfg.Config().Agents[config.AgentSidekick]; ok {
 		sidekick, err := c.buildSidekickAgent(ctx, sidekickCfg)
 		if err != nil {
 			return nil, err

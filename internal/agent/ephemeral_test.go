@@ -72,7 +72,7 @@ func TestEphemeralAgentBusyRejectsInsteadOfQueueing(t *testing.T) {
 	require.NoError(t, err)
 
 	// Make the session look busy: an earlier prompt is active.
-	sa.activeRequests.Set(sess.ID, func() {})
+	sa.activeRequests.Set(sess.ID, &activeCancel{cancel: func() {}})
 	defer sa.activeRequests.Del(sess.ID)
 
 	result, err := ea.Run(t.Context(), SessionAgentCall{
@@ -96,7 +96,7 @@ func TestEphemeralAgentBusyClosesAcceptReservation(t *testing.T) {
 	sess, err := ea.Sessions.Create(t.Context(), "Sidekick")
 	require.NoError(t, err)
 
-	sa.activeRequests.Set(sess.ID, func() {})
+	sa.activeRequests.Set(sess.ID, &activeCancel{cancel: func() {}})
 	defer sa.activeRequests.Del(sess.ID)
 
 	accept := sa.BeginAccepted(sess.ID)
@@ -119,7 +119,7 @@ func TestEphemeralAgentIndependentBusyTracking(t *testing.T) {
 	other := newEphemeralTestAgent("done")
 
 	const sid = "shared-session-id"
-	other.SessionAgent.(*sessionAgent).activeRequests.Set(sid, func() {})
+	other.SessionAgent.(*sessionAgent).activeRequests.Set(sid, &activeCancel{cancel: func() {}})
 
 	require.True(t, other.IsSessionBusy(sid))
 	require.False(t, ea.IsSessionBusy(sid),

@@ -5134,7 +5134,6 @@ func (m *UI) handleA2UIButtonClicked(clicked a2uievent.ButtonClicked) tea.Cmd {
 		}
 		return tea.Batch(refocus, m.sendMessage(chat.A2UISubmissionPrompt(clicked, values)))
 	}
-	values, _ := m.chat.RetireA2UISurface(clicked.SurfaceID)
 	if chat.A2UIButtonIsCancel(clicked) {
 		m.chat.RetireA2UISurface(clicked.SurfaceID)
 		return nil

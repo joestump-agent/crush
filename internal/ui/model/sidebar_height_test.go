@@ -39,7 +39,10 @@ func (w *sidebarHeightTestWorkspace) SidekickAvailable() bool {
 func (w *sidebarHeightTestWorkspace) SidekickSubscribe(context.Context) <-chan pubsub.Event[message.Message] {
 	return nil
 }
+
 func (w *sidebarHeightTestWorkspace) LSPGetStates() map[string]workspace.LSPClientInfo {
+	return nil
+}
 
 func (w *sidebarHeightTestWorkspace) SidekickModel() config.SelectedModel {
 	return config.SelectedModel{}

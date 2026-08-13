@@ -23,7 +23,8 @@ type mainAgentSidekickWorkspace struct {
 	agentPrompts []string
 }
 
-func (w *mainAgentSidekickWorkspace) AgentIsReady() bool { return true }
+func (w *mainAgentSidekickWorkspace) AgentIsReady() bool   { return true }
+func (w *mainAgentSidekickWorkspace) AgentReadyErr() error { return nil }
 
 func (w *mainAgentSidekickWorkspace) AgentRun(_ context.Context, _, prompt string, _ ...message.Attachment) error {
 	w.agentPrompts = append(w.agentPrompts, prompt)
