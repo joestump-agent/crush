@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/chat"
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/crush/internal/ui/util"
+	"github.com/joestump-agent/a2tea/render"
 )
 
 // sidekickClearCommand wipes the ephemeral Sidekick conversation (#48):
@@ -90,6 +91,26 @@ type sidekickState struct {
 	// pinned. It persists after the agent's turn ends, until the next
 	// main-agent prompt, a /clear, or an explicit dismiss.
 	dashboard string
+
+	// dashboardModel is the live a2tea surface for the pinned dashboard —
+	// the same live-model treatment the main chat gives its surfaces
+	// (#44): it can receive focus, Tab through its elements, and submit
+	// buttons. Nil when nothing is pinned or the push had nothing
+	// renderable (then the string fallback renders display-only).
+	dashboardModel render.Model
+
+	// dashboardSurfaceID is the A2UI surface ID the live model draws,
+	// used to match ButtonClicked events back to the dashboard.
+	dashboardSurfaceID string
+
+	// dashboardRetired marks the dashboard form as already submitted or
+	// dismissed (#45): it still renders in its final state but no longer
+	// accepts focus or keys, so it cannot be re-submitted.
+	dashboardRetired bool
+
+	// dashboardFocused is true while keyboard focus inside the Sidekick
+	// pane is on the dashboard surface instead of the prompt input.
+	dashboardFocused bool
 
 	// dashboardEvents is the subscription to the dashboard push broker;
 	// nil until the first successful subscribe.
@@ -208,19 +229,120 @@ func (m *UI) awaitSidekickDashboardEvent() tea.Cmd {
 // applySidekickDashboard folds one dashboard push into the panel:
 // replace-in-place (a new surface always supersedes the previous one, so
 // rapid live updates within a turn never stack) and an unread bump so
-// the tab badge lights up while the panel is hidden (#52).
+// the tab badge lights up while the panel is hidden (#52). The pushed
+// content becomes a live a2tea model — interactive like the main chat's
+// surfaces — with the raw string kept as a display-only fallback. A
+// replacement clears any retirement (an agent updating a submitted form
+// is a fresh form) and re-grants focus when the user was interacting
+// with the previous surface.
 func (m *UI) applySidekickDashboard(ev pubsub.Event[agenttools.SidekickSurface]) {
 	if ev.Payload.Content == "" {
 		return
 	}
-	m.sidekick.dashboard = ev.Payload.Content
+	sk := &m.sidekick
+	sk.dashboard = ev.Payload.Content
+	sk.dashboardRetired = false
+	model, surfaceID, ok := chat.NewA2UIDashboardSurface(ev.Payload.Content)
+	if !ok {
+		sk.dashboardModel = nil
+		sk.dashboardSurfaceID = ""
+		sk.dashboardFocused = false
+	} else {
+		sk.dashboardModel = model
+		sk.dashboardSurfaceID = surfaceID
+		if sk.dashboardFocused {
+			_ = model.Focus()
+		}
+	}
 	m.bumpSidekickUnread()
 }
 
 // dismissSidekickDashboard drops the pinned dashboard surface (bound to
-// a key in the Sidekick pane). The agent's next push re-pins it.
-func (m *UI) dismissSidekickDashboard() {
-	m.sidekick.dashboard = ""
+// a key in the Sidekick pane). The agent's next push re-pins it. When
+// the surface held keyboard focus, focus returns to the prompt input and
+// the returned cmd carries its cursor blink.
+func (m *UI) dismissSidekickDashboard() tea.Cmd {
+	sk := &m.sidekick
+	wasFocused := sk.dashboardFocused
+	sk.dashboard = ""
+	sk.dashboardModel = nil
+	sk.dashboardSurfaceID = ""
+	sk.dashboardRetired = false
+	sk.dashboardFocused = false
+	if wasFocused {
+		return m.focusSidekickInput()
+	}
+	return nil
+}
+
+// focusSidekickInput moves keyboard focus inside the Sidekick pane to
+// the prompt input, blurring the dashboard surface if it held focus.
+func (m *UI) focusSidekickInput() tea.Cmd {
+	sk := &m.sidekick
+	if sk.dashboardFocused {
+		sk.dashboardFocused = false
+		if sk.dashboardModel != nil {
+			sk.dashboardModel.Blur()
+		}
+	}
+	m.ensureSidekickInput()
+	return sk.input.Focus()
+}
+
+// focusSidekickDashboard moves keyboard focus inside the Sidekick pane
+// to the pinned dashboard surface, engaging its a2tea focus ring (Tab
+// cycles elements, Enter activates — #44). No-op when there is no live,
+// non-retired surface to focus.
+func (m *UI) focusSidekickDashboard() {
+	sk := &m.sidekick
+	if sk.dashboardModel == nil || sk.dashboardRetired || sk.dashboardFocused {
+		return
+	}
+	if sk.initialized {
+		sk.input.Blur()
+	}
+	sk.dashboardFocused = true
+	_ = sk.dashboardModel.Focus()
+}
+
+// updateSidekickDashboard forwards msg into the live dashboard surface's
+// Update and stores the returned model back. Button activations inside
+// the surface surface as a2uievent.ButtonClicked through the returned
+// cmd, which the top-level Update routes to the MAIN agent (#45): the
+// dashboard is the main agent's push channel.
+func (m *UI) updateSidekickDashboard(msg tea.Msg) tea.Cmd {
+	sk := &m.sidekick
+	if sk.dashboardModel == nil {
+		return nil
+	}
+	model, cmd := sk.dashboardModel.Update(msg)
+	if rm, ok := model.(render.Model); ok {
+		sk.dashboardModel = rm
+	}
+	return cmd
+}
+
+// retireSidekickDashboardSurface retires the live dashboard surface after
+// one of its buttons was activated (#45): it reads the surface's current
+// field values, revokes focus (back to the prompt input), and marks the
+// form retired so it cannot be re-submitted. Only claims the event while
+// the dashboard actually holds focus — only a focused surface emits
+// button events — so a same-ID surface in the main chat is never
+// shadowed. Returns the gathered values and whether the dashboard was
+// the source.
+func (m *UI) retireSidekickDashboardSurface(surfaceID string) (map[string]any, bool) {
+	sk := &m.sidekick
+	if sk.dashboardModel == nil || sk.dashboardRetired || !sk.dashboardFocused {
+		return nil, false
+	}
+	if surfaceID != sk.dashboardSurfaceID {
+		return nil, false
+	}
+	values := chat.A2UISurfaceFieldValues(sk.dashboardModel)
+	sk.dashboardRetired = true
+	sk.dashboardFocused = false
+	sk.dashboardModel.Blur()
+	return values, true
 }
 
 // applySidekickEvent folds one Sidekick message event into the panel's
@@ -261,16 +383,33 @@ func (m *UI) applySidekickEvent(ev pubsub.Event[message.Message]) {
 
 // handleSidekickKey routes a key press to the Sidekick chat panel. Tab
 // keeps cycling the sidebar tabs (#52); Esc is handled earlier in
-// handleKeyPressMsg (cancel-or-leave). Everything else feeds the prompt
-// textarea, which keeps the sidebar's global-key-inertness contract.
+// handleKeyPressMsg (cancel-or-leave). Shift+Tab moves focus onto the
+// pinned dashboard surface when one is live; while the surface holds
+// focus it gets first claim on the keys it understands (Tab cycles its
+// focus ring, Enter activates — the same whitelist the main chat uses,
+// #44). Everything else feeds the prompt textarea, which keeps the
+// sidebar's global-key-inertness contract.
 func (m *UI) handleSidekickKey(msg tea.KeyPressMsg) tea.Cmd {
 	m.ensureSidekickInput()
+	sk := &m.sidekick
+	if sk.dashboardFocused && sk.dashboardModel != nil && !sk.dashboardRetired {
+		if key.Matches(msg, m.keyMap.SidekickFocusSurface) {
+			return m.focusSidekickInput()
+		}
+		if chat.A2UISurfaceWantsKey(sk.dashboardModel, msg) {
+			return m.updateSidekickDashboard(msg)
+		}
+	}
 	var cmds []tea.Cmd
 	switch {
+	case key.Matches(msg, m.keyMap.SidekickFocusSurface):
+		m.focusSidekickDashboard()
 	case key.Matches(msg, m.keyMap.Tab):
 		m.cycleSidebarTab()
 	case key.Matches(msg, m.keyMap.SidekickDismiss):
-		m.dismissSidekickDashboard()
+		if cmd := m.dismissSidekickDashboard(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case key.Matches(msg, m.keyMap.Editor.Newline):
 		m.sidekick.input.InsertRune('\n')
 	case key.Matches(msg, m.keyMap.Editor.SendMessage):
@@ -287,11 +426,22 @@ func (m *UI) handleSidekickKey(msg tea.KeyPressMsg) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// handleSidekickEscape implements Esc inside the Sidekick pane: cancel a
-// streaming Sidekick run, otherwise hand focus back to the editor. It
-// deliberately never reaches the main agent's cancel path — Sidekick
-// activity and the main run are independent (#50).
+// handleSidekickEscape implements Esc inside the Sidekick pane: close a
+// modal the focused dashboard surface holds open, step focus back from
+// the dashboard surface to the prompt input, cancel a streaming Sidekick
+// run, otherwise hand focus back to the editor. It deliberately never
+// reaches the main agent's cancel path — Sidekick activity and the main
+// run are independent (#50).
 func (m *UI) handleSidekickEscape() tea.Cmd {
+	sk := &m.sidekick
+	if sk.dashboardFocused && sk.dashboardModel != nil {
+		esc := tea.KeyPressMsg{Code: tea.KeyEscape}
+		if !sk.dashboardRetired && chat.A2UISurfaceWantsKey(sk.dashboardModel, esc) {
+			// The surface has a modal open: Esc closes it first.
+			return m.updateSidekickDashboard(esc)
+		}
+		return m.focusSidekickInput()
+	}
 	if m.sidekick.busy {
 		if m.com != nil && m.com.Workspace != nil {
 			m.com.Workspace.SidekickCancel()
@@ -351,7 +501,7 @@ func (m *UI) clearSidekickConversation() tea.Cmd {
 	sk.errText = ""
 	sk.busy = false
 	sk.scrollback = 0
-	sk.dashboard = ""
+	_ = m.dismissSidekickDashboard()
 
 	ws := m.com.Workspace
 	if ws == nil || !ws.SidekickAvailable() {
@@ -409,17 +559,23 @@ func (m *UI) renderSidekickPanel(width, height int) string {
 }
 
 // renderSidekickDashboard renders the pinned agent-pushed dashboard
-// surface through the shared a2tea pipeline at panel (sidebar) width,
-// capped to maxHeight so the prompt input and footer always stay on
-// screen. Returns "" when nothing is pinned.
+// surface at panel (sidebar) width, capped to maxHeight so the prompt
+// input and footer always stay on screen. Returns "" when nothing is
+// pinned. The live model renders directly (its View reflects the current
+// focus ring and edited values, like the main chat's surfaces); the
+// string pipeline is the fallback for pushes with no renderable model.
 func (m *UI) renderSidekickDashboard(width, maxHeight int) string {
 	sk := &m.sidekick
 	if sk.dashboard == "" || width <= 0 || maxHeight <= 0 {
 		return ""
 	}
 	t := m.com.Styles
-	out, ok := chat.RenderA2UIInline(t, sk.dashboard, width, true)
-	if !ok {
+	var out string
+	if sk.dashboardModel != nil {
+		out = chat.RenderA2UISurfaceModel(t, sk.dashboardModel, width)
+	} else if o, ok := chat.RenderA2UIInline(t, sk.dashboard, width, true); ok {
+		out = o
+	} else {
 		// The tool validates payloads before publishing, so this is a
 		// defensive fallback: show the content rather than nothing.
 		out = t.Sidebar.SidekickAssistant.Width(width).Render(strings.TrimSpace(sk.dashboard))

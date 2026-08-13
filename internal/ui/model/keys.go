@@ -70,6 +70,10 @@ type KeyMap struct {
 	// SidekickDismiss drops the pinned dashboard surface; only active
 	// while the Sidekick pane is focused.
 	SidekickDismiss key.Binding
+	// SidekickFocusSurface toggles keyboard focus between the Sidekick
+	// prompt input and the pinned dashboard surface; only active while
+	// the Sidekick pane is focused.
+	SidekickFocusSurface key.Binding
 }
 
 func DefaultKeyMap() KeyMap {
@@ -113,6 +117,10 @@ func DefaultKeyMap() KeyMap {
 		SidekickDismiss: key.NewBinding(
 			key.WithKeys("ctrl+x"),
 			key.WithHelp("ctrl+x", "dismiss dashboard"),
+		),
+		SidekickFocusSurface: key.NewBinding(
+			key.WithKeys("shift+tab"),
+			key.WithHelp("shift+tab", "focus dashboard"),
 		),
 	}
 
