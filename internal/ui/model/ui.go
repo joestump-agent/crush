@@ -297,11 +297,14 @@ type UI struct {
 	lastCompletionEnd      int
 	lastCompletionText     string
 	lastCompletionFilePath string // non-empty when the last completion attached a file
-	// mentionAttachments maps a token in the prompt to the attachment it
-	// owns, so deleting the token can take the attachment with it. Only
-	// tokens put entries here, so a pasted image or a dropped file — which
-	// has no token — is never touched.
-	mentionAttachments map[string]string
+	// mentionAttachments maps a token in the prompt to the attachments it
+	// owns, so deleting the token can take the attachment with it. The
+	// value is a list because the same token text can appear more than
+	// once: two insertions of "/server:prompt" differ only in their
+	// resolved bodies, so each gets its own entry here and a backspace
+	// pops exactly one. Only tokens put entries here, so a pasted image
+	// or a dropped file — which has no token — is never touched.
+	mentionAttachments map[string][]string
 	// discardedMentions holds attachment keys whose token was deleted before
 	// the (asynchronous) read that produces the attachment came back. The
 	// attachment is dropped on arrival rather than landing as an orphan chip
@@ -4246,12 +4249,15 @@ func promptMentions(value, target string) bool {
 }
 
 // trackMentionAttachment records which attachment a token in the prompt owns,
-// so deleting that token can take the attachment with it.
+// so deleting that token can take the attachment with it. A token that
+// already has an entry (the same prompt inserted twice, the same file
+// mentioned twice) appends rather than overwrites, so each occurrence can be
+// removed independently.
 func (m *UI) trackMentionAttachment(key, token string) {
 	if m.mentionAttachments == nil {
-		m.mentionAttachments = map[string]string{}
+		m.mentionAttachments = map[string][]string{}
 	}
-	m.mentionAttachments[token] = key
+	m.mentionAttachments[token] = append(m.mentionAttachments[token], key)
 }
 
 // dropMentionAttachment removes the attachment owned by a token that has just
@@ -4261,10 +4267,10 @@ func (m *UI) trackMentionAttachment(key, token string) {
 // prompt after every keystroke. Reconciling looks more thorough and is much
 // worse: an attachment's identity would have to be recoverable from the
 // prompt text, and it often is not. A path or resource title containing a
-// space does not tokenize back to what was inserted, editing an MCP prompt's
-// arguments changes the token, and the tokenizer's known-name set is re-primed
-// asynchronously when MCP servers reload — each of which made a live
-// attachment disappear mid-composition while its mention sat on screen.
+// space does not tokenize back to what was inserted, and the tokenizer's
+// known-name set is re-primed asynchronously when MCP servers reload — each
+// of which made a live attachment disappear mid-composition while its
+// mention sat on screen.
 // Acting only where the token is known to have gone can miss a removal, which
 // is a visible chip the user can delete; the alternative silently drops data
 // the user believes they attached.
@@ -4272,8 +4278,8 @@ func (m *UI) dropMentionAttachment(token string) {
 	if token == "" {
 		return
 	}
-	key, ok := m.mentionAttachments[token]
-	if !ok {
+	keys, ok := m.mentionAttachments[token]
+	if !ok || len(keys) == 0 {
 		return
 	}
 	// A repeat mention shares one attachment (fileCmd dedupes), so it only
@@ -4281,8 +4287,18 @@ func (m *UI) dropMentionAttachment(token string) {
 	if slices.Contains(m.promptTokenTexts(), token) {
 		return
 	}
+	// The token is gone. Drop one tracking entry and remove its attachment;
+	// if more entries remain (a duplicate token was deleted earlier and the
+	// rest of the prompt was edited away in the meantime), they go too, so
+	// no orphan chip survives its token.
+	key := keys[len(keys)-1]
+	keys = keys[:len(keys)-1]
+	if len(keys) == 0 {
+		delete(m.mentionAttachments, token)
+	} else {
+		m.mentionAttachments[token] = keys
+	}
 	m.attachments.RemoveByFilePath(key)
-	delete(m.mentionAttachments, token)
 	// A late-arriving read for a mention that is already gone would land as
 	// an orphan chip with nothing referring to it.
 	if m.discardedMentions == nil {
@@ -4557,45 +4573,22 @@ func (m *UI) insertMCPPromptCompletion(p completions.PromptCompletionValue) tea.
 	return nil
 }
 
-// promptTokenValue renders one argument value for the inline token.
-//
-// Values come from free-text dialog inputs, so they can contain anything.
-// Whitespace is the one thing the token grammar cannot carry —
-// ScanPromptTokens ends a token at the first space — so it is percent-encoded
-// rather than dropped: the value stays readable and the token stays a single
-// highlighted, atomically-deletable unit.
-func promptTokenValue(v string) string {
-	var b strings.Builder
-	for _, r := range v {
-		switch r {
-		case ' ':
-			b.WriteString("%20")
-		case '\t':
-			b.WriteString("%09")
-		case '\n':
-			b.WriteString("%0A")
-		case '\r':
-			b.WriteString("%0D")
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
 // attachMCPPrompt resolves the prompt against its server and attaches the
 // result.
 //
 // The resolved body becomes an attachment rather than text spliced into the
 // editor: prompt templates run long, and dropping one into the prompt area
 // would bury whatever the user was writing. The editor keeps a compact
-// "/server:prompt(arg=value)" token — space-free, so it stays one highlighted
-// unit and one atomic backspace removes it — while the body rides along as an
-// attachment the model receives, exactly like an @file mention.
+// "/server:prompt" token — argument values stay out of it, so a long value
+// cannot wrap the token across lines and no escaping scheme leaks into what
+// the user reads — while the body rides along as an attachment the model
+// receives, exactly like an @file mention. The chip under the composer
+// carries the argument count, which is the only piece of argument
+// information the composer needs to show.
 func (m *UI) attachMCPPrompt(name, mcpName, promptID string, args map[string]string) tea.Cmd {
 	// The dialog returns every declared argument, blank ones included. A
-	// blank optional is "not supplied": it must not reach the server, must
-	// not appear in the token, and must not be counted on the chip.
+	// blank optional is "not supplied": it must not reach the server and
+	// must not be counted on the chip.
 	supplied := make(map[string]string, len(args))
 	for k, v := range args {
 		if strings.TrimSpace(v) != "" {
@@ -4604,18 +4597,6 @@ func (m *UI) attachMCPPrompt(name, mcpName, promptID string, args map[string]str
 	}
 
 	token := "/" + name
-	if len(supplied) > 0 {
-		keys := make([]string, 0, len(supplied))
-		for k := range supplied {
-			keys = append(keys, k)
-		}
-		slices.Sort(keys)
-		parts := make([]string, 0, len(keys))
-		for _, k := range keys {
-			parts = append(parts, k+"="+promptTokenValue(supplied[k]))
-		}
-		token += "(" + strings.Join(parts, ",") + ")"
-	}
 
 	prevHeight := m.textarea.Height()
 	if !m.insertCompletionText(token) {

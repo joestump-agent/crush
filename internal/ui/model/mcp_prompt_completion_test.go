@@ -74,11 +74,11 @@ func TestAttachMCPPromptWithoutArguments(t *testing.T) {
 	require.Zero(t, att.PromptArgCount)
 }
 
-// TestAttachMCPPromptWithArguments pins the token's argument form. It has to
-// be space-free: ScanPromptTokens ends a token at the first space, so a
-// spaced form would highlight only the name and leave the arguments rendering
-// as loose prose, and one atomic backspace would no longer remove the whole
-// thing.
+// TestAttachMCPPromptWithArguments pins the token's argument-free form.
+// Argument values stay out of the editor text: a long or whitespace-bearing
+// value would wrap the token across lines or force an escaping scheme into
+// what the user reads. The chip under the composer reports the count, and
+// the values themselves go to the server out of band.
 func TestAttachMCPPromptWithArguments(t *testing.T) {
 	t.Parallel()
 
@@ -92,7 +92,7 @@ func TestAttachMCPPromptWithArguments(t *testing.T) {
 		map[string]string{"repo": "stump.wtf/crush", "id": "42"}))
 
 	got := m.textarea.Value()
-	require.Equal(t, "do /gitea:review(id=42,repo=stump.wtf/crush) ", got)
+	require.Equal(t, "do /gitea:review ", got)
 	token := strings.TrimSpace(got[strings.Index(got, "/"):])
 	require.NotContains(t, token, " ",
 		"the token itself must contain no spaces, or ScanPromptTokens ends it early")
@@ -131,11 +131,11 @@ func TestAtomicBackspaceRemovesPromptChip(t *testing.T) {
 }
 
 // TestAttachMCPPromptDropsBlankArguments pins that a blank optional argument
-// is "not supplied": absent from the token, absent from the chip's count, and
-// never sent to the server. The arguments dialog returns every declared
-// argument, blank ones included, so without filtering the chip claimed
-// "(3 args)" beside a token showing one, and the server was handed
-// empty-string values it never asked for.
+// is "not supplied": absent from the chip's count and never sent to the
+// server. The arguments dialog returns every declared argument, blank ones
+// included, so without filtering the chip claimed "(3 args)" beside a token
+// that took one, and the server was handed empty-string values it never
+// asked for.
 func TestAttachMCPPromptDropsBlankArguments(t *testing.T) {
 	t.Parallel()
 
@@ -148,19 +148,21 @@ func TestAttachMCPPromptDropsBlankArguments(t *testing.T) {
 	runPromptCmd(t, m, m.attachMCPPrompt("gitea:review", "gitea", "review",
 		map[string]string{"id": "42", "title": "", "body": "   "}))
 
-	require.Equal(t, "go /gitea:review(id=42) ", m.textarea.Value())
+	require.Equal(t, "go /gitea:review ", m.textarea.Value())
 	require.Equal(t, map[string]string{"id": "42"}, ws.gotArgs,
 		"blank arguments must not reach the server")
 	require.Len(t, m.attachments.List(), 1)
 	require.Equal(t, 1, m.attachments.List()[0].PromptArgCount,
-		"the count must match what the token shows")
+		"the count must match what the server received")
 }
 
-// TestAttachMCPPromptEncodesWhitespaceInValues pins the token grammar against
-// free-text argument values. ScanPromptTokens ends a token at the first
-// space, so an unescaped value like "fix the bug" split the token in half —
-// the exact failure the design claims to prevent.
-func TestAttachMCPPromptEncodesWhitespaceInValues(t *testing.T) {
+// TestAttachMCPPromptKeepsValuesOutOfTheToken pins that a whitespace-bearing
+// argument value does not leak into the editor text. The token must remain
+// "/server:prompt" with no encoded form of the value: percent-encoding kept
+// the grammar intact but leaked "%20" into what the user read, and any
+// inlined value is one long argument away from wrapping the token across
+// lines.
+func TestAttachMCPPromptKeepsValuesOutOfTheToken(t *testing.T) {
 	t.Parallel()
 
 	ws := &promptWorkspace{body: "body"}
@@ -172,12 +174,10 @@ func TestAttachMCPPromptEncodesWhitespaceInValues(t *testing.T) {
 	runPromptCmd(t, m, m.attachMCPPrompt("gitea:review", "gitea", "review",
 		map[string]string{"title": "fix the bug"}))
 
-	got := m.textarea.Value()
-	token := strings.TrimSpace(got[strings.Index(got, "/"):])
-	require.NotContains(t, token, " ", "the token must survive a spaced value")
-	require.Contains(t, token, "%20")
-	// The server still gets the real value, not the encoded one.
-	require.Equal(t, map[string]string{"title": "fix the bug"}, ws.gotArgs)
+	require.Equal(t, "go /gitea:review ", m.textarea.Value(),
+		"no part of the value — encoded or otherwise — belongs in the token")
+	require.Equal(t, map[string]string{"title": "fix the bug"}, ws.gotArgs,
+		"the server still gets the real value")
 }
 
 // TestAttachMCPPromptRollsBackOnResolveFailure pins that a prompt whose body
@@ -222,4 +222,44 @@ func TestAttachMCPPromptRollsBackOnResolveFailure(t *testing.T) {
 	require.Equal(t, "please ", m.textarea.Value(),
 		"the token must be rolled back when its body never arrives")
 	require.Empty(t, m.attachments.List())
+}
+
+// TestAttachMCPPromptTwiceTracksEachInsertion pins that two insertions of
+// the same prompt are independently removable. With argument values no
+// longer inline, both tokens are the same text, so the mention tracker must
+// hold one attachment key per occurrence rather than letting the second
+// insert overwrite the first.
+func TestAttachMCPPromptTwiceTracksEachInsertion(t *testing.T) {
+	t.Parallel()
+
+	ws := &promptWorkspace{body: "body"}
+	ws.ready = true
+	m := newCompletionBackspaceUIWith(ws)
+	m.textarea.SetValue("do /")
+	m.completionsStartIndex = len("do ")
+
+	runPromptCmd(t, m, m.attachMCPPrompt("gitea:review", "gitea", "review",
+		map[string]string{"id": "42"}))
+	require.Equal(t, "do /gitea:review ", m.textarea.Value())
+	require.Len(t, m.attachments.List(), 1)
+
+	// Move past the inserted trailing space, then trigger and resolve the
+	// same prompt a second time.
+	m.textarea.InsertRune('x')
+	m.textarea.InsertRune(' ')
+	m.completionsStartIndex = len("do /gitea:review x ")
+	m.textarea.SetValue("do /gitea:review x /")
+	runPromptCmd(t, m, m.attachMCPPrompt("gitea:review", "gitea", "review",
+		map[string]string{"id": "43"}))
+
+	require.Equal(t, "do /gitea:review x /gitea:review ", m.textarea.Value())
+	require.Len(t, m.attachments.List(), 2,
+		"each insertion must own its own attachment")
+
+	// Backspacing the second token drops only its chip; the first must stay.
+	m.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+	require.Equal(t, "do /gitea:review x ", m.textarea.Value())
+	require.Len(t, m.attachments.List(), 1,
+		"the surviving token's chip must survive its twin's deletion")
+	require.Equal(t, "gitea:review#1", m.attachments.List()[0].FilePath)
 }
