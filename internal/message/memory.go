@@ -141,6 +141,18 @@ func (s *memoryService) ListAllUserMessages(ctx context.Context) ([]Message, err
 	return all, nil
 }
 
+func (s *memoryService) GetLastAssistantMessage(ctx context.Context, sessionID string) (Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := s.order[sessionID]
+	for i := len(ids) - 1; i >= 0; i-- {
+		if msg, ok := s.messages[ids[i]]; ok && msg.Role == Assistant && !msg.IsSummaryMessage {
+			return msg.Clone(), nil
+		}
+	}
+	return Message{}, sql.ErrNoRows
+}
+
 func (s *memoryService) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	msg, ok := s.messages[id]
