@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/agent/notify"
+	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -90,6 +91,12 @@ func (w *countingWorkspace) AgentClearQueue(string) { w.clearQueueCalls++; w.que
 func (w *countingWorkspace) AgentCancel(string)     { w.cancelCalls++ }
 
 func (w *countingWorkspace) AgentListCronTasks(string) []scheduler.Task { return nil }
+
+// sendMessage retires the Sidekick dashboard and retries its
+// subscription on every prompt; report it unavailable here.
+func (w *countingWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
+	return nil
+}
 
 func (w *countingWorkspace) ListMessages(context.Context, string) ([]message.Message, error) {
 	return nil, nil

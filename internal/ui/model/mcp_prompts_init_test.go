@@ -24,8 +24,9 @@ type mcpPromptWorkspace struct {
 	calls   int
 }
 
-func (w *mcpPromptWorkspace) AgentIsReady() bool   { return true }
-func (w *mcpPromptWorkspace) AgentReadyErr() error { return nil }
+func (w *mcpPromptWorkspace) AgentIsReady() bool      { return true }
+func (w *mcpPromptWorkspace) AgentReadyErr() error    { return nil }
+func (w *mcpPromptWorkspace) SidekickAvailable() bool { return false }
 
 // Init fans out to the other loaders too, and loadCustomCommands reads
 // Options.DataDirectory, so this has to be a real (if empty) config.
