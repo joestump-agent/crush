@@ -47,8 +47,9 @@ func newSidekickTestCoordinator(t *testing.T, env fakeEnv, baseURL string) *coor
 	coderCfg.AllowedTools = nil
 	cfg.Config().Agents[config.AgentCoder] = coderCfg
 
-	// Close the package-global MCP init gate (no MCP servers are
-	// configured) so the coordinator's readyWg never blocks on it.
+	// Close the package-global MCP init gate so the coordinator's readyWg
+	// never blocks on it. No MCP servers are configured: TestMain isolates
+	// the global config so the ambient user crush.json stays out.
 	mcp.Initialize(t.Context(), env.permissions, cfg)
 
 	coord, err := NewCoordinator(
