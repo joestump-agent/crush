@@ -2,9 +2,29 @@ package projects
 
 import (
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
+
+// Paths in these tests are opaque identifiers: Register only stores and
+// compares them as strings, so the Unix-style spelling is portable and reads
+// the same on every platform.
+
+// fakeClock pins the package clock and returns a function that advances it, so
+// ordering assertions do not depend on the host clock's resolution. Left at the
+// pinned instant, every registration shares a timestamp — the case a coarse
+// clock (Windows ticks roughly every 15ms) produces on its own.
+func fakeClock(t *testing.T) func(time.Duration) {
+	t.Helper()
+
+	current := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	restore := nowFunc
+	nowFunc = func() time.Time { return current }
+	t.Cleanup(func() { nowFunc = restore })
+
+	return func(d time.Duration) { current = current.Add(d) }
+}
 
 func TestRegisterAndList(t *testing.T) {
 	// Create a temporary directory for the test
@@ -13,6 +33,10 @@ func TestRegisterAndList(t *testing.T) {
 	// Override the projects file path for testing
 	t.Setenv("XDG_DATA_HOME", tmpDir)
 	t.Setenv("CRUSH_GLOBAL_DATA", filepath.Join(tmpDir, "crush"))
+
+	// Both registrations land on the same timestamp, so ordering has to come
+	// from recency of registration rather than from the clock.
+	fakeClock(t)
 
 	// Test registering a project
 	err := Register("/home/user/project1", "/home/user/project1/.crush")
@@ -64,6 +88,8 @@ func TestRegisterUpdatesExisting(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", tmpDir)
 	t.Setenv("CRUSH_GLOBAL_DATA", filepath.Join(tmpDir, "crush"))
 
+	advance := fakeClock(t)
+
 	// Register a project
 	err := Register("/home/user/project1", "/home/user/project1/.crush")
 	if err != nil {
@@ -73,8 +99,8 @@ func TestRegisterUpdatesExisting(t *testing.T) {
 	projects, _ := List()
 	firstAccess := projects[0].LastAccessed
 
-	// Wait a bit and re-register
-	time.Sleep(10 * time.Millisecond)
+	// Move the clock forward and re-register
+	advance(time.Second)
 
 	err = Register("/home/user/project1", "/home/user/project1/.crush-new")
 	if err != nil {
@@ -93,6 +119,68 @@ func TestRegisterUpdatesExisting(t *testing.T) {
 
 	if !projects[0].LastAccessed.After(firstAccess) {
 		t.Error("Expected LastAccessed to be updated")
+	}
+}
+
+func TestRegisterOrdersTiedTimestampsByRecency(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", tmpDir)
+	t.Setenv("CRUSH_GLOBAL_DATA", filepath.Join(tmpDir, "crush"))
+
+	// The clock never advances, so all three projects record the same
+	// LastAccessed and only registration order can break the tie.
+	fakeClock(t)
+
+	for _, path := range []string{"/home/user/a", "/home/user/b", "/home/user/c"} {
+		if err := Register(path, path+"/.crush"); err != nil {
+			t.Fatalf("Register(%s) failed: %v", path, err)
+		}
+	}
+
+	assertOrder(t, "/home/user/c", "/home/user/b", "/home/user/a")
+
+	// Re-registering the oldest project moves it back to the front, still
+	// without any help from the clock.
+	if err := Register("/home/user/a", "/home/user/a/.crush"); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	assertOrder(t, "/home/user/a", "/home/user/c", "/home/user/b")
+}
+
+func TestRegisterOrdersDistinctTimestampsByTime(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", tmpDir)
+	t.Setenv("CRUSH_GLOBAL_DATA", filepath.Join(tmpDir, "crush"))
+
+	advance := fakeClock(t)
+
+	for _, path := range []string{"/home/user/a", "/home/user/b", "/home/user/c"} {
+		if err := Register(path, path+"/.crush"); err != nil {
+			t.Fatalf("Register(%s) failed: %v", path, err)
+		}
+		advance(time.Minute)
+	}
+
+	assertOrder(t, "/home/user/c", "/home/user/b", "/home/user/a")
+}
+
+// assertOrder checks that List returns exactly the given paths, in order.
+func assertOrder(t *testing.T, want ...string) {
+	t.Helper()
+
+	projects, err := List()
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+
+	got := make([]string, len(projects))
+	for i, p := range projects {
+		got[i] = p.Path
+	}
+
+	if !slices.Equal(got, want) {
+		t.Errorf("Expected order %v, got %v", want, got)
 	}
 }
 

@@ -27,6 +27,10 @@ type ProjectList struct {
 
 var mu sync.Mutex
 
+// nowFunc returns the current time. Overridden in tests so that ordering
+// assertions do not depend on the host clock's resolution.
+var nowFunc = func() time.Time { return time.Now().UTC() }
+
 // projectsFilePath returns the path to the projects.json file.
 func projectsFilePath() string {
 	return filepath.Join(filepath.Dir(config.GlobalConfigData()), projectsFileName)
@@ -81,36 +85,24 @@ func Register(workingDir, dataDir string) error {
 		return err
 	}
 
-	now := time.Now().UTC()
+	// Drop any existing entry for this path, then put the freshly registered one
+	// at the front. Position, not the timestamp alone, is what makes this project
+	// the most recent: coarse system clocks (Windows ticks roughly every 15ms)
+	// hand out identical timestamps to back-to-back registrations.
+	list.Projects = slices.DeleteFunc(list.Projects, func(p Project) bool {
+		return p.Path == workingDir
+	})
+	list.Projects = append([]Project{{
+		Path:         workingDir,
+		DataDir:      dataDir,
+		LastAccessed: nowFunc(),
+	}}, list.Projects...)
 
-	// Check if project already exists
-	found := false
-	for i, p := range list.Projects {
-		if p.Path == workingDir {
-			list.Projects[i].DataDir = dataDir
-			list.Projects[i].LastAccessed = now
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		list.Projects = append(list.Projects, Project{
-			Path:         workingDir,
-			DataDir:      dataDir,
-			LastAccessed: now,
-		})
-	}
-
-	// Sort by last accessed (most recent first)
-	slices.SortFunc(list.Projects, func(a, b Project) int {
-		if a.LastAccessed.After(b.LastAccessed) {
-			return -1
-		}
-		if a.LastAccessed.Before(b.LastAccessed) {
-			return 1
-		}
-		return 0
+	// Sort by last accessed (most recent first). Stable, so projects sharing a
+	// timestamp keep the order established above instead of being reordered
+	// arbitrarily.
+	slices.SortStableFunc(list.Projects, func(a, b Project) int {
+		return b.LastAccessed.Compare(a.LastAccessed)
 	})
 
 	return Save(list)
