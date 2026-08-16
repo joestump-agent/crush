@@ -26,7 +26,54 @@ import (
 
 func TestMain(m *testing.M) {
 	slog.SetLogLoggerLevel(slog.LevelError)
-	m.Run()
+	cleanup := isolateGlobalConfig()
+	code := m.Run()
+	cleanup()
+	os.Exit(code)
+}
+
+// isolateGlobalConfig points every global Crush lookup at a throwaway
+// directory tree for the lifetime of the test binary, and returns the
+// func that tears it down.
+//
+// config.Init always merges the user-level config locations on top of
+// the working dir, so without this the package loads the developer's
+// real ~/.config/crush/crush.json: their providers, LSPs, global
+// CRUSH.md context, skills, and — most visibly — their MCP servers,
+// which mcp.Initialize then actually connects to. Those servers'
+// tools land in every buildTools result, because an agent with a nil
+// AllowedMCP means "no MCP restrictions" and so bypasses the
+// AllowedTools filter entirely. A test asserting an exact tool list
+// then fails on a developer machine and passes in CI, which is how
+// TestSidekickDashboardSubscribeDeliversToolPushes came to report 129
+// tools where it expects 1.
+//
+// This has to happen once, before m.Run: the tests in this package run
+// under t.Parallel(), which forbids t.Setenv.
+func isolateGlobalConfig() func() {
+	root, err := os.MkdirTemp("", "crush-agent-test-*")
+	if err != nil {
+		panic(fmt.Sprintf("isolate global config: %v", err))
+	}
+	// CRUSH_SKILLS_DIR replaces the whole default skills search path,
+	// which otherwise reaches into ~/.claude/skills and friends.
+	// XDG_CONFIG_HOME covers the home.Config() lookups that have no
+	// dedicated override (crush/ignore, git/ignore, commands).
+	for envVar, dir := range map[string]string{
+		"CRUSH_GLOBAL_CONFIG": filepath.Join(root, "config", "crush"),
+		"CRUSH_GLOBAL_DATA":   filepath.Join(root, "data", "crush"),
+		"CRUSH_CACHE_DIR":     filepath.Join(root, "cache"),
+		"CRUSH_SKILLS_DIR":    filepath.Join(root, "skills"),
+		"XDG_CONFIG_HOME":     filepath.Join(root, "config"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			panic(fmt.Sprintf("isolate global config: %v", err))
+		}
+		if err := os.Setenv(envVar, dir); err != nil {
+			panic(fmt.Sprintf("isolate global config: %v", err))
+		}
+	}
+	return func() { os.RemoveAll(root) }
 }
 
 var modelPairs = []modelPair{
