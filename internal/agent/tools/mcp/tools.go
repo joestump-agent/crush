@@ -98,7 +98,16 @@ func RunTool(ctx context.Context, cfg *config.ConfigStore, name, toolName string
 	if err != nil {
 		return ToolResult{}, err
 	}
+
+	// Attach the A2UI capability to the call's _meta for stateless servers
+	// that cannot carry initialize-time state. This is the per-turn claim, so
+	// it tracks whether THIS turn will actually render — not just whether the
+	// deployment allows surfaces. A headless `crush run` or a
+	// channel-originated turn does not divert surfaces to a UI, so claiming
+	// a2ui there earns a surface payload that gets folded into model-facing
+	// content as raw JSON instead of an answer.
 	result, err := c.CallTool(ctx, &mcp.CallToolParams{
+		Meta:      a2uiRequestMeta(ctx, a2uiDisabled(cfg)),
 		Name:      toolName,
 		Arguments: args,
 	})
