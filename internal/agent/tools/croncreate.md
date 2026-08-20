@@ -16,6 +16,11 @@ To schedule N minutes from now, add N to the current minute (handling hour/day r
 
 Expressions that are syntactically valid but can never match — "0 0 30 2 *", February 30th — are rejected rather than accepted as a task that silently never runs.
 
-A one-shot (recurring: false) whose pinned time has already passed today is also rejected: its next match would jump to tomorrow or next year, which is never what a one-shot means. Recompute the cron fields against the current time and try again. Recurring schedules are unaffected — a daily 9am task created at 10:30 legitimately fires tomorrow.
+A one-shot (recurring: false) whose pinned moment has already gone by is also rejected: its next match would jump to next month or next year, which is never what a one-shot means. The rejection names both the match that slipped by and the next one, and comes in two flavours:
+
+- The pinned **time** passed earlier today — recompute the minute/hour and try again.
+- The pinned **date** is on an earlier day, which happens when a long session crosses midnight — recompute day-of-month and month too, not just the minute. Call `date` first: this is exactly the case where the stale `<env>` time bites.
+
+A one-shot that still fires within the next 24 hours is always accepted, even if the same expression matched a moment ago — "*/5 * * * *" created at 06:29 fires at 06:30. Recurring schedules are unaffected — a daily 9am task created at 10:30 legitimately fires tomorrow.
 
 Set recurring to false for a one-shot reminder that fires once and deletes itself (pin minute/hour/day-of-month/month to specific values). Set durable to true to persist the task to disk so it survives restarts; otherwise it lives only in this session. A session can hold up to 50 scheduled tasks. Returns a task ID you can pass to CronDelete.

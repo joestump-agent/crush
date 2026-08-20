@@ -63,14 +63,27 @@ var ErrTooManyTasks = errors.New("session already has the maximum of 50 schedule
 var ErrNeverFires = errors.New("cron expression is valid but will never fire")
 
 // ErrOneShotInPast is returned when a one-shot (non-recurring) task's
-// schedule already matched at an earlier minute today. The intended
-// fire time is then unrecoverable: the schedule's next match has jumped
-// to tomorrow, next month, or next year, which is never what a one-shot
-// means. The usual cause is an agent computing the cron fields against
-// a stale clock (e.g. the session-start time in its prompt rather than
-// the actual current time), so the error names the next match to make
-// the discrepancy visible.
-var ErrOneShotInPast = errors.New("one-shot schedule's fire time has already passed today")
+// schedule matched within the last day and does not match again within
+// the next one. The intended fire time is then unrecoverable: the
+// schedule's next match has jumped to tomorrow, next month, or next
+// year, which is never what a one-shot means. The usual cause is an
+// agent computing the cron fields against a stale clock (e.g. the
+// session-start time in its prompt rather than the actual current
+// time), so the error names both the match that slipped by and the
+// next one.
+var ErrOneShotInPast = errors.New("one-shot schedule's fire time has already passed")
+
+// ErrOneShotDateInPast is the same rejection for a one-shot whose
+// slipped match was on an EARLIER DAY: the cron fields name a calendar
+// date that is already behind us, so the next match is a month or a
+// year out. It is a distinct sentinel because the remedy differs — the
+// caller must recompute the day-of-month/month fields, not just the
+// minute — and because the two are easy to confuse from the message
+// alone (both report a far-future next match).
+//
+// It wraps ErrOneShotInPast, so callers that only care that a one-shot
+// was rejected as stale can keep matching the single sentinel.
+var ErrOneShotDateInPast = fmt.Errorf("%w: its day-of-month/month name a date that is already behind us", ErrOneShotInPast)
 
 // Store keeps scheduled tasks for all sessions. Session tasks live only
 // in memory; durable tasks are additionally persisted to a JSON file so
@@ -184,11 +197,19 @@ func (s *Store) Create(sessionID, cronExpr, prompt string, recurring, durable bo
 	// that so users are not confused by sub-minute firing.
 	nextRun = nextRun.Truncate(time.Minute)
 
-	// A one-shot whose schedule already matched earlier today pinned a
-	// fire time that has passed; accepting it would store a task firing
-	// tomorrow or next year when the caller meant "in a few minutes".
-	if !recurring && matchedEarlierToday(sched, now) {
-		return Task{}, fmt.Errorf("%w: %q next matches %s", ErrOneShotInPast, cronExpr, nextRun.Format(time.RFC3339))
+	// A one-shot whose intended moment has already slipped by pinned a
+	// fire time that is now unrecoverable; accepting it would store a
+	// task firing next month or next year when the caller meant "in a
+	// few minutes".
+	if !recurring {
+		if slipped, ok := oneShotSlipped(sched, now, nextRun); ok {
+			kind := ErrOneShotInPast
+			if !sameDay(slipped, now) {
+				kind = ErrOneShotDateInPast
+			}
+			return Task{}, fmt.Errorf("%w: %q matched %s, which has passed, and does not match again until %s",
+				kind, cronExpr, slipped.Format(time.RFC3339), nextRun.Format(time.RFC3339))
+		}
 	}
 
 	id, err := NewTaskID()
@@ -213,20 +234,68 @@ func (s *Store) Create(sessionID, cronExpr, prompt string, recurring, durable bo
 	return *task, nil
 }
 
-// matchedEarlierToday reports whether the schedule's most recent match
-// is at or before the current minute today. A one-shot created after
-// such a match can only fire on a later day than its fields suggest —
-// the signature of cron fields computed against a stale clock. The
-// current minute counts as "already passed": robfig treats it as
-// consumed, so a schedule matching it next fires tomorrow or beyond.
-// Next returns the first match strictly after its argument, so the
-// cursor starts a second before midnight to include a "0 0 ..."
-// schedule firing exactly at midnight.
-func matchedEarlierToday(sched *Schedule, now time.Time) bool {
-	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	today := now.Truncate(time.Minute)
-	next := sched.Next(midnight.Add(-time.Second))
-	return !next.IsZero() && !next.After(today)
+// oneShotWindow is how far back a slipped match still counts as the
+// moment the caller meant, and how far ahead the next match may be
+// before the schedule is treated as unrecoverable. A one-shot is a
+// pinned instant, so both sides ask the same question: is there a
+// matching moment in the last day, and is the next one further off
+// than a day?
+const oneShotWindow = 24 * time.Hour
+
+// oneShotSlipped reports whether a one-shot's intended fire time has
+// already gone by, returning the match that slipped.
+//
+// Both halves are required, and each rules out a different false
+// positive:
+//
+//   - A match within the last day. Without it, "0 9 25 12 *" created in
+//     August — a legitimate one-shot four months out — looks identical
+//     to a stale one.
+//   - A next match more than a day out. Without it, "*/5 * * * *"
+//     created at 06:29 is rejected even though it fires at 06:30: a
+//     match did just slip by, but the caller loses nothing.
+//
+// Together they say: the fields describe a moment that just passed, and
+// the schedule will not come back around in time to be what the caller
+// asked for. That is the signature of cron fields computed against a
+// stale clock, and it holds across midnight — the previous form of this
+// check looked back only to midnight, so a schedule pinned to
+// yesterday's date sailed through and was stored to fire a year later
+// (issue #272).
+//
+// Next returns the first match strictly after its argument, so a match
+// landing exactly on the current minute counts as slipped: robfig
+// treats the current minute as consumed, and the stored next run would
+// jump a full period.
+func oneShotSlipped(sched *Schedule, now, next time.Time) (time.Time, bool) {
+	if next.IsZero() || next.Sub(now) <= oneShotWindow {
+		return time.Time{}, false
+	}
+	minute := now.Truncate(time.Minute)
+	slipped := sched.Next(now.Add(-oneShotWindow))
+	if slipped.IsZero() || slipped.After(minute) {
+		return time.Time{}, false
+	}
+	// Next walks forward, so land on the LAST match in the window rather
+	// than the first: "0 22,23 19 8 *" matched twice yesterday, and the
+	// message should name 23:00, the moment the caller most likely meant.
+	// Bounded by construction — the loop only advances through matches
+	// inside a 24h window that the schedule has already left behind.
+	for {
+		after := sched.Next(slipped)
+		if after.IsZero() || after.After(minute) {
+			return slipped, true
+		}
+		slipped = after
+	}
+}
+
+// sameDay reports whether a and b fall on the same calendar day. Both
+// come from the same clock, so they share a location.
+func sameDay(a, b time.Time) bool {
+	ay, am, ad := a.Date()
+	by, bm, bd := b.Date()
+	return ay == by && am == bm && ad == bd
 }
 
 // List returns the tasks belonging to sessionID, ordered by next run.

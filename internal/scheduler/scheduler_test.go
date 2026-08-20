@@ -348,18 +348,18 @@ func TestCreateRejectsScheduleThatNeverFires(t *testing.T) {
 	require.Empty(t, store.ListAll(), "a rejected task must not be stored")
 }
 
-// A one-shot pinned to a minute that already passed today must be
-// rejected: its next match has jumped to tomorrow or next year, which
-// is never what "remind me in 3 minutes" means. This is the signature
-// of cron fields computed against a stale clock. Recurring tasks are
-// exempt — "0 9 * * *" created at 10:30 legitimately fires tomorrow.
+// A one-shot pinned to a minute that already passed must be rejected:
+// its next match has jumped to tomorrow or next year, which is never
+// what "remind me in 3 minutes" means. This is the signature of cron
+// fields computed against a stale clock. Recurring tasks are exempt —
+// "0 9 * * *" created at 10:30 legitimately fires tomorrow.
 func TestCreateRejectsOneShotInPast(t *testing.T) {
 	t.Parallel()
 
 	// testStore's clock is 2026-07-27 10:30 local.
 	store := testStore(t)
 
-	// 09:15 today already passed: the next match is tomorrow.
+	// 09:15 today already passed: the next match is a year out.
 	_, err := store.Create("s1", "15 9 27 7 *", "stale-clock one-shot", false, false)
 	require.ErrorIs(t, err, ErrOneShotInPast)
 	require.Empty(t, store.ListAll(), "a rejected task must not be stored")
@@ -378,6 +378,94 @@ func TestCreateRejectsOneShotInPast(t *testing.T) {
 	// A daily recurring schedule whose time passed today is fine.
 	_, err = store.Create("s1", "0 9 * * *", "recurring 9am", true, false)
 	require.NoError(t, err)
+}
+
+// The guard has to survive midnight. A one-shot pinned to YESTERDAY's
+// date used to sail through, because the old check only looked back as
+// far as this morning's midnight: the next match was next year, which
+// is trivially "not earlier today", so the task was accepted and stored
+// to fire in 2027 (issue #272). The rejection now carries the more
+// specific ErrOneShotDateInPast, because the fix is to recompute the
+// date fields rather than just the minute.
+func TestCreateRejectsOneShotPinnedToAnEarlierDate(t *testing.T) {
+	t.Parallel()
+
+	store := testStore(t)
+	// One minute past midnight, 2026-07-28 — the reported scenario: a
+	// session that crossed midnight while the agent was computing.
+	store.now = func() time.Time {
+		return time.Date(2026, 7, 28, 0, 1, 0, 0, time.Local)
+	}
+
+	_, err := store.Create("s1", "22 22 27 7 *", "yesterday's date", false, false)
+	require.ErrorIs(t, err, ErrOneShotDateInPast)
+	require.ErrorIs(t, err, ErrOneShotInPast, "the specific error must still satisfy the general one")
+	require.Empty(t, store.ListAll(), "a rejected task must not be stored")
+
+	// The message must name BOTH the match that slipped and the next
+	// one. Reporting only the next match reads as the scheduler jumping
+	// a year for no reason, which is how issue #272 got misdiagnosed as
+	// a timezone bug.
+	require.Contains(t, err.Error(), "2026-07-27T22:22:00")
+	require.Contains(t, err.Error(), "2027-07-27T22:22:00")
+
+	// When several matches slipped inside the window, the message names
+	// the last one — the moment the caller most likely meant.
+	_, err = store.Create("s1", "0 22,23 27 7 *", "twice yesterday", false, false)
+	require.ErrorIs(t, err, ErrOneShotDateInPast)
+	require.Contains(t, err.Error(), "2026-07-27T23:00:00")
+	require.NotContains(t, err.Error(), "2026-07-27T22:00:00")
+
+	// Same clock, but the slip was earlier the same day: the general
+	// error, not the date-specific one.
+	store.now = func() time.Time {
+		return time.Date(2026, 7, 28, 23, 0, 0, 0, time.Local)
+	}
+	_, err = store.Create("s1", "22 22 28 7 *", "earlier today", false, false)
+	require.ErrorIs(t, err, ErrOneShotInPast)
+	require.NotErrorIs(t, err, ErrOneShotDateInPast)
+}
+
+// The guard must not reject a one-shot the caller can still use. Both
+// halves of the check earn their place here: a schedule that comes back
+// around within the day loses nothing to a slipped match, and a date
+// months out has no recent match to be confused by.
+func TestCreateAcceptsOneShotsThatStillFireSoon(t *testing.T) {
+	t.Parallel()
+
+	// testStore's clock is 2026-07-27 10:30 local.
+	store := testStore(t)
+
+	// Matched a minute ago AND matches again in a minute: the caller
+	// wanted "the next one", and gets it. The midnight-based guard used
+	// to reject this outright.
+	task, err := store.Create("s1", "*/5 * * * *", "next five-minute boundary", false, false)
+	require.NoError(t, err)
+	require.Equal(t, time.Date(2026, 7, 27, 10, 35, 0, 0, time.Local), task.NextRunAt)
+
+	// Matched at 20:00 yesterday, matches again at 20:00 tonight —
+	// inside the day, so "8pm" still means tonight.
+	task, err = store.Create("s1", "0 20 * * *", "8pm tonight", false, false)
+	require.NoError(t, err)
+	require.Equal(t, time.Date(2026, 7, 27, 20, 0, 0, 0, time.Local), task.NextRunAt)
+
+	// A legitimate far-future one-shot: no match in the last day, so
+	// nothing slipped. Christmas is four months out, not stale.
+	task, err = store.Create("s1", "0 9 25 12 *", "christmas morning", false, false)
+	require.NoError(t, err)
+	require.Equal(t, time.Date(2026, 12, 25, 9, 0, 0, 0, time.Local), task.NextRunAt)
+}
+
+// Store.Create takes no caller-supplied timestamp: the only clock is
+// s.now, which NewStore wires to time.Now. Issue #272 suspected a
+// prompt-derived time leaking in through a caller; this pins that there
+// is no seam for one to enter through, so the suspicion cannot silently
+// become true later.
+func TestStoreClockIsTimeNow(t *testing.T) {
+	t.Parallel()
+
+	store := NewStore("")
+	require.WithinDuration(t, time.Now(), store.now(), time.Minute)
 }
 
 // The same guard has to hold on the rescheduling path. A recurring task
