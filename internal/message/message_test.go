@@ -91,6 +91,21 @@ func (c *eventCollector) reset() {
 	c.events = nil
 }
 
+// waitForEvents blocks until the collector has seen at least n events.
+//
+// Use this instead of sleeping before reset(): the publish path is
+// asynchronous, so a fixed sleep is a bet on scheduler latency that a loaded
+// CI runner will eventually lose. When it does, reset() clears an empty slice
+// and the straggler shows up in the next snapshot, so the failure surfaces as
+// a wrong event count in an unrelated assertion.
+func waitForEvents(t *testing.T, c *eventCollector, n int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return len(c.snapshot()) >= n
+	}, 5*time.Second, time.Millisecond,
+		"expected at least %d event(s) before continuing", n)
+}
+
 func TestUpdate_DebouncesTextDeltas(t *testing.T) {
 	t.Parallel()
 
@@ -106,8 +121,11 @@ func TestUpdate_DebouncesTextDeltas(t *testing.T) {
 		Role: Assistant,
 	})
 	require.NoError(t, err)
-	// Drop the CreatedEvent emitted by Create.
-	time.Sleep(5 * time.Millisecond)
+	// Drop the CreatedEvent emitted by Create — but wait for it to actually
+	// arrive first. A fixed sleep is a guess about scheduler latency: when it
+	// loses, reset() clears nothing, the create event lands afterwards, and
+	// the assertion below counts it alongside the event under test.
+	waitForEvents(t, collector, 1)
 	collector.reset()
 
 	// Push 5 deltas inside a single debounce window.
@@ -147,7 +165,7 @@ func TestUpdate_TerminalUpdatesFlushSynchronously(t *testing.T) {
 
 	msg, err := svc.Create(t.Context(), sessionID, CreateMessageParams{Role: Assistant})
 	require.NoError(t, err)
-	time.Sleep(5 * time.Millisecond)
+	waitForEvents(t, collector, 1)
 	collector.reset()
 
 	// AddFinish makes the message terminal; Update must flush
