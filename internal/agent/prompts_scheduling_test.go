@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/crush/internal/agent/prompt"
@@ -38,10 +39,14 @@ func TestCoderPromptSchedulingGate(t *testing.T) {
 // With the section off, the rendered prompt must be byte-identical to what
 // it was before the section existed — a stray blank line left behind by the
 // {{if}} is still a cassette-breaking diff, and it is invisible in review.
+//
+// Newlines are normalized first: the template is checked out CRLF on
+// Windows, so an \n-only assertion fails there for a reason that has
+// nothing to do with the gate.
 func TestCoderPromptSchedulingOffLeavesNoWhitespace(t *testing.T) {
 	t.Parallel()
 
-	off := renderCoderTemplate(t, prompt.PromptDat{})
+	off := strings.ReplaceAll(renderCoderTemplate(t, prompt.PromptDat{}), "\r\n", "\n")
 	require.Contains(t, off, "</bash_commands>\n</tool_usage>",
 		"the disabled scheduling gate left whitespace between the sections")
 }
