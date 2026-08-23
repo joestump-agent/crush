@@ -125,18 +125,24 @@ func queueList(queueItems []string, t *styles.Styles) string {
 	return strings.Join(lines, "\n")
 }
 
-// cronPill renders the scheduled-task count pill.
+// cronPill renders the scheduled-task count pill. The glyph matches the
+// stopwatch used by the harness TUI for scheduled entries, not a clock
+// emoji — keeping the pills panel visually consistent with the rest of
+// the TUI's geometric icon set.
 func cronPill(tasks []scheduler.Task, t *styles.Styles) string {
 	if len(tasks) == 0 {
 		return ""
 	}
-	icon := t.Pills.QueueLabel.Render("⏰")
+	icon := t.Pills.QueueLabel.Render(styles.CronOneShotIcon)
 	label := t.Pills.QueueLabel.Render(fmt.Sprintf("%d Scheduled", len(tasks)))
 	content := fmt.Sprintf("%s %s", icon, label)
 	return t.Pills.Focused.Render(content)
 }
 
-// cronList renders the expanded scheduled-task list.
+// cronList renders the expanded scheduled-task list. Each item's prefix
+// glyph distinguishes recurring (↻) from one-shot (⏱) tasks so the
+// recurrence state is legible at a glance without expanding the full
+// tool-call body.
 func cronList(tasks []scheduler.Task, t *styles.Styles) string {
 	if len(tasks) == 0 {
 		return ""
@@ -152,18 +158,30 @@ func cronList(tasks []scheduler.Task, t *styles.Styles) string {
 		if ansi.StringWidth(prompt) > maxQueueDisplayLength {
 			prompt = ansi.Truncate(prompt, maxQueueDisplayLength-1, "…")
 		}
-		recurring := ""
-		if task.Recurring {
-			recurring = " ↻"
-		}
-		text := fmt.Sprintf("%s %s%s — %s", task.ID, nextRun, recurring, prompt)
-		// A clock prefix keeps scheduled tasks distinct from the queued-prompt
+		// Recurrence is carried by the prefix glyph; repeating it inline
+		// would print ↻ twice on the same row.
+		text := fmt.Sprintf("%s %s — %s", task.ID, nextRun, prompt)
+		// The prefix glyph distinguishes recurring from one-shot tasks,
+		// keeping scheduled items visually distinct from the queued-prompt
 		// list directly above them when both sections are expanded.
-		prefix := t.Pills.CronItemPrefix.Render() + " "
+		prefix := cronItemPrefix(task, t) + " "
 		lines = append(lines, prefix+t.Pills.QueueItemText.Render(text))
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// cronItemPrefix returns the glyph prefix for a scheduled-task list
+// item: ↻ for recurring, ⏱ for one-shot.
+func cronItemPrefix(task scheduler.Task, t *styles.Styles) string {
+	if task.Recurring {
+		// Tool.CronRecurringIcon carries no SetString — unlike the Pills
+		// styles, which do — so the glyph has to be passed in. Rendering
+		// it with no argument styles the empty string and the row loses
+		// its prefix entirely.
+		return t.Tool.CronRecurringIcon.Render(styles.CronRecurringIcon)
+	}
+	return t.Pills.CronItemPrefix.Render()
 }
 
 // pillsHeightReasonableTerminalHeight is the minimum terminal height at which

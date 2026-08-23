@@ -268,7 +268,12 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 	// TODO: make this dynamic when we support multiple agents
 	// A2UI is on unless the user disables it; see prompt.WithA2UI for the
 	// host-capability trade-off.
-	promptOpts := []prompt.Option{prompt.WithWorkingDir(c.cfg.WorkingDir())}
+	// The cron tools below are registered unconditionally in buildAgent, so
+	// the matching prompt guidance is always on for the coder agent.
+	promptOpts := []prompt.Option{
+		prompt.WithWorkingDir(c.cfg.WorkingDir()),
+		prompt.WithScheduling(),
+	}
 	if !c.cfg.Config().Options.DisableA2UI {
 		promptOpts = append(promptOpts, prompt.WithA2UI())
 		// The dashboard push channel (#57) exists only when a Sidekick

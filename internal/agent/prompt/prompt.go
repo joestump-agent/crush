@@ -30,6 +30,7 @@ type Prompt struct {
 	workingDir     string
 	a2ui           bool
 	sidekickUpdate bool
+	scheduling     bool
 }
 
 type PromptDat struct {
@@ -48,6 +49,7 @@ type PromptDat struct {
 	A2UI               bool
 	A2UIVersion        string
 	SidekickUpdate     bool
+	Scheduling         bool
 }
 
 type ContextFile struct {
@@ -95,6 +97,18 @@ func WithA2UI() Option {
 func WithSidekickUpdate() Option {
 	return func(p *Prompt) {
 		p.sidekickUpdate = true
+	}
+}
+
+// WithScheduling enables the template's scheduling guidance, which tells the
+// model to reach for the CronCreate / CronList / CronDelete tools instead of
+// bash sleep loops. Guidance follows the tool: callers that build a coder
+// prompt without registering the cron tools — the agent package's own tests
+// among them — leave it off, so the model is never pointed at a tool it does
+// not have.
+func WithScheduling() Option {
+	return func(p *Prompt) {
+		p.scheduling = true
 	}
 }
 
@@ -249,6 +263,7 @@ func (p *Prompt) promptData(ctx context.Context, provider, model string, store *
 		A2UI:           p.a2ui,
 		A2UIVersion:    a2ui.Version,
 		SidekickUpdate: p.sidekickUpdate,
+		Scheduling:     p.scheduling,
 	}
 	if isGit {
 		var err error
