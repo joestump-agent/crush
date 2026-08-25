@@ -363,25 +363,12 @@ func (s *runStream) handle(ev any, stopSpinner func()) (done bool, err error) {
 		stop()
 
 		content := msg.Content().String()
-		readBytes := s.read[msg.ID]
-		if len(content) < readBytes {
-			// The message was rewritten or the stream reset: the
-			// cursor is stale. Re-emit from the start rather than
-			// killing the run.
-			slog.Warn("Non-interactive: message content shrank; resetting stream cursor",
-				"message_length", len(content), "read_bytes", readBytes)
-			readBytes = 0
-		}
-
-		part := content[readBytes:]
-		if readBytes == 0 {
-			part = strings.TrimLeft(part, " \t")
-		}
+		part, next := format.NextStreamChunk(content, s.read[msg.ID])
 		if s.printed || strings.TrimSpace(part) != "" {
 			s.printed = true
 			fmt.Fprint(s.out, part)
 		}
-		s.read[msg.ID] = len(content)
+		s.read[msg.ID] = next
 		return false, nil
 
 	case pubsub.Event[proto.RunComplete]:
