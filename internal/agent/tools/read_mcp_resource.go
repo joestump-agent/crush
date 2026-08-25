@@ -42,6 +42,12 @@ const a2uiMIMEType = mcp.A2UIJSONMIMEType
 type ReadMCPResourceResponseMetadata struct {
 	A2UISurfaces         []string `json:"a2ui_surfaces,omitempty"`
 	MCPSurfaceProvenance []string `json:"mcp_surface_provenance,omitempty"`
+	// TextIsModelOnly marks the tool's text content as written for the
+	// model alone, so the chat renderer draws the surfaces and stops —
+	// rather than repeating a digest of the same results underneath them.
+	// Resource reads leave this false: their text is the resource's own
+	// content and belongs to the user as much as the surface does.
+	TextIsModelOnly bool `json:"a2ui_text_model_only,omitempty"`
 }
 
 // A2UISurfacePlaceholderPrefix starts every model-facing placeholder that

@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"charm.land/fantasy"
-
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/semantic"
 )
 
@@ -21,7 +21,7 @@ type SemanticSearchParams struct {
 // NewSemanticSearchTool creates a semantic search tool backed by the
 // given semantic store. If store is nil the tool returns an error
 // indicating the index is not available.
-func NewSemanticSearchTool(store *semantic.Store, client *semantic.Client) fantasy.AgentTool {
+func NewSemanticSearchTool(cfg *config.ConfigStore, store *semantic.Store, client *semantic.Client) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		SemanticSearchToolName,
 		semanticSearchDescription(),
@@ -63,24 +63,26 @@ func NewSemanticSearchTool(store *semantic.Store, client *semantic.Client) fanta
 				return fantasy.NewTextResponse("No results found for this query."), nil
 			}
 
-			var b strings.Builder
-			fmt.Fprintf(&b, "Found %d results:\n\n", len(results))
+			hits := make([]semanticSearchHit, len(results))
 			for i, r := range results {
-				fmt.Fprintf(&b, "%d. %s", i+1, r.Path)
-				if r.Symbol != "" {
-					fmt.Fprintf(&b, " :: %s", r.Symbol)
+				hits[i] = semanticSearchHit{
+					Path:      r.Path,
+					Symbol:    r.Symbol,
+					StartLine: r.StartLine,
+					EndLine:   r.EndLine,
+					Score:     r.Score,
+					Snippet:   r.Content,
 				}
-				fmt.Fprintf(&b, " (lines %d-%d, score %.3f)\n", r.StartLine+1, r.EndLine+1, r.Score)
-
-				snippet := r.Content
-				lines := strings.Split(snippet, "\n")
-				if len(lines) > 5 {
-					snippet = strings.Join(lines[:5], "\n") + "\n..."
-				}
-				fmt.Fprintf(&b, "   %s\n\n", strings.ReplaceAll(snippet, "\n", "\n   "))
 			}
 
-			return fantasy.NewTextResponse(b.String()), nil
+			// With a chat UI attached, the result card renders as a live
+			// A2UI surface in the tool bubble and the model gets the snippet-
+			// free digest; otherwise the tool behaves exactly as before.
+			if semanticDivert(ctx, cfg) {
+				resp := fantasy.NewTextResponse(semanticSearchDigest(hits, false))
+				return withSemanticSurface(resp, a2uiSurfaceIDPrefix+"search", semanticSearchSurface(params.Query, hits)), nil
+			}
+			return fantasy.NewTextResponse(semanticSearchDigest(hits, true)), nil
 		},
 	)
 }

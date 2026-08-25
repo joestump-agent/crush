@@ -242,3 +242,51 @@ func TestGenericToolA2UICollapse(t *testing.T) {
 	require.NotContains(t, outExpanded, "lines hidden")
 	require.Contains(t, outExpanded, "row a0")
 }
+
+// A tool whose text is a model-facing digest of the very results its
+// surface draws (semantic_search, semantic_index) must not have that digest
+// rendered underneath the card — the user would read the same hits twice,
+// once styled and once flat.
+func TestGenericToolModelOnlyTextIsHidden(t *testing.T) {
+	t.Parallel()
+
+	meta, err := json.Marshal(tools.ReadMCPResourceResponseMetadata{
+		A2UISurfaces:    []string{a2uiSurface},
+		TextIsModelOnly: true,
+	})
+	require.NoError(t, err)
+
+	sty := styles.CharmtonePantera()
+	ctx := &GenericToolRenderContext{}
+	out := ctx.RenderTool(&sty, 100, genericToolOptsFor(t, tools.SemanticSearchToolName, &message.ToolResult{
+		Content:  "Found 1 results:\n\n1. main.go :: Hello (lines 1-3, score 0.912)\n",
+		Metadata: string(meta),
+	}))
+	plain := ansi.Strip(out)
+
+	require.Contains(t, plain, "Hello from A2UI")
+	require.NotContains(t, plain, "Found 1 results")
+	require.NotContains(t, plain, "score 0.912")
+}
+
+// The flag is opt-in: a resource read leaves it unset, and its text still
+// belongs to the user alongside the surface.
+func TestGenericToolTextShownWhenNotModelOnly(t *testing.T) {
+	t.Parallel()
+
+	meta, err := json.Marshal(tools.ReadMCPResourceResponseMetadata{
+		A2UISurfaces: []string{a2uiSurface},
+	})
+	require.NoError(t, err)
+
+	sty := styles.CharmtonePantera()
+	ctx := &GenericToolRenderContext{}
+	out := ctx.RenderTool(&sty, 100, genericToolOpts(t, &message.ToolResult{
+		Content:  a2uiTestPlaceholder + "\nreal resource prose",
+		Metadata: string(meta),
+	}))
+	plain := ansi.Strip(out)
+
+	require.Contains(t, plain, "Hello from A2UI")
+	require.Contains(t, plain, "real resource prose")
+}

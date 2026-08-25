@@ -83,7 +83,7 @@ func (b *MCPToolRenderContext) RenderTool(sty *styles.Styles, width int, opts *T
 	if opts.Result.Metadata != "" {
 		var meta tools.ReadMCPResourceResponseMetadata
 		if err := json.Unmarshal([]byte(opts.Result.Metadata), &meta); err == nil && len(meta.A2UISurfaces) > 0 {
-			return joinToolParts(header, renderToolA2UIResultBody(sty, meta.A2UISurfaces, opts, widths))
+			return joinToolParts(header, renderToolA2UIResultBody(sty, meta, opts, widths))
 		}
 	}
 
