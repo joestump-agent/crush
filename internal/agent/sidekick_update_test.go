@@ -88,7 +88,11 @@ func TestSidekickDashboardSubscribeDeliversToolPushes(t *testing.T) {
 	agentCfg := config.Agent{ID: config.AgentCoder, AllowedTools: []string{tools.SidekickUpdateToolName}}
 	built, err := coord.buildTools(t.Context(), agentCfg, false)
 	require.NoError(t, err)
-	require.Len(t, built, 1)
+	// AllowedTools admits exactly one built-in. A longer list means MCP
+	// tools leaked in (AllowedMCP is nil here, so MCP servers bypass the
+	// AllowedTools filter) — see isolateGlobalConfig in agent_test.go.
+	require.Len(t, built, 1, "expected only %s; got %v", tools.SidekickUpdateToolName, toolNames(built))
+	require.Equal(t, tools.SidekickUpdateToolName, built[0].Info().Name)
 
 	const payload = `{"version":"v0.9","updateComponents":{"surfaceId":"s1","components":[{"component":"Text","id":"t","text":"Step 1/3"}]}}`
 	input, err := json.Marshal(map[string]string{"surface": payload})

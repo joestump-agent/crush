@@ -26,30 +26,54 @@ import (
 
 func TestMain(m *testing.M) {
 	slog.SetLogLoggerLevel(slog.LevelError)
-	defer isolateGlobalConfig()()
-	m.Run()
+	cleanup := isolateGlobalConfig()
+	code := m.Run()
+	cleanup()
+	os.Exit(code)
 }
 
-// isolateGlobalConfig points the global config and data JSON paths at a
-// throwaway directory for the whole package.
+// isolateGlobalConfig points every global Crush lookup at a throwaway
+// directory tree for the lifetime of the test binary, and returns the
+// func that tears it down.
 //
-// Tests here call config.Init, which always merges the user-level
-// crush.json on top of the project config. On a developer machine that
-// file carries real MCP servers, so without this the tests spawn the
-// developer's actual MCP processes and count their tools — tool-list
-// assertions then fail with counts nobody can reproduce, and VCR
-// cassettes stop matching. CI only passes because its runners have no
-// user config. Env vars, not t.Setenv: the tests run in parallel.
+// config.Init always merges the user-level config locations on top of
+// the working dir, so without this the package loads the developer's
+// real ~/.config/crush/crush.json: their providers, LSPs, global
+// CRUSH.md context, skills, and — most visibly — their MCP servers,
+// which mcp.Initialize then actually connects to. Those servers'
+// tools land in every buildTools result, because an agent with a nil
+// AllowedMCP means "no MCP restrictions" and so bypasses the
+// AllowedTools filter entirely. A test asserting an exact tool list
+// then fails on a developer machine and passes in CI, which is how
+// TestSidekickDashboardSubscribeDeliversToolPushes came to report 129
+// tools where it expects 1.
 //
-// It returns a cleanup func for the caller to defer.
+// This has to happen once, before m.Run: the tests in this package run
+// under t.Parallel(), which forbids t.Setenv.
 func isolateGlobalConfig() func() {
-	dir, err := os.MkdirTemp("", "crush-agent-test-config")
+	root, err := os.MkdirTemp("", "crush-agent-test-*")
 	if err != nil {
 		panic(fmt.Sprintf("isolate global config: %v", err))
 	}
-	os.Setenv("CRUSH_GLOBAL_CONFIG", dir)
-	os.Setenv("CRUSH_GLOBAL_DATA", dir)
-	return func() { os.RemoveAll(dir) }
+	// CRUSH_SKILLS_DIR replaces the whole default skills search path,
+	// which otherwise reaches into ~/.claude/skills and friends.
+	// XDG_CONFIG_HOME covers the home.Config() lookups that have no
+	// dedicated override (crush/ignore, git/ignore, commands).
+	for envVar, dir := range map[string]string{
+		"CRUSH_GLOBAL_CONFIG": filepath.Join(root, "config", "crush"),
+		"CRUSH_GLOBAL_DATA":   filepath.Join(root, "data", "crush"),
+		"CRUSH_CACHE_DIR":     filepath.Join(root, "cache"),
+		"CRUSH_SKILLS_DIR":    filepath.Join(root, "skills"),
+		"XDG_CONFIG_HOME":     filepath.Join(root, "config"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			panic(fmt.Sprintf("isolate global config: %v", err))
+		}
+		if err := os.Setenv(envVar, dir); err != nil {
+			panic(fmt.Sprintf("isolate global config: %v", err))
+		}
+	}
+	return func() { os.RemoveAll(root) }
 }
 
 var modelPairs = []modelPair{
