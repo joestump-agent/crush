@@ -53,7 +53,7 @@ The additions, in brief:
 | Addition | What it is |
 | --- | --- |
 | [Sidekick](/features/sidekick) | A second, ephemeral agent in the sidebar, plus a pinned dashboard the main agent pushes A2UI status to |
-| [Channels](/features/channels) | MCP servers that push events into your session, with deterministic reply routing |
+| [Channels](/features/channels) | The push mechanism is upstream; the fork adds the `channel_enabled` config key and deterministic reply routing |
 | [A2UI](/features/a2ui) | Inline rendering of A2UI surfaces via [a2tea](https://github.com/joestump-agent/a2tea), including interactive round-trips |
 | [Scheduled tasks](/features/scheduled-tasks) | `CronCreate` / `CronList` / `CronDelete` tools that re-run prompts on a cron schedule |
 | [Semantic search](/features/semantic-search) | A local sqlite-vec index over the repo, searched by meaning |

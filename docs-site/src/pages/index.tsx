@@ -111,8 +111,8 @@ function Fork(): ReactNode {
                 in the sidebar, plus a pushed A2UI dashboard
               </li>
               <li>
-                <Link to="/features/channels">Channels</Link> — MCP servers that
-                push events into your session
+                <Link to="/features/channels">Channel reply routing</Link> —
+                deterministic replies back through the pushing server
               </li>
               <li>
                 <Link to="/features/a2ui">A2UI rendering</Link> via{' '}

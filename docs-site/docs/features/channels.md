@@ -7,9 +7,11 @@ description: MCP servers that push real-time events into your session — CI fai
 
 # Channels
 
-:::info[Fork feature]
-Channels are an addition in the `joestump-agent/crush` fork. They are
-experimental and the shape may change.
+:::info[Partly a fork feature]
+The channel push mechanism and the `--channels` flag are upstream Crush,
+though undocumented there. The `channel_enabled` config key and
+[reply routing](#reply-routing) are additions in the `joestump-agent/crush`
+fork. All of it is experimental and the shape may change.
 :::
 
 An MCP server can act as a **channel**: instead of only exposing tools that
@@ -49,7 +51,8 @@ crush --channels server:webhook
 crush --channels server:webhook --channels server:signal
 ```
 
-Or persistently, with `channel_enabled` on the server's `mcp` entry:
+Or persistently, with `channel_enabled` on the server's `mcp` entry — a fork
+addition, so upstream Crush needs the flag on every launch:
 
 ```json
 {
@@ -67,6 +70,10 @@ Either source enables the channel — but the server must still declare the
 capability. Servers that are live channels are marked `channel` in the MCP list.
 
 ## Reply routing
+
+:::info[Fork feature]
+`channel_reply` does not exist upstream.
+:::
 
 By default a channel-originated turn only produces terminal output, so a person
 messaging you on Signal never sees the answer unless the model happens to call a
