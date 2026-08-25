@@ -1,0 +1,621 @@
+/*
+ * Crush Docs — Charm Design System Bridge
+ *
+ * Docusaurus ships Infima, which owns the chrome through its own `--ifm-*`
+ * custom properties. Rather than fight it, this file re-points every Infima
+ * variable that matters at a Charm token, so the whole site inherits CharmTone
+ * colour, Charm's type scale, and Charm's radii without hand-styling each
+ * component. Anything Infima has no variable for gets a short override below.
+ *
+ * The rule that keeps this maintainable: never write a literal colour in this
+ * file. Every value is `var(--<charm token>)`, and the tokens live in
+ * `tokens/semantic.css` (roles) and `tokens/charmtone.css` (palette).
+ *
+ * @joestump-agent 08/25/2026 - Initial Charm bridge for the MVP docs site.
+ */
+
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&display=swap");
+@import "./tokens/charmtone.css";
+@import "./tokens/semantic.css";
+
+/* ---------------------------------------------------------------- Infima */
+
+:root {
+  --ifm-color-primary: var(--charmtone-charple);
+  --ifm-color-primary-dark: var(--charmtone-darple);
+  --ifm-color-primary-darker: var(--charmtone-jelly);
+  --ifm-color-primary-darkest: var(--charmtone-ox);
+  --ifm-color-primary-light: var(--charmtone-larple);
+  --ifm-color-primary-lighter: var(--charmtone-hazy);
+  --ifm-color-primary-lightest: var(--charmtone-orchid);
+
+  --ifm-background-color: var(--surface-base);
+  --ifm-background-surface-color: var(--surface-raised);
+
+  --ifm-font-family-base: var(--font-sans);
+  --ifm-font-family-monospace: var(--font-mono);
+  --ifm-heading-font-family: var(--font-display);
+  --ifm-font-weight-semibold: var(--font-weight-semibold);
+  --ifm-font-weight-bold: var(--font-weight-bold);
+  --ifm-heading-font-weight: var(--font-weight-bold);
+
+  --ifm-font-color-base: var(--fg-default);
+  --ifm-heading-color: var(--fg-default);
+  --ifm-link-color: var(--link);
+  --ifm-link-hover-color: var(--link-hover);
+
+  --ifm-global-radius: var(--radius-md);
+  --ifm-code-border-radius: var(--radius-sm);
+  --ifm-alert-border-radius: var(--radius-lg);
+  --ifm-button-border-radius: var(--radius-pill);
+
+  --ifm-toc-border-color: var(--border-subtle);
+  --ifm-hr-border-color: var(--border-subtle);
+  --ifm-table-border-color: var(--border-subtle);
+  --ifm-table-stripe-background: var(--surface-sunken);
+  --ifm-blockquote-color: var(--fg-muted);
+  --ifm-blockquote-border-color: var(--accent);
+
+  --ifm-code-font-size: 88%;
+  --ifm-code-background: var(--surface-sunken);
+  --docusaurus-highlighted-code-line-bg: rgba(107, 80, 255, 0.16);
+
+  --ifm-navbar-background-color: var(--surface-base);
+  --ifm-navbar-shadow: inset 0 -1px 0 var(--border-subtle);
+  --ifm-navbar-link-color: var(--fg-muted);
+  --ifm-navbar-link-hover-color: var(--fg-default);
+
+  --ifm-footer-background-color: var(--surface-sunken);
+  --ifm-footer-color: var(--fg-muted);
+  --ifm-footer-link-color: var(--fg-muted);
+  --ifm-footer-link-hover-color: var(--link);
+  --ifm-footer-title-color: var(--fg-default);
+
+  --ifm-menu-color: var(--fg-muted);
+  --ifm-menu-color-active: var(--accent);
+  --ifm-menu-color-background-active: transparent;
+  --ifm-menu-color-background-hover: var(--surface-sunken);
+
+  --ifm-transition-fast: var(--motion-fast);
+  --ifm-transition-slow: var(--motion-slow);
+}
+
+[data-theme="dark"] {
+  --ifm-color-primary: var(--charmtone-dolly);
+  --ifm-color-primary-dark: var(--charmtone-pony);
+  --ifm-color-primary-darker: var(--charmtone-macaron);
+  --ifm-color-primary-darkest: var(--charmtone-urchin);
+  --ifm-color-primary-light: var(--charmtone-blush);
+  --ifm-color-primary-lighter: var(--charmtone-lilac);
+  --ifm-color-primary-lightest: var(--charmtone-mochi);
+
+  --docusaurus-highlighted-code-line-bg: rgba(255, 96, 255, 0.14);
+}
+
+/* ------------------------------------------------------------ Typography */
+
+html {
+  font-synthesis-weight: none;
+}
+
+body {
+  background-color: var(--surface-base);
+  color: var(--fg-default);
+  font-weight: var(--font-weight-regular);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  letter-spacing: -0.02em;
+}
+
+h1 {
+  font-size: var(--text-4xl);
+  line-height: var(--leading-tight);
+}
+
+.markdown h2 {
+  font-size: var(--text-2xl);
+  margin-top: var(--space-12);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.markdown h3 {
+  font-size: var(--text-xl);
+  margin-top: var(--space-8);
+}
+
+.markdown > p,
+.markdown li {
+  line-height: var(--leading-relaxed);
+}
+
+/*
+ * Charm is a terminal company; inline code is the house voice, so it gets a
+ * real box rather than Infima's tinted text run.
+ */
+code {
+  border: 1px solid var(--border-subtle);
+  background-color: var(--surface-sunken);
+  color: var(--accent);
+  font-weight: var(--font-weight-medium);
+  padding: 0.1rem 0.35rem;
+}
+
+[data-theme="dark"] code {
+  color: var(--charmtone-zest);
+}
+
+a code {
+  color: inherit;
+}
+
+pre code {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+kbd {
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  background-color: var(--surface-raised);
+  color: var(--fg-default);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  padding: 0.15rem 0.4rem;
+}
+
+/* --------------------------------------------------------------- Chrome */
+
+.navbar {
+  backdrop-filter: blur(12px);
+  background-color: var(--surface-overlay);
+}
+
+.navbar__title {
+  font-family: var(--font-mono);
+  font-weight: var(--font-weight-bold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.navbar__link--active,
+.menu__link--active {
+  font-weight: var(--font-weight-semibold);
+}
+
+.menu__link {
+  border-radius: var(--radius-sm);
+}
+
+.menu__list-item-collapsible:hover,
+.menu__link:hover {
+  background-color: var(--surface-sunken);
+}
+
+.table-of-contents__link--active {
+  font-weight: var(--font-weight-semibold);
+}
+
+.theme-doc-sidebar-container {
+  border-right: 1px solid var(--border-subtle) !important;
+}
+
+.pagination-nav__link {
+  border-color: var(--border-subtle);
+  border-radius: var(--radius-lg);
+  transition: border-color var(--motion-base) var(--ease-out);
+}
+
+.pagination-nav__link:hover {
+  border-color: var(--accent);
+}
+
+/*
+ * Infima's `.footer--dark` hard-codes its own near-black palette, which wins
+ * over the --ifm-footer-* variables above and lands unreadable grey-on-grey in
+ * either theme. Re-state the Charm tokens on the modifier class so the footer
+ * reads in both.
+ */
+.footer,
+.footer--dark {
+  border-top: 1px solid var(--border-subtle);
+  background-color: var(--surface-sunken);
+  color: var(--fg-muted);
+}
+
+.footer--dark .footer__title {
+  color: var(--fg-default);
+}
+
+.footer--dark .footer__link-item,
+.footer--dark .footer__copyright {
+  color: var(--fg-muted);
+}
+
+.footer--dark .footer__link-item:hover {
+  color: var(--link);
+}
+
+.theme-code-block {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg) !important;
+  box-shadow: none !important;
+}
+
+/*
+ * Admonitions. Infima builds every callout from its own --ifm-color-<intent>
+ * family, so re-pointing those four families at the Charm intent tokens themes
+ * :::note / :::tip / :::warning / :::danger in one place.
+ */
+:root {
+  --ifm-color-info: var(--intent-info);
+  --ifm-color-success: var(--intent-success);
+  --ifm-color-warning: var(--intent-warning);
+  --ifm-color-danger: var(--intent-danger);
+  --ifm-color-secondary: var(--border-strong);
+}
+
+.theme-admonition {
+  border: 1px solid var(--border-default);
+  border-left: 3px solid var(--ifm-alert-border-color, var(--accent));
+  background-color: var(--surface-raised);
+  color: var(--fg-default);
+  box-shadow: none;
+}
+
+/*
+ * The tinted background Infima computes from the intent colour is too loud on
+ * the near-black app surface, so the callout keeps the Raised surface and the
+ * intent shows only in the left rule and the heading.
+ */
+.theme-admonition .admonitionHeading_Gvgb,
+.theme-admonition div[class^='admonitionHeading'] {
+  color: var(--ifm-alert-border-color, var(--accent));
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.08em;
+}
+
+.alert {
+  border: 1px solid var(--border-default);
+  border-left-width: 3px;
+}
+
+table {
+  display: table;
+  width: 100%;
+}
+
+table th {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-subtle);
+}
+
+/* ------------------------------------------------------------ Home page */
+
+.charmHero {
+  position: relative;
+  overflow: hidden;
+  padding: var(--space-20) var(--space-4) var(--space-12);
+  text-align: center;
+  background-color: var(--surface-base);
+}
+
+/* The Charple glow behind the hero — the one piece of pure ornament here. */
+.charmHero::before {
+  content: "";
+  position: absolute;
+  inset: -40% 20% auto;
+  height: 70vh;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(107, 80, 255, 0.28),
+    transparent 65%
+  );
+  pointer-events: none;
+}
+
+[data-theme="dark"] .charmHero::before {
+  background: radial-gradient(
+    ellipse at center,
+    rgba(255, 96, 255, 0.16),
+    rgba(107, 80, 255, 0.22) 40%,
+    transparent 70%
+  );
+}
+
+.charmHero__inner {
+  position: relative;
+  margin: 0 auto;
+  max-width: 56rem;
+}
+
+.charmHero__eyebrow {
+  display: inline-block;
+  margin-bottom: var(--space-6);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-pill);
+  background-color: var(--surface-raised);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.charmHero__title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: clamp(3rem, 12vw, 7rem);
+  font-weight: var(--font-weight-bold);
+  letter-spacing: -0.04em;
+  line-height: 0.95;
+  text-transform: uppercase;
+  background: linear-gradient(
+    100deg,
+    var(--charmtone-charple),
+    var(--charmtone-urchin) 45%,
+    var(--charmtone-dolly)
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+[data-theme="dark"] .charmHero__title {
+  background: linear-gradient(
+    100deg,
+    var(--charmtone-hazy),
+    var(--charmtone-dolly) 50%,
+    var(--charmtone-cheeky)
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+}
+
+.charmHero__tagline {
+  margin: var(--space-6) auto 0;
+  max-width: 40rem;
+  color: var(--fg-default);
+  font-size: var(--text-xl);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--leading-tight);
+}
+
+.charmHero__subtitle {
+  margin: var(--space-3) auto 0;
+  max-width: 38rem;
+  color: var(--fg-muted);
+  font-size: var(--text-lg);
+  line-height: var(--leading-relaxed);
+}
+
+.charmHero__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  justify-content: center;
+  margin-top: var(--space-8);
+}
+
+/*
+ * Charm buttons press down rather than light up: the resting state carries a
+ * shadow, and hover removes it while nudging the button a pixel into the page.
+ */
+.charmButton {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-6);
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  font-weight: var(--font-weight-semibold);
+  text-decoration: none !important;
+  transition:
+    transform var(--motion-fast) var(--ease-out),
+    box-shadow var(--motion-fast) var(--ease-out),
+    background-color var(--motion-fast) var(--ease-out);
+}
+
+.charmButton--primary {
+  background-color: var(--accent);
+  color: var(--fg-on-accent);
+  box-shadow: 0 3px 0 0 var(--accent-hover);
+}
+
+.charmButton--primary:hover {
+  background-color: var(--accent-hover);
+  color: var(--fg-on-accent);
+  transform: translateY(2px);
+  box-shadow: 0 1px 0 0 var(--accent-hover);
+}
+
+.charmButton--ghost {
+  border-color: var(--border-strong);
+  background-color: transparent;
+  color: var(--fg-default);
+}
+
+.charmButton--ghost:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: translateY(1px);
+}
+
+.charmHero__install {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-8);
+  padding: var(--space-3) var(--space-5);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-pill);
+  background-color: var(--surface-sunken);
+  color: var(--fg-default);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.charmHero__install span[aria-hidden] {
+  color: var(--accent);
+}
+
+.charmShot {
+  margin: var(--space-12) auto 0;
+  max-width: 74rem;
+  padding: 0 var(--space-4);
+}
+
+.charmShot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: var(--radius-xl);
+  filter: drop-shadow(0 30px 60px rgba(0, 0, 0, 0.35));
+}
+
+.charmSection {
+  padding: var(--space-20) var(--space-4);
+}
+
+.charmSection--sunken {
+  background-color: var(--surface-sunken);
+  border-block: 1px solid var(--border-subtle);
+}
+
+.charmSection__inner {
+  margin: 0 auto;
+  max-width: 74rem;
+}
+
+.charmSection__eyebrow {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.charmSection__title {
+  margin: var(--space-2) 0 var(--space-3);
+  font-size: var(--text-3xl);
+  font-weight: var(--font-weight-bold);
+  letter-spacing: -0.03em;
+}
+
+.charmSection__lede {
+  margin: 0 0 var(--space-10);
+  max-width: 44rem;
+  color: var(--fg-muted);
+  font-size: var(--text-lg);
+  line-height: var(--leading-relaxed);
+}
+
+.charmTiles {
+  display: grid;
+  gap: var(--space-4);
+  grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+}
+
+.charmTile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-6);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-xl);
+  background-color: var(--surface-raised);
+  color: inherit;
+  text-decoration: none !important;
+  transition:
+    transform var(--motion-base) var(--ease-out),
+    border-color var(--motion-base) var(--ease-out),
+    box-shadow var(--motion-base) var(--ease-out);
+}
+
+.charmTile:hover {
+  border-color: var(--accent);
+  transform: translateY(-3px);
+  box-shadow: var(--shadow-2);
+  color: inherit;
+}
+
+.charmTile__icon {
+  font-family: var(--font-mono);
+  font-size: var(--text-xl);
+  line-height: 1;
+}
+
+.charmTile__title {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: -0.01em;
+}
+
+.charmTile__body {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+}
+
+.charmTile__more {
+  margin-top: auto;
+  padding-top: var(--space-4);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.charmSplit {
+  display: grid;
+  gap: var(--space-8);
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  align-items: start;
+}
+
+.charmNote {
+  padding: var(--space-6);
+  border: 1px solid var(--border-default);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-lg);
+  background-color: var(--surface-raised);
+}
+
+.charmNote h3 {
+  margin-top: 0;
+  font-size: var(--text-lg);
+}
+
+.charmNote p:last-child {
+  margin-bottom: 0;
+}
+
+@media (max-width: 768px) {
+  .charmHero {
+    padding-top: var(--space-12);
+  }
+
+  .charmSection {
+    padding: var(--space-12) var(--space-4);
+  }
+}

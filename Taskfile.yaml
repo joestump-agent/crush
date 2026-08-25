@@ -84,6 +84,39 @@ tasks:
     cmds:
       - go test -race -failfast ./... {{.CLI_ARGS}}
 
+  # Docs Site
+  #
+  # The Docusaurus site under docs-site/ that ships to GitHub Pages. Node
+  # tooling rather than Go, so these wrap npm rather than replacing it; see
+  # docs-site/README.md.
+  #
+  # @joestump-agent 08/25/2026 - Added for the initial docs site.
+
+  docs:install:
+    desc: Install the docs site's Node dependencies
+    dir: docs-site
+    cmds:
+      - npm ci
+
+  docs:dev:
+    desc: Run the docs site dev server
+    dir: docs-site
+    cmds:
+      - npm start
+
+  docs:build:
+    desc: Build the docs site (strict — broken links and anchors fail)
+    dir: docs-site
+    cmds:
+      - npm run build
+
+  docs:check:
+    desc: Typecheck and build the docs site
+    dir: docs-site
+    cmds:
+      - npm run typecheck
+      - npm run build
+
   test:record:
     desc: Run tests and record all VCR cassettes again
     aliases: [record]
