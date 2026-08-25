@@ -510,32 +510,43 @@ func (c *Config) applyEnv(resolver VariableResolver) {
 // resolveEmbeddings shell-expands the credential-bearing embedding fields
 // in place so $VAR and $(command) templates in api_key and base_url behave
 // like every other credential field in the config.
+//
+// A field that fails to resolve is cleared rather than left holding its
+// unexpanded template: keeping it would send the literal "$EMB_KEY" as the
+// bearer token (or as the base URL) to the embeddings endpoint, which fails
+// far away from the config mistake that caused it. Clearing lets
+// ResolvedEmbeddings reapply the documented defaults instead.
+//
+// @joestump-agent 08/25/2026 - Initial implementation.
+//
+// @joestump 08/25/2026 - Stopped logging the resolution error for api_key.
+// resolveError renders the pre-expansion template, which is the secret
+// itself when the user wrote a literal key, so the failure path wrote the
+// key to the crush log in clear text (CodeQL go/clear-text-logging, high).
+// The error is still logged for base_url, matching how configureProviders
+// treats API keys versus endpoints. Also clear failed fields, see above.
 func (c *Config) resolveEmbeddings(resolver VariableResolver) {
 	if c.Embeddings == nil {
 		return
 	}
-	for _, field := range []struct {
-		name  string
-		value string
-	}{
-		{"api_key", c.Embeddings.APIKey},
-		{"base_url", c.Embeddings.BaseURL},
-	} {
-		if field.value == "" {
-			continue
-		}
-		resolved, err := resolver.ResolveValue(field.value)
+
+	if v := c.Embeddings.APIKey; v != "" {
+		resolved, err := resolver.ResolveValue(v)
 		if err != nil {
-			slog.Warn("Skipping embeddings field due to resolution failure.",
-				"field", field.name, "error", err)
-			continue
+			// No "error" attribute: it embeds the unresolved template.
+			slog.Warn("Ignoring embeddings API key that failed to resolve.")
+			resolved = ""
 		}
-		switch field.name {
-		case "api_key":
-			c.Embeddings.APIKey = resolved
-		case "base_url":
-			c.Embeddings.BaseURL = resolved
+		c.Embeddings.APIKey = resolved
+	}
+
+	if v := c.Embeddings.BaseURL; v != "" {
+		resolved, err := resolver.ResolveValue(v)
+		if err != nil {
+			slog.Warn("Ignoring embeddings base URL that failed to resolve.", "error", err)
+			resolved = ""
 		}
+		c.Embeddings.BaseURL = resolved
 	}
 }
 
