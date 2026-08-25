@@ -28,10 +28,16 @@ names [hook matchers](/features/hooks) test against.
 | `grep` | Search file contents by regex or literal, sorted by modification time |
 | `ls` | List files and directories as a tree, skipping hidden and system dirs |
 | `sourcegraph` | Search code across public GitHub repos via Sourcegraph — regex, language, repo, and file filters |
-| `semantic_search` | Vector search over the local index — [not currently registered](/features/semantic-search) |
+| `semantic_search` | Vector search over the local index by meaning. Registered only when an embeddings provider is configured — see [Semantic search](/features/semantic-search) |
+| `semantic_index` | Build or refresh that index. Incremental; unchanged files are skipped |
 
 The `glob`, `grep`, and `ls` result limits are tunable under the top-level
 `tools` key in [`crush.json`](/configuration/json).
+
+:::info[Fork feature]
+`semantic_search` and `semantic_index` are additions in the
+`joestump-agent/crush` fork.
+:::
 
 ## Shell and job control
 
@@ -47,7 +53,15 @@ platform — Windows included. [`jq` is a built-in](/features/skills#jq); no
 external binary needed.
 
 A [blocklist](/configuration/permissions#blocked-commands) sits in front of the
-`bash` tool's permission flow.
+`bash` tool's permission flow. The fork adds
+[`allowed_commands`](/configuration/permissions#blocked-commands) to punch
+named holes in it.
+
+:::note[Upstream, not fork]
+Background jobs — `bash` backgrounding long-running commands, plus `job_output`
+and `job_kill` — are upstream Crush, not a fork addition. Bugs in them belong
+[upstream](https://github.com/charmbracelet/crush/issues).
+:::
 
 ## Network
 
@@ -90,6 +104,12 @@ Registered when at least one MCP server is configured. See
 | `call_mcp_prompt` | Invoke a prompt and get its rendered content |
 
 Tools exposed *by* MCP servers arrive as `mcp_<server>_<tool>`.
+
+:::info[Fork feature]
+`list_mcp_prompts` and `call_mcp_prompt` are additions in the
+`joestump-agent/crush` fork. See
+[MCP prompts](/features/mcp#prompts-and-resources).
+:::
 
 ## Scheduling
 

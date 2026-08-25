@@ -26,6 +26,12 @@ running build.
 | <kbd>shift+tab</kbd> | Focus the Sidekick dashboard surface |
 | <kbd>ctrl+x</kbd> | Dismiss the Sidekick dashboard |
 
+:::info[Fork feature]
+The three Sidekick bindings are fork-only. <kbd>tab</kbd> is also three-state
+here — chat, editor, sidebar — because the fork makes the
+[sidebar focusable](/fork#sidebar-and-header).
+:::
+
 ## Editor
 
 | Keys | Does |
@@ -53,6 +59,11 @@ running build.
 | <kbd>ctrl+d</kbd> | Toggle details |
 | <kbd>ctrl+t</kbd> | Toggle the pills panel (tasks, [scheduled tasks](/features/scheduled-tasks)) |
 
+:::info[Fork feature]
+The scheduled-tasks pill is fork-only, and <kbd>ctrl+t</kbd> expands *every*
+pills section rather than only the first.
+:::
+
 ### Navigation
 
 | Keys | Does |
@@ -67,7 +78,7 @@ running build.
 | <kbd>G</kbd> / <kbd>end</kbd> | End |
 | <kbd>ctrl+end</kbd> | End and follow |
 | <kbd>h</kbd> / <kbd>←</kbd> | Focus chat |
-| <kbd>l</kbd> / <kbd>→</kbd> | Focus sidebar |
+| <kbd>l</kbd> / <kbd>→</kbd> | Focus sidebar (fork: the sidebar takes focus, scrolls with the mouse, and hides irrelevant help while focused) |
 | <kbd>shift+←</kbd> / <kbd>H</kbd> | Scroll left |
 | <kbd>shift+→</kbd> / <kbd>L</kbd> | Scroll right |
 
@@ -81,6 +92,10 @@ running build.
 
 Finished assistant and user messages also carry a click-to-copy icon, and plain
 clicks on hyperlinks open them in your browser.
+
+:::info[Fork feature]
+Both the click-to-copy icon and click-to-open hyperlinks are fork additions.
+:::
 
 ## Initialization prompt
 
@@ -99,6 +114,12 @@ Typing certain characters opens an inline completion list:
 | --- | --- |
 | <kbd>@</kbd> | Files in the project |
 | <kbd>/</kbd> | Commands, [user-invocable skills](/features/skills#user-invocable-skills), and MCP prompts |
+
+:::info[Fork feature]
+Skill and MCP-prompt completions, the token highlighting that makes them
+visually distinct, and the atomic-backspace behaviour below are all fork
+additions. Upstream completes files and commands only.
+:::
 
 Completion list size is tunable:
 

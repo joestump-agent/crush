@@ -41,8 +41,17 @@ tries to call them. To disable tools from a specific MCP server instead, use
 ## Blocked commands
 
 The `bash` tool blocks a set of potentially dangerous commands by default — for
-example `ssh`, `curl`, `systemctl`, and various package managers. Selectively
-remove commands from that blocklist:
+example `ssh`, `curl`, `systemctl`, and various package managers.
+
+:::info[Fork feature]
+The blocklist itself is upstream. Selectively re-allowing commands —
+`allowed_commands`, `allow_all_commands`, `--allow-commands`,
+`--allow-all-commands`, `CRUSH_ALLOW_COMMANDS`, and `CRUSH_ALLOW_ALL_COMMANDS`
+— is an addition in the `joestump-agent/crush` fork. Upstream the blocklist is
+all-or-nothing.
+:::
+
+Selectively remove commands from that blocklist:
 
 ```json
 {

@@ -45,6 +45,11 @@ authoring checklist, and Claude Code compatibility. See
 
 ### `a2ui`
 
+:::info[Fork feature]
+The `a2ui` skill only exists in the `joestump-agent/crush` fork. Upstream ships
+three built-in skills; this fork ships four.
+:::
+
 > Use when the user asks you to output, speak in, or communicate using the A2UI
 > (a2tea) format, or when you need to understand how to construct A2UI JSON
 > components to render interactive terminal UIs.
@@ -210,9 +215,15 @@ option disable-skill jq
 
 ## Seeing what loaded
 
+:::info[Fork feature]
+The `/skills` dialog is an addition in the `joestump-agent/crush` fork. Skill
+discovery and loading themselves are upstream.
+:::
+
 The `/skills` dialog lists every discovered skill, where it came from, and any
 that failed to parse — with the error and its source labelled. Skills that fail
-validation are reported rather than silently dropped.
+validation are reported rather than silently dropped. You can reload skills
+from disk and toggle individual skills off from the dialog.
 
 Ask the agent for the same thing at any time; the `crush_info` tool reports
 active and available skills alongside model, LSP, MCP, hook, and permission

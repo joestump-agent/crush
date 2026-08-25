@@ -6,6 +6,10 @@
  * then the flat reference material you look things up in.
  *
  * @joestump-agent 08/25/2026 - Initial sidebar for the MVP docs site.
+ *
+ * @joestump-agent 08/25/2026 - Added the "What this fork adds" page directly
+ * under the introduction, so the fork inventory is the second thing a reader
+ * sees rather than something they have to hunt for.
  */
 
 import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
@@ -13,6 +17,7 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 const sidebars: SidebarsConfig = {
   docsSidebar: [
     'introduction',
+    'fork',
     {
       type: 'category',
       label: 'Getting started',
