@@ -417,10 +417,13 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 
 				content := msg.Content().String()
 				readBytes := messageReadBytes[msg.ID]
-
 				if len(content) < readBytes {
-					slog.Error("Non-interactive: message content is shorter than read bytes", "message_length", len(content), "read_bytes", readBytes)
-					return fmt.Errorf("message content is shorter than read bytes: %d < %d", len(content), readBytes)
+					// The message was rewritten or the stream reset: the
+					// cursor is stale. Re-emit from the start rather than
+					// killing the run.
+					slog.Warn("Non-interactive: message content shrank; resetting stream cursor",
+						"message_length", len(content), "read_bytes", readBytes)
+					readBytes = 0
 				}
 
 				part := content[readBytes:]

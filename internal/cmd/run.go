@@ -365,9 +365,12 @@ func (s *runStream) handle(ev any, stopSpinner func()) (done bool, err error) {
 		content := msg.Content().String()
 		readBytes := s.read[msg.ID]
 		if len(content) < readBytes {
-			slog.Error("Non-interactive: message content shorter than read bytes",
+			// The message was rewritten or the stream reset: the
+			// cursor is stale. Re-emit from the start rather than
+			// killing the run.
+			slog.Warn("Non-interactive: message content shrank; resetting stream cursor",
 				"message_length", len(content), "read_bytes", readBytes)
-			return false, fmt.Errorf("message content is shorter than read bytes: %d < %d", len(content), readBytes)
+			readBytes = 0
 		}
 
 		part := content[readBytes:]

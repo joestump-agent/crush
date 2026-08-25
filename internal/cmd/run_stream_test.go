@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +11,38 @@ import (
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/stretchr/testify/require"
 )
+
+// TestRunStream_ContentShrinkResetsCursor is the regression test for
+// the fatal "message content is shorter than read bytes" exit: when a
+// provider stream reset or rewritten content part makes the same
+// message ID come back shorter than the stdout cursor, the stream must
+// reset the cursor and re-emit from the start, not abort the run.
+func TestRunStream_ContentShrinkResetsCursor(t *testing.T) {
+	t.Parallel()
+
+	buf := &bytes.Buffer{}
+	s := &runStream{sessionID: "S", out: buf, read: map[string]int{}}
+
+	long := strings.Repeat("a", 270)
+	done, err := s.handle(pubsub.Event[proto.Message]{Payload: proto.Message{
+		ID: "m1", SessionID: "S", Role: proto.Assistant,
+		Parts: []proto.ContentPart{proto.TextContent{Text: long}},
+	}}, nil)
+	require.NoError(t, err)
+	require.False(t, done)
+	require.Equal(t, 270, s.read["m1"])
+	require.Len(t, buf.String(), 270)
+
+	// Same message ID comes back with 2 bytes of content.
+	done, err = s.handle(pubsub.Event[proto.Message]{Payload: proto.Message{
+		ID: "m1", SessionID: "S", Role: proto.Assistant,
+		Parts: []proto.ContentPart{proto.TextContent{Text: "ok"}},
+	}}, nil)
+	require.NoError(t, err, "shrinking content must not be fatal")
+	require.False(t, done)
+	require.Equal(t, 2, s.read["m1"])
+	require.Equal(t, long+"ok", buf.String(), "cursor reset must re-emit from the start")
+}
 
 // TestRunStream_ToolUseDoesNotTerminate is the regression test for
 // the original bug: a tool-call assistant message has a Finish part
