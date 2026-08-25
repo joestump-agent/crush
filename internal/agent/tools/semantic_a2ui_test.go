@@ -120,9 +120,12 @@ func TestScoreMeter(t *testing.T) {
 // card's width on the part every hit shares.
 func TestSemanticSearchSurfaceRelativizesPaths(t *testing.T) {
 	t.Parallel()
-	wd := filepath.Join(string(filepath.Separator), "src", "repo")
+	// t.TempDir is absolute on every platform. A hand-built "/src/repo" is
+	// not absolute on Windows, so relativizePath would decline it and the
+	// test would pass everywhere the separator happens to be "/".
+	wd := t.TempDir()
 	inside := filepath.Join(wd, "internal", "auth.go")
-	outside := filepath.Join(string(filepath.Separator), "etc", "elsewhere.go")
+	outside := filepath.Join(filepath.Dir(wd), "elsewhere.go")
 
 	text := surfaceText(t, semanticSearchSurface("q", wd, 0, []semanticSearchHit{
 		{Path: inside, Score: 0.5, Snippet: "x"},
@@ -207,7 +210,7 @@ func TestSemanticIndexSurfaceLinks(t *testing.T) {
 // provider JSON, which wraps into an unreadable wall inside a card.
 func TestSemanticIndexSurfaceErrors(t *testing.T) {
 	t.Parallel()
-	wd := filepath.Join(string(filepath.Separator), "src", "repo")
+	wd := t.TempDir()
 	errs := []string{
 		filepath.Join(wd, "a.go") + ": generate embeddings: embedding API returned 422:\n" + strings.Repeat("{\"error\": \"deep\"}", 40),
 	}

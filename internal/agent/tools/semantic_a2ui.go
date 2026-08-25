@@ -476,14 +476,16 @@ var fenceLanguage = func() func(path string) string {
 }()
 
 // splitIndexError pulls the path off a per-file index error, which the index
-// tool formats as "<path>: <err>", and condenses the message. An error with
-// no recognizable path prefix returns an empty path and the whole condensed
-// string.
+// tool formats as "<path>: <err>", and condenses the message. The prefix only
+// counts as a path when it ends in an extension the indexer accepts — a
+// message like "indexing cancelled: context deadline exceeded" would
+// otherwise lose its first clause to the path column, and a heuristic on
+// spaces or separators would drop a real path under a directory with a space
+// in its name. An error with no path prefix returns an empty path and the
+// whole condensed string.
 func splitIndexError(workingDir, e string) (path, msg string) {
-	if i := strings.Index(e, ": "); i > 0 {
-		if p := relativizePath(workingDir, e[:i]); !strings.Contains(p, " ") {
-			return p, condenseError(e[i+2:])
-		}
+	if i := strings.Index(e, ": "); i > 0 && indexableExtensions[strings.ToLower(filepath.Ext(e[:i]))] {
+		return relativizePath(workingDir, e[:i]), condenseError(e[i+2:])
 	}
 	return "", condenseError(e)
 }
