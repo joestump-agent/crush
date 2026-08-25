@@ -7,6 +7,12 @@ description: A local vector index over your codebase, searched by meaning rather
 
 # Semantic search
 
+:::info[Fork feature]
+Semantic search is an addition in the `joestump-agent/crush` fork. Neither the
+tools nor the `embeddings` config block exist upstream. See
+[What this fork adds](/fork).
+:::
+
 A vector index over the repository, stored in the project's own SQLite database
 via the `vec0` virtual table from
 [`modernc.org/sqlite/vec`](https://pkg.go.dev/modernc.org/sqlite) — the same

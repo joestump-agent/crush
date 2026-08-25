@@ -33,6 +33,12 @@ Run `crush dirs` to see what these actually resolved to.
 | `CRUSH_CORE_UTILS` | Force the Go coreutils implementations on (`true`) or off (`false`) in the embedded shell. Defaults to on for Windows, off elsewhere. |
 | `CRUSH_VERSION` | Set by Crush inside a `crushrc`, for [version-conditional config](/configuration/crushrc#config-versioning) |
 
+:::info[Fork feature]
+`CRUSH_ALLOW_COMMANDS` and `CRUSH_ALLOW_ALL_COMMANDS` are fork additions — see
+[Permissions](/configuration/permissions#blocked-commands). Everything else in
+this table is upstream.
+:::
+
 ## Server
 
 | Variable | Effect |

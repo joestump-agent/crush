@@ -149,9 +149,10 @@ Resources whose URI ends in `/a2ui` render as
 | `call_mcp_prompt` | Invoke a prompt and get its rendered content |
 
 :::info[Fork feature]
-This fork also offers MCP prompts in the inline `/` completions and loads them
-at startup, so a server's prompts are reachable from the composer as soon as the
-session opens.
+`list_mcp_prompts` and `call_mcp_prompt`, MCP prompts in the inline `/`
+completions and the command palette, and loading prompts at startup rather than
+on first use are all additions in the `joestump-agent/crush` fork. The
+resource tools above are upstream.
 :::
 
 These four tools are only registered when you have at least one MCP server
@@ -165,6 +166,18 @@ tools should be used — and it is what makes a two-way
 [channel](/features/channels#two-way-channels) work without any
 channel-specific plumbing.
 
+## The MCP Servers dialog
+
+:::info[Fork feature]
+The MCP servers dialog is an addition in the `joestump-agent/crush` fork.
+:::
+
+Open it from the command palette (<kbd>ctrl+p</kbd> → **MCP Servers**, or type
+`/mcp` in the composer). It lists every configured server with its live status,
+and lets you reconnect or refresh one without restarting Crush. A reconnect re-reads config
+from disk, so an edit to `crush.json` takes effect immediately. Servers acting
+as [channels](/features/channels) are marked.
+
 ## Startup behaviour
 
 MCP initialization is bounded, so a wedged server cannot blank the application
@@ -172,6 +185,12 @@ at launch. Servers that fail to start are reported in the sidebar with their
 error, and Crush carries on. Servers that are live
 [channels](/features/channels) are marked `channel` in the MCP list, so you can
 confirm an opt-in actually took effect.
+
+:::info[Fork feature]
+The bounded init wait, the per-server lifecycle serialization, and reaping
+stdio server process groups on shutdown are fixes carried by this fork. See
+[What this fork adds](/fork#fixes-this-fork-carries).
+:::
 
 ## Checking state
 

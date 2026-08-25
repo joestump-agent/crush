@@ -109,6 +109,15 @@ builtin yet: `allowed_commands`, `allow_all_commands` (see
 (see [A2UI](/features/a2ui)). Top-level `tools` tunes the `glob`, `grep`, and
 `ls` tool limits.
 
+:::info[Fork feature]
+These `crush.json` keys do not exist upstream: `options.allowed_commands`,
+`options.allow_all_commands`, `options.disable_a2ui`, the top-level
+`embeddings` block ([semantic search](/features/semantic-search)), the
+per-server `channel_enabled` ([channels](/features/channels)), and the
+`agents.sidekick` agent ID ([Sidekick](/features/sidekick)). See
+[What this fork adds](/fork#configuration).
+:::
+
 ## Top-level `env`
 
 The top-level `env` field sets environment variables at startup, **before**

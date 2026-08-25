@@ -53,11 +53,19 @@ The additions, in brief:
 | Addition | What it is |
 | --- | --- |
 | [Sidekick](/features/sidekick) | A second, ephemeral agent in the sidebar, plus a pinned dashboard the main agent pushes A2UI status to |
-| [Channels](/features/channels) | The push mechanism is upstream; the fork adds the `channel_enabled` config key and deterministic reply routing |
 | [A2UI](/features/a2ui) | Inline rendering of A2UI surfaces via [a2tea](https://github.com/joestump-agent/a2tea), including interactive round-trips |
 | [Scheduled tasks](/features/scheduled-tasks) | `CronCreate` / `CronList` / `CronDelete` tools that re-run prompts on a cron schedule |
 | [Semantic search](/features/semantic-search) | A local sqlite-vec index over the repo, searched by meaning |
+| [Channels](/features/channels) | The push mechanism is upstream; the fork adds the `channel_enabled` config key, the `channel_reply` tool, and deterministic reply routing |
 | [MCP prompts](/features/mcp#prompts-and-resources) | MCP prompts offered in the `/` completions and the command palette |
+
+Plus a long tail of quality-of-life work — click-to-copy, clickable
+hyperlinks, a syntax-highlighted composer, text-file attachments, Skills, MCP
+and Channels dialogs, a focusable sidebar — and a set of fixes to upstream
+behaviour.
+
+**[What this fork adds](/fork)** is the complete, verified inventory, including
+a list of things commonly mistaken for fork features that are in fact upstream.
 
 Crush is licensed
 [FSL-1.1-MIT](https://github.com/charmbracelet/crush/raw/main/LICENSE.md).

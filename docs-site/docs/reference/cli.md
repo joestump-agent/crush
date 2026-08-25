@@ -25,17 +25,28 @@ These are persistent flags — they work on every subcommand.
 | `--debug` | `-d` | Debug logging |
 | `--host <url>` | `-H` | Connect to a specific Crush server (advanced) |
 | `--channels <server:name>` | | Enable an MCP server as a [channel](/features/channels). Repeatable. |
+| `--yolo` | `-y` | Auto-accept all permissions (**dangerous**) |
+
+:::info[Fork feature]
+`--yolo` is persistent in this fork, so it works on subcommands too —
+`crush --yolo run "…"`. Upstream it is a root-only flag and that invocation
+fails with `unknown flag`.
+:::
 
 ## `crush`
 
 | Flag | Short | Does |
 | --- | --- | --- |
-| `--yolo` | `-y` | Auto-accept all permissions (**dangerous**) |
 | `--session <id>` | `-s` | Continue a previous session by ID |
 | `--continue` | `-C` | Continue the most recent session |
 | `--allow-commands <cmd>` | | Allow a command from the bash blocklist. Repeatable. Env: `CRUSH_ALLOW_COMMANDS` (comma-separated) |
 | `--allow-all-commands` | | Remove **all** bash blocklist restrictions, including package-manager blocks (**dangerous**). Env: `CRUSH_ALLOW_ALL_COMMANDS` |
 | `--help` | `-h` | Help |
+
+:::info[Fork feature]
+`--allow-commands` and `--allow-all-commands` are fork additions. See
+[Permissions](/configuration/permissions#blocked-commands).
+:::
 
 ```bash
 crush

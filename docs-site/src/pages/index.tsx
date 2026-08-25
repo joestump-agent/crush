@@ -100,7 +100,10 @@ function Fork(): ReactNode {
                 charmbracelet/crush
               </a>{' '}
               upstream and adds a handful of features on top. Where a page
-              documents something the fork adds, it says so.
+              documents something the fork adds, it says so — and{' '}
+              <Link to="/fork">What this fork adds</Link> lists every one of
+              them, along with the things people assume are ours but are
+              actually upstream.
             </p>
             <p className="charmSection__lede">
               Crush itself is a{' '}
@@ -136,8 +139,13 @@ function Fork(): ReactNode {
                 local vector index over the repo
               </li>
               <li>
-                <Link to="/reference/tools#shell-and-job-control">Background jobs</Link>,
-                click-to-copy, clipboard image paste, and more
+                <Link to="/features/mcp#prompts-and-resources">MCP prompts</Link>{' '}
+                in the <code>/</code> completions and the palette
+              </li>
+              <li>
+                <Link to="/fork">Everything else</Link> — click-to-copy,
+                clickable links, a highlighted composer, text attachments, and
+                the Skills, MCP and Channels dialogs
               </li>
             </ul>
           </div>
