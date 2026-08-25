@@ -114,11 +114,58 @@ You normally only *consume* server surfaces (path 1). Build them only when you a
 
 ## Best practices
 
-1. **Keep it compact.** Surfaces are concise summaries, controls, or dashboards. Use fenced code blocks for code or long logs.
+1. **Keep it compact.** Surfaces are concise summaries, controls, or dashboards — not viewers. Show a handful of lines and point at the file for the rest.
 2. **One surface per block.** All components inside the `components` array of a single `updateComponents` message.
 3. **Link correctly.** Every `child`/`children` id must exist in your array — a dangling id renders `[a2tea: missing component ...]`.
 4. **Mix with Markdown.** Prose before and after the `<a2ui-json>` block is fine.
 5. **Don't re-emit server surfaces.** If you read an `/a2ui` resource, the user already sees it — move on in prose.
+
+## Code and syntax highlighting in a surface
+
+**Yes — a surface can show syntax-highlighted code.** Body-variant `Text` (a `Text` with no `variant`) is routed through the host's Markdown renderer, which in Crush is glamour + chroma. So a body `Text` whose content is a fenced code block renders with real highlighting, and the same path gives you tables, lists, bold, and inline code.
+
+```json
+{"component": "Text", "id": "snippet", "text": "```go\n42  func Verify() error {\n43      return nil\n44  }\n```"}
+```
+
+Three things to get right:
+
+- **Tag the fence with a language.** The tag is what selects the lexer — an untagged fence renders as plain code. Use the language's usual Markdown tag (`go`, `python`, `typescript`, `bash`, `json`, `yaml`).
+- **Escape the newlines and quotes.** The fence lives inside a JSON string, so it is `` "```go\nx := 1\n```" ``, not a literal multi-line value.
+- **Grow the fence if the code contains one.** Markdown content can carry its own `` ``` ``; wrap it in four backticks (or one more than the longest run inside) or the block ends early and the rest spills out as prose.
+
+Line numbers are just part of the code: prefix each line with a right-aligned number and two spaces, as above. The gutter is lexed as part of the block, which reads as a distinct color rather than as source.
+
+Long lines are word-wrapped by the renderer and the continuation restarts at column zero, which breaks that gutter — so **truncate lines rather than letting them wrap** when you are drawing one.
+
+## Recipe: a result card
+
+The shape Crush's own `semantic_search` card uses — a heading, a caption of metadata, and a code snippet per result, separated by dividers. Copy it for anything list-shaped with a payload per row:
+
+```json
+<a2ui-json>{
+  "version": "v0.9",
+  "updateComponents": {
+    "surfaceId": "results",
+    "components": [
+      {"component": "Card", "id": "root", "child": "col"},
+      {"component": "Column", "id": "col", "children": ["title", "sub", "hit1", "div", "hit2"]},
+      {"component": "Text", "id": "title", "variant": "h3", "text": "Semantic search"},
+      {"component": "Text", "id": "sub", "variant": "caption", "text": "\"where is auth handled\" · 2 results"},
+      {"component": "Column", "id": "hit1", "children": ["h1-head", "h1-meta", "h1-code"]},
+      {"component": "Text", "id": "h1-head", "variant": "h5", "text": "1. internal/auth/token.go:42"},
+      {"component": "Text", "id": "h1-meta", "variant": "caption", "text": "Verify · lines 42–89 · ███████░░░ 0.734"},
+      {"component": "Text", "id": "h1-code", "text": "```go\n42  func Verify() error {\n43      return nil\n44  }\n```"},
+      {"component": "Divider", "id": "div"},
+      {"component": "Column", "id": "hit2", "children": ["h2-head", "h2-meta"]},
+      {"component": "Text", "id": "h2-head", "variant": "h5", "text": "2. internal/auth/session.go:8"},
+      {"component": "Text", "id": "h2-meta", "variant": "caption", "text": "newSession · lines 8–31 · ████░░░░░░ 0.412"}
+    ]
+  }
+}</a2ui-json>
+```
+
+A fixed-width meter (`█` filled, `░` empty) beside a score lets neighboring rows be compared at a glance — cheaper to read than the number alone, and it costs no components.
 
 ## Common mistakes (anti-patterns)
 
@@ -160,6 +207,16 @@ Components are a **flat list**; `child` is a **string id**, not an object.
 {"component": "Text", "id": "body", "text": "Hello"}
 ```
 
-### Do not put code in a surface
+### Only body `Text` renders Markdown
 
-A2UI surfaces are for compact visual structure. Use fenced code blocks (`` ``` ``) for code, command output, or logs — a `Text` component will not syntax-highlight.
+The heading and caption variants are short labels — they render with their variant style and nothing else. Markdown in an `h3` or a `caption` shows up as literal `**asterisks**` and unrendered fences.
+
+**Wrong — the fence renders as three literal backticks:**
+```json
+{"component": "Text", "id": "snippet", "variant": "caption", "text": "```go\nx := 1\n```"}
+```
+
+**Correct — omit `variant` so it is body text:**
+```json
+{"component": "Text", "id": "snippet", "text": "```go\nx := 1\n```"}
+```
