@@ -40,8 +40,10 @@ import (
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/scheduler"
+	"github.com/charmbracelet/crush/internal/semantic"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/internal/symbols"
 	"golang.org/x/sync/errgroup"
 
 	"charm.land/fantasy/providers/anthropic"
@@ -173,6 +175,14 @@ type coordinator struct {
 
 	cronStore *scheduler.Store
 
+	// semanticStore and semanticClient back the semantic_search and
+	// semantic_index tools. Both are nil unless an embedding provider is
+	// configured and the store initialised, in which case neither tool
+	// is registered.
+	semanticStore   *semantic.Store
+	semanticClient  *semantic.Client
+	semanticSymbols *symbols.Extractor
+
 	// sidekickAgent is the fully independent Sidekick agent: its own
 	// (ephemeral, in-memory) sessions and messages, its own read-only
 	// tool set, its own model config, and its own activeRequests — so
@@ -219,6 +229,13 @@ type CoordinatorOptions struct {
 	RunComplete pubsub.Publisher[notify.RunComplete]
 	Skills      *skills.Manager
 	Interactive bool
+
+	// SemanticStore/SemanticClient enable the semantic_search and
+	// semantic_index tools. Both must be non-nil for the tools to be
+	// registered; the caller (app) is responsible for constructing them
+	// from the configured embedding provider.
+	SemanticStore  *semantic.Store
+	SemanticClient *semantic.Client
 }
 
 func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, error) {
@@ -258,6 +275,9 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		skillTracker:      skillTracker,
 		sidekickDashboard: pubsub.NewBroker[tools.SidekickSurface](),
 		interactive:       opts.Interactive,
+		semanticStore:     opts.SemanticStore,
+		semanticClient:    opts.SemanticClient,
+		semanticSymbols:   symbols.NewExtractor(),
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]
@@ -1174,7 +1194,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	allTools = append(
 		allTools,
 		tools.NewBashTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Options.Attribution, modelID, allowedCommands, allowAllCommands),
-		tools.NewCrushInfoTool(c.cfg, c.lspManager, c.allSkills, c.activeSkills, c.skillTracker),
+		tools.NewCrushInfoTool(c.cfg, c.lspManager, c.allSkills, c.activeSkills, c.skillTracker, c.semanticStore),
 		tools.NewCrushLogsTool(logFile),
 		tools.NewCronCreateTool(c.cronStore),
 		tools.NewCronListTool(c.cronStore),
@@ -1211,6 +1231,17 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 			tools.NewCallHierarchyTool(c.lspManager),
 			tools.NewRenameTool(c.lspManager, c.permissions, c.history, c.filetracker),
 			tools.NewReplaceSymbolTool(c.lspManager, c.permissions, c.history, c.filetracker),
+		)
+	}
+
+	// Semantic search tools are registered only when an embedding
+	// provider is configured and the store initialised — the same
+	// conditional-registration style as the LSP and MCP blocks above.
+	if c.semanticStore != nil && c.semanticClient != nil {
+		allTools = append(
+			allTools,
+			tools.NewSemanticSearchTool(c.semanticStore, c.semanticClient),
+			tools.NewSemanticIndexTool(c.semanticStore, c.semanticSymbols, c.cfg.WorkingDir()),
 		)
 	}
 
