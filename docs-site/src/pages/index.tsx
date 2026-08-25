@@ -47,10 +47,10 @@ function Hero(): ReactNode {
       </div>
       <div className="charmShot">
         <img
-          src={useBaseUrl('/img/crush-screenshot.png')}
-          alt="Crush running in a terminal: a tool-call transcript on the left, and a sidebar showing the session, model, modified files, LSPs, MCP servers, and skills on the right."
-          width={1332}
-          height={839}
+          src={useBaseUrl('/img/crush-demo.gif')}
+          alt="Crush running in a terminal: a prompt is answered, tool calls stream in, and the sidebar tracks the session, model, modified files, LSPs, and MCP servers."
+          width={1600}
+          height={900}
         />
       </div>
     </header>

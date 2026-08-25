@@ -89,11 +89,9 @@ const config: Config = {
       respectPrefersColorScheme: true,
     },
     navbar: {
+      // Wordmark only — no logo. `.navbar__title` styles it as uppercase mono,
+      // which is the mark. The favicon is still the browser-tab icon.
       title: 'Crush',
-      logo: {
-        alt: 'Crush',
-        src: 'img/favicon.svg',
-      },
       items: [
         {
           type: 'docSidebar',
