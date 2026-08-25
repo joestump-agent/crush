@@ -481,10 +481,17 @@ table th {
   padding: 0 var(--space-4);
 }
 
+/*
+ * The demo recording carries no window chrome of its own, and its terminal
+ * background sits within a few points of Pepper — so without an explicit edge
+ * the top of the frame dissolves into the page. The drop shadow only defines
+ * the bottom. A hairline border draws the whole rectangle.
+ */
 .charmShot img {
   display: block;
   width: 100%;
   height: auto;
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-xl);
   filter: drop-shadow(0 30px 60px rgba(0, 0, 0, 0.35));
 }
