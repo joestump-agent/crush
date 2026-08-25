@@ -42,8 +42,17 @@ function Hero(): ReactNode {
         </div>
         <div className="charmHero__install">
           <span aria-hidden="true">$</span>
-          <span>go install github.com/charmbracelet/crush@latest</span>
+          <span className="charmHero__installCmd">
+            git clone https://github.com/joestump-agent/crush.git &amp;&amp; cd
+            crush &amp;&amp; go install .
+          </span>
         </div>
+        <p className="charmHero__installNote">
+          The fork isn&apos;t packaged anywhere — and{' '}
+          <code>go install github.com/charmbracelet/crush@latest</code> gets you
+          upstream, not this.{' '}
+          <Link to="/getting-started/installation">Why</Link>.
+        </p>
       </div>
       <div className="charmShot">
         <img
