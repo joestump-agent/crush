@@ -471,8 +471,31 @@ table th {
   font-size: var(--text-sm);
 }
 
+.charmHero__install {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
 .charmHero__install span[aria-hidden] {
   color: var(--accent);
+  flex: none;
+}
+
+/* One line, scrolled on narrow viewports — never broken mid-command. */
+.charmHero__installCmd {
+  white-space: nowrap;
+}
+
+.charmHero__installNote {
+  margin: var(--space-3) auto 0;
+  max-width: 34rem;
+  color: var(--fg-subtle);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+}
+
+.charmHero__installNote code {
+  font-size: 0.9em;
 }
 
 .charmShot {

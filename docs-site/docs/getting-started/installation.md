@@ -2,151 +2,88 @@
 id: installation
 title: Installation
 sidebar_position: 1
-description: Install Crush with a package manager, from a release binary, or from source.
+description: Build the joestump-agent/crush fork from source — the only way to get it today.
 ---
 
 # Installation
 
-## Package managers
+:::warning[Read this before you install anything]
+These docs cover the
+**[`joestump-agent/crush`](https://github.com/joestump-agent/crush) fork**, and
+the fork is **not published to any package manager**. Every published Crush
+package — Homebrew, npm, winget, scoop, apt, the NUR, the GitHub releases —
+installs **upstream Charm Crush**, which does not have
+[Sidekick](/features/sidekick), [A2UI](/features/a2ui),
+[scheduled tasks](/features/scheduled-tasks),
+[semantic search](/features/semantic-search), or the fork's
+[channel additions](/features/channels).
+
+`go install github.com/charmbracelet/crush@latest` is the same trap: the fork
+keeps upstream's module path, so that command resolves to Charm's repository
+regardless of which fork you meant. It will succeed, and you will silently have
+the wrong binary.
+
+**Build from source. It is the only way to get this Crush.**
+:::
+
+## Prerequisites
+
+- **Go 1.26.5 or newer** — the toolchain is the only build dependency.
+- **git**.
 
 ```bash
-# Homebrew
-brew install charmbracelet/tap/crush
-
-# NPM
-npm install -g @charmland/crush
-
-# Arch Linux (btw)
-yay -S crush-bin
-
-# Nix
-nix run github:numtide/nix-ai-tools#crush
-
-# FreeBSD
-pkg install crush
+go version   # must be >= go1.26.5
 ```
 
-Windows:
-
-```powershell
-# Winget
-winget install charmbracelet.crush
-
-# Scoop
-scoop bucket add charm https://github.com/charmbracelet/scoop-bucket.git
-scoop install crush
-```
-
-## Debian / Ubuntu
-
-```bash
-sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://repo.charm.sh/apt/gpg.key \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
-echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" \
-  | sudo tee /etc/apt/sources.list.d/charm.list
-sudo apt update && sudo apt install crush
-```
-
-## Fedora / RHEL
-
-```bash
-echo '[charm]
-name=Charm
-baseurl=https://repo.charm.sh/yum/
-enabled=1
-gpgcheck=1
-gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo
-sudo yum install crush
-```
-
-## Nix (NUR)
-
-Crush is available via the official Charm
-[NUR](https://github.com/nix-community/NUR) in
-`nur.repos.charmbracelet.crush`, which is the most up-to-date way to get Crush
-in Nix.
-
-```bash
-# Add the NUR channel.
-nix-channel --add https://github.com/nix-community/NUR/archive/main.tar.gz nur
-nix-channel --update
-
-# Get Crush in a Nix shell.
-nix-shell -p '(import <nur> { pkgs = import <nixpkgs> {}; }).repos.charmbracelet.crush'
-```
-
-NixOS and Home Manager modules ship via NUR as well. The module auto-detects
-which context it is in, so the import is identical either way:
-
-```nix
-{
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nur.url = "github:nix-community/NUR";
-  };
-
-  outputs = { self, nixpkgs, nur, ... }: {
-    nixosConfigurations.your-hostname = nixpkgs.lib.nixosSystem {
-      modules = [
-        nur.modules.nixos.default
-        nur.repos.charmbracelet.modules.crush
-        {
-          programs.crush = {
-            enable = true;
-            settings = {
-              # …see the Configuration section.
-            };
-          };
-        }
-      ];
-    };
-  };
-}
-```
-
-## Release binaries
-
-Prebuilt binaries for every supported platform are attached to each
-[upstream release](https://github.com/charmbracelet/crush/releases). Download,
-unpack, and put `crush` on your `PATH`.
-
-## From source
-
-Crush is a Go program with no build-time dependencies beyond the Go toolchain.
-
-```bash
-go install github.com/charmbracelet/crush@latest
-```
-
-Crush stores its local database with
-[modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite), so it builds on the
-platforms that driver supports — every platform binaries are published for, plus
-Android. The illumos and Solaris family is not among them and no longer builds.
-
-## Building this fork
-
-The [fork](https://github.com/joestump-agent/crush) is not published to any
-package manager — build it from source:
+## Install
 
 ```bash
 git clone https://github.com/joestump-agent/crush.git
 cd crush
-go build -o crush .
+go install .
 ```
 
-The repo uses [Task](https://taskfile.dev) for its development targets:
+`go install .` builds the module in the current directory and drops a `crush`
+binary in `$GOBIN` (or `$GOPATH/bin`, `~/go/bin` by default). Make sure that
+directory is on your `PATH`:
 
 ```bash
-task build     # build the binary
-task test      # go test -race ./...
-task lint      # golangci-lint
+export PATH="$(go env GOPATH)/bin:$PATH"
 ```
 
-:::warning
-`lint` is not enforced by the fork's CI, so run `task lint` locally before you
-push. The `build` matrix is the only gating check.
-:::
+Prefer to control where the binary lands? Build it in place instead:
+
+```bash
+go build -o ~/.local/bin/crush .
+```
+
+## Verify you got the fork
+
+```bash
+crush --version
+```
+
+The surest check is a fork-only feature — press <kbd>ctrl+a</kbd> in a session.
+If the [Sidekick](/features/sidekick) panel opens, you are on the fork. If
+nothing happens, you are running upstream Crush.
+
+## Updating
+
+```bash
+cd crush
+git pull
+go install .
+```
+
+There is no release channel and no auto-update. Pull when you want the latest.
+
+## Platform support
+
+Crush stores its local database with
+[modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite), so it builds on the
+platforms that driver supports — macOS, Linux, Windows, FreeBSD, OpenBSD,
+NetBSD, and Android. The illumos and Solaris family is not among them and no
+longer builds.
 
 ## Clipboard support
 
@@ -158,6 +95,31 @@ Copy and paste needs an external helper on some Unix-like systems:
 | Windows | Native support |
 | Linux/BSD + Wayland | `wl-copy` and `wl-paste` |
 | Linux/BSD + X11 | `xclip` or `xsel` |
+
+## Working on Crush itself
+
+The repo uses [Task](https://taskfile.dev) for its development targets:
+
+```bash
+task build     # build the binary
+task test      # go test -race ./...
+task lint      # golangci-lint
+task docs:dev  # this documentation site
+```
+
+:::warning
+`lint` is not enforced by the fork's CI — `lint.yml` delegates to
+`charmbracelet/meta`'s reusable workflow, which does not run here. Run
+`task lint` locally before you push; the `build` matrix is the only gating
+check.
+:::
+
+## Looking for upstream Crush?
+
+If you want Charm's Crush rather than this fork — the packaged, released,
+supported one — its installation instructions are in the
+[upstream README](https://github.com/charmbracelet/crush#installation). Nothing
+on this site applies to it except by coincidence.
 
 ## Next
 
