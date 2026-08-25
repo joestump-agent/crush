@@ -22,6 +22,10 @@ import (
 //
 // @joestump-agent 08/25/2026 - Initial version for semantic_search and
 // semantic_index.
+//
+// @joestump 08/25/2026 - Marked the diverted text model-only so the chat
+// stops drawing the digest underneath the card, restored the blank line
+// between headless results, and pluralized the surface's result count.
 
 // a2uiSurfaceIDPrefix namespaces the semantic tools' surface IDs so they
 // cannot collide with MCP-served surfaces sharing an ID.
@@ -56,6 +60,10 @@ func withSemanticSurface(resp fantasy.ToolResponse, surfaceID string, components
 	}
 	metadata := ReadMCPResourceResponseMetadata{
 		A2UISurfaces: []string{"<a2ui-json>" + string(payload) + "</a2ui-json>"},
+		// resp's text is the model's digest of the same results the surface
+		// draws. Without this the chat would render the card and then repeat
+		// the digest underneath it.
+		TextIsModelOnly: true,
 	}
 	return fantasy.WithResponseMetadata(resp, metadata)
 }
@@ -110,7 +118,7 @@ func semanticSearchSurface(query string, results []semanticSearchHit) []a2ui.Com
 			Text:    a2ui.StringLiteral(fmt.Sprintf("Semantic search: %q", query)),
 			Variant: a2ui.TextVariantH3,
 		}},
-		caption(subID, fmt.Sprintf("%d results", len(results))),
+		caption(subID, fmt.Sprintf("%d %s", len(results), pluralize(len(results), "result"))),
 	}, extra...)
 }
 
@@ -182,10 +190,22 @@ func semanticSearchDigest(results []semanticSearchHit, withSnippets bool) string
 		fmt.Fprintf(&b, " (lines %d-%d, score %.3f)\n", r.StartLine+1, r.EndLine+1, r.Score)
 		if withSnippets {
 			snippet := firstLines(r.Snippet, 5)
-			fmt.Fprintf(&b, "   %s\n", strings.ReplaceAll(snippet, "\n", "\n   "))
+			// The trailing blank line is part of the pre-A2UI format this
+			// path must reproduce byte for byte on headless runs.
+			fmt.Fprintf(&b, "   %s\n\n", strings.ReplaceAll(snippet, "\n", "\n   "))
 		}
 	}
 	return b.String()
+}
+
+// pluralize appends an s to word unless n is exactly 1. The surface is the
+// user-facing copy, so "1 results" would read as a bug there; the
+// model-facing digest keeps its original wording.
+func pluralize(n int, word string) string {
+	if n == 1 {
+		return word
+	}
+	return word + "s"
 }
 
 // firstLines truncates s to at most n lines, marking the cut.

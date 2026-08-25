@@ -165,3 +165,60 @@ func TestSemanticSearchDivert(t *testing.T) {
 	require.Contains(t, plainResp.Content, "return")
 	require.Empty(t, plainResp.Metadata)
 }
+
+// The diverted text is a digest of the same hits the surface draws, so it
+// must be flagged model-only — otherwise the chat renders the card and then
+// repeats the digest as flat text underneath it.
+func TestSemanticSurfaceMarksTextModelOnly(t *testing.T) {
+	t.Parallel()
+	resp := withSemanticSurface(fantasy.NewTextResponse("digest"), a2uiSurfaceIDPrefix+"search",
+		semanticSearchSurface("q", []semanticSearchHit{{Path: "a.go", Score: 0.5, Snippet: "x"}}))
+	var meta ReadMCPResourceResponseMetadata
+	require.NoError(t, json.Unmarshal([]byte(resp.Metadata), &meta))
+	require.True(t, meta.TextIsModelOnly)
+}
+
+// The headless path must reproduce the pre-A2UI text byte for byte: the
+// blank line between results was part of it, and dropping it silently
+// changed every non-interactive semantic_search result.
+func TestSemanticSearchDigestHeadlessFormat(t *testing.T) {
+	t.Parallel()
+	hits := []semanticSearchHit{
+		{Path: "a.go", Symbol: "Foo", StartLine: 0, EndLine: 1, Score: 0.5, Snippet: "one\ntwo"},
+		{Path: "b.go", StartLine: 4, EndLine: 4, Score: 0.25, Snippet: "solo"},
+	}
+	require.Equal(t, "Found 2 results:\n\n"+
+		"1. a.go :: Foo (lines 1-2, score 0.500)\n   one\n   two\n\n"+
+		"2. b.go (lines 5-5, score 0.250)\n   solo\n\n",
+		semanticSearchDigest(hits, true))
+
+	require.Equal(t, "Found 2 results:\n\n"+
+		"1. a.go :: Foo (lines 1-2, score 0.500)\n"+
+		"2. b.go (lines 5-5, score 0.250)\n",
+		semanticSearchDigest(hits, false))
+}
+
+// The surface is user-facing copy, so a single hit reads "1 result".
+func TestSemanticSearchSurfacePluralizesCount(t *testing.T) {
+	t.Parallel()
+	one := semanticSearchSurface("q", []semanticSearchHit{{Path: "a.go", Score: 0.5, Snippet: "x"}})
+	require.Contains(t, surfaceText(t, one), "1 result")
+	require.NotContains(t, surfaceText(t, one), "1 results")
+	two := semanticSearchSurface("q", []semanticSearchHit{
+		{Path: "a.go", Score: 0.5, Snippet: "x"},
+		{Path: "b.go", Score: 0.4, Snippet: "y"},
+	})
+	require.Contains(t, surfaceText(t, two), "2 results")
+}
+
+// surfaceText joins every Text component's literal in a surface.
+func surfaceText(t *testing.T, components []a2ui.Component) string {
+	t.Helper()
+	var parts []string
+	for _, c := range components {
+		if c.Text != nil && c.Text.Text.Literal != nil {
+			parts = append(parts, *c.Text.Text.Literal)
+		}
+	}
+	return strings.Join(parts, "\n")
+}

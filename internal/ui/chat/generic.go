@@ -87,7 +87,7 @@ func (g *GenericToolRenderContext) RenderTool(sty *styles.Styles, width int, opt
 	if opts.Result.Metadata != "" {
 		var meta tools.ReadMCPResourceResponseMetadata
 		if err := json.Unmarshal([]byte(opts.Result.Metadata), &meta); err == nil && len(meta.A2UISurfaces) > 0 {
-			return joinToolParts(header, renderToolA2UIResultBody(sty, meta.A2UISurfaces, opts, widths))
+			return joinToolParts(header, renderToolA2UIResultBody(sty, meta, opts, widths))
 		}
 	}
 	// Pre-change read_mcp_resource results persisted the raw payload in the
@@ -113,7 +113,8 @@ func (g *GenericToolRenderContext) RenderTool(sty *styles.Styles, width int, opt
 // When every surface fails to render, an alert replaces the body — the
 // model-facing placeholder claims the user can already see the surface,
 // which would be false here.
-func renderToolA2UIResultBody(sty *styles.Styles, surfaces []string, opts *ToolRenderOpts, widths toolResultContentWidths) string {
+func renderToolA2UIResultBody(sty *styles.Styles, meta tools.ReadMCPResourceResponseMetadata, opts *ToolRenderOpts, widths toolResultContentWidths) string {
+	surfaces := meta.A2UISurfaces
 	var b strings.Builder
 	failed := 0
 	if opts.LiveSurfaces != nil {
@@ -146,8 +147,10 @@ func renderToolA2UIResultBody(sty *styles.Styles, surfaces []string, opts *ToolR
 	}
 	// Show any real text the resource returned alongside its surfaces — the
 	// model-facing placeholder lines are stripped, the rest belongs to the
-	// user just as much as the surfaces do.
-	if text := stripA2UIPlaceholders(opts.Result.Content); text != "" {
+	// user just as much as the surfaces do. Tools that flag their text as
+	// model-only (a digest of the very results the surface draws) show
+	// nothing here, so the card is not shadowed by a flat copy of itself.
+	if text := stripA2UIPlaceholders(opts.Result.Content); text != "" && !meta.TextIsModelOnly {
 		chunks = append(chunks, renderToolResultTextContent(sty, text, widths, opts.ExpandedContent))
 	}
 	return strings.Join(chunks, "\n")
