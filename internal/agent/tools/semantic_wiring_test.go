@@ -105,6 +105,45 @@ func TestSemanticIndexToolIndexesFiles(t *testing.T) {
 	require.Equal(t, int64(1), count)
 }
 
+// TestSemanticIndexToolIsIncremental pins the claim in the tool's own
+// description: a second run over unchanged files re-embeds nothing and
+// reports them as skipped, so re-running is cheap rather than a full
+// re-index at the embedding provider's expense.
+func TestSemanticIndexToolIsIncremental(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc Hello() string { return \"hi\" }\n"), 0o644))
+
+	srv := embeddingServer(t)
+	store := newSemanticTestStore(t, srv.URL)
+	tool := NewSemanticIndexTool(store, symbols.NewExtractor(), dir)
+
+	first, err := runTool(t, tool, SemanticIndexParams{})
+	require.NoError(t, err)
+	require.Contains(t, first, "0 files unchanged and skipped")
+
+	second, err := runTool(t, tool, SemanticIndexParams{})
+	require.NoError(t, err)
+	require.Contains(t, second, "Indexed 0 chunks")
+	require.Contains(t, second, "1 files unchanged and skipped")
+
+	// Idempotent: the second run must not duplicate the chunk.
+	count, err := store.ChunkCount(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, int64(1), count)
+
+	// A changed file is re-indexed rather than skipped.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc Goodbye() string { return \"bye\" }\n"), 0o644))
+	third, err := runTool(t, tool, SemanticIndexParams{})
+	require.NoError(t, err)
+	require.Contains(t, third, "0 files unchanged and skipped")
+
+	// Re-indexing replaces the file's chunks rather than accumulating
+	// stale ones alongside them.
+	count, err = store.ChunkCount(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, int64(1), count)
+}
+
 func TestSemanticIndexToolUnconfigured(t *testing.T) {
 	tool := NewSemanticIndexTool(nil, nil, t.TempDir())
 	resp, err := runTool(t, tool, SemanticIndexParams{})
