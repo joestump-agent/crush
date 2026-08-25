@@ -29,7 +29,7 @@ func newSemanticTestStore(t *testing.T, baseURL string) *semantic.Store {
 	db, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS chunks (
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE IF NOT EXISTS chunks (
 			chunk_id   INTEGER PRIMARY KEY,
 			session_id TEXT,
 			path       TEXT,
