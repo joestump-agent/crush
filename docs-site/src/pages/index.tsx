@@ -42,7 +42,7 @@ function Hero(): ReactNode {
         </div>
         <div className="charmHero__install">
           <span aria-hidden="true">$</span>
-          <span>brew install charmbracelet/tap/crush</span>
+          <span>go install github.com/charmbracelet/crush@latest</span>
         </div>
       </div>
       <div className="charmShot">
