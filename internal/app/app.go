@@ -34,6 +34,7 @@ import (
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/question"
+	"github.com/charmbracelet/crush/internal/semantic"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/charmbracelet/crush/internal/skills"
@@ -67,6 +68,11 @@ type App struct {
 	Skills *skills.Manager
 
 	config *config.ConfigStore
+
+	// conn is the shared project database handle, retained so the
+	// semantic index store can be (re)built against it when the coder
+	// agent initialises.
+	conn *sql.DB
 
 	serviceEventsWG *sync.WaitGroup
 	eventsCtx       context.Context
@@ -119,6 +125,7 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 		globalCtx: ctx,
 
 		config: store,
+		conn:   conn,
 
 		events:             pubsub.NewBroker[tea.Msg](),
 		serviceEventsWG:    &sync.WaitGroup{},
@@ -681,7 +688,7 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		return fmt.Errorf("coder agent configuration is missing")
 	}
 	var err error
-	app.AgentCoordinator, err = agent.NewCoordinator(ctx, agent.CoordinatorOptions{
+	coordinatorOpts := agent.CoordinatorOptions{
 		Config:      app.config,
 		Sessions:    app.Sessions,
 		Messages:    app.Messages,
@@ -694,7 +701,33 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		RunComplete: app.runCompletions,
 		Skills:      app.Skills,
 		Interactive: interactive,
-	})
+	}
+
+	// Semantic search is opt-in: only wire the store and client when an
+	// embedding provider is configured. A failed store init (e.g. a
+	// dimension change demanding a reindex) disables the tools for this
+	// run with a logged, actionable error rather than killing startup.
+	if emb, ok := app.config.Config().ResolvedEmbeddings(); ok {
+		store, err := semantic.NewStore(ctx, app.conn, semantic.EmbeddingConfig{
+			BaseURL:   emb.BaseURL,
+			APIKey:    emb.APIKey,
+			Model:     emb.Model,
+			Dimension: emb.Dimension,
+		})
+		if err != nil {
+			slog.Error("Semantic search disabled: index store initialisation failed", "error", err)
+		} else {
+			coordinatorOpts.SemanticStore = store
+			coordinatorOpts.SemanticClient = semantic.NewClient(semantic.EmbeddingConfig{
+				BaseURL:   emb.BaseURL,
+				APIKey:    emb.APIKey,
+				Model:     emb.Model,
+				Dimension: emb.Dimension,
+			})
+		}
+	}
+
+	app.AgentCoordinator, err = agent.NewCoordinator(ctx, coordinatorOpts)
 	if err != nil {
 		slog.Error("Failed to create coder agent", "err", err)
 		return err

@@ -7,16 +7,6 @@ description: A local vector index over your codebase, searched by meaning rather
 
 # Semantic search
 
-:::info[Fork feature — not yet wired up]
-The storage and search layer has landed in the `joestump-agent/crush` fork, but
-the `semantic_search` tool is **not currently registered** in the agent's tool
-list and there is no `crushrc` or `crush.json` surface for the embedding
-provider yet. This page documents what exists so far. Until it is wired up, use
-`grep`, `glob`, and the [LSP tools](/features/lsp).
-:::
-
-## What it is
-
 A vector index over the repository, stored in the project's own SQLite database
 via the `vec0` virtual table from
 [`modernc.org/sqlite/vec`](https://pkg.go.dev/modernc.org/sqlite) — the same
@@ -40,9 +30,42 @@ is much cheaper.
 3. Vectors go into a `chunk_vectors` virtual table alongside the chunk text.
 4. A query is embedded the same way and matched by K-nearest-neighbour search.
 
-## Embedding configuration
+## Enabling it
 
-The embedding client takes four values, with these defaults:
+Semantic search is **opt-in**: it is disabled unless an embedding provider is
+configured. When it is configured, two tools appear in the agent's palette —
+`semantic_search` and `semantic_index`.
+
+### `crush.json`
+
+Add a top-level `embeddings` block:
+
+```json
+{
+  "embeddings": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "${OPENAI_API_KEY:?set OPENAI_API_KEY}",
+    "model": "text-embedding-3-small",
+    "dimension": 768
+  }
+}
+```
+
+`api_key` and `base_url` support the same shell expansion as every other
+credential field: `$VAR`, `${VAR}`, `${VAR:?message}`, and `$(command)`.
+
+### `crushrc`
+
+```bash
+embeddings set --base-url https://api.openai.com/v1 \
+               --api-key ${OPENAI_API_KEY:?set OPENAI_API_KEY} \
+               --model text-embedding-3-small \
+               --dimension 768
+
+embeddings clear   # remove the provider and disable semantic search
+```
+
+### Fields and defaults
 
 | Field | Default |
 | --- | --- |
@@ -55,21 +78,44 @@ Any OpenAI-compatible embeddings endpoint works, including a local one.
 
 **The dimension is baked into the table on first creation.** Changing it later
 is detected and fails with an actionable error rather than silently mismatching
-every insert — a dimension change means reindexing.
+every insert — a dimension change means reindexing (drop the `chunks` and
+`chunk_vectors` tables and run `semantic_index` again).
 
-## The tool
+## The tools
 
-When registered, `semantic_search` takes:
+| Tool | Purpose |
+| --- | --- |
+| `semantic_index` | Build or refresh the index. Unchanged files are skipped, so it is incremental and safe to re-run. |
+| `semantic_search` | Query the index by natural-language description. |
+
+**Indexing lifecycle:** the index is built on demand — the agent (or you, via
+a prompt) runs `semantic_index` before searching, and re-runs it after large
+changes. With no arguments it walks the working directory gitignore-aware and
+skips files whose contents and embedding model have not changed since the last
+run, so repeat runs only pay for what moved.
+
+`semantic_search` takes:
 
 | Parameter | Meaning |
 | --- | --- |
 | `query` | A natural-language description of the code or concept to find |
 | `limit` | Maximum results (default 10) |
 
-It returns an explicit error rather than nothing when no embedding provider is
-configured, or when the index is empty.
+It returns file locations, symbol names, line ranges, and relevance scores —
+not full file contents; follow up with `view` for the authoritative text.
 
-## Tracking this
+## Checking state
 
-Follow [`joestump-agent/crush`](https://github.com/joestump-agent/crush) for
-when the tool is registered and the config surface lands.
+`crush_info` reports the semantic index alongside LSP and MCP:
+
+```
+[semantic_index]
+model = text-embedding-3-small (dim 768)
+chunks = 1337
+```
+
+The section is absent when no embedding provider is configured.
+
+Note that changing the embedding `dimension` against an existing index
+disables the tools for that run with a logged, actionable error, since the
+vector table cannot be resized in place.
