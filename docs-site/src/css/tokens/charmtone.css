@@ -1,0 +1,96 @@
+/*
+ * CharmTone Palette
+ *
+ * The raw named colours from @charmland/design-system, copied verbatim so the
+ * docs site reads as Charm rather than as generic Docusaurus. These are
+ * decoration-level tokens: prefer the semantic names in `semantic.css`
+ * (`--intent-danger`, `--fg-muted`) and reach for a CharmTone name directly
+ * only for accents and ornament.
+ *
+ * @joestump-agent 08/25/2026 - Imported the palette from the Charm design
+ * system bundle for the Docusaurus docs site.
+ */
+
+:root {
+  /* Purples — the Charm spine */
+  --charmtone-charple: #6b50ff;
+  --charmtone-darple: #5b40ec;
+  --charmtone-larple: #7b62ff;
+  --charmtone-jelly: #4a30d9;
+  --charmtone-hazy: #8b75ff;
+  --charmtone-guppy: #7272ff;
+  --charmtone-sapphire: #4949ff;
+  --charmtone-ox: #3331b2;
+  --charmtone-grape: #7134dd;
+  --charmtone-prince: #9c35e1;
+  --charmtone-plum: #9953ff;
+  --charmtone-orchid: #ad6eff;
+  --charmtone-violet: #c259ff;
+  --charmtone-mauve: #d46eff;
+  --charmtone-urchin: #c337e0;
+
+  /* Pinks */
+  --charmtone-dolly: #ff60ff;
+  --charmtone-blush: #ff84ff;
+  --charmtone-lilac: #f379ff;
+  --charmtone-mochi: #eb5dff;
+  --charmtone-flamingo: #f947e3;
+  --charmtone-macaron: #e940b0;
+  --charmtone-cheeky: #ff79d0;
+  --charmtone-pony: #ff4fbf;
+  --charmtone-cherry: #ff388b;
+  --charmtone-chili: #e23080;
+  --charmtone-tuna: #ff6daa;
+  --charmtone-pom: #ab2454;
+
+  /* Reds & oranges */
+  --charmtone-coral: #ff577d;
+  --charmtone-salmon: #ff7f90;
+  --charmtone-sriracha: #eb4268;
+  --charmtone-bengal: #ff6e63;
+  --charmtone-uni: #ff937d;
+  --charmtone-paprika: #d36c64;
+  --charmtone-tang: #ff985a;
+  --charmtone-yam: #ffb587;
+  --charmtone-cumin: #bf976f;
+  --charmtone-steak: #582238;
+  --charmtone-toast: #412130;
+
+  /* Yellows & greens */
+  --charmtone-mustard: #f5ef34;
+  --charmtone-citron: #e8ff27;
+  --charmtone-zest: #e8fe96;
+  --charmtone-julep: #00ffb2;
+  --charmtone-bok: #68ffd6;
+  --charmtone-guac: #12c78f;
+  --charmtone-pickle: #00a475;
+  --charmtone-gator: #18463d;
+  --charmtone-spinach: #1c3634;
+
+  /* Blues & cyans */
+  --charmtone-malibu: #00a4ff;
+  --charmtone-sardine: #4fbefe;
+  --charmtone-lichen: #5cdfea;
+  --charmtone-turtle: #0adcd9;
+  --charmtone-ice: #00fffc;
+  --charmtone-zinc: #10b1ae;
+  --charmtone-anchovy: #719afc;
+  --charmtone-thunder: #4776ff;
+  --charmtone-oceania: #2b55b3;
+  --charmtone-damson: #007ab8;
+
+  /* Neutrals — dark to light */
+  --charmtone-pepper: #201f26;
+  --charmtone-bbq: #2d2c36;
+  --charmtone-char: #3a3943;
+  --charmtone-iron: #4d4c57;
+  --charmtone-oyster: #605f6b;
+  --charmtone-squid: #858392;
+  --charmtone-steam: #a2a0ad;
+  --charmtone-smoke: #bfbcc8;
+  --charmtone-steep: #d6d3dc;
+  --charmtone-sash: #ecebf0;
+  --charmtone-salt: #f7f6fb;
+  --charmtone-soda: #fbfbfb;
+  --charmtone-butter: #fffaf1;
+}

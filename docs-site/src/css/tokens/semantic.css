@@ -1,0 +1,168 @@
+/*
+ * Semantic Tokens
+ *
+ * The role-named layer of the Charm design system: surfaces, foregrounds,
+ * borders, intents, spacing, radius, type and depth. Values track the upstream
+ * @charmland/design-system bundle. Charm is a dark-first system — the app
+ * surface is Pepper — so the dark theme carries the canonical values and the
+ * light theme re-points the same names at the Salt/Butter end of the palette.
+ *
+ * Reach for these before a raw `--charmtone-*` name.
+ *
+ * @joestump-agent 08/25/2026 - Imported from the Charm design system bundle
+ * and extended with a light-theme mapping Docusaurus needs.
+ */
+
+:root {
+  /* Surfaces — light theme */
+  --surface-base: var(--charmtone-butter);
+  --surface-raised: #ffffff;
+  --surface-sunken: var(--charmtone-sash);
+  --surface-overlay: rgba(255, 250, 241, 0.94);
+
+  /* Foregrounds — light theme */
+  --fg-default: var(--charmtone-pepper);
+  --fg-muted: var(--charmtone-iron);
+  --fg-subtle: var(--charmtone-oyster);
+  --fg-disabled: var(--charmtone-steam);
+  --fg-on-accent: var(--charmtone-butter);
+
+  /* Borders — light theme */
+  --border-subtle: rgba(32, 31, 38, 0.08);
+  --border-default: var(--charmtone-steep);
+  --border-strong: var(--charmtone-steam);
+
+  /* Accent & link — light theme */
+  --accent: var(--charmtone-charple);
+  --accent-hover: var(--charmtone-grape);
+  --accent-contrast: var(--charmtone-charple);
+  --link: var(--charmtone-charple);
+  --link-hover: var(--charmtone-urchin);
+  --focus-ring: var(--charmtone-charple);
+  --focus-ring-offset: 2px;
+
+  /* Intents */
+  --intent-success: var(--charmtone-pickle);
+  --intent-success-soft: rgba(18, 199, 143, 0.12);
+  --intent-warning: var(--charmtone-cumin);
+  --intent-warning-soft: rgba(245, 239, 52, 0.18);
+  --intent-danger: var(--charmtone-chili);
+  --intent-danger-soft: rgba(255, 56, 139, 0.12);
+  --intent-info: var(--charmtone-damson);
+  --intent-info-soft: rgba(79, 190, 254, 0.12);
+
+  /* Spacing */
+  --space-0-5: 0.125rem;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+  --space-20: 5rem;
+
+  /* Radius */
+  --radius-sm: 0.4rem;
+  --radius-md: 0.6rem;
+  --radius-lg: 0.8rem;
+  --radius-xl: 1rem;
+  --radius-2xl: 1.25rem;
+  --radius-pill: 9999px;
+
+  /*
+   * Type. Charm's brand faces (PP Mori, PP Monument) are commercially licensed
+   * and are not redistributable, so `--font-sans` and `--font-display` resolve
+   * to a system stack here. JetBrains Mono is open source and is served from
+   * Google Fonts. Lean on weight and scale for hierarchy, not on the face.
+   */
+  --font-sans:
+    "Mori Web", "PP Mori", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-display: var(--font-sans);
+  --font-mono:
+    "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    Consolas, "Liberation Mono", monospace;
+
+  --font-weight-regular: 440;
+  --font-weight-medium: 520;
+  --font-weight-semibold: 620;
+  --font-weight-bold: 720;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 2rem;
+  --text-4xl: 2.75rem;
+  --text-5xl: 3.75rem;
+
+  --leading-tight: 1.25;
+  --leading-norm: 1.5;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.625;
+
+  /* Depth & motion */
+  --shadow-flat: 0 1px 3px 0 rgba(0, 0, 0, 0.18);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-2: 0 10px 15px -3px rgba(0, 0, 0, 0.45), 0 4px 6px -4px rgba(0, 0, 0, 0.3);
+  --shadow-3: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.35);
+  --shadow-glow: 0 0 40px -10px rgba(108, 82, 255, 0.4);
+  --shadow-glow-lg: 0 0 80px -20px rgba(108, 82, 255, 0.3);
+
+  --motion-fast: 0.12s;
+  --motion-base: 0.18s;
+  --motion-slow: 0.26s;
+  --ease-out: cubic-bezier(0.2, 0.6, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/*
+ * Dark theme — the canonical Charm surface. Pepper ground, Butter type,
+ * Dolly accent, Zest for the high-contrast counterpoint.
+ */
+[data-theme="dark"] {
+  --surface-base: var(--charmtone-pepper);
+  --surface-raised: var(--charmtone-char);
+  --surface-sunken: #17161c;
+  --surface-overlay: rgba(32, 31, 38, 0.92);
+
+  --fg-default: var(--charmtone-butter);
+  --fg-muted: var(--charmtone-smoke);
+  --fg-subtle: var(--charmtone-squid);
+  --fg-disabled: var(--charmtone-oyster);
+  --fg-on-accent: var(--charmtone-pepper);
+
+  --border-subtle: rgba(255, 250, 241, 0.08);
+  --border-default: var(--charmtone-char);
+  --border-strong: var(--charmtone-iron);
+
+  --accent: var(--charmtone-dolly);
+  --accent-hover: var(--charmtone-blush);
+  --accent-contrast: var(--charmtone-zest);
+  --link: var(--charmtone-dolly);
+  --link-hover: var(--charmtone-bok);
+  --focus-ring: var(--charmtone-dolly);
+
+  --intent-success: var(--charmtone-guac);
+  --intent-success-soft: rgba(18, 199, 143, 0.12);
+  --intent-warning: var(--charmtone-mustard);
+  --intent-warning-soft: rgba(245, 239, 52, 0.12);
+  --intent-danger: var(--charmtone-salmon);
+  --intent-danger-soft: rgba(255, 56, 139, 0.12);
+  --intent-info: var(--charmtone-sardine);
+  --intent-info-soft: rgba(79, 190, 254, 0.12);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0s;
+    --motion-base: 0s;
+    --motion-slow: 0s;
+  }
+}

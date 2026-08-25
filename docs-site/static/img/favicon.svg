@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Crush">
+  <title>Crush</title>
+  <rect width="64" height="64" rx="14" fill="#201f26"/>
+  <!-- Charple/Dolly hatching above and below the mark, echoing the TUI logo. -->
+  <g stroke="#6b50ff" stroke-width="2.5" opacity=".85">
+    <path d="M10 15 L16 9 M18 15 L24 9 M26 15 L32 9 M34 15 L40 9 M42 15 L48 9 M50 15 L54 11"/>
+  </g>
+  <g stroke="#6b50ff" stroke-width="2.5" opacity=".85">
+    <path d="M10 55 L16 49 M18 55 L24 49 M26 55 L32 49 M34 55 L40 49 M42 55 L48 49 M50 55 L54 51"/>
+  </g>
+  <!-- Blocky terminal "C" in Dolly. -->
+  <path fill="#ff60ff" d="M46 25h-8v-3H26v20h12v-3h8v11H18V19h28z"/>
+</svg>
