@@ -129,6 +129,8 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	// like AWS_PROFILE are visible to the AWS SDK credential chain.
 	cfg.applyEnv(valueResolver)
 
+	cfg.resolveEmbeddings(valueResolver)
+
 	if err := cfg.configureProviders(context.Background(), store, env, valueResolver, store.knownProviders); err != nil {
 		return nil, fmt.Errorf("failed to configure providers: %w", err)
 	}
@@ -502,6 +504,38 @@ func (c *Config) applyEnv(resolver VariableResolver) {
 			continue
 		}
 		os.Setenv(k, resolved)
+	}
+}
+
+// resolveEmbeddings shell-expands the credential-bearing embedding fields
+// in place so $VAR and $(command) templates in api_key and base_url behave
+// like every other credential field in the config.
+func (c *Config) resolveEmbeddings(resolver VariableResolver) {
+	if c.Embeddings == nil {
+		return
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"api_key", c.Embeddings.APIKey},
+		{"base_url", c.Embeddings.BaseURL},
+	} {
+		if field.value == "" {
+			continue
+		}
+		resolved, err := resolver.ResolveValue(field.value)
+		if err != nil {
+			slog.Warn("Skipping embeddings field due to resolution failure.",
+				"field", field.name, "error", err)
+			continue
+		}
+		switch field.name {
+		case "api_key":
+			c.Embeddings.APIKey = resolved
+		case "base_url":
+			c.Embeddings.BaseURL = resolved
+		}
 	}
 }
 

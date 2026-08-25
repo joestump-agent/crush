@@ -78,6 +78,10 @@
           "$ref": "#/$defs/LSPs",
           "description": "Language Server Protocol configurations"
         },
+        "embeddings": {
+          "$ref": "#/$defs/EmbeddingsConfig",
+          "description": "Embedding provider configuration for semantic search"
+        },
         "options": {
           "$ref": "#/$defs/Options",
           "description": "General application options"
@@ -106,6 +110,40 @@
           },
           "type": "object",
           "description": "Environment variables to set on startup"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "EmbeddingsConfig": {
+      "properties": {
+        "base_url": {
+          "type": "string",
+          "description": "Base URL of an OpenAI-compatible embeddings endpoint",
+          "default": "https://api.openai.com/v1",
+          "examples": [
+            "https://api.openai.com/v1"
+          ]
+        },
+        "api_key": {
+          "type": "string",
+          "description": "API key for the embeddings endpoint. Supports shell expansion of $VAR and $(command)."
+        },
+        "model": {
+          "type": "string",
+          "description": "Embedding model name",
+          "default": "text-embedding-3-small",
+          "examples": [
+            "text-embedding-3-small"
+          ]
+        },
+        "dimension": {
+          "type": "integer",
+          "description": "Embedding vector dimension. Baked into the vector table on first creation; changing it requires reindexing.",
+          "default": 768,
+          "examples": [
+            768
+          ]
         }
       },
       "additionalProperties": false,
@@ -641,23 +679,6 @@
         "disable_a2ui": {
           "type": "boolean",
           "description": "Disable A2UI entirely: drops the prompt section inviting the model to emit renderable \u003ca2ui-json\u003e surfaces and stops advertising the a2ui capability to MCP servers",
-          "default": false
-        },
-        "allowed_commands": {
-          "items": {
-            "type": "string",
-            "examples": [
-              "ssh",
-              "curl",
-              "scp"
-            ]
-          },
-          "type": "array",
-          "description": "List of commands to allow that are normally banned. Only affects the exact-command block list; package-manager argument blocks (e.g. 'apt install') are unaffected. Allowed commands still require permission approval."
-        },
-        "allow_all_commands": {
-          "type": "boolean",
-          "description": "Remove all command restrictions from the bash tool",
           "default": false
         },
         "allowed_commands": {

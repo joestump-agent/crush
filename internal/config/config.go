@@ -402,6 +402,17 @@ type Options struct {
 
 type MCPs map[string]MCPConfig
 
+// EmbeddingsConfig configures the embedding provider that backs the
+// semantic_search tool. It points at any OpenAI-compatible
+// /v1/embeddings endpoint. A nil config disables semantic search
+// entirely — the tool is not registered.
+type EmbeddingsConfig struct {
+	BaseURL   string `json:"base_url,omitempty" jsonschema:"description=Base URL of an OpenAI-compatible embeddings endpoint,default=https://api.openai.com/v1,example=https://api.openai.com/v1"`
+	APIKey    string `json:"api_key,omitempty" jsonschema:"description=API key for the embeddings endpoint. Supports shell expansion of $VAR and $(command)."`
+	Model     string `json:"model,omitempty" jsonschema:"description=Embedding model name,default=text-embedding-3-small,example=text-embedding-3-small"`
+	Dimension int    `json:"dimension,omitempty" jsonschema:"description=Embedding vector dimension. Baked into the vector table on first creation; changing it requires reindexing.,default=768,example=768"`
+}
+
 type MCP struct {
 	Name string    `json:"name"`
 	MCP  MCPConfig `json:"mcp"`
@@ -700,6 +711,26 @@ func (h *HookConfig) TimeoutDuration() time.Duration {
 	return time.Duration(h.Timeout) * time.Second
 }
 
+// ResolvedEmbeddings returns the effective embedding configuration with
+// defaults applied, and whether semantic search is enabled at all. The
+// second return value is false when no embeddings block is configured.
+func (c *Config) ResolvedEmbeddings() (EmbeddingsConfig, bool) {
+	if c.Embeddings == nil {
+		return EmbeddingsConfig{}, false
+	}
+	e := *c.Embeddings
+	if e.BaseURL == "" {
+		e.BaseURL = "https://api.openai.com/v1"
+	}
+	if e.Model == "" {
+		e.Model = "text-embedding-3-small"
+	}
+	if e.Dimension <= 0 {
+		e.Dimension = 768
+	}
+	return e, true
+}
+
 // Config holds the configuration for crush.
 type Config struct {
 	Schema string `json:"$schema,omitempty"`
@@ -716,6 +747,10 @@ type Config struct {
 	MCP MCPs `json:"mcp,omitempty" jsonschema:"description=Model Context Protocol server configurations"`
 
 	LSP LSPs `json:"lsp,omitempty" jsonschema:"description=Language Server Protocol configurations"`
+
+	// Embeddings enables the semantic_search tool. Nil (the default)
+	// leaves the tool unregistered.
+	Embeddings *EmbeddingsConfig `json:"embeddings,omitempty" jsonschema:"description=Embedding provider configuration for semantic search"`
 
 	Options *Options `json:"options,omitempty" jsonschema:"description=General application options"`
 
@@ -876,6 +911,8 @@ func allToolNames() []string {
 		"grep",
 		"ls",
 		"question",
+		"semantic_search",
+		"semantic_index",
 		"sidekick_update",
 		"sourcegraph",
 		"todos",
@@ -897,7 +934,7 @@ func resolveAllowedTools(allTools []string, disabledTools []string) []string {
 }
 
 func resolveReadOnlyTools(tools []string) []string {
-	readOnlyTools := []string{"glob", "grep", "ls", "lsp_call_hierarchy", "lsp_definition", "lsp_symbols", "sourcegraph", "view"}
+	readOnlyTools := []string{"glob", "grep", "ls", "lsp_call_hierarchy", "lsp_definition", "lsp_symbols", "semantic_search", "sourcegraph", "view"}
 	// filter to only include tools that are in allowedtools (include mode)
 	return filterSlice(tools, readOnlyTools, true)
 }
