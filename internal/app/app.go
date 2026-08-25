@@ -416,25 +416,13 @@ func (app *App) RunNonInteractive(ctx context.Context, output io.Writer, prompt,
 				stopSpinner()
 
 				content := msg.Content().String()
-				readBytes := messageReadBytes[msg.ID]
-
-				if len(content) < readBytes {
-					slog.Error("Non-interactive: message content is shorter than read bytes", "message_length", len(content), "read_bytes", readBytes)
-					return fmt.Errorf("message content is shorter than read bytes: %d < %d", len(content), readBytes)
-				}
-
-				part := content[readBytes:]
-				// Trim leading whitespace. Sometimes the LLM includes leading
-				// formatting and intentation, which we don't want here.
-				if readBytes == 0 {
-					part = strings.TrimLeft(part, " \t")
-				}
+				part, next := format.NextStreamChunk(content, messageReadBytes[msg.ID])
 				// Ignore initial whitespace-only messages.
 				if printed || strings.TrimSpace(part) != "" {
 					printed = true
 					fmt.Fprint(output, part)
 				}
-				messageReadBytes[msg.ID] = len(content)
+				messageReadBytes[msg.ID] = next
 			}
 
 		case <-ctx.Done():

@@ -363,22 +363,12 @@ func (s *runStream) handle(ev any, stopSpinner func()) (done bool, err error) {
 		stop()
 
 		content := msg.Content().String()
-		readBytes := s.read[msg.ID]
-		if len(content) < readBytes {
-			slog.Error("Non-interactive: message content shorter than read bytes",
-				"message_length", len(content), "read_bytes", readBytes)
-			return false, fmt.Errorf("message content is shorter than read bytes: %d < %d", len(content), readBytes)
-		}
-
-		part := content[readBytes:]
-		if readBytes == 0 {
-			part = strings.TrimLeft(part, " \t")
-		}
+		part, next := format.NextStreamChunk(content, s.read[msg.ID])
 		if s.printed || strings.TrimSpace(part) != "" {
 			s.printed = true
 			fmt.Fprint(s.out, part)
 		}
-		s.read[msg.ID] = len(content)
+		s.read[msg.ID] = next
 		return false, nil
 
 	case pubsub.Event[proto.RunComplete]:
