@@ -104,6 +104,14 @@ run, so repeat runs only pay for what moved.
 It returns file locations, symbol names, line ranges, and relevance scores —
 not full file contents; follow up with `view` for the authoritative text.
 
+In the interactive TUI, both tools render their results as an A2UI surface
+under the tool call — a card with per-result location, score, and snippet
+for `semantic_search`, and an index summary card for `semantic_index`. The
+surface travels in tool-result metadata and never enters the model's
+context; the model still receives a compact text digest it can act on.
+Headless runs, channel-originated turns, and `disable_a2ui` deployments get
+the original plain-text output unchanged.
+
 ## Checking state
 
 `crush_info` reports the semantic index alongside LSP and MCP:

@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"charm.land/fantasy"
-
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/semantic"
 	"github.com/charmbracelet/crush/internal/symbols"
@@ -41,7 +41,7 @@ var indexableExtensions = map[string]bool{
 // semantic search index. Files whose contents and embedding model have
 // not changed since the last index are skipped, so repeated runs are
 // incremental.
-func NewSemanticIndexTool(store *semantic.Store, extractor *symbols.Extractor, workingDir string) fantasy.AgentTool {
+func NewSemanticIndexTool(cfg *config.ConfigStore, store *semantic.Store, extractor *symbols.Extractor, workingDir string) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		SemanticIndexToolName,
 		semanticIndexDescription(),
@@ -110,7 +110,13 @@ func NewSemanticIndexTool(store *semantic.Store, extractor *symbols.Extractor, w
 			for _, e := range errs {
 				fmt.Fprintf(&b, "error: %s\n", e)
 			}
-			return fantasy.NewTextResponse(b.String()), nil
+			resp := fantasy.NewTextResponse(b.String())
+			// The summary card renders as a live A2UI surface when a chat UI
+			// is attached; the text above stays model-facing either way.
+			if semanticDivert(ctx, cfg) {
+				resp = withSemanticSurface(resp, a2uiSurfaceIDPrefix+"index", semanticIndexSurface(indexed, skipped, failed, int(total), errs))
+			}
+			return resp, nil
 		},
 	)
 }

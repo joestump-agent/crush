@@ -95,7 +95,7 @@ func TestSemanticIndexToolIndexesFiles(t *testing.T) {
 	srv := embeddingServer(t)
 	store := newSemanticTestStore(t, srv.URL)
 
-	tool := NewSemanticIndexTool(store, symbols.NewExtractor(), dir)
+	tool := NewSemanticIndexTool(nil, store, symbols.NewExtractor(), dir)
 	resp, err := runTool(t, tool, SemanticIndexParams{})
 	require.NoError(t, err)
 	require.Contains(t, resp, "Index now holds 1 chunks")
@@ -115,7 +115,7 @@ func TestSemanticIndexToolIsIncremental(t *testing.T) {
 
 	srv := embeddingServer(t)
 	store := newSemanticTestStore(t, srv.URL)
-	tool := NewSemanticIndexTool(store, symbols.NewExtractor(), dir)
+	tool := NewSemanticIndexTool(nil, store, symbols.NewExtractor(), dir)
 
 	first, err := runTool(t, tool, SemanticIndexParams{})
 	require.NoError(t, err)
@@ -145,14 +145,14 @@ func TestSemanticIndexToolIsIncremental(t *testing.T) {
 }
 
 func TestSemanticIndexToolUnconfigured(t *testing.T) {
-	tool := NewSemanticIndexTool(nil, nil, t.TempDir())
+	tool := NewSemanticIndexTool(nil, nil, nil, t.TempDir())
 	resp, err := runTool(t, tool, SemanticIndexParams{})
 	require.NoError(t, err)
 	require.Contains(t, resp, "not configured")
 }
 
 func TestSemanticSearchToolUnconfigured(t *testing.T) {
-	tool := NewSemanticSearchTool(nil, nil)
+	tool := NewSemanticSearchTool(nil, nil, nil)
 	resp, err := runTool(t, tool, SemanticSearchParams{Query: "anything"})
 	require.NoError(t, err)
 	require.Contains(t, resp, "not configured")

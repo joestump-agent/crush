@@ -1240,8 +1240,8 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	if c.semanticStore != nil && c.semanticClient != nil {
 		allTools = append(
 			allTools,
-			tools.NewSemanticSearchTool(c.semanticStore, c.semanticClient),
-			tools.NewSemanticIndexTool(c.semanticStore, c.semanticSymbols, c.cfg.WorkingDir()),
+			tools.NewSemanticSearchTool(c.cfg, c.semanticStore, c.semanticClient),
+			tools.NewSemanticIndexTool(c.cfg, c.semanticStore, c.semanticSymbols, c.cfg.WorkingDir()),
 		)
 	}
 
