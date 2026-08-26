@@ -80,7 +80,7 @@ func NewSemanticSearchTool(cfg *config.ConfigStore, store *semantic.Store, clien
 			// free digest; otherwise the tool behaves exactly as before.
 			if semanticDivert(ctx, cfg) {
 				resp := fantasy.NewTextResponse(semanticSearchDigest(hits, false))
-				return withSemanticSurface(resp, a2uiSurfaceIDPrefix+"search", semanticSearchSurface(params.Query, hits)), nil
+				return withSemanticSurface(resp, a2uiSurfaceIDPrefix+"search", semanticSearchSurface(params.Query, cfg.WorkingDir(), GetContentWidthFromContext(ctx), hits)), nil
 			}
 			return fantasy.NewTextResponse(semanticSearchDigest(hits, true)), nil
 		},

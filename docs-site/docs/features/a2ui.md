@@ -126,6 +126,57 @@ When a surface comes from a server, the
 Crush advertises `capabilities.a2ui` at MCP `initialize`, so a server can detect
 that it is talking to an A2UI-capable host before offering surfaces.
 
+## Code, Markdown, and syntax highlighting
+
+Body-variant `Text` — a `Text` with no `variant` — is passed through Crush's
+Markdown renderer (glamour, with chroma for code). So a surface is not limited
+to flat strings: tables, lists, bold, inline code, and **syntax-highlighted
+fenced code blocks** all render inside a card.
+
+```json
+{"component": "Text", "id": "snippet", "text": "```go\n42  func Verify() error {\n43      return nil\n44  }\n```"}
+```
+
+The fence's language tag selects the lexer, so tag it. Line numbers are simply
+part of the block's text — the gutter is lexed along with the code and reads as
+a distinct color. Long lines word-wrap to column zero, which breaks that gutter,
+so a producer drawing one should truncate instead.
+
+The heading and caption variants deliberately skip the Markdown renderer: they
+are short labels, and their variant style already handles them.
+
+## Semantic search results
+
+`semantic_search` and `semantic_index` use all of this. When a chat UI is
+attached, their results divert into a surface and the model keeps a compact
+text digest — so the snippets cost the user nothing in context:
+
+```text
+╭───────────────────────────────────────────────────────╮
+│ Semantic search                                       │
+│ "where is auth handled" · 3 results                   │
+│ 1. internal/auth/token.go:42                          │
+│ Verify · lines 42–89 · ███████░░░ 0.734               │
+│                                                       │
+│   42  func Verify() error {                           │
+│   43      return nil                                  │
+│   44  }                                               │
+│       …                                               │
+│                                                       │
+│ ───────────────────────────────────────────────────── │
+│ 2. …                                                  │
+╰───────────────────────────────────────────────────────╯
+```
+
+Each hit carries a rank, a `path:line` jump target relativized to the working
+directory, the symbol, the chunk's line range, a fixed-width relevance meter
+beside the score, and the chunk's opening lines with a line-number gutter and
+syntax highlighting. Snippet lines are sized from the pane's width hint so the
+gutter survives.
+
+Headless and channel-originated runs are unaffected — with no chat UI to render
+metadata, both tools emit their original plain text.
+
 ## Where surfaces render
 
 | Location | Behaviour |
@@ -149,8 +200,8 @@ With A2UI disabled, `<a2ui-json>` blocks are left as text and the
 - A block that fails to parse shows an alert rather than silently disappearing.
 - Every `child` / `children` id must exist — a dangling id renders
   `[a2tea: missing component …]`.
-- Keep surfaces compact. Code and long logs belong in fenced code blocks, not in
-  a surface.
+- Keep surfaces compact. A surface is a summary, not a viewer — show a handful
+  of lines of code and point at the file for the rest.
 
 ## The built-in skill
 

@@ -30,6 +30,60 @@ func TestContentHasA2UI(t *testing.T) {
 	require.False(t, contentHasA2UI("plain prose"))
 }
 
+// --- Syntax highlighting inside a surface ---
+
+// A body-variant Text is the one variant a2tea routes through the host's
+// Markdown renderer, which in Crush is glamour + chroma. That is what lets a
+// surface show code with real highlighting — the semantic_search result card
+// depends on it, and the a2ui skill tells the model it works.
+func TestA2UIBodyTextCodeFenceSyntaxHighlights(t *testing.T) {
+	t.Parallel()
+
+	const code = "func Verify() error {\n\treturn nil\n}"
+	surface := func(text string) string {
+		body, err := json.Marshal(text)
+		require.NoError(t, err)
+		return `<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s","components":[` +
+			`{"component":"Card","id":"root","child":"t"},` +
+			`{"component":"Text","id":"t","text":` + string(body) + `}` +
+			`]}}</a2ui-json>`
+	}
+
+	sty := styles.CharmtonePantera()
+	renderSurface := func(payload string) string {
+		out, err := renderToolA2UI(&sty, payload, 60)
+		require.NoError(t, err)
+		return out
+	}
+
+	fenced := renderSurface(surface("```go\n" + code + "\n```"))
+	plain := renderSurface(surface(code))
+
+	// Both show the code; only the fenced one is colored, and its keyword
+	// carries a different color than its identifier.
+	require.Contains(t, ansi.Strip(fenced), "func Verify() error {")
+	require.Contains(t, ansi.Strip(plain), "func Verify() error {")
+	require.Greater(t, countSGR(fenced), countSGR(plain))
+	require.NotEqual(t, colorOfWord(t, fenced, "func"), colorOfWord(t, fenced, "Verify"))
+}
+
+// countSGR counts the SGR escape sequences in s — a proxy for "was this
+// styled at all".
+func countSGR(s string) int {
+	return strings.Count(s, "\x1b[")
+}
+
+// colorOfWord returns the SGR sequence immediately preceding word in s.
+func colorOfWord(t *testing.T, s, word string) string {
+	t.Helper()
+	idx := strings.Index(s, word)
+	require.GreaterOrEqual(t, idx, 0, "%q not found", word)
+	prefix := s[:idx]
+	start := strings.LastIndex(prefix, "\x1b[")
+	require.GreaterOrEqual(t, start, 0, "no SGR before %q", word)
+	return prefix[start:]
+}
+
 // --- Issue #6: fenced code blocks should not render as live surfaces ---
 
 func TestContentHasA2UIIgnoresFencedCode(t *testing.T) {
