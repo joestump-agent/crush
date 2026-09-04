@@ -42,6 +42,7 @@ func (w attachmentClickWorkspace) SidekickSubscribe(context.Context) <-chan pubs
 func (w attachmentClickWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
 	return nil
 }
+
 func (w attachmentClickWorkspace) SidekickModel() config.SelectedModel         { return config.SelectedModel{} }
 func (w attachmentClickWorkspace) SidekickSetModel(config.SelectedModel) error { return nil }
 
@@ -57,6 +58,7 @@ func (w *channelWorkspace) SidekickSubscribe(context.Context) <-chan pubsub.Even
 func (w *channelWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
 	return nil
 }
+
 func (w *channelWorkspace) SidekickModel() config.SelectedModel         { return config.SelectedModel{} }
 func (w *channelWorkspace) SidekickSetModel(config.SelectedModel) error { return nil }
 
@@ -72,6 +74,7 @@ func (w *slashCommandWorkspace) SidekickSubscribe(context.Context) <-chan pubsub
 func (w *slashCommandWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
 	return nil
 }
+
 func (w *slashCommandWorkspace) SidekickModel() config.SelectedModel         { return config.SelectedModel{} }
 func (w *slashCommandWorkspace) SidekickSetModel(config.SelectedModel) error { return nil }
 
@@ -86,5 +89,6 @@ func (w *mcpPromptWorkspace) SidekickSubscribe(context.Context) <-chan pubsub.Ev
 func (w *mcpPromptWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
 	return nil
 }
+
 func (w *mcpPromptWorkspace) SidekickModel() config.SelectedModel         { return config.SelectedModel{} }
 func (w *mcpPromptWorkspace) SidekickSetModel(config.SelectedModel) error { return nil }
