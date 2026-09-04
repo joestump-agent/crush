@@ -78,11 +78,29 @@ func TestCronCreateValidatesExpression(t *testing.T) {
 	store := scheduler.NewStore("")
 	ctx := cronTestContext("test-session")
 
-	_, err := runCronTool(t, NewCronCreateTool(store), CronCreateToolName, ctx, CronCreateParams{
+	resp, err := runCronTool(t, NewCronCreateTool(store), CronCreateToolName, ctx, CronCreateParams{
 		Cron:   "not cron",
 		Prompt: "hello",
 	})
-	require.Error(t, err)
+	require.NoError(t, err)
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "not cron")
+	require.Len(t, store.List("test-session"), 0)
+}
+
+func TestCronCreateMissingPromptIsError(t *testing.T) {
+	t.Parallel()
+
+	store := scheduler.NewStore("")
+	ctx := cronTestContext("test-session")
+
+	resp, err := runCronTool(t, NewCronCreateTool(store), CronCreateToolName, ctx, CronCreateParams{
+		Cron:   "* * * * *",
+		Prompt: "",
+	})
+	require.NoError(t, err)
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "prompt is required")
 }
 
 func TestCronCreateDefaultsRecurring(t *testing.T) {
@@ -182,9 +200,22 @@ func TestCronDeleteUnknownID(t *testing.T) {
 	store := scheduler.NewStore("")
 	ctx := cronTestContext("test-session")
 
-	_, err := runCronTool(t, NewCronDeleteTool(store), CronDeleteToolName, ctx, CronDeleteParams{ID: "deadbeef"})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "deadbeef")
+	resp, err := runCronTool(t, NewCronDeleteTool(store), CronDeleteToolName, ctx, CronDeleteParams{ID: "deadbeef"})
+	require.NoError(t, err)
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "deadbeef")
+}
+
+func TestCronDeleteMissingID(t *testing.T) {
+	t.Parallel()
+
+	store := scheduler.NewStore("")
+	ctx := cronTestContext("test-session")
+
+	resp, err := runCronTool(t, NewCronDeleteTool(store), CronDeleteToolName, ctx, CronDeleteParams{ID: ""})
+	require.NoError(t, err)
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "id is required")
 }
 
 func TestCronDeleteOtherSessionsTask(t *testing.T) {
@@ -194,8 +225,10 @@ func TestCronDeleteOtherSessionsTask(t *testing.T) {
 	task, err := store.Create("other-session", "* * * * *", "not yours", true, false)
 	require.NoError(t, err)
 
-	_, err = runCronTool(t, NewCronDeleteTool(store), CronDeleteToolName, cronTestContext("test-session"), CronDeleteParams{ID: task.ID})
-	require.Error(t, err)
+	resp, err := runCronTool(t, NewCronDeleteTool(store), CronDeleteToolName, cronTestContext("test-session"), CronDeleteParams{ID: task.ID})
+	require.NoError(t, err)
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, task.ID)
 }
 
 func TestCronCreateEnforcesSessionLimit(t *testing.T) {
@@ -213,10 +246,11 @@ func TestCronCreateEnforcesSessionLimit(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	_, err := runCronTool(t, tool, CronCreateToolName, ctx, CronCreateParams{
+	resp, err := runCronTool(t, tool, CronCreateToolName, ctx, CronCreateParams{
 		Cron:   "* * * * *",
 		Prompt: "one too many",
 	})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "50")
+	require.NoError(t, err)
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "50")
 }

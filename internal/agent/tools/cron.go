@@ -83,7 +83,10 @@ func NewCronCreateTool(store *scheduler.Store) fantasy.AgentTool {
 
 			task, err := store.Create(sessionID, params.Cron, params.Prompt, recurring, params.Durable)
 			if err != nil {
-				return fantasy.ToolResponse{}, err
+				// Invalid cron expressions, missing prompts, and per-session
+				// task limits are all recoverable by the model; returning a
+				// Go error here would abort the whole agent stream.
+				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
 
 			kind := "recurring"
@@ -160,12 +163,13 @@ func NewCronDeleteTool(store *scheduler.Store) fantasy.AgentTool {
 				return fantasy.ToolResponse{}, err
 			}
 			if params.ID == "" {
-				return fantasy.ToolResponse{}, errors.New("id is required")
+				return fantasy.NewTextErrorResponse("id is required"), nil
 			}
 
 			task, err := store.Delete(sessionID, params.ID)
 			if errors.Is(err, scheduler.ErrTaskNotFound) {
-				return fantasy.ToolResponse{}, fmt.Errorf("no scheduled task with ID %q in this session", params.ID)
+				return fantasy.NewTextErrorResponse(
+					fmt.Sprintf("no scheduled task with ID %q in this session", params.ID)), nil
 			}
 			if err != nil {
 				return fantasy.ToolResponse{}, err
