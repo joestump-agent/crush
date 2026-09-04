@@ -22,14 +22,9 @@ running build.
 | <kbd>ctrl+z</kbd> | Suspend |
 | <kbd>tab</kbd> | Change focus |
 | <kbd>ctrl+y</kbd> | Toggle [yolo mode](/configuration/permissions#yolo-mode) |
-| <kbd>ctrl+a</kbd> | Toggle the [Sidekick](/features/sidekick) |
-| <kbd>shift+tab</kbd> | Focus the Sidekick dashboard surface |
-| <kbd>ctrl+x</kbd> | Dismiss the Sidekick dashboard |
-
 :::info[Fork feature]
-The three Sidekick bindings are fork-only. <kbd>tab</kbd> is also three-state
-here — chat, editor, sidebar — because the fork makes the
-[sidebar focusable](/fork#sidebar-and-header).
+<kbd>tab</kbd> is three-state here — chat, editor, sidebar — because the fork
+makes the [sidebar focusable](/fork#sidebar-and-header).
 :::
 
 ## Editor

@@ -112,9 +112,8 @@ builtin yet: `allowed_commands`, `allow_all_commands` (see
 :::info[Fork feature]
 These `crush.json` keys do not exist upstream: `options.allowed_commands`,
 `options.allow_all_commands`, `options.disable_a2ui`, the top-level
-`embeddings` block ([semantic search](/features/semantic-search)), the
-per-server `channel_enabled` ([channels](/features/channels)), and the
-`agents.sidekick` agent ID ([Sidekick](/features/sidekick)). See
+`embeddings` block ([semantic search](/features/semantic-search)), and the
+per-server `channel_enabled` ([channels](/features/channels)). See
 [What this fork adds](/fork#configuration).
 :::
 

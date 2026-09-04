@@ -45,8 +45,7 @@ func TestMain(m *testing.M) {
 // AllowedMCP means "no MCP restrictions" and so bypasses the
 // AllowedTools filter entirely. A test asserting an exact tool list
 // then fails on a developer machine and passes in CI, which is how
-// TestSidekickDashboardSubscribeDeliversToolPushes came to report 129
-// tools where it expects 1.
+// a similar un-isolated test came to report 129 tools where it expects 1.
 //
 // This has to happen once, before m.Run: the tests in this package run
 // under t.Parallel(), which forbids t.Setenv.

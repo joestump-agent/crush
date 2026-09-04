@@ -84,18 +84,6 @@ const TILES: Tile[] = [
     more: 'A2UI',
   },
   {
-    icon: '◑',
-    title: 'Sidekick',
-    body: (
-      <>
-        A second, ephemeral agent in the sidebar with read-only tools, plus a
-        pinned dashboard the main agent pushes live status to.
-      </>
-    ),
-    href: '/features/sidekick',
-    more: 'Sidekick',
-  },
-  {
     icon: '◇',
     title: 'LSP-enhanced',
     body: (

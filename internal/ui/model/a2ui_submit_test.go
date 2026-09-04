@@ -8,10 +8,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/ui/textarea"
 
-	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
-	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/ui/chat"
 	"github.com/charmbracelet/crush/internal/ui/common"
@@ -30,13 +28,6 @@ type a2uiWorkspace struct {
 func (w *a2uiWorkspace) AgentIsReady() bool     { return true }
 func (w *a2uiWorkspace) AgentReadyErr() error   { return nil }
 func (w *a2uiWorkspace) Config() *config.Config { return nil }
-
-// SidekickDashboardSubscribe is attempted on every prompt by the Sidekick
-// dashboard wiring; report it unavailable so the A2UI submission path does
-// not depend on it.
-func (w *a2uiWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
-	return nil
-}
 
 func (w *a2uiWorkspace) AgentRun(_ context.Context, _, prompt string, _ ...message.Attachment) error {
 	w.prompts = append(w.prompts, prompt)

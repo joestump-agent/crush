@@ -182,8 +182,6 @@ metadata, both tools emit their original plain text.
 | Location | Behaviour |
 | --- | --- |
 | Chat transcript | Full rendering, interactive |
-| [Sidekick](/features/sidekick) chat | Rendered at sidebar width, display-only |
-| Sidekick dashboard | Pinned, fully interactive; pushed by the main agent's `sidekick_update` tool |
 
 ## Turning it off
 
@@ -192,7 +190,6 @@ metadata, both tools emit their original plain text.
 ```
 
 With A2UI disabled, `<a2ui-json>` blocks are left as text and the
-`sidekick_update` tool is not registered.
 
 ## Notes and limits
 

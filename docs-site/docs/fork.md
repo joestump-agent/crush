@@ -27,7 +27,6 @@ New subsystems — each one has its own page.
 
 | Feature | What it is |
 | --- | --- |
-| **[Sidekick](/features/sidekick)** | A second, ephemeral agent living in the sidebar, plus a pinned dashboard surface the main agent pushes A2UI status into. Its own tools (`sidekick_bash`, `sidekick_update`), its own memory, no persistence. |
 | **[A2UI rendering](/features/a2ui)** | The model can emit [A2UI](https://a2ui.org) documents and Crush draws them inline — cards, lists, buttons, forms, dashboards — via [a2tea](https://github.com/joestump-agent/a2tea). Interactive surfaces round-trip: a button press goes back to the model. Includes MCP resource surfaces and an `a2ui` capability advertised at MCP `initialize`. |
 | **[Scheduled tasks](/features/scheduled-tasks)** | `CronCreate`, `CronList`, and `CronDelete` tools that re-run a prompt on a cron schedule, with a scheduler, one-shot support, and a pills-panel entry showing what is queued. |
 | **[Semantic search](/features/semantic-search)** | A local vector index over the repo — chunked by symbol, embedded through any OpenAI-compatible endpoint, stored in the project's own SQLite via `sqlite-vec`. Adds the `semantic_search` and `semantic_index` tools and a symbol-extraction package. |
