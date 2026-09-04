@@ -26,6 +26,7 @@ func (w *a2uiActionWorkspace) SidekickSubscribe(context.Context) <-chan pubsub.E
 func (w *a2uiActionWorkspace) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[agenttools.SidekickSurface] {
 	return nil
 }
+
 func (w *a2uiActionWorkspace) SidekickModel() config.SelectedModel         { return config.SelectedModel{} }
 func (w *a2uiActionWorkspace) SidekickSetModel(config.SelectedModel) error { return nil }
 
