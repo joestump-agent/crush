@@ -1,7 +1,6 @@
 package model
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
@@ -9,8 +8,6 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/lsp"
-	"github.com/charmbracelet/crush/internal/message"
-	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/charmbracelet/crush/internal/ui/common"
@@ -32,20 +29,8 @@ func (w *sidebarHeightTestWorkspace) Config() *config.Config { return w.cfg }
 func (w *sidebarHeightTestWorkspace) WorkingDir() string     { return "/tmp/project" }
 func (w *sidebarHeightTestWorkspace) AgentIsReady() bool     { return false }
 func (w *sidebarHeightTestWorkspace) AgentReadyErr() error   { return nil }
-func (w *sidebarHeightTestWorkspace) SidekickAvailable() bool {
-	return true // exercise the full Sidekick chat panel in draw tests
-}
-
-func (w *sidebarHeightTestWorkspace) SidekickSubscribe(context.Context) <-chan pubsub.Event[message.Message] {
-	return nil
-}
-
 func (w *sidebarHeightTestWorkspace) LSPGetStates() map[string]workspace.LSPClientInfo {
 	return nil
-}
-
-func (w *sidebarHeightTestWorkspace) SidekickModel() config.SelectedModel {
-	return config.SelectedModel{}
 }
 
 func (w *sidebarHeightTestWorkspace) LSPGetDiagnosticCounts(string) lsp.DiagnosticCounts {
@@ -120,11 +105,10 @@ func TestSidebarAllSectionTitlesVisibleAtTightHeight(t *testing.T) {
 
 	m := newSidebarHeightTestUI(t)
 
-	// Header is 9 lines (tab bar, blank, logo, title, blank, cwd, blank,
-	// model info, blank). The five sections at minimum need 2 title+blank
-	// lines each, 4 blank separators, and 2 item lines each:
-	// 9 + (5*2 + 4) + 5*2 = 33.
-	const width, height = 32, 33
+	// Header is 7 lines (logo, title, blank, cwd, blank, model info, blank).
+	// The five sections at minimum need 2 title+blank lines each, 4 blank
+	// separators, and 2 item lines each: 7 + (5*2 + 4) + 5*2 = 31.
+	const width, height = 32, 31
 	m.layout.sidebar = uv.Rect(0, 0, width, height)
 
 	scr := uv.NewScreenBuffer(width, height)

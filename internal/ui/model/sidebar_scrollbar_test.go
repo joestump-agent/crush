@@ -45,9 +45,8 @@ func TestBlankSidebarColumn(t *testing.T) {
 }
 
 // TestShortHelpTabStability verifies that the Tab key binding description
-// in ShortHelp is "change focus" for the editor/main panels, "switch tab"
-// for the sidebar (where Tab cycles the Info/Sidekick tabs instead), and
-// that the per-focus overrides don't pollute the global/base key map.
+// in ShortHelp remains stable and focus-neutral, rather than fluctuating,
+// and doesn't pollute the global/base key map definitions when focus changes.
 func TestShortHelpTabStability(t *testing.T) {
 	t.Parallel()
 	m := newSidebarTestUI()
@@ -85,14 +84,11 @@ func TestShortHelpTabStability(t *testing.T) {
 		}
 	}
 
-	// Editor/main are focus-neutral ("change focus") rather than shifting to
-	// "focus chat"/"focus sidebar"; the sidebar advertises tab cycling.
+	// Validate they are all stable and focus-neutral ("change focus")
+	// rather than shifting to "focus chat", "focus sidebar", or "focus editor".
 	require.Equal(t, "change focus", editorTabHelp)
 	require.Equal(t, "change focus", mainTabHelp)
-	require.Equal(t, "switch tab", sidebarTabHelp)
-
-	// The base keymap must be unchanged by the sidebar's cloned override.
-	require.Equal(t, "change focus", m.keyMap.Tab.Help().Desc, "base keymap Tab desc must not be polluted by ShortHelp")
+	require.Equal(t, "change focus", sidebarTabHelp)
 }
 
 // TestSidebarUpDownHelpNoStatePollution verifies that customizing UpDown help

@@ -11,12 +11,10 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent"
-	"github.com/charmbracelet/crush/internal/agent/tools"
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
-	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/scheduler"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/google/uuid"
@@ -162,21 +160,6 @@ func (c *recordingCoordinator) Summarize(context.Context, string) error       { 
 func (c *recordingCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (c *recordingCoordinator) UpdateModels(context.Context) error            { return nil }
 func (c *recordingCoordinator) GenerateTitle(context.Context, string, string) {}
-func (c *recordingCoordinator) RunSidekick(context.Context, string) (*fantasy.AgentResult, error) {
-	return nil, nil
-}
-
-func (c *recordingCoordinator) Sidekick() *agent.EphemeralAgent     { return nil }
-func (c *recordingCoordinator) CancelSidekick()                     {}
-func (c *recordingCoordinator) IsSidekickBusy() bool                { return false }
-func (c *recordingCoordinator) ClearSidekick(context.Context) error { return nil }
-func (c *recordingCoordinator) SidekickDashboardSubscribe(context.Context) <-chan pubsub.Event[tools.SidekickSurface] {
-	return nil
-}
-
-func (c *recordingCoordinator) SidekickModel() config.SelectedModel { return config.SelectedModel{} }
-
-func (c *recordingCoordinator) SetSidekickModel(config.SelectedModel) error { return nil }
 
 // fullFakeSessions adapts fakeChannelSessions to the full session.Service
 // interface by embedding it; only the channelSessionStore subset is

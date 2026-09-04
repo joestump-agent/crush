@@ -203,13 +203,8 @@ type sessionAgent struct {
 	tools              *csync.Slice[fantasy.AgentTool]
 
 	isSubAgent bool
-	// ephemeral marks a fire-and-forget agent (e.g. Sidekick): its
-	// sessions live only in memory, it never generates titles, never
-	// auto-summarizes, never queues busy-session calls, and never
-	// publishes notifications.
-	ephemeral bool
-	sessions  session.Service
-	messages  message.Service
+	sessions   session.Service
+	messages   message.Service
 	// cfg backs channel reply routing (config lookup + MCP tool
 	// invocation). Nil in tests and sub-agents that never see channel
 	// turns; sendChannelReply treats nil as "routing disabled".
@@ -261,16 +256,11 @@ type sessionAgent struct {
 }
 
 type SessionAgentOptions struct {
-	LargeModel         Model
-	SmallModel         Model
-	SystemPromptPrefix string
-	SystemPrompt       string
-	IsSubAgent         bool
-	// Ephemeral marks the agent as fire-and-forget (e.g. Sidekick):
-	// title generation, auto-summarize, busy-session queueing, and
-	// notifications are all disabled. Pair with in-memory session and
-	// message services (see NewEphemeralAgent) so nothing persists.
-	Ephemeral            bool
+	LargeModel           Model
+	SmallModel           Model
+	SystemPromptPrefix   string
+	SystemPrompt         string
+	IsSubAgent           bool
 	DisableAutoSummarize bool
 	IsYolo               bool
 	Sessions             session.Service
@@ -284,19 +274,12 @@ type SessionAgentOptions struct {
 func NewSessionAgent(
 	opts SessionAgentOptions,
 ) SessionAgent {
-	if opts.Ephemeral {
-		// Ephemeral runs are fire-and-forget: no auto-summarize and no
-		// user-facing notifications, regardless of what the caller wired.
-		opts.DisableAutoSummarize = true
-		opts.Notify = nil
-	}
 	return &sessionAgent{
 		largeModel:           csync.NewValue(opts.LargeModel),
 		smallModel:           csync.NewValue(opts.SmallModel),
 		systemPromptPrefix:   csync.NewValue(opts.SystemPromptPrefix),
 		systemPrompt:         csync.NewValue(opts.SystemPrompt),
 		isSubAgent:           opts.IsSubAgent,
-		ephemeral:            opts.Ephemeral,
 		sessions:             opts.Sessions,
 		messages:             opts.Messages,
 		cfg:                  opts.Cfg,
@@ -674,16 +657,6 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	}
 
 	if a.IsSessionBusy(call.SessionID) {
-		if a.ephemeral {
-			// Ephemeral runs are always fire-and-forget: a busy session
-			// rejects the call outright instead of queueing it, so no
-			// queue state can outlive the active turn.
-			if call.Accepted != nil {
-				call.Accepted.Close()
-			}
-			sessMu.Unlock()
-			return nil, ErrSessionBusy
-		}
 		// Busy: an earlier prompt is active. Queue this call so it is
 		// folded into (or sequenced after) the active turn, and release any
 		// accept reservation. A Cancel arriving after this point sees the
@@ -766,12 +739,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		return nil, fmt.Errorf("failed to get session messages: %w", err)
 	}
 
-	// Generate title from the first real (non-shell) user prompt.
-	// Ephemeral sessions never generate titles. Title generation
-	// can take tens of seconds. Blocking Run on it delays the
-	// response to the caller. Use a detached context so the title
-	// goroutine survives Run's cancel.
-	if !a.ephemeral && !hasUserTextMessage(msgs) {
+	// Generate title from the first real (non-shell) user prompt. Use a
+	// detached context so the title goroutine survives Run's cancel.
+	if !hasUserTextMessage(msgs) {
 		titleCtx := context.WithoutCancel(ctx)
 		go a.GenerateTitle(titleCtx, call.SessionID, call.Prompt)
 	}
@@ -1817,8 +1787,6 @@ func hasUserTextMessage(msgs []message.Message) bool {
 }
 
 // GenerateTitle generates a session title based on the initial prompt.
-// It is a no-op for ephemeral agents, whose sessions never surface in
-// the session list.
 // titleProviderOptions forwards the model's configured provider_options
 // (e.g. disabling thinking for Qwen models via chat_template_kwargs) to
 // the title call, which otherwise never goes through getProviderOptions.
@@ -1846,7 +1814,7 @@ func titleProviderOptions(m Model) fantasy.ProviderOptions {
 }
 
 func (a *sessionAgent) GenerateTitle(ctx context.Context, sessionID string, userPrompt string) {
-	if a.ephemeral || userPrompt == "" {
+	if userPrompt == "" {
 		return
 	}
 
