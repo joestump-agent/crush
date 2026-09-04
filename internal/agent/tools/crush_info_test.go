@@ -229,7 +229,7 @@ func TestCrushInfo_TUIOptions(t *testing.T) {
 		},
 	})
 
-	output := buildCrushInfo(cfg, nil, nil, nil, nil)
+	output := buildCrushInfo(cfg, nil, nil, nil, nil, nil)
 	require.Contains(t, output, "compact_mode = true")
 	require.Contains(t, output, "diff_mode = split")
 	require.Contains(t, output, "scrollbar = never")
@@ -247,7 +247,7 @@ func TestCrushInfo_TUIOptionsUnpinnedCompletionsOmitted(t *testing.T) {
 		Options:   &config.Options{TUI: &config.TUIOptions{}},
 	})
 
-	output := buildCrushInfo(cfg, nil, nil, nil, nil)
+	output := buildCrushInfo(cfg, nil, nil, nil, nil, nil)
 	require.Contains(t, output, "transparent = false")
 	require.NotContains(t, output, "completions_max_depth")
 	require.NotContains(t, output, "completions_max_items")

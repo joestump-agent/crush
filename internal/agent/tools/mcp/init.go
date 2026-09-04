@@ -1100,25 +1100,6 @@ func createSession(ctx context.Context, cfg *config.ConfigStore, name string, m 
 	}, nil
 }
 
-// transportWrapper is implemented by every transport decorator crush layers
-// around a base transport, so diagnostics that need the innermost transport
-// can reach it without knowing which decorators are in play.
-type transportWrapper interface {
-	unwrapTransport() mcp.Transport
-}
-
-// unwrapTransport peels every decorator off a transport and returns the
-// innermost one.
-func unwrapTransport(transport mcp.Transport) mcp.Transport {
-	for {
-		w, ok := transport.(transportWrapper)
-		if !ok {
-			return transport
-		}
-		transport = w.unwrapTransport()
-	}
-}
-
 // maybeStdioErr if a stdio mcp prints an error in non-json format, it'll fail
 // to parse, and the cli will then close it, causing the EOF error.
 // so, if we got an EOF err, and the transport is STDIO, we try to exec it

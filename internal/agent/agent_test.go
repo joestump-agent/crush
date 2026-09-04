@@ -77,7 +77,7 @@ func isolateGlobalConfig() func() {
 }
 
 var modelPairs = []modelPair{
-	{"deepseek-v4", hyperBuilder("deepseek-v4-pro-0813"), hyperBuilder("deepseek-v4-flash-0731")},
+	{"glm-5.1", hyperBuilder("glm-5.1"), hyperBuilder("gpt-oss-120b")},
 }
 
 func getModels(t *testing.T, r *vcr.Recorder, pair modelPair) (fantasy.LanguageModel, fantasy.LanguageModel) {

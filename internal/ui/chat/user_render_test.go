@@ -11,7 +11,7 @@ import (
 )
 
 // newTestUserItem builds a UserMessageItem carrying text.
-func newTestUserItem(t *testing.T, text string) *UserMessageItem {
+func newTestUserItemRender(t *testing.T, text string) *UserMessageItem {
 	t.Helper()
 	sty := styles.CharmtonePantera()
 	msg := &message.Message{
@@ -30,7 +30,7 @@ func newTestUserItem(t *testing.T, text string) *UserMessageItem {
 // depending on ANSI styling or trailing pad.
 func renderedLines(t *testing.T, text string, width int) []string {
 	t.Helper()
-	out := newTestUserItem(t, text).RawRender(width)
+	out := newTestUserItemRender(t, text).RawRender(width)
 	lines := strings.Split(out, "\n")
 	for i, l := range lines {
 		lines[i] = strings.TrimSpace(ansi.Strip(l))

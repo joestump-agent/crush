@@ -69,8 +69,9 @@ func GetPromptMessages(ctx context.Context, cfg *config.ConfigStore, clientName,
 // RefreshPrompts gets the updated list of prompts from the MCP and updates the
 // global state.
 func RefreshPrompts(ctx context.Context, name string) {
-	// Runs under the per-name lifecycle lock so a concurrent renewal can't
-	// swap the session between our Get and the state update below.
+	// Serialize with session renewal so the registered session can't be
+	// swapped between the Get and the state update below — a stale error
+	// transition would otherwise tear down the healthy replacement.
 	mu := renewLock(name)
 	mu.Lock()
 	defer mu.Unlock()

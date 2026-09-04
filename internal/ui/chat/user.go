@@ -92,7 +92,7 @@ func (m *UserMessageItem) RawRender(width int) string {
 			// Check if this is a channel-originated message.
 			content = m.renderChannelMessage(msgContent, cappedWidth)
 		} else {
-			renderer := common.MarkdownRenderer(m.sty, cappedWidth)
+			renderer := common.UserMarkdownRenderer(m.sty, cappedWidth)
 			mu := common.LockMarkdownRenderer(renderer)
 
 			mu.Lock()

@@ -76,12 +76,13 @@ func (s *memoryService) Update(ctx context.Context, msg Message) error {
 		return sql.ErrNoRows
 	}
 	s.messages[msg.ID] = cloned
+	prevBaseline := newFlushBaseline(&prev)
 	s.mu.Unlock()
 	// Terminal events — message finished, tool call added or finished,
 	// reasoning ended — use the bounded must-deliver path so they never
 	// get dropped under channel contention, matching the DB-backed
 	// service.
-	if shouldFlushNow(&prev, &cloned) {
+	if shouldFlushNow(&prevBaseline, &cloned) {
 		s.PublishMustDeliver(ctx, pubsub.UpdatedEvent, cloned)
 	} else {
 		s.Publish(pubsub.UpdatedEvent, cloned)

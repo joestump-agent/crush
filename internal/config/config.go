@@ -327,8 +327,8 @@ type TUIOptions struct {
 	Scrollbar   string      `json:"scrollbar,omitempty" jsonschema:"description=Chat scrollbar visibility,enum=default,enum=always,enum=never,default=default"`
 	// WorkingDirFormat controls how the working directory is rendered in
 	// the header. Supported placeholders: {cwd}, {user}, {host}.
-	WorkingDirFormat string `json:"working_dir_format,omitempty" jsonschema:"description=Format for the working directory shown in the header. Supported placeholders: {cwd} for the path\\, {user} for the current user\\, {host} for the hostname.,default={user}@{host}:{cwd},example={cwd},example={host}:{cwd}"`
-	ExitBanner  ExitBanner  `json:"exit_banner,omitempty" jsonschema:"description=Exit banner style after quitting Crush,enum=default,enum=compact,enum=none,default=default"`
+	WorkingDirFormat string     `json:"working_dir_format,omitempty" jsonschema:"description=Format for the working directory shown in the header. Supported placeholders: {cwd} for the path\\, {user} for the current user\\, {host} for the hostname.,default={user}@{host}:{cwd},example={cwd},example={host}:{cwd}"`
+	ExitBanner       ExitBanner `json:"exit_banner,omitempty" jsonschema:"description=Exit banner style after quitting Crush,enum=default,enum=compact,enum=none,default=default"`
 }
 
 // IsTransparent reports whether the TUI draws a transparent background. The
@@ -442,7 +442,7 @@ type Options struct {
 	// allowed_commands, this also removes the package-manager argument blocks.
 	// This is a dangerous option and should be used with caution.
 	AllowAllCommands bool `json:"allow_all_commands,omitempty" jsonschema:"description=Remove all command restrictions from the bash tool, including package-manager argument blocks (dangerous). Commands still require permission approval unless yolo mode is enabled.,default=false"`
-	RequestTimeout            *int         `json:"request_timeout,omitempty" jsonschema:"description=Timeout in seconds for each LLM API request. Streaming responses are aborted only after this much inactivity\\, so slow but active streams are never killed. 0 disables it\\, negative values are invalid.,default=60,example=120,example=300,example=0"`
+	RequestTimeout   *int `json:"request_timeout,omitempty" jsonschema:"description=Timeout in seconds for each LLM API request. Streaming responses are aborted only after this much inactivity\\, so slow but active streams are never killed. 0 disables it\\, negative values are invalid.,default=60,example=120,example=300,example=0"`
 }
 
 // DefaultRequestTimeout bounds each LLM API request when the user has not
