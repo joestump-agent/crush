@@ -175,10 +175,6 @@ func TestWaitForInitBudget_ReturnsWhenNotArmed(t *testing.T) {
 		"WaitForInitBudget must return immediately when initialization was never armed")
 }
 
-// TestWaitForInit_ToolsVisibleAfterInit is the regression test for the bug the
-// coordinator fix addresses: buildTools read allTools concurrently with MCP
-// initialization, so a slow server's tools were silently missing from the LLM's
-// palette even though crush_info later reported the server as connected. Gating
 // TestWaitForInit_ToolsVisibleAfterInit pins the visibility guarantee
 // WaitForInit gives the non-interactive path: any tool registered before
 // initialization completes must be visible once WaitForInit returns. The

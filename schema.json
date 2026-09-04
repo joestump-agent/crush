@@ -390,6 +390,11 @@
             120
           ]
         },
+        "sessionless": {
+          "type": "boolean",
+          "description": "Mark a sessionless MCP server (no Mcp-Session-Id) so Crush skips the subscriptions/listen stream it would otherwise reject. Leave unset to auto-detect known sessionless servers (e.g. GitHub MCP)",
+          "default": false
+        },
         "headers": {
           "additionalProperties": {
             "type": "string"
@@ -697,6 +702,16 @@
           "type": "boolean",
           "description": "Remove all command restrictions from the bash tool",
           "default": false
+        },
+        "request_timeout": {
+          "type": "integer",
+          "description": "Timeout in seconds for each LLM API request. Streaming responses are aborted only after this much inactivity, so slow but active streams are never killed. 0 disables it, negative values are invalid.",
+          "default": 60,
+          "examples": [
+            120,
+            300,
+            0
+          ]
         }
       },
       "additionalProperties": false,
@@ -945,6 +960,16 @@
             "{cwd}",
             "{host}:{cwd}"
           ]
+        },
+        "exit_banner": {
+          "type": "string",
+          "enum": [
+            "default",
+            "compact",
+            "none"
+          ],
+          "description": "Exit banner style after quitting Crush",
+          "default": "default"
         }
       },
       "additionalProperties": false,

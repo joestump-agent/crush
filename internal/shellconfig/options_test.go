@@ -174,13 +174,7 @@ func TestOption_UIWorkingDirFormat(t *testing.T) {
 
 	ui := result["options"].(map[string]any)["tui"].(map[string]any)
 	require.Equal(t, "{host}:{cwd}", ui["working_dir_format"])
-}
-
-func TestOption_UIWorkingDirFormatRequiresValue(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "crushrc")
-	_, err := LoadShellConfig(t.Context(), path, []byte(`option ui working-dir-format ""`))
+	_, err = LoadShellConfig(t.Context(), path, []byte(`option ui working-dir-format ""`))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "requires a value")
 }
@@ -192,6 +186,24 @@ func TestOption_UIWorkingDirFormatRequiresPlaceholder(t *testing.T) {
 	_, err := LoadShellConfig(t.Context(), path, []byte(`option ui working-dir-format "{pwd}"`))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "expects at least one of")
+}
+
+func TestOption_UIExitBanner(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "crushrc")
+	jsonBytes, err := LoadShellConfig(t.Context(), path, []byte(`option ui exit-banner compact`))
+	require.NoError(t, err)
+
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(jsonBytes, &result))
+
+	ui := result["options"].(map[string]any)["tui"].(map[string]any)
+	require.Equal(t, "compact", ui["exit_banner"])
+
+	_, err = LoadShellConfig(t.Context(), path, []byte(`option ui exit-banner bogus`))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "expects default, compact, or none")
 }
 
 func TestOption_BoolShorthand(t *testing.T) {
@@ -240,4 +252,34 @@ func TestOption_UnknownKey(t *testing.T) {
 	_, err := LoadShellConfig(t.Context(), path, []byte(script))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unknown key")
+}
+
+func TestOption_RequestTimeout(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	script := `option request-timeout 300
+option request-timeout 0`
+	path := filepath.Join(dir, "crushrc")
+
+	jsonBytes, err := LoadShellConfig(t.Context(), path, []byte(script))
+	require.NoError(t, err)
+
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(jsonBytes, &result))
+
+	opts := result["options"].(map[string]any)
+	require.Equal(t, float64(0), opts["request_timeout"])
+}
+
+func TestOption_RequestTimeoutInvalid(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	script := `option request-timeout soon`
+	path := filepath.Join(dir, "crushrc")
+
+	_, err := LoadShellConfig(t.Context(), path, []byte(script))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "expects a number of seconds")
 }

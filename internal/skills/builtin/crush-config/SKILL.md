@@ -188,6 +188,7 @@ option reset <list-key>    # clear a list option back to empty
   `assisted-by`) and `attribution-generated-with` (boolean).
 - **UI settings**: `option ui compact BOOL`, `option ui diff unified|split`,
   `option ui transparent BOOL`, `option ui scrollbar default|always|never`,
+  `option ui exit-banner default|compact|none`,
   `option ui completions-max-depth N`, `option ui completions-max-items N`,
   `option ui working-dir-format FMT` (header working-dir format with
   `{cwd}`, `{user}`, `{host}` placeholders; default `{user}@{host}:{cwd}`).
@@ -203,6 +204,7 @@ option attribution-trailer-style assisted-by
 option attribution-generated-with true
 option ui compact true
 option ui diff unified
+option ui exit-banner compact
 ```
 
 > [!IMPORTANT] These skill paths are loaded by default and do NOT need
@@ -349,6 +351,7 @@ The `$schema` property enables IDE autocomplete but is optional.
 | `permissions deny bash`              | `options.disabled_tools = ["bash"]`                    |
 | `option skill-path ./skills`         | `options.skills_paths = ["./skills"]`                  |
 | `option metrics false`               | `options.disable_metrics = true`                       |
+| `option request-timeout 300`          | `options.request_timeout = 300`                        |
 | `option attribution-trailer-style none` | `options.attribution.trailer_style = "none"`        |
 | `option attribution-generated-with false` | `options.attribution.generated_with = false`       |
 

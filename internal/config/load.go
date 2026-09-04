@@ -404,7 +404,7 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 	// with no user models to fall back on are recorded below so the
 	// interactive reload can retry them.
 	discoverCtx, discoverCancel := context.WithTimeout(ctx, loadModelDiscoveryTimeout)
-	discoveryResults, _ := discoverProviderModels(discoverCtx, candidates, knownProviderNames, resolver)
+	discoveryResults, discoveryErrs := discoverProviderModels(discoverCtx, candidates, knownProviderNames, resolver)
 	discoverCancel()
 
 	// Validate the custom providers.
@@ -442,14 +442,16 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 			continue
 		}
 
-		// Apply discovery results if available. discoverProviderModels
-		// returns entries only for providers whose discovery succeeded;
-		// failures (and empty results) fall through to the no-models
-		// check below, which drops the provider when it has no
+		// Apply discovery results if available. A failed discovery logs a
+		// warning; both failures and empty results fall through to the
+		// no-models check below, which drops the provider when it has no
 		// user-specified models to fall back on.
 		if models, ok := discoveryResults[id]; ok && len(models) > 0 {
 			providerConfig.Models = models
 			slog.Info("Discovered models for provider", "provider", id, "count", len(models))
+		}
+		if err, ok := discoveryErrs[id]; ok && err != nil {
+			slog.Warn("Model discovery failed", "provider", id, "error", err)
 		}
 
 		if len(providerConfig.Models) == 0 {
@@ -550,13 +552,30 @@ func (c *Config) resolveEmbeddings(resolver VariableResolver) {
 	}
 }
 
-func (c *Config) setDefaults(workingDir, dataDir string) {
+// NormalizeOptions allocates Options and Options.TUI and fills in the option
+// defaults the UI relies on, so readers can dereference them without guarding.
+// Configs loaded from disk get this via setDefaults; configs arriving over the
+// wire from a Crush server need the same treatment before the UI reads them.
+//
+// DiffMode is deliberately left alone: the permissions dialog reads its zero
+// value as "choose split or unified from the terminal width".
+func (c *Config) NormalizeOptions() {
 	if c.Options == nil {
 		c.Options = &Options{}
 	}
 	if c.Options.TUI == nil {
 		c.Options.TUI = &TUIOptions{}
 	}
+	if c.Options.TUI.Scrollbar == "" {
+		c.Options.TUI.Scrollbar = ScrollbarDefault
+	}
+	if c.Options.TUI.ExitBanner == "" {
+		c.Options.TUI.ExitBanner = ExitBannerDefault
+	}
+}
+
+func (c *Config) setDefaults(workingDir, dataDir string) {
+	c.NormalizeOptions()
 	if len(c.Options.GlobalContextPaths) == 0 {
 		crushConfigDir := filepath.Dir(GlobalConfig())
 		c.Options.GlobalContextPaths = []string{

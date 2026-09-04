@@ -675,6 +675,9 @@ func (a *AssistantMessageItem) renderThinking(thinking string, width int) string
 	renderer := common.QuietMarkdownRenderer(a.sty, width)
 	rendered := a.streamingThinking.Render(thinking, width, renderer)
 	rendered = strings.TrimSpace(rendered)
+	// The renderer already knows this count from its cached prefix, so
+	// take it rather than rescanning a document that only grows.
+	renderedLines := a.streamingThinking.LastLines()
 
 	// Count lines and, for the windowed view modes, slice the tail
 	// WITHOUT splitting the entire rendered document. Splitting a
@@ -685,7 +688,7 @@ func (a *AssistantMessageItem) renderThinking(thinking string, width int) string
 	var totalLines int
 	switch a.thinkingViewMode {
 	case thinkingCollapsed:
-		totalLines = countLines(rendered)
+		totalLines = renderedLines
 		if totalLines > maxCollapsedThinkingHeight {
 			tail, hidden := tailLines(rendered, maxCollapsedThinkingHeight, totalLines)
 			hint := a.sty.Messages.ThinkingTruncationHint.Render(
@@ -696,7 +699,7 @@ func (a *AssistantMessageItem) renderThinking(thinking string, width int) string
 			lines = strings.Split(rendered, "\n")
 		}
 	case thinkingTailWindow:
-		totalLines = countLines(rendered)
+		totalLines = renderedLines
 		if totalLines > maxExpandedThinkingTailLines {
 			tail, hidden := tailLines(rendered, maxExpandedThinkingTailLines, totalLines)
 			hint := a.sty.Messages.ThinkingTruncationHint.Render(

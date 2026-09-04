@@ -89,6 +89,7 @@ var (
 func NewClientWorkspace(c *client.Client, ws proto.Workspace) *ClientWorkspace {
 	if ws.Config != nil {
 		ws.Config.SetupAgents()
+		ws.Config.NormalizeOptions()
 	}
 	states := protoToSkillStates(ws.Skills)
 	mgr := skills.NewManager(nil, nil, states, skills.WithGlobalMirror())
@@ -123,6 +124,7 @@ func (w *ClientWorkspace) refreshWorkspaceErr() error {
 	}
 	if updated.Config != nil {
 		updated.Config.SetupAgents()
+		updated.Config.NormalizeOptions()
 	}
 	w.mu.Lock()
 	w.ws = *updated
@@ -1047,6 +1049,7 @@ func (w *ClientWorkspace) recoverWorkspace() error {
 	}
 	if created.Config != nil {
 		created.Config.SetupAgents()
+		created.Config.NormalizeOptions()
 	}
 	w.mu.Lock()
 	oldID := w.ws.ID

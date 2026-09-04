@@ -487,6 +487,12 @@ String Keys:
   attribution-trailer-style string attribution trailer: none, co-authored-by,
                                    or assisted-by
 
+Integer Keys:
+  request-timeout int              seconds before an LLM request is aborted;
+                                   streaming responses are only aborted after
+                                   this much inactivity; 0 waits forever
+                                   (default 60)
+
 List Keys:
   context-path string             append a project context path
   global-context-path string      append a global context path
@@ -530,6 +536,10 @@ Available Keys:
   transparent bool              use the terminal background
   scrollbar string              control chat scrollbar visibility: default,
                                 always, or never
+  exit-banner default|compact|none
+                                control the post-session banner: default shows
+                                the Crush logo, compact shows only the resume
+                                hint, none hides it entirely
   completions-max-depth int     maximum directory depth shown by completions
   completions-max-items int     maximum items returned to completions
   working-dir-format string     how the header shows the working directory,
@@ -543,6 +553,7 @@ option ui compact true
 option ui diff unified
 option ui transparent true
 option ui scrollbar always
+option ui exit-banner compact
 option ui completions-max-depth 4
 option ui completions-max-items 200
 option ui working-dir-format "{host}:{cwd}"
