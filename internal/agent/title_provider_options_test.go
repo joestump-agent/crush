@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"charm.land/catwalk/pkg/catwalk"
-	"charm.land/fantasy"
 	"charm.land/fantasy/providers/openaicompat"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/stretchr/testify/require"
@@ -70,6 +69,6 @@ func TestTitleProviderOptions(t *testing.T) {
 				},
 			},
 		}
-		var _ fantasy.ProviderOptions = titleProviderOptions(m)
+		_ = titleProviderOptions(m)
 	})
 }
