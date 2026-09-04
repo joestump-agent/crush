@@ -12,7 +12,7 @@ import (
 )
 
 // memoryService is an in-memory implementation of [Service] for
-// ephemeral sessions (e.g. Sidekick). Messages never touch SQLite and
+// ephemeral sessions (e.g. dispatched agents). Messages never touch SQLite and
 // are destroyed when the process exits. Every update flushes
 // synchronously — there is no debounce buffer — so Flush and FlushAll
 // are no-ops and reads always observe the latest [Service.Update].

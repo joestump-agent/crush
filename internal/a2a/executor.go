@@ -38,8 +38,8 @@ type DiffFunc func(ctx context.Context) (string, error)
 // diff as the terminal artifact.
 //
 // Phase 1 emits a single Working status before the run and a terminal status
-// after it; richer per-todo progress streaming into the Sidekick dashboard is
-// wired in #71, where the SessionAgent's progress broker is bridged to SSE.
+// after it; richer per-todo progress streaming is wired in #71, where the
+// SessionAgent's progress broker is bridged to SSE.
 type Executor struct {
 	runner    Runner
 	sessionID string

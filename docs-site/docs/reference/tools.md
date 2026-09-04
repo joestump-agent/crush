@@ -133,28 +133,11 @@ See [Scheduled tasks](/features/scheduled-tasks).
 | `crush_logs` | Read Crush's internal application logs — useful when debugging Crush itself |
 | `agent` | Launch a sub-agent with `glob`, `grep`, `ls`, and `view`, for searches that need several tries |
 
-## Sidekick
-
-:::info[Fork feature]
-See [Sidekick](/features/sidekick).
-:::
-
-| Tool | Does |
-| --- | --- |
-| `sidekick_update` | Push a live A2UI status surface to the pinned Sidekick dashboard |
-
-Registered only for the top-level coder agent, only when a Sidekick is
-configured, and only when [A2UI](/features/a2ui) is enabled.
-
 ## What sub-agents get
 
 Sub-agents (`agent`, `agentic_fetch`) run with a restricted tool set and are
 **not** intercepted by `PreToolUse` hooks, so a single delegated turn doesn't
 fire your hooks N times. The outer sub-agent tool call itself *is* hooked.
-
-The [Sidekick](/features/sidekick#read-only-tools) gets its own read-only set: a
-statically filtered `bash`, plus `glob`, `grep`, `ls`, `view`, and
-`sourcegraph`.
 
 ## Checking what's live
 

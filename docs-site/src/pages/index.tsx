@@ -119,10 +119,6 @@ function Fork(): ReactNode {
             <h3>Fork additions</h3>
             <ul>
               <li>
-                <Link to="/features/sidekick">Sidekick</Link> — a second agent
-                in the sidebar, plus a pushed A2UI dashboard
-              </li>
-              <li>
                 <Link to="/features/channels">Channel reply routing</Link> —
                 deterministic replies back through the pushing server
               </li>

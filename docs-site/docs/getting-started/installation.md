@@ -13,7 +13,7 @@ These docs cover the
 the fork is **not published to any package manager**. Every published Crush
 package — Homebrew, npm, winget, scoop, apt, the NUR, the GitHub releases —
 installs **upstream Charm Crush**, which does not have
-[Sidekick](/features/sidekick), [A2UI](/features/a2ui),
+[A2UI](/features/a2ui),
 [scheduled tasks](/features/scheduled-tasks),
 [semantic search](/features/semantic-search), or the fork's
 [channel additions](/features/channels).
@@ -63,9 +63,9 @@ go build -o ~/.local/bin/crush .
 crush --version
 ```
 
-The surest check is a fork-only feature — press <kbd>ctrl+a</kbd> in a session.
-If the [Sidekick](/features/sidekick) panel opens, you are on the fork. If
-nothing happens, you are running upstream Crush.
+The surest check is a fork-only feature — enable [A2UI](/features/a2ui) and
+send a prompt; if the assistant emits a renderable surface, you are on the
+fork.
 
 ## Updating
 

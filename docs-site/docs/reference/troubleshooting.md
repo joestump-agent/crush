@@ -79,7 +79,7 @@ Three separate things hide a tool:
 | --- | --- |
 | `permissions deny <tool>` | Remove it — a denied tool is invisible to the model |
 | Per-server `--disabled-tools` / `--enabled-tools` | Adjust the MCP server config |
-| The tool is conditionally registered | LSP tools need an LSP or `auto-lsp`; MCP resource/prompt tools need a configured server; `question` is interactive-only; `sidekick_update` needs a Sidekick and A2UI enabled |
+| The tool is conditionally registered | LSP tools need an LSP or `auto-lsp`; MCP resource/prompt tools need a configured server; `question` is interactive-only; |
 
 `crush_info` reports what is actually registered right now — ask the agent.
 
