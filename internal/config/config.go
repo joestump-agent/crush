@@ -57,9 +57,8 @@ const (
 )
 
 const (
-	AgentCoder    string = "coder"
-	AgentTask     string = "task"
-	AgentSidekick string = "sidekick"
+	AgentCoder string = "coder"
+	AgentTask  string = "task"
 )
 
 type SelectedModel struct {
@@ -1007,7 +1006,6 @@ func allToolNames() []string {
 		"question",
 		"semantic_search",
 		"semantic_index",
-		"sidekick_update",
 		"sourcegraph",
 		"todos",
 		"view",
@@ -1031,14 +1029,6 @@ func resolveReadOnlyTools(tools []string) []string {
 	readOnlyTools := []string{"glob", "grep", "ls", "lsp_call_hierarchy", "lsp_definition", "lsp_symbols", "semantic_search", "sourcegraph", "view"}
 	// filter to only include tools that are in allowedtools (include mode)
 	return filterSlice(tools, readOnlyTools, true)
-}
-
-// resolveSidekickTools returns the Sidekick tool subset: the read-only
-// tools plus bash (the Sidekick gets the read-only bash variant under the
-// same tool name). Disabling a tool globally also removes it here.
-func resolveSidekickTools(tools []string) []string {
-	sidekickTools := []string{"bash", "glob", "grep", "ls", "sourcegraph", "view"}
-	return filterSlice(tools, sidekickTools, true)
 }
 
 func filterSlice(data []string, mask []string, include bool) []string {
@@ -1073,17 +1063,6 @@ func (c *Config) SetupAgents() {
 			Model:        SelectedModelTypeLarge,
 			ContextPaths: c.Options.ContextPaths,
 			AllowedTools: resolveReadOnlyTools(allowedTools),
-			// NO MCPs or LSPs by default
-			AllowedMCP: map[string][]string{},
-		},
-
-		AgentSidekick: {
-			ID:           AgentSidekick,
-			Name:         "Sidekick",
-			Description:  "A read-only companion agent that answers questions about the workspace without interrupting the coder agent.",
-			Model:        SelectedModelTypeSmall,
-			ContextPaths: c.Options.ContextPaths,
-			AllowedTools: resolveSidekickTools(allowedTools),
 			// NO MCPs or LSPs by default
 			AllowedMCP: map[string][]string{},
 		},

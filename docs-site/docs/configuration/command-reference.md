@@ -133,7 +133,7 @@ Usage:
 
 ### `model large`, `model small`
 
-Set the large (coding) or small (titles, summaries, Sidekick) model slot. With
+Set the large (coding) or small (titles, summaries) model slot. With
 no model argument, prints the current selection.
 
 ```text

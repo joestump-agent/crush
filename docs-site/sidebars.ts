@@ -51,7 +51,6 @@ const sidebars: SidebarsConfig = {
         'features/mcp',
         'features/channels',
         'features/a2ui',
-        'features/sidekick',
         'features/skills',
         'features/hooks',
         'features/scheduled-tasks',

@@ -34,8 +34,7 @@ complete table.
 Crush uses two model slots:
 
 - **large** — the coding model, used for the main agent.
-- **small** — a cheaper model used for titles, summaries, and the
-  [Sidekick](/features/sidekick).
+- **small** — a cheaper model used for titles and summaries.
 
 ## 3. Let Crush learn the project
 
@@ -68,7 +67,6 @@ every prompt and should be used with care.
 | <kbd>ctrl+l</kbd> | Model picker |
 | <kbd>ctrl+s</kbd> | Session picker |
 | <kbd>ctrl+n</kbd> | New session |
-| <kbd>ctrl+a</kbd> | Toggle the [Sidekick](/features/sidekick) |
 | <kbd>@</kbd> | Mention a file |
 | <kbd>ctrl+f</kbd> | Attach a file |
 | <kbd>ctrl+o</kbd> | Open your `$EDITOR` for the prompt |
