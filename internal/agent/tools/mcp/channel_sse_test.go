@@ -170,6 +170,7 @@ func TestChannelSSEFilterLeavesNonChannelEventsForSDK(t *testing.T) {
 	gate := newChannelGate()
 	gotLogging := make(chan struct{}, 1)
 	client := mcp.NewClient(&mcp.Implementation{Name: "crush", Version: "test"}, &mcp.ClientOptions{
+		//nolint:staticcheck // SA1019: only non-channel notification the SDK dispatches without extra capability negotiation
 		LoggingMessageHandler: func(context.Context, *mcp.LoggingMessageRequest) {
 			gotLogging <- struct{}{}
 		},
