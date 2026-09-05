@@ -151,6 +151,12 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 	mcp.ArmInit()
 	go mcp.Initialize(ctx, app.Permissions, store)
 
+	// Keep channel MCP sessions healthy: a channel-only connection carries no
+	// traffic of its own, so a dropped stream is never surfaced by the lazy
+	// tool-call renewal path. The health check pings channel sessions
+	// periodically and renews the dead ones.
+	mcp.StartChannelHealthCheck(ctx, store)
+
 	// Start herdr integration when running inside a herdr pane.
 	app.herdrClient = herdr.Init()
 	herdr.BridgeLocal(ctx, app.herdrClient, herdr.BridgeSources{
