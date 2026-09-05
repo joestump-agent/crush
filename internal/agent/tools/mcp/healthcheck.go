@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -47,13 +48,30 @@ func runChannelHealthCheck(ctx context.Context, cfg *config.ConfigStore, interva
 // fails. Only channel sessions are checked: ordinary servers have their
 // sessions renewed lazily by tool calls, so proactively pinging them would
 // add traffic for no benefit.
+//
+// A ping alone cannot see the failure mode that matters most: on a
+// streamable-HTTP channel server, doorbells arrive on the standalone SSE
+// stream, and a session whose stream is gone keeps answering pings over
+// ordinary request/response. So a channel session on a streamable transport
+// is only healthy when its notification stream is connected too; when the
+// stream has stayed down past the reconnect grace the session is forced
+// through the same rebuild path a failed ping takes.
 func checkChannelSessions(ctx context.Context, cfg *config.ConfigStore) {
 	for name, sess := range sessions.Seq2() {
 		if !sess.IsChannel() {
 			continue
+		}
+		if health, ok := channelStreamStates.Get(name); ok && !health.healthy(channelStreamClosedGrace) {
+			channelStreamReportable(name, health)
+			state, _ := states.Get(name)
+			updateState(name, StateError, errChannelStreamDown, sess, state.Counts)
 		}
 		if _, err := getOrRenewClient(ctx, cfg, name); err != nil {
 			slog.Warn("MCP channel health check failed to renew session", "name", name, "error", err)
 		}
 	}
 }
+
+// errChannelStreamDown forces a channel session rebuild when the standalone
+// SSE notification stream has been down longer than the reconnect grace.
+var errChannelStreamDown = errors.New("standalone SSE notification stream not connected")
