@@ -142,3 +142,85 @@ func TestChannelHealthCheckLoop_StopsOnContextCancel(t *testing.T) {
 		t.Fatal("health check loop did not stop after context cancellation")
 	}
 }
+
+// The regression this fix exists for.
+//
+// A channel session whose notification stream is down still answers pings — ping rides ordinary
+// POSTs and says nothing about the stream. The first version of this health check handled that by
+// calling updateState(StateError) itself and then getOrRenewClient. StateError DELETES the registry
+// entry, so the renewal's post-lock guard found nothing and returned "mcp '<name>' not available"
+// without ever rebuilding. The health check became a once-a-minute outage: it destroyed a working
+// session every tick and never replaced it.
+//
+// The session must come back, and it must still be registered afterwards.
+func TestChannelHealthCheckRebuildsAStreamDownSessionThatPingsFine(t *testing.T) {
+	const name = "test-stream-down"
+	t.Cleanup(cleanupSession(name))
+
+	cfg := config.NewTestStore(&config.Config{MCP: config.MCPs{name: {Type: config.MCPStdio}}})
+
+	// A LIVE session — it pings fine, which is the whole point.
+	live, _ := liveSession(t, "send_message")
+	live.channel = true
+	sessions.Set(name, live)
+	require.NoError(t, pingSession(context.Background(), live, time.Second),
+		"precondition: the session must be pingable, or this test proves nothing")
+
+	// ...whose notification stream never opened.
+	health := &channelStreamHealth{}
+	channelStreamStates.Set(name, health)
+	t.Cleanup(func() { channelStreamStates.Del(name) })
+	require.False(t, health.healthy(channelStreamClosedGrace),
+		"precondition: an unopened stream must read as unhealthy")
+
+	var created int
+	orig := newSession
+	newSession = func(context.Context, *config.ConfigStore, string, config.MCPConfig, config.VariableResolver, bool) (*ClientSession, error) {
+		created++
+		sess, _ := liveSession(t, "send_message")
+		sess.channel = true
+		return sess, nil
+	}
+	t.Cleanup(func() { newSession = orig })
+
+	checkChannelSessions(context.Background(), cfg)
+
+	require.Equal(t, 1, created, "a stream-down session must be rebuilt, not merely torn down")
+	got, ok := sessions.Get(name)
+	require.True(t, ok, "the rebuilt session must be registered — the bug left the registry empty")
+	require.NotSame(t, live, got, "the dead session must have been replaced")
+	require.NoError(t, pingSession(context.Background(), got, time.Second))
+}
+
+// A channel session with a healthy stream must be left alone: forcing a rebuild every minute
+// would churn every working consumer.
+func TestChannelHealthCheckLeavesAHealthyStreamAlone(t *testing.T) {
+	const name = "test-stream-ok"
+	t.Cleanup(cleanupSession(name))
+
+	cfg := config.NewTestStore(&config.Config{MCP: config.MCPs{name: {Type: config.MCPStdio}}})
+	live, _ := liveSession(t, "send_message")
+	live.channel = true
+	sessions.Set(name, live)
+
+	health := &channelStreamHealth{}
+	health.opened.Store(true)
+	health.active.Store(true)
+	channelStreamStates.Set(name, health)
+	t.Cleanup(func() { channelStreamStates.Del(name) })
+
+	var created int
+	orig := newSession
+	newSession = func(context.Context, *config.ConfigStore, string, config.MCPConfig, config.VariableResolver, bool) (*ClientSession, error) {
+		created++
+		s, _ := liveSession(t, "send_message")
+		return s, nil
+	}
+	t.Cleanup(func() { newSession = orig })
+
+	checkChannelSessions(context.Background(), cfg)
+
+	require.Zero(t, created, "a healthy channel session must not be rebuilt")
+	got, _ := sessions.Get(name)
+	require.Same(t, live, got, "the healthy session must be the same object afterwards")
+}

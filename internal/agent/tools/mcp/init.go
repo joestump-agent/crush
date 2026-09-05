@@ -733,12 +733,35 @@ func teardown(name string) {
 	clearMCPData(name)
 }
 
+// errForcedRenewal is the reason recorded when a session is rebuilt despite
+// answering pings — the caller had evidence ping cannot see, such as a channel
+// notification stream that is not connected.
+var errForcedRenewal = errors.New("forced renewal: session healthy to ping but unusable")
+
 func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string) (*ClientSession, error) {
+	return renewClient(ctx, cfg, name, false)
+}
+
+// forceRenewClient rebuilds name's session even when it answers pings.
+//
+// A channel session whose standalone notification stream is down still pings
+// fine — ping rides ordinary POSTs and says nothing about the stream — so the
+// ping-gated path above would keep a session that can never receive another
+// doorbell. Callers that have out-of-band evidence the session is unusable use
+// this instead of tearing the session down themselves: the teardown belongs
+// inside the renewal, under the same lock that rebuilds, because a caller that
+// deletes the session first leaves renewClient's registry guard with nothing to
+// find and it bails with "not available" without ever rebuilding.
+func forceRenewClient(ctx context.Context, cfg *config.ConfigStore, name string) (*ClientSession, error) {
+	return renewClient(ctx, cfg, name, true)
+}
+
+func renewClient(ctx context.Context, cfg *config.ConfigStore, name string, force bool) (*ClientSession, error) {
 	m := cfg.Config().MCP[name]
 	timeout := mcpTimeout(m)
 
 	// Fast path: reuse a healthy session without taking the renewal lock.
-	if sess, ok := sessions.Get(name); ok {
+	if sess, ok := sessions.Get(name); ok && !force {
 		if err := pingSession(ctx, sess, timeout); err == nil {
 			return sess, nil
 		}
@@ -765,10 +788,15 @@ func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string)
 	}
 
 	// A concurrent goroutine may have already renewed the session while we
-	// waited for the lock. Reuse it if it is now healthy.
+	// waited for the lock. Reuse it if it is now healthy — unless the caller
+	// forced a rebuild, in which case a healthy ping is exactly the signal that
+	// must NOT short-circuit us.
 	pingErr := pingSession(ctx, sess, timeout)
-	if pingErr == nil {
+	if pingErr == nil && !force {
 		return sess, nil
+	}
+	if pingErr == nil {
+		pingErr = errForcedRenewal
 	}
 
 	state, _ := states.Get(name)

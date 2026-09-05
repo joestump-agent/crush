@@ -61,12 +61,19 @@ func checkChannelSessions(ctx context.Context, cfg *config.ConfigStore) {
 		if !sess.IsChannel() {
 			continue
 		}
+		// A channel session whose notification stream is down pings fine, so the
+		// ordinary ping-gated renewal would keep it forever. Force the rebuild
+		// instead — and force it THROUGH the renewal path rather than tearing the
+		// session down here first. updateState(StateError) deletes the registry
+		// entry, and renewClient's post-lock guard then finds nothing and bails
+		// with "not available" without ever rebuilding, which turned this health
+		// check into a once-a-minute outage.
+		renew := getOrRenewClient
 		if health, ok := channelStreamStates.Get(name); ok && !health.healthy(channelStreamClosedGrace) {
 			channelStreamReportable(name, health)
-			state, _ := states.Get(name)
-			updateState(name, StateError, errChannelStreamDown, sess, state.Counts)
+			renew = forceRenewClient
 		}
-		if _, err := getOrRenewClient(ctx, cfg, name); err != nil {
+		if _, err := renew(ctx, cfg, name); err != nil {
 			slog.Warn("MCP channel health check failed to renew session", "name", name, "error", err)
 		}
 	}
