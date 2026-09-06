@@ -932,6 +932,7 @@ func quickStyle(o quickStyleOpts) Styles {
 	s.Messages.AssistantInfoModel = muted
 	s.Messages.AssistantInfoProvider = subtle
 	s.Messages.AssistantInfoDuration = subtle
+	s.Messages.SubduedHypercreditIcon = subtle
 	s.Messages.AssistantCanceled = lipgloss.NewStyle().Foreground(o.fgSubtle).Italic(true)
 	s.Messages.AssistantCopyIcon = muted
 
