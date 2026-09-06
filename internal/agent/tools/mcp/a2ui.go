@@ -219,3 +219,22 @@ func injectA2UICapability(raw json.RawMessage) json.RawMessage {
 // unwrapTransport implements [transportWrapper], so wrapping the transport
 // for A2UI never hides the stdio startup diagnostics maybeStdioErr digs out.
 func (t *a2uiInitTransport) unwrapTransport() mcp.Transport { return t.inner }
+
+// isStreamableHTTP reports whether transport is (or wraps) a streamable-HTTP
+// transport, for which the connection must reach the SDK unwrapped.
+//
+// It looks through transportWrapper so the answer does not depend on the order
+// wrappers were applied — the property being asked about belongs to the
+// underlying transport, not to whoever wrapped it last.
+func isStreamableHTTP(t mcp.Transport) bool {
+	for {
+		if _, ok := t.(*mcp.StreamableClientTransport); ok {
+			return true
+		}
+		w, ok := t.(transportWrapper)
+		if !ok {
+			return false
+		}
+		t = w.unwrapTransport()
+	}
+}
