@@ -44,7 +44,20 @@ type channelStreamHealth struct {
 // how long a closed stream is given to come back before it counts as down.
 func (h *channelStreamHealth) healthy(closedGrace time.Duration) bool {
 	if !h.opened.Load() {
-		return false
+		// Never observed open. This is ABSENCE OF EVIDENCE, not evidence of
+		// failure, and treating it as unhealthy created a self-sustaining
+		// rebuild loop: installChannelSSEFilter registers a fresh health record
+		// on every Connect, so each forced rebuild reset opened to false, the
+		// next tick read "never opened" and forced another rebuild, once a
+		// minute forever, on hosts whose streams were in fact open and
+		// delivering doorbells.
+		//
+		// A genuinely never-opened stream is not something a rebuild fixes
+		// either: that was the wrapped-connection bug, which is a code defect
+		// repaired in the transport, not a runtime condition. So the forced
+		// rebuild is reserved for the recoverable case below — observed open,
+		// then closed, and not back within the grace.
+		return true
 	}
 	if h.active.Load() {
 		return true
@@ -75,7 +88,14 @@ func installChannelSSEFilter(t *mcp.StreamableClientTransport, name string, gate
 		inner = t.HTTPClient.Transport
 	}
 	health := &channelStreamHealth{}
-	channelStreamStates.Set(name, health)
+	// Reuse the existing record when one is already registered for this server.
+	// Replacing it on every Connect discards what has been observed about the
+	// stream, which is what made the health predicate flap.
+	if existing, ok := channelStreamStates.Get(name); ok {
+		health = existing
+	} else {
+		channelStreamStates.Set(name, health)
+	}
 	t.HTTPClient = &http.Client{Transport: &channelSSEFilter{
 		inner:  inner,
 		name:   name,
