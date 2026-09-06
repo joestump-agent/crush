@@ -166,12 +166,17 @@ func TestChannelHealthCheckRebuildsAStreamDownSessionThatPingsFine(t *testing.T)
 	require.NoError(t, pingSession(context.Background(), live, time.Second),
 		"precondition: the session must be pingable, or this test proves nothing")
 
-	// ...whose notification stream never opened.
+	// ...whose notification stream opened and then died and did not come back.
+	// Observed-open-then-closed is the recoverable case a rebuild is for; a
+	// never-observed stream is absence of evidence and deliberately reads as
+	// healthy, because treating it as down caused a once-a-minute rebuild loop.
 	health := &channelStreamHealth{}
+	health.opened.Store(true)
+	health.closedAt.Store(time.Now().Add(-2 * channelStreamClosedGrace).UnixMilli())
 	channelStreamStates.Set(name, health)
 	t.Cleanup(func() { channelStreamStates.Del(name) })
 	require.False(t, health.healthy(channelStreamClosedGrace),
-		"precondition: an unopened stream must read as unhealthy")
+		"precondition: a stream closed beyond the grace must read as down")
 
 	var created int
 	orig := newSession

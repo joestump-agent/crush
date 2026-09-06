@@ -192,23 +192,6 @@ func TestChannelSSEFilterLeavesNonChannelEventsForSDK(t *testing.T) {
 	}
 }
 
-// TestChannelStreamHealthClosesAfterGrace covers the health predicate: an
-// unopened stream is down, a closed one is healthy within the reconnect
-// grace and down after it.
-func TestChannelStreamHealthClosesAfterGrace(t *testing.T) {
-	t.Parallel()
-	h := &channelStreamHealth{}
-	require.False(t, h.healthy(time.Minute), "never-opened stream must be unhealthy")
-
-	h.opened.Store(true)
-	require.True(t, h.healthy(time.Minute), "open stream is healthy")
-
-	h.active.Store(false)
-	h.closedAt.Store(time.Now().Add(-time.Minute).UnixMilli())
-	require.True(t, h.healthy(2*time.Minute), "stream closed within grace is healthy")
-	require.False(t, h.healthy(time.Second), "stream closed beyond grace is unhealthy")
-}
-
 // TestEventFilterStripsDoorbellAndKeepsKeepalive exercises the SSE event
 // parser directly: the doorbell event is removed, comments (keepalives) and
 // unrelated events pass through, and bytes are delivered in order.
@@ -257,4 +240,67 @@ func TestChannelDoorbellBufferedUntilGateResolves(t *testing.T) {
 	buffered := gate2.resolve(true)
 	require.Len(t, buffered, 1)
 	require.Equal(t, raw, buffered[0])
+}
+
+// The rebuild loop this predicate caused.
+//
+// installChannelSSEFilter registers a fresh health record on every Connect, so a forced rebuild
+// reset opened to false. The next tick read "never opened", forced another rebuild, and the cycle
+// repeated once a minute — on hosts whose streams were open and delivering doorbells the whole
+// time. Absence of evidence must not read as failure.
+func TestChannelStreamHealthNeverOpenedIsNotUnhealthy(t *testing.T) {
+	t.Parallel()
+	h := &channelStreamHealth{}
+	if !h.healthy(channelStreamClosedGrace) {
+		t.Fatal("a never-observed stream must not be reported down; that is what caused the rebuild loop")
+	}
+}
+
+// The recoverable case still forces a rebuild: observed open, then closed, and not back within
+// the grace the SDK's own reconnect loop is given.
+func TestChannelStreamHealthClosedBeyondGraceIsUnhealthy(t *testing.T) {
+	t.Parallel()
+	h := &channelStreamHealth{}
+	h.opened.Store(true)
+
+	h.active.Store(true)
+	if !h.healthy(channelStreamClosedGrace) {
+		t.Error("an active stream is healthy")
+	}
+
+	h.active.Store(false)
+	h.closedAt.Store(time.Now().Add(-time.Second).UnixMilli())
+	if !h.healthy(channelStreamClosedGrace) {
+		t.Error("a stream that closed a second ago is mid-reconnect and still healthy")
+	}
+
+	h.closedAt.Store(time.Now().Add(-2 * channelStreamClosedGrace).UnixMilli())
+	if h.healthy(channelStreamClosedGrace) {
+		t.Error("a stream closed well beyond the grace must read as down")
+	}
+}
+
+// Reconnecting must not discard what has been observed about the stream — that reset is the other
+// half of the loop.
+func TestInstallChannelSSEFilterKeepsAnExistingHealthRecord(t *testing.T) {
+	const name = "test-health-reuse"
+	t.Cleanup(func() { channelStreamStates.Del(name) })
+
+	first := &channelStreamHealth{}
+	first.opened.Store(true)
+	first.active.Store(true)
+	channelStreamStates.Set(name, first)
+
+	installChannelSSEFilter(&mcp.StreamableClientTransport{}, name, newChannelGate())
+
+	got, ok := channelStreamStates.Get(name)
+	if !ok {
+		t.Fatal("health record disappeared on reconnect")
+	}
+	if got != first {
+		t.Fatal("reconnect replaced the health record, discarding the observed stream state")
+	}
+	if !got.healthy(channelStreamClosedGrace) {
+		t.Error("an observed-healthy stream must stay healthy across a reconnect")
+	}
 }
