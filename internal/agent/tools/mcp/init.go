@@ -1044,7 +1044,26 @@ func createSession(ctx context.Context, cfg *config.ConfigStore, name string, m 
 	// Advertise A2UI support in the initialize handshake so an A2UI-over-MCP
 	// server knows it can send surfaces. A host that won't render A2UI must
 	// not claim the capability.
-	if !a2uiDisabled(cfg) {
+	// A2UI injects its capability by wrapping the CONNECTION, and for
+	// streamable HTTP a wrapped connection is fatal: the SDK starts the
+	// standalone SSE stream (the hanging GET every server-initiated
+	// notification rides) only after type-asserting the connection to its
+	// unexported clientConnection interface, and a wrapper declared in this
+	// package can never satisfy an unexported method. The assert fails
+	// silently — the ok is discarded — so the stream is never opened and every
+	// push is rejected with "stream not connected or already closed".
+	//
+	// channelTransport already avoids that by filtering below the connection
+	// for streamable HTTP. Wrapping again out here put the wrapper straight
+	// back on and undid it, which is why channel doorbells still never
+	// arrived after that fix.
+	//
+	// The capability is not lost: a2uiSDKCapabilities carries the same payload
+	// in the typed Extensions field (see opts.Capabilities below), which is
+	// what a go-sdk server reads. Only the raw top-level "capabilities.a2ui"
+	// key — the spec-conformant-non-go-sdk path — is skipped here, and only
+	// for streamable HTTP, where the alternative is no notifications at all.
+	if !a2uiDisabled(cfg) && !isStreamableHTTP(transport) {
 		transport = &a2uiInitTransport{inner: transport}
 	}
 
