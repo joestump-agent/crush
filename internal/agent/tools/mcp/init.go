@@ -365,10 +365,10 @@ const InitWaitBudget = 10 * time.Second
 // WaitForInitBudget blocks like WaitForInit, but only until the budget —
 // measured from when initialization was armed, not from this call —
 // elapses. Anchoring the deadline at arming means the several sequential
-// waiters on a turn's path (readyWg's tool build, then the turn itself)
-// share one deadline instead of each stacking a fresh budget while a
-// server is wedged, and turns arriving after the deadline don't wait at
-// all. It returns nil both when initialization completed and when the
+// waiters on a turn's path (the agent build's tool goroutine, then the
+// turn itself) share one deadline instead of each stacking a fresh budget
+// while a server is wedged, and turns arriving after the deadline don't
+// wait at all. It returns nil both when initialization completed and when the
 // budget elapsed first — in the latter case the caller proceeds with
 // whatever servers have registered so far, and stragglers appear on a
 // later turn once they finish. The caller's own context ending is still

@@ -139,9 +139,10 @@ func TestWaitForInitBudget_CallerCancellationStillAborts(t *testing.T) {
 
 // TestWaitForInitBudget_DeadlineIsAbsolute pins that the budget anchors at
 // ArmInit, not at each call: a turn's path holds several sequential waiters
-// (readyWg's tool build, then the turn's own gate), and per-call budgets would
-// stack into multiples of the budget while a server is wedged. A call arriving
-// after the armed-at deadline has already passed must return at once.
+// (the agent build's tool goroutine, then the turn's own gate), and per-call
+// budgets would stack into multiples of the budget while a server is wedged.
+// A call arriving after the armed-at deadline has already passed must return
+// at once.
 func TestWaitForInitBudget_DeadlineIsAbsolute(t *testing.T) {
 	swapInitGate(t) // armed, never closed
 
