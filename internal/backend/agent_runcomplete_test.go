@@ -77,7 +77,7 @@ func insertRunCompleteWorkspace(t *testing.T, b *Backend, base context.Context, 
 
 // TestRunAgent_PreRunErrorPublishesTerminalRunComplete proves that an
 // error returned from RunAccepted before the coordinator could publish
-// its own terminal event (e.g. a readyWg or UpdateModels failure,
+// its own terminal event (e.g. an agent-readiness or UpdateModels failure,
 // modeled here by a stub coordinator) still yields a reliable terminal
 // RunComplete for the run's RunID. Without it, a `crush run` caller
 // blocking on that RunID would hang because the lossy TypeAgentError
