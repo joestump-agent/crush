@@ -63,13 +63,18 @@ func TestSemanticToolsGatedOnStore(t *testing.T) {
 	})
 
 	t.Run("present with store", func(t *testing.T) {
-		coord := newGateTestCoordinator(t, false)
 		emb := semantic.EmbeddingConfig{
 			BaseURL: "http://127.0.0.1:9/v1", Model: "test", Dimension: 3,
 		}
-		coord.semanticStore = semanticTestStore(t)
-		coord.semanticClient = semantic.NewClient(emb)
-		coord.semanticSymbols = symbols.NewExtractor()
+		store := semanticTestStore(t)
+		// Wire the store in before the coder agent is built: buildAgent's
+		// background tool build reads these fields, so setting them on the
+		// returned coordinator is a data race.
+		coord := newGateTestCoordinator(t, false, func(c *coordinator) {
+			c.semanticStore = store
+			c.semanticClient = semantic.NewClient(emb)
+			c.semanticSymbols = symbols.NewExtractor()
+		})
 
 		names := coordinatorToolNames(t, coord)
 		require.Contains(t, names, "semantic_search")
