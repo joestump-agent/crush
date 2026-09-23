@@ -933,6 +933,15 @@
           ],
           "description": "Diff mode for the TUI interface"
         },
+        "active_theme": {
+          "type": "string",
+          "description": "Name of the currently active theme",
+          "default": "charmtone-panther",
+          "examples": [
+            "charmtone-panther",
+            "gruvbox-dark"
+          ]
+        },
         "completions": {
           "$ref": "#/$defs/Completions",
           "description": "Completions UI options"
@@ -951,6 +960,11 @@
           ],
           "description": "Chat scrollbar visibility",
           "default": "default"
+        },
+        "mouse": {
+          "type": "boolean",
+          "description": "Enable terminal mouse capture for selection, clicks, and scrolling in the TUI. Disable to let the terminal emulator or tmux handle text selection and copy/paste",
+          "default": true
         },
         "working_dir_format": {
           "type": "string",
@@ -981,6 +995,12 @@
           "type": "string"
         },
         "refresh_token": {
+          "type": "string"
+        },
+        "id_token": {
+          "type": "string"
+        },
+        "account_id": {
           "type": "string"
         },
         "expires_in": {

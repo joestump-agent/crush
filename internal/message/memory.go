@@ -113,6 +113,29 @@ func (s *memoryService) List(ctx context.Context, sessionID string) ([]Message, 
 	return messages, nil
 }
 
+// ListFromSummary returns the messages at or after summaryMessageID.
+// Mirrors the SQL service: an empty ID, or an ID no longer present in the
+// session, falls back to the whole session rather than sending nothing.
+func (s *memoryService) ListFromSummary(ctx context.Context, sessionID, summaryMessageID string) ([]Message, error) {
+	if summaryMessageID == "" {
+		return s.List(ctx, sessionID)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := s.order[sessionID]
+	start := slices.Index(ids, summaryMessageID)
+	if start < 0 {
+		start = 0
+	}
+	messages := make([]Message, 0, len(ids)-start)
+	for _, id := range ids[start:] {
+		if msg, ok := s.messages[id]; ok {
+			messages = append(messages, msg.Clone())
+		}
+	}
+	return messages, nil
+}
+
 func (s *memoryService) ListUserMessages(ctx context.Context, sessionID string) ([]Message, error) {
 	msgs, err := s.List(ctx, sessionID)
 	if err != nil {

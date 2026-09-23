@@ -1485,8 +1485,10 @@ func clearMCPData(name string) {
 	}
 }
 
+var stdioCheckTimeout = 5 * time.Second
+
 func stdioCheck(old *exec.Cmd) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	ctx, cancel := context.WithTimeout(context.Background(), stdioCheckTimeout)
 	defer cancel()
 	// old.Args includes argv0 as the first element; exec.CommandContext
 	// prepends old.Path as argv0, so we must skip it to avoid duplication
@@ -1497,6 +1499,7 @@ func stdioCheck(old *exec.Cmd) error {
 	}
 	cmd := exec.CommandContext(ctx, old.Path, args...)
 	cmd.Env = old.Env
+	cmd.WaitDelay = stdioCheckTimeout
 	out, err := cmd.CombinedOutput()
 	if err == nil || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return nil
