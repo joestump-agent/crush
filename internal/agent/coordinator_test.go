@@ -23,6 +23,7 @@ type mockSessionAgent struct {
 	model     Model
 	runFunc   func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error)
 	cancelled []string
+	readyErr  error
 }
 
 func (m *mockSessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
@@ -37,7 +38,7 @@ func (m *mockSessionAgent) Model() Model                        { return m.model
 func (m *mockSessionAgent) SetModels(large, small Model)        {}
 func (m *mockSessionAgent) SetTools(tools []fantasy.AgentTool)  {}
 func (m *mockSessionAgent) SetSystemPrompt(systemPrompt string) {}
-func (m *mockSessionAgent) WaitReady() error                    { return nil }
+func (m *mockSessionAgent) WaitReady() error                    { return m.readyErr }
 func (m *mockSessionAgent) Cancel(sessionID string) {
 	m.cancelled = append(m.cancelled, sessionID)
 }
@@ -279,6 +280,36 @@ func TestRunSubAgent(t *testing.T) {
 			SessionTitle:   "Test",
 		})
 		require.Error(t, err)
+	})
+
+	t.Run("sub-agent setup failure stops before the run", func(t *testing.T) {
+		env := testEnv(t)
+		coord := newTestCoordinator(t, env, providerID, providerCfg)
+
+		parentSession, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+
+		buildErr := errors.New("tool build failed")
+		agent := newMockAgent(providerID, 4096, func(_ context.Context, _ SessionAgentCall) (*fantasy.AgentResult, error) {
+			t.Error("a sub-agent whose setup failed must not take a turn")
+			return nil, nil
+		})
+		agent.readyErr = buildErr
+
+		_, err = coord.runSubAgent(t.Context(), subAgentParams{
+			Agent:          agent,
+			SessionID:      parentSession.ID,
+			AgentMessageID: "msg-1",
+			ToolCallID:     "call-1",
+			Prompt:         "test",
+			SessionTitle:   "Test",
+		})
+		require.ErrorIs(t, err, buildErr)
+
+		// The wait precedes sub-session creation, so a failed build leaves
+		// no orphaned task session behind.
+		_, err = env.sessions.Get(t.Context(), env.sessions.CreateAgentToolSessionID("msg-1", "call-1"))
+		require.Error(t, err, "no task session may be created for a sub-agent that never became ready")
 	})
 
 	t.Run("provider not configured", func(t *testing.T) {
