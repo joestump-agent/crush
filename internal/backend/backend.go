@@ -136,6 +136,11 @@ type Backend struct {
 	createGrace time.Duration
 	lingerDelay time.Duration
 	detachGrace time.Duration
+
+	// tracker counts workspaces whose teardown hook has not yet
+	// returned. It is the only observable that reports resource
+	// release rather than map membership; see [workspaceTracker].
+	tracker workspaceTracker
 }
 
 // clientState tracks one client's claim on a workspace.
@@ -210,11 +215,33 @@ type Workspace struct {
 	// embedded [app.App.Shutdown]; tests may override it to avoid
 	// driving a full [app.App] through shutdown.
 	shutdownFn func()
+
+	// tracker, when non-nil, is the owning backend's lifecycle
+	// counter. invokeShutdown reports to it exactly once, after the
+	// teardown hook has returned. retiredOnce keeps that report
+	// single-shot: the losing-race paths in CreateWorkspace and
+	// teardown both funnel through invokeShutdown, and a workspace
+	// reaching it twice must not double-decrement the counter.
+	tracker     *workspaceTracker
+	retiredOnce sync.Once
+}
+
+// trackWith registers w with the backend's lifecycle counter. It must
+// be called once, at the point where w starts owning resources, and
+// before w becomes reachable by any teardown path.
+func (w *Workspace) trackWith(t *workspaceTracker) {
+	w.tracker = t
+	t.born()
 }
 
 // invokeShutdown calls the workspace shutdown hook if set, falling
 // back to the workspace [Workspace.Shutdown] wrapper when not.
 func (w *Workspace) invokeShutdown() {
+	// Report AFTER the hook returns, not before: the whole point of
+	// the counter is that the resources are actually released.
+	if w.tracker != nil {
+		defer func() { w.retiredOnce.Do(w.tracker.retired) }()
+	}
 	if w.shutdownFn != nil {
 		w.shutdownFn()
 		return
@@ -469,6 +496,11 @@ func (b *Backend) CreateWorkspace(args proto.Workspace) (*Workspace, proto.Works
 		cancel:       wsCancel,
 		clients:      make(map[string]*clientState),
 	}
+	// Register before ws is reachable by any teardown path. From here
+	// on every exit out of this function releases ws through
+	// invokeShutdown, including the two lost-race paths below, so the
+	// counter is balanced.
+	ws.trackWith(&b.tracker)
 
 	b.mu.Lock()
 	// Re-check admission: the client may have retired while the slow
