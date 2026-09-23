@@ -10,6 +10,7 @@ import (
 
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/csync"
+	"github.com/charmbracelet/crush/internal/discover"
 	"github.com/charmbracelet/crush/internal/env"
 	"github.com/stretchr/testify/require"
 )
@@ -530,4 +531,10 @@ func TestModelDiscoveryTimeouts_CoverRemoteGateways(t *testing.T) {
 		"load-time discovery must tolerate a slow remote gateway")
 	require.GreaterOrEqual(t, modelDiscoveryTimeout, loadModelDiscoveryTimeout,
 		"an explicitly requested reload must be at least as patient as startup")
+
+	// The discover package's HTTP client carries its own timeout, and the
+	// shorter of the two wins. At 10s it silently capped the 15s budget,
+	// so a gateway answering in 10.5s was still dropped.
+	require.Greater(t, discover.RequestTimeout, modelDiscoveryTimeout,
+		"the HTTP client backstop must not undercut the discovery budget")
 }
