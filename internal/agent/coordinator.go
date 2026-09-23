@@ -179,8 +179,6 @@ type coordinator struct {
 	allSkills    []*skills.Skill // Pre-filter: all discovered after dedup.
 	activeSkills []*skills.Skill // Post-filter: active skills only.
 	skillTracker *skills.Tracker
-
-	readyWg errgroup.Group
 }
 
 // CoordinatorOptions holds the dependencies for NewCoordinator. Using a
@@ -372,10 +370,6 @@ func (c *coordinator) RunAccepted(ctx context.Context, accept *AcceptedRun, sess
 // dispatchMu; when nil (the in-process/local path) no accept tracking
 // applies.
 func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
-	if err := c.readyWg.Wait(); err != nil {
-		return nil, err
-	}
-
 	// MCP servers connect asynchronously (see mcp.Initialize).
 	//
 	// Interactive runs never wait for that to finish: the tool list below
@@ -402,6 +396,16 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	// its model settings, and the model refresh below must all target the
 	// same agent even if SetMainAgent swaps the main agent mid-flight.
 	agent, agentName := c.activeAgent()
+
+	// Wait for this agent's own build-time setup (system prompt, initial
+	// tool list) rather than for coordinator-wide state: a latch belonging
+	// to the agent cannot be rearmed by a later build while this run is
+	// parked on it. Waiting on the snapshot keeps the wait and the run on
+	// the same agent. See readiness and joestump-agent/crush#298.
+	if err := agent.WaitReady(); err != nil {
+		return nil, err
+	}
+
 	if err := c.updateAgentModels(ctx, agent, agentName); err != nil {
 		return nil, fmt.Errorf("failed to update models: %w", err)
 	}
@@ -828,7 +832,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 	}
 
 	largeProviderCfg, _ := c.cfg.Config().Providers.Get(large.ModelCfg.Provider)
-	result := NewSessionAgent(SessionAgentOptions{
+	result := newSessionAgent(SessionAgentOptions{
 		LargeModel:           large,
 		SmallModel:           small,
 		SystemPromptPrefix:   largeProviderCfg.SystemPromptPrefix,
@@ -856,7 +860,16 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 	// values; the work is local and always completes.
 	initCtx := context.WithoutCancel(ctx)
 
-	c.readyWg.Go(func() error {
+	// The group is local to this build and the latch belongs to the agent it
+	// builds, so a later buildAgent never touches either. Sharing one group
+	// across builds and runs is what crash-looped channel mode: a build's
+	// Add landed while a run's Wait was outstanding, which Go 1.27's
+	// sync.WaitGroup panics on (joestump-agent/crush#298).
+	ready := newReadiness()
+	result.ready = ready
+
+	var build errgroup.Group
+	build.Go(func() error {
 		systemPrompt, err := prompt.Build(initCtx, large.Model.Provider(), large.Model.Model(), c.cfg)
 		if err != nil {
 			return err
@@ -865,7 +878,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		return nil
 	})
 
-	c.readyWg.Go(func() error {
+	build.Go(func() error {
 		tools, err := c.buildTools(initCtx, agent, isSubAgent)
 		if err != nil {
 			return err
@@ -873,6 +886,8 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		result.SetTools(tools)
 		return nil
 	})
+
+	go func() { ready.settle(build.Wait()) }()
 
 	return result, nil
 }
@@ -1727,6 +1742,17 @@ func callTopK(providerCfg config.ProviderConfig, topK *int64) *int64 {
 // It creates a sub-session, runs the agent with the given prompt, and propagates
 // the cost to the parent session.
 func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (fantasy.ToolResponse, error) {
+	// A sub-agent built by buildAgent is handed to its tool before its
+	// system prompt and tool list land, so wait for its own setup here.
+	// Previously the only wait was coordinator.run's, which covered whichever
+	// builds happened to be registered when a run started — so a sub-agent
+	// could take a turn with an empty prompt, and a sub-agent build error
+	// surfaced on an unrelated later run instead of on the call that needed
+	// it.
+	if err := params.Agent.WaitReady(); err != nil {
+		return fantasy.ToolResponse{}, fmt.Errorf("sub-agent setup failed: %w", err)
+	}
+
 	// Create sub-session
 	agentToolSessionID := c.sessions.CreateAgentToolSessionID(params.AgentMessageID, params.ToolCallID)
 	session, err := c.sessions.CreateTaskSession(ctx, agentToolSessionID, params.SessionID, params.SessionTitle)

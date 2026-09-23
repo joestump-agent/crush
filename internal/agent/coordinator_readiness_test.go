@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,17 +22,20 @@ import (
 // short-lived HTTP request context — the InitAgent/UpdateAgent handlers, and
 // the sub-agent build reached through UpdateModels -> buildTools -> agentTool.
 // When that request context was canceled the moment the handler returned, the
-// readyWg errgroup recorded context.Canceled and every later coordinator.run
-// failed at readyWg.Wait() before emitting anything — the session hung with
-// no visible LLM response. (This was made worse while the tool-list goroutine
-// also blocked in mcp.WaitForInit, which kept it parked long enough to
-// observe the cancellation; the readiness work no longer waits on MCP init —
-// see coordinator.run — but the cancellation detachment still matters.)
+// readiness work recorded context.Canceled and every later coordinator.run
+// failed at its readiness wait before emitting anything — the session hung
+// with no visible LLM response. (This was made worse while the tool-list
+// goroutine also blocked in mcp.WaitForInit, which kept it parked long enough
+// to observe the cancellation; the readiness work no longer waits on MCP init
+// — see coordinator.run — but the cancellation detachment still matters.)
 //
 // The fix detaches the readiness work from the caller context via
 // context.WithoutCancel, so canceling the context that triggered the build no
-// longer poisons readyWg. Here we build an agent with a cancelable context,
-// cancel it, and require that readyWg still completes cleanly.
+// longer poisons readiness. Here we build an agent with a cancelable context,
+// cancel it, and require that the agent still becomes ready cleanly.
+//
+// @joestump-agent 09/22/2026 - Waits on the built agent's own readiness latch
+// instead of the coordinator-wide readyWg errgroup, which #298 removed.
 func TestBuildAgentReadinessSurvivesCallerCancellation(t *testing.T) {
 	env := testEnv(t)
 
@@ -74,7 +78,7 @@ func TestBuildAgentReadinessSurvivesCallerCancellation(t *testing.T) {
 	agentCfg := cfg.Config().Agents[config.AgentCoder]
 
 	ctx, cancel := context.WithCancel(context.Background())
-	_, err = coord.buildAgent(ctx, p, agentCfg, false)
+	built, err := coord.buildAgent(ctx, p, agentCfg, false)
 	require.NoError(t, err)
 
 	// The caller goes away, mirroring an HTTP handler returning and canceling
@@ -82,16 +86,58 @@ func TestBuildAgentReadinessSurvivesCallerCancellation(t *testing.T) {
 	cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- coord.readyWg.Wait() }()
+	go func() { done <- built.WaitReady() }()
 
 	select {
 	case err := <-done:
 		// context.Canceled is the regression: the caller's cancellation
-		// leaked into the readiness work and poisoned the errgroup.
+		// leaked into the readiness work and poisoned the latch.
 		require.NotErrorIs(t, err, context.Canceled,
-			"readyWg was poisoned by caller cancellation (client/server new-session hang regression)")
+			"readiness was poisoned by caller cancellation (client/server new-session hang regression)")
 		require.NoError(t, err, "unexpected buildAgent readiness error")
 	case <-time.After(2 * time.Second):
-		t.Fatal("readyWg did not complete; the readiness goroutines must not block on MCP init")
+		t.Fatal("readiness did not settle; the readiness goroutines must not block on MCP init")
 	}
+}
+
+// TestConcurrentRunsDoNotPanicOnAgentReadiness is a regression test for the
+// channel-mode crash loop in joestump-agent/crush#298.
+//
+// Readiness used to live in one errgroup.Group on the coordinator: every run
+// waited on it, and every buildAgent added to it. buildAgent is not
+// once-per-process — coordinator.run calls UpdateModels, which reaches
+// buildTools -> agentTool -> buildAgent for the sub-agent on every single run —
+// so with two runs in flight one could register readiness work while the other
+// was parked in Wait. Go 1.27's sync.WaitGroup treats that as reuse before Wait
+// returned and panics, taking the process down; channel mode hit it constantly
+// because messages arrive unsolicited and concurrently.
+//
+// Each run below waits for readiness and then builds a sub-agent, so a handful
+// of concurrent runs reproduces the interleaving. The runs are expected to fail
+// (the session does not exist and the provider port is closed); the assertion
+// is that the process survives them. A panic in a run goroutine takes the test
+// binary down with it, which is the failure signal.
+//
+// @joestump-agent 09/22/2026 - Added with the per-agent readiness latch.
+func TestConcurrentRunsDoNotPanicOnAgentReadiness(t *testing.T) {
+	coord := newGateTestCoordinator(t, true)
+
+	const (
+		workers = 8
+		rounds  = 25
+	)
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				// The error is irrelevant — reaching the readiness wait and
+				// the sub-agent build inside UpdateModels is the point.
+				_, _ = coord.run(context.Background(), nil, "missing-session", "hello")
+			}
+		}()
+	}
+	wg.Wait()
 }

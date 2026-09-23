@@ -167,6 +167,10 @@ type SessionAgent interface {
 	SetModels(large Model, small Model)
 	SetTools(tools []fantasy.AgentTool)
 	SetSystemPrompt(systemPrompt string)
+	// WaitReady blocks until the agent's build-time setup (system prompt,
+	// initial tool list) has finished and returns its error. Agents whose
+	// prompt and tools are supplied at construction return immediately.
+	WaitReady() error
 	Cancel(sessionID string)
 	CancelAll()
 	IsSessionBusy(sessionID string) bool
@@ -253,6 +257,11 @@ type sessionAgent struct {
 	// across the agent. Cancel uses its current value as the per-session
 	// high-water mark.
 	acceptSeqGen uint64
+	// ready is this agent's own one-shot setup latch, observed through
+	// WaitReady. It is satisfied from construction unless a builder
+	// (coordinator.buildAgent) replaces it with an armed latch before the
+	// agent is reachable by anyone else.
+	ready *readiness
 }
 
 type SessionAgentOptions struct {
@@ -274,6 +283,13 @@ type SessionAgentOptions struct {
 func NewSessionAgent(
 	opts SessionAgentOptions,
 ) SessionAgent {
+	return newSessionAgent(opts)
+}
+
+// newSessionAgent is the concrete constructor behind NewSessionAgent. Builders
+// inside the package use it so they can arm the agent's readiness latch before
+// handing the agent out; see coordinator.buildAgent.
+func newSessionAgent(opts SessionAgentOptions) *sessionAgent {
 	return &sessionAgent{
 		largeModel:           csync.NewValue(opts.LargeModel),
 		smallModel:           csync.NewValue(opts.SmallModel),
@@ -293,6 +309,7 @@ func NewSessionAgent(
 		dispatchMu:           csync.NewMap[string, *sync.Mutex](),
 		acceptedRuns:         csync.NewMap[string, int](),
 		cancelMark:           csync.NewMap[string, uint64](),
+		ready:                readyNow(),
 	}
 }
 
@@ -2190,6 +2207,10 @@ func (a *sessionAgent) SetTools(tools []fantasy.AgentTool) {
 
 func (a *sessionAgent) SetSystemPrompt(systemPrompt string) {
 	a.systemPrompt.Set(systemPrompt)
+}
+
+func (a *sessionAgent) WaitReady() error {
+	return a.ready.wait()
 }
 
 func (a *sessionAgent) Model() Model {
