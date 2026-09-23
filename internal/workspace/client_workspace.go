@@ -354,6 +354,10 @@ func (w *ClientWorkspace) AgentListCronTasks(sessionID string) []scheduler.Task 
 	return nil
 }
 
+func (w *ClientWorkspace) AgentSetMain(agentID string) error {
+	return w.client.SetMainAgent(context.Background(), w.workspaceID(), agentID)
+}
+
 func (w *ClientWorkspace) AgentSummarize(ctx context.Context, sessionID string) error {
 	return w.client.AgentSummarizeSession(ctx, w.workspaceID(), sessionID)
 }
@@ -602,6 +606,15 @@ func (w *ClientWorkspace) SetConfigField(scope config.Scope, key string, value a
 		w.refreshWorkspace()
 	}
 	return err
+}
+
+func (w *ClientWorkspace) SetConfigFields(scope config.Scope, fields map[string]any) error {
+	for key, value := range fields {
+		if err := w.SetConfigField(scope, key, value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *ClientWorkspace) RemoveConfigField(scope config.Scope, key string) error {
@@ -1391,7 +1404,7 @@ func protoToMessage(m proto.Message) message.Message {
 	for _, p := range m.Parts {
 		switch v := p.(type) {
 		case proto.TextContent:
-			msg.Parts = append(msg.Parts, message.TextContent{Text: v.Text})
+			msg.Parts = append(msg.Parts, message.TextContent{Text: v.Text, Hidden: v.Hidden})
 		case proto.ReasoningContent:
 			msg.Parts = append(msg.Parts, message.ReasoningContent{
 				Thinking:   v.Thinking,

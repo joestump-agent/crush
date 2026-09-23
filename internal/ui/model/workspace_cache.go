@@ -229,6 +229,18 @@ func (m *UI) applyBusyState(msg busyStateMsg) []tea.Cmd {
 
 	var cmds []tea.Cmd
 	busy := m.isCurrentSessionBusy()
+	if m.isAgentBusy() {
+		// A session reload that raced an unpopulated busy cache (the
+		// zero-value read at boot) froze the animation clock even though
+		// the agent is working. The authoritative probe re-enables it so
+		// freshly rendered spinners tick. When the probe reports idle the
+		// reload gate stands, keeping ghost spinners still.
+		//
+		// Deliberately the global probe, not `busy` above: the animation
+		// clock is process-wide, so a run in any session must keep it
+		// ticking, while `busy` is scoped to the session being viewed.
+		m.chat.SetAnimationsAllowed(true)
+	}
 	if m.hasSession() && hasInProgressTodo(m.session.Todos) && busy && !m.todoIsSpinning {
 		m.todoIsSpinning = true
 		cmds = append(cmds, m.todoSpinner.Tick)
@@ -348,6 +360,9 @@ func (m *UI) toggleYoloMode() bool {
 	// re-dispatches the stale probe.
 	m.busyFetchGen++
 	m.setEditorPrompt(yolo)
+	// Any explicit toggle hands YOLO ownership back to the user; the
+	// Shift+Tab cycle re-claims it right after its own call.
+	m.cycleYolo = false
 	return yolo
 }
 

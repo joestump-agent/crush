@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/charmbracelet/crush/internal/ui/attachments"
 	"github.com/charmbracelet/crush/internal/ui/common"
+	"github.com/charmbracelet/crush/internal/ui/dialog"
 	"github.com/stretchr/testify/require"
 )
 
@@ -177,6 +178,9 @@ func TestRefreshStylesRepushesHighlighterStyles(t *testing.T) {
 		lipgloss.NewStyle().Foreground(lipgloss.Color("1")),
 		lipgloss.NewStyle().Foreground(lipgloss.Color("2")),
 	)
+	// refreshStyles reaches into the dialog overlay to re-style an open theme
+	// dialog, so the overlay has to be real too, as it is in New().
+	m.dialog = dialog.NewOverlay()
 
 	// Swap in a theme whose token styles differ from the ones above.
 	want := m.com.Styles.Editor.TokenFile
