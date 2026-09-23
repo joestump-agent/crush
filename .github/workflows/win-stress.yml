@@ -1,0 +1,35 @@
+# TEMPORARY - remove before merging this PR.
+#
+# The bug this branch fixes is a Windows-only cleanup race that cannot
+# be reproduced on macOS or Linux, and it is flaky: a single green
+# windows-latest run proves nothing. This workflow re-runs the affected
+# package under -count several times on Windows so the fix is shown to
+# close the race rather than merely to have not been observed.
+#
+# @joestump-agent 09/23/2026 - Added for PR verification only.
+name: win-stress
+
+on:
+  push:
+    branches: ['bug/e2e-windows-tempdir-teardown']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=5 -run 'TestE2E' ./internal/server/
+      - run: go test -race -count=5 ./internal/backend/
