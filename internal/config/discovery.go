@@ -13,17 +13,24 @@ import (
 	"github.com/charmbracelet/crush/internal/discover"
 )
 
-// loadModelDiscoveryTimeout bounds the model-discovery pass that runs
-// during config load. It is deliberately tight because it blocks startup;
-// providers whose endpoints miss it are recorded on the store and can be
+// loadModelDiscoveryTimeout bounds each provider's model-discovery probe
+// during config load. It is per provider, not a budget shared across the
+// pass: probes run concurrently, so a shared deadline is wall-clock from
+// the start of the pass and silently drops whichever endpoint happens to
+// be slowest that run, rather than the one that is actually unreachable.
+// Providers whose endpoints miss it are recorded on the store and can be
 // retried later via ReloadModelDiscovery.
-const loadModelDiscoveryTimeout = 3 * time.Second
+//
+// It is sized for a remote gateway on a poor link (LiteLLM and Hyper have
+// been measured at 10.5s and 6.7s respectively over hotel/boat wifi), not
+// for a healthy LAN. Because the probes are concurrent, the worst case it
+// adds to startup is one provider's timeout, not the sum.
+const loadModelDiscoveryTimeout = 15 * time.Second
 
-// modelDiscoveryTimeout bounds an interactive model-discovery reload. It
-// is more generous than loadModelDiscoveryTimeout because the user
-// explicitly asked for it and local model servers (Ollama, LM Studio, …)
-// can be slow to answer.
-const modelDiscoveryTimeout = 10 * time.Second
+// modelDiscoveryTimeout bounds each provider's probe on an interactive
+// model-discovery reload. Like loadModelDiscoveryTimeout it is per
+// provider.
+const modelDiscoveryTimeout = 15 * time.Second
 
 // providerWantsDiscovery reports whether a custom provider consents to
 // model discovery. userModels is the provider's user-configured model
@@ -67,13 +74,15 @@ func knownProviderNameSet(known []catwalk.Provider, disableDefaults bool) map[st
 // discovery errors, both keyed by provider ID. A provider that succeeds
 // but reports no models gets a results entry with an empty list.
 //
-// The caller owns the context deadline; both load and reload set one so a
-// slow or unreachable provider endpoint cannot block indefinitely.
+// perProviderTimeout bounds each provider's probe independently, so one
+// slow endpoint cannot consume another's budget. The caller's ctx still
+// cancels the whole pass.
 func discoverProviderModels(
 	ctx context.Context,
 	candidates map[string]ProviderConfig,
 	knownProviderNames map[string]bool,
 	resolver VariableResolver,
+	perProviderTimeout time.Duration,
 ) (map[string][]catwalk.Model, map[string]error) {
 	results := make(map[string][]catwalk.Model)
 	errs := make(map[string]error)
@@ -101,7 +110,12 @@ func discoverProviderModels(
 		}
 		providerType := cmp.Or(pc.Type, catwalk.TypeOpenAICompat)
 		wg.Go(func() {
-			models, err := discover.DiscoverModels(ctx, cfg, resolver)
+			// Each provider gets its own deadline. Enrichment shares it
+			// with the probe: together they are this provider's budget.
+			pctx, pcancel := context.WithTimeout(ctx, perProviderTimeout)
+			defer pcancel()
+
+			models, err := discover.DiscoverModels(pctx, cfg, resolver)
 			if err != nil {
 				slog.Warn("Model discovery failed", "provider", id, "error", err)
 				mu.Lock()
@@ -111,7 +125,7 @@ func discoverProviderModels(
 			}
 			if len(models) > 0 {
 				if enricher := discover.GetEnricher(string(providerType)); enricher != nil {
-					models, _ = enricher.EnrichModels(ctx, cfg, resolver, models)
+					models, _ = enricher.EnrichModels(pctx, cfg, resolver, models)
 				}
 			}
 			mu.Lock()
@@ -179,10 +193,7 @@ func (s *ConfigStore) ReloadModelDiscovery(ctx context.Context) (int, error) {
 		}
 	}
 
-	discoverCtx, cancel := context.WithTimeout(ctx, modelDiscoveryTimeout)
-	defer cancel()
-
-	results, errs := discoverProviderModels(discoverCtx, candidates, known, s.resolver)
+	results, errs := discoverProviderModels(ctx, candidates, known, s.resolver, modelDiscoveryTimeout)
 	if len(errs) > 0 && len(results) == 0 {
 		return 0, fmt.Errorf("model discovery failed for all %d eligible providers", len(errs))
 	}

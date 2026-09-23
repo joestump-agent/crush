@@ -409,9 +409,7 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 	// Per-provider errors are logged by the helper; providers that fail
 	// with no user models to fall back on are recorded below so the
 	// interactive reload can retry them.
-	discoverCtx, discoverCancel := context.WithTimeout(ctx, loadModelDiscoveryTimeout)
-	discoveryResults, discoveryErrs := discoverProviderModels(discoverCtx, candidates, knownProviderNames, resolver)
-	discoverCancel()
+	discoveryResults, discoveryErrs := discoverProviderModels(ctx, candidates, knownProviderNames, resolver, loadModelDiscoveryTimeout)
 
 	// Validate the custom providers.
 	for id, providerConfig := range c.Providers.Seq2() {
