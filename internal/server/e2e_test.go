@@ -43,6 +43,14 @@ type e2eHarness struct {
 	// cannot leave behind background readers (and therefore unclosed
 	// response bodies) after returning.
 	sseWG sync.WaitGroup
+
+	// afterWorkspaceTeardown, when set, runs inside the harness's
+	// cleanup immediately after the workspace-teardown wait returns.
+	// It is the only place a test can assert on state that becomes
+	// true only once every shutdown hook has completed: cleanups a
+	// test body registers itself run BEFORE the harness's, because
+	// t.Cleanup is LIFO and the harness registered first.
+	afterWorkspaceTeardown func()
 }
 
 // installServer attaches a fresh Server (with a custom shutdown
@@ -120,12 +128,34 @@ func newE2EHarness(t *testing.T) *e2eHarness {
 	return h
 }
 
+// workspaceTeardownTimeout bounds the harness's wait for workspace
+// teardown during cleanup. It only has to cover the create/detach
+// grace windows the test configures (hundreds of milliseconds), so a
+// long ceiling costs nothing on the happy path and turns a genuine
+// regression into a named failure instead of a hung test binary.
+const workspaceTeardownTimeout = 30 * time.Second
+
 // newRealCreateHarness builds an in-process server WITHOUT any
 // pre-inserted workspace, intended for tests that drive the real
 // [backend.CreateWorkspace] HTTP path (path-dedupe scenario). It
 // isolates HOME/XDG_* via [t.Setenv] so [config.Init] doesn't read
 // the host machine's config, which means callers MUST NOT mark the
 // test as parallel.
+//
+// Those t.TempDir calls, plus the data directory the test passes to
+// POST /v1/workspaces, are removed by the testing package's own
+// cleanup — which is registered HERE, and therefore runs LAST. A
+// workspace created over HTTP owns a pooled DB connection inside one
+// of those directories, and the connection is closed by the
+// workspace's teardown hook, which fires on a grace timer's goroutine
+// well after the test body returns. Windows cannot unlink a file that
+// still has an open handle, so the removal fails and the testing
+// package attributes it to the test.
+//
+// The wait below is registered before installServer so LIFO cleanup
+// ordering places it after hs.Close and sseWG.Wait (which is what
+// makes the streams drop and arms the detach timers) and before the
+// t.TempDir removals above.
 func newRealCreateHarness(t *testing.T) *e2eHarness {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
@@ -134,6 +164,18 @@ func newRealCreateHarness(t *testing.T) *e2eHarness {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 
 	h := &e2eHarness{}
+	t.Cleanup(func() {
+		if h.backend == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), workspaceTeardownTimeout)
+		defer cancel()
+		require.NoError(t, backend.WaitForWorkspaceTeardownForTest(ctx, h.backend),
+			"workspace teardown did not complete before temp dir cleanup")
+		if h.afterWorkspaceTeardown != nil {
+			h.afterWorkspaceTeardown()
+		}
+	})
 	h.installServer(t)
 	return h
 }
@@ -386,9 +428,20 @@ func TestE2E_TwoClientsReceiveSameMessage(t *testing.T) {
 	// release the pooled DB connection so Windows can clean up
 	// the temp data directory.
 	wsDataDir := ws.Cfg.Config().Options.DataDirectory
+	var dbReleased atomic.Bool
 	backend.SetWorkspaceShutdownFnForTest(ws, func() {
 		_ = db.Release(wsDataDir)
+		dbReleased.Store(true)
 	})
+	// Assert the ordering the Windows failure depends on. This runs
+	// after the harness's teardown wait and before t.TempDir removes
+	// wsDataDir, so it fails loudly on any platform if the wait ever
+	// stops actually waiting — rather than only on Windows, only
+	// sometimes, and reported as someone else's cleanup error.
+	h.afterWorkspaceTeardown = func() {
+		require.True(t, dbReleased.Load(),
+			"pooled DB connection must be released before the data dir is removed")
+	}
 
 	evcA, cancelA := h.subscribeSSE(t, ctx, ws.ID, cidA)
 	t.Cleanup(cancelA)
