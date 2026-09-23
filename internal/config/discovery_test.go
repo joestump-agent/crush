@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/csync"
@@ -450,4 +451,83 @@ func TestReloadModelDiscovery_DisableDefaultProviders(t *testing.T) {
 		require.Len(t, p.Models, 1)
 		require.Equal(t, "found-model", p.Models[0].ID)
 	})
+}
+
+// TestDiscoverProviderModels_SlowProviderDoesNotDropPeers pins two things:
+// the timeout argument is honoured per provider, and a provider that blows
+// it is reported as an error rather than silently vanishing while its peers
+// still resolve.
+//
+// It deliberately does NOT claim to prove the deadline is per provider
+// rather than shared. While every probe runs concurrently those two designs
+// are behaviourally identical, and this test passes under both — verified by
+// running it against a shared-budget implementation. The per-provider split
+// is a structural guarantee for the day probing is staged or throttled; the
+// behavioural fix for the dropped-provider bug is the budget itself, which
+// TestModelDiscoveryTimeouts_CoverRemoteGateways guards.
+func TestDiscoverProviderModels_SlowProviderDoesNotDropPeers(t *testing.T) {
+	t.Parallel()
+
+	const perProvider = 150 * time.Millisecond
+
+	quick := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data": [{"id": "quick-model", "object": "model"}]}`))
+	}))
+	defer quick.Close()
+
+	// Comfortably past its own deadline, so it fails on its own terms.
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(perProvider * 4)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data": [{"id": "stalled-model", "object": "model"}]}`))
+	}))
+	defer stalled.Close()
+
+	discoverTrue := true
+	candidates := map[string]ProviderConfig{
+		"quick": {
+			ID:                 "quick",
+			APIKey:             "test-key",
+			BaseURL:            quick.URL + "/v1",
+			AutoDiscoverModels: &discoverTrue,
+		},
+		"stalled": {
+			ID:                 "stalled",
+			APIKey:             "test-key",
+			BaseURL:            stalled.URL + "/v1",
+			AutoDiscoverModels: &discoverTrue,
+		},
+	}
+
+	resolver := NewShellVariableResolver(env.NewFromMap(map[string]string{}))
+	results, errs := discoverProviderModels(
+		context.Background(),
+		candidates,
+		map[string]bool{},
+		resolver,
+		perProvider,
+	)
+
+	require.Contains(t, results, "quick", "a responsive provider must survive a peer blowing its deadline")
+	require.Len(t, results["quick"], 1)
+	require.Equal(t, "quick-model", results["quick"][0].ID)
+
+	require.Contains(t, errs, "stalled", "a provider past its own deadline must report an error, not vanish")
+	require.NotContains(t, results, "stalled")
+}
+
+// TestModelDiscoveryTimeouts_CoverRemoteGateways guards the budget itself.
+// The load-time deadline was 3s, which is under the round-trip of a remote
+// gateway on a poor link — LiteLLM and Hyper were measured at 10.5s and
+// 6.7s — so whichever was slowest that run was dropped from the model list
+// without an error the user could see. Keep enough headroom that a working
+// remote provider is not mistaken for a broken one.
+func TestModelDiscoveryTimeouts_CoverRemoteGateways(t *testing.T) {
+	t.Parallel()
+
+	require.GreaterOrEqual(t, loadModelDiscoveryTimeout, 10*time.Second,
+		"load-time discovery must tolerate a slow remote gateway")
+	require.GreaterOrEqual(t, modelDiscoveryTimeout, loadModelDiscoveryTimeout,
+		"an explicitly requested reload must be at least as patient as startup")
 }
