@@ -370,14 +370,6 @@ func (c *coordinator) RunAccepted(ctx context.Context, accept *AcceptedRun, sess
 // dispatchMu; when nil (the in-process/local path) no accept tracking
 // applies.
 func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
-	// Wait for this agent's own build-time setup (system prompt, initial
-	// tool list) rather than for coordinator-wide state: a latch belonging
-	// to the agent cannot be rearmed by a later build while this run is
-	// parked on it. See readiness and joestump-agent/crush#298.
-	if err := c.currentAgent.WaitReady(); err != nil {
-		return nil, err
-	}
-
 	// MCP servers connect asynchronously (see mcp.Initialize).
 	//
 	// Interactive runs never wait for that to finish: the tool list below
@@ -404,6 +396,16 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	// its model settings, and the model refresh below must all target the
 	// same agent even if SetMainAgent swaps the main agent mid-flight.
 	agent, agentName := c.activeAgent()
+
+	// Wait for this agent's own build-time setup (system prompt, initial
+	// tool list) rather than for coordinator-wide state: a latch belonging
+	// to the agent cannot be rearmed by a later build while this run is
+	// parked on it. Waiting on the snapshot keeps the wait and the run on
+	// the same agent. See readiness and joestump-agent/crush#298.
+	if err := agent.WaitReady(); err != nil {
+		return nil, err
+	}
+
 	if err := c.updateAgentModels(ctx, agent, agentName); err != nil {
 		return nil, fmt.Errorf("failed to update models: %w", err)
 	}
