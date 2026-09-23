@@ -15,9 +15,12 @@ import (
 
 // loadModelDiscoveryTimeout bounds each provider's model-discovery probe
 // during config load. It is per provider, not a budget shared across the
-// pass: probes run concurrently, so a shared deadline is wall-clock from
-// the start of the pass and silently drops whichever endpoint happens to
-// be slowest that run, rather than the one that is actually unreachable.
+// pass. Because the probes run concurrently, both designs start the same
+// clock and behave identically today: a shared deadline drops every
+// endpoint slower than the budget, not only the slowest one, so raising
+// the budget is what recovers a slow remote gateway. The per-provider
+// split is the structural guarantee for the day probing is staged or
+// throttled, when a shared budget would start to starve later probes.
 // Providers whose endpoints miss it are recorded on the store and can be
 // retried later via ReloadModelDiscovery.
 //
