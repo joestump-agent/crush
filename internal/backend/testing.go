@@ -1,8 +1,6 @@
 package backend
 
-import (
-	"context"
-)
+import "context"
 
 // InsertWorkspaceForTest registers ws with b under its current ID and
 // path. It is intended for tests in other packages that need to drive

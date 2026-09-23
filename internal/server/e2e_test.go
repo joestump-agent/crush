@@ -170,8 +170,13 @@ func newRealCreateHarness(t *testing.T) *e2eHarness {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), workspaceTeardownTimeout)
 		defer cancel()
-		require.NoError(t, backend.WaitForWorkspaceTeardownForTest(ctx, h.backend),
-			"workspace teardown did not complete before temp dir cleanup")
+		// t.Errorf, not require: a FailNow here would runtime.Goexit
+		// out of the cleanup chain and skip every remaining cleanup,
+		// including the t.TempDir removals this hook exists to
+		// protect. Fail the test and let cleanup finish.
+		if err := backend.WaitForWorkspaceTeardownForTest(ctx, h.backend); err != nil {
+			t.Errorf("workspace teardown did not complete before temp dir cleanup: %v", err)
+		}
 		if h.afterWorkspaceTeardown != nil {
 			h.afterWorkspaceTeardown()
 		}
@@ -439,8 +444,9 @@ func TestE2E_TwoClientsReceiveSameMessage(t *testing.T) {
 	// stops actually waiting — rather than only on Windows, only
 	// sometimes, and reported as someone else's cleanup error.
 	h.afterWorkspaceTeardown = func() {
-		require.True(t, dbReleased.Load(),
-			"pooled DB connection must be released before the data dir is removed")
+		if !dbReleased.Load() {
+			t.Errorf("pooled DB connection must be released before the data dir is removed")
+		}
 	}
 
 	evcA, cancelA := h.subscribeSSE(t, ctx, ws.ID, cidA)
