@@ -6148,8 +6148,8 @@ func (m *UI) handleChannelMessage(ev mcp.Event) tea.Cmd {
 	}
 	loadCmd, err := m.ensureSession()
 	if err != nil {
-		slog.Warn("Failed to create session for channel message", "error", err)
-		return nil
+		slog.Warn("Failed to create session for channel message", "error", err, "channel", ev.Name)
+		return channelErrorCmd(ev.Name, fmt.Errorf("create session: %w", err))
 	}
 	if !m.hasSession() {
 		return loadCmd
@@ -6157,24 +6157,43 @@ func (m *UI) handleChannelMessage(ev mcp.Event) tea.Cmd {
 	updatedSession, err := m.com.Workspace.SetSessionChannel(context.Background(), m.session.ID, ev.Name)
 	if err != nil {
 		slog.Warn("Failed to set session channel", "error", err, "session", m.session.ID, "channel", ev.Name)
-		return loadCmd
+		return tea.Batch(loadCmd, channelErrorCmd(ev.Name, fmt.Errorf("set session channel: %w", err)))
 	}
 	m.session = &updatedSession
 	sessionID := m.session.ID
 	channel := ev.Name
 	content := ev.ChannelMessage
 	runCmd := func() tea.Msg {
-		if err := m.com.Workspace.AgentRunChannel(context.Background(), channel, sessionID, content); err != nil {
-			slog.Warn("Failed to inject channel message", "error", err, "session", sessionID)
-		}
 		// The prompt may have been enqueued behind a running turn;
 		// re-fetch busy/queue state.
-		return agentRunSubmittedMsg{}
+		submitted := func() tea.Msg { return agentRunSubmittedMsg{} }
+		err := m.com.Workspace.AgentRunChannel(context.Background(), channel, sessionID, content)
+		if err == nil {
+			return submitted()
+		}
+		slog.Warn("Failed to inject channel message", "error", err, "session", sessionID, "channel", channel)
+		if errors.Is(err, context.Canceled) {
+			return submitted()
+		}
+		// Surface the failure the way a typed prompt's does. Without
+		// this a channel-driven session that fails every turn looks
+		// healthy in the TUI.
+		return tea.BatchMsg{submitted, channelErrorCmd(channel, err)}
 	}
 	if loadCmd != nil {
 		return tea.Batch(loadCmd, runCmd)
 	}
 	return runCmd
+}
+
+// channelErrorCmd reports a failure handling a channel event to the UI,
+// prefixed with the channel name so it reads as coming from that channel
+// rather than from something the user typed.
+func channelErrorCmd(channel string, err error) tea.Cmd {
+	if channel == "" {
+		channel = "channel"
+	}
+	return util.ReportError(fmt.Errorf("%s: %w", channel, err))
 }
 
 // runShellCommand executes a shell command server-side without triggering
