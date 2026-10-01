@@ -2,13 +2,16 @@ package config
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
+	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/discover"
 	"github.com/charmbracelet/crush/internal/env"
@@ -537,4 +540,151 @@ func TestModelDiscoveryTimeouts_CoverRemoteGateways(t *testing.T) {
 	// so a gateway answering in 10.5s was still dropped.
 	require.Greater(t, discover.RequestTimeout, modelDiscoveryTimeout,
 		"the HTTP client backstop must not undercut the discovery budget")
+}
+
+// TestDiscoverProviderModels_FillsCatalogMetadata pins the catalog lookup
+// that describes discovered models. /models returns bare IDs, so a custom
+// provider named after a catalog provider (a "hyper" or "zai" entry under
+// disable_default_providers) ran every model with no context window and no
+// reasoning settings. On Hyper that sent glm-5.3 out with thinking off and
+// no reasoning_effort, which Hyper rejects as invalid input.
+func TestDiscoverProviderModels_FillsCatalogMetadata(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewShellVariableResolver(env.NewFromMap(map[string]string{}))
+
+	// newServer lists ids at /v1/models and serves feed at /v1/provider,
+	// or a 404 there when feed is empty.
+	newServer := func(t *testing.T, ids []string, feed string) *httptest.Server {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/models":
+				var data []string
+				for _, id := range ids {
+					data = append(data, fmt.Sprintf(`{"id": %q, "object": "model"}`, id))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"data": [%s]}`, strings.Join(data, ","))
+			case "/v1/provider":
+				if feed == "" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(feed))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	discoverOne := func(t *testing.T, id string, typ catwalk.Type, srv *httptest.Server) []catwalk.Model {
+		t.Helper()
+		discoverTrue := true
+		results, errs := discoverProviderModels(
+			context.Background(),
+			map[string]ProviderConfig{id: {
+				ID:                 id,
+				Type:               typ,
+				APIKey:             "test-key",
+				BaseURL:            srv.URL + "/v1",
+				AutoDiscoverModels: &discoverTrue,
+			}},
+			map[string]bool{},
+			resolver,
+			5*time.Second,
+		)
+		require.Empty(t, errs)
+		return results[id]
+	}
+
+	t.Run("hyper reads the live feed", func(t *testing.T) {
+		t.Parallel()
+		srv := newServer(t, []string{"live-model"}, `{
+			"id": "hyper",
+			"models": [{
+				"id": "live-model", "name": "Live Model", "context_window": 123456,
+				"default_max_tokens": 4096, "can_reason": true,
+				"reasoning_levels": ["low", "high", "max"], "default_reasoning_effort": "high"
+			}]
+		}`)
+
+		models := discoverOne(t, "hyper", catwalk.TypeOpenAICompat, srv)
+		require.Len(t, models, 1)
+		require.Equal(t, "Live Model", models[0].Name)
+		require.Equal(t, int64(123456), models[0].ContextWindow)
+		require.Equal(t, int64(4096), models[0].DefaultMaxTokens)
+		require.True(t, models[0].CanReason)
+		require.Equal(t, []string{"low", "high", "max"}, models[0].ReasoningLevels)
+		require.Equal(t, "high", models[0].DefaultReasoningEffort)
+	})
+
+	t.Run("hyper falls back to the bundled copy", func(t *testing.T) {
+		t.Parallel()
+		bundled := hyper.Embedded().Models
+		require.NotEmpty(t, bundled)
+		want := bundled[0]
+		srv := newServer(t, []string{want.ID}, "")
+
+		models := discoverOne(t, "hyper", catwalk.TypeOpenAICompat, srv)
+		require.Len(t, models, 1)
+		require.Equal(t, want.Name, models[0].Name)
+		require.Equal(t, want.ContextWindow, models[0].ContextWindow)
+	})
+
+	t.Run("hyper under another API type is not described", func(t *testing.T) {
+		t.Parallel()
+		srv := newServer(t, []string{"live-model"}, `{"id": "hyper", "models": [{"id": "live-model", "name": "Live Model"}]}`)
+
+		models := discoverOne(t, "hyper", catwalk.TypeAnthropic, srv)
+		require.Len(t, models, 1)
+		require.Equal(t, "live-model", models[0].Name)
+	})
+
+	t.Run("zai is described by the embedded catwalk catalog", func(t *testing.T) {
+		t.Parallel()
+		zai, ok := embeddedCatalog()["zai"]
+		require.True(t, ok)
+		require.NotEmpty(t, zai.Models)
+		want := zai.Models[0]
+		srv := newServer(t, []string{want.ID}, "")
+
+		models := discoverOne(t, "zai", catwalk.TypeOpenAICompat, srv)
+		require.Len(t, models, 1)
+		require.Equal(t, want.Name, models[0].Name)
+		require.Equal(t, want.ContextWindow, models[0].ContextWindow)
+		require.Equal(t, want.CanReason, models[0].CanReason)
+		require.Equal(t, want.ReasoningLevels, models[0].ReasoningLevels)
+	})
+
+	t.Run("a catalog for another API type is not used", func(t *testing.T) {
+		t.Parallel()
+		gemini, ok := embeddedCatalog()["gemini"]
+		require.True(t, ok)
+		require.Equal(t, catwalk.TypeGoogle, gemini.Type)
+		require.NotEmpty(t, gemini.Models)
+		id := gemini.Models[0].ID
+		srv := newServer(t, []string{id}, "")
+
+		models := discoverOne(t, "gemini", catwalk.TypeOpenAICompat, srv)
+		require.Len(t, models, 1)
+		require.Equal(t, id, models[0].Name)
+		require.Zero(t, models[0].ContextWindow)
+	})
+
+	t.Run("a provider with no catalog is untouched", func(t *testing.T) {
+		t.Parallel()
+		// glm-5.3 is in the zai catalog: the provider ID, not the model
+		// ID, decides whether a catalog applies.
+		srv := newServer(t, []string{"glm-5.3"}, "")
+
+		models := discoverOne(t, "myprov", catwalk.TypeOpenAICompat, srv)
+		require.Len(t, models, 1)
+		require.Equal(t, "glm-5.3", models[0].Name)
+		require.Zero(t, models[0].ContextWindow)
+		require.False(t, models[0].CanReason)
+	})
 }
