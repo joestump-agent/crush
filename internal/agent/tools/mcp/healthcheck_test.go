@@ -88,6 +88,11 @@ func TestChannelHealthCheck_RenewsDeadChannelSession(t *testing.T) {
 // session on its own, with no tool call ever made. This is the property the
 // production deployment depends on — the loop is the only thing standing
 // between a dropped channel stream and a deaf consumer.
+//
+// @joestump-agent 10/01/2026 - Joins the loop before teardown. Left unjoined,
+// a loop still inside a renewal raced the newSession restore and called the
+// liveSession stub after the test had completed, panicking the test binary
+// ("Fail in goroutine after ... has completed") and turning main red.
 func TestChannelHealthCheckLoop_TickerRenewsDeadSession(t *testing.T) {
 	const name = "test-health-loop"
 	t.Cleanup(cleanupSession(name))
@@ -105,8 +110,26 @@ func TestChannelHealthCheckLoop_TickerRenewsDeadSession(t *testing.T) {
 	t.Cleanup(func() { newSession = origNewSession })
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go runChannelHealthCheck(ctx, cfg, 10*time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runChannelHealthCheck(ctx, cfg, 10*time.Millisecond)
+	}()
+	// Stop and join the loop before anything else is torn down. This cleanup
+	// is registered after the newSession restore, so it runs first: a loop
+	// goroutine still inside a renewal when the test body returns races that
+	// restore and can call back into t after the test has completed, which
+	// panics the whole test binary ("Fail in goroutine after ... has
+	// completed"). Joining here is what keeps the stub's liveSession call
+	// inside the test's lifetime.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("health check loop did not stop after context cancellation")
+		}
+	})
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -141,6 +164,46 @@ func TestChannelHealthCheckLoop_StopsOnContextCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("health check loop did not stop after context cancellation")
 	}
+}
+
+// TestChannelHealthCheckLoop_LeavesNoGoroutineBehind pins that a test which
+// starts the loop joins it before tearing down.
+//
+// The loop is driven through a stub that calls liveSession, and liveSession
+// asserts on t. A loop left running past the test body races the stub's
+// restoration and can call t after the test has completed, which panics the
+// whole test binary with "Fail in goroutine after ... has completed" rather
+// than failing one test. This is the flake that turned main red; the assertion
+// below fails if the join is dropped.
+//
+// @joestump-agent 10/01/2026 - Added after the unjoined loop in
+// TestChannelHealthCheckLoop_TickerRenewsDeadSession panicked CI on main.
+func TestChannelHealthCheckLoop_LeavesNoGoroutineBehind(t *testing.T) {
+	cfg := config.NewTestStore(&config.Config{MCP: config.MCPs{}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	// Registered first, so it runs LAST: the join below must already have
+	// observed the loop exit by the time this runs.
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		default:
+			t.Error("the health check loop goroutine outlived the test")
+		}
+	})
+
+	go func() {
+		defer close(done)
+		runChannelHealthCheck(ctx, cfg, 10*time.Millisecond)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	time.Sleep(50 * time.Millisecond)
 }
 
 // The regression this fix exists for.
