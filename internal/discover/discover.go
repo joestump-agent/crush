@@ -85,6 +85,10 @@ type Config struct {
 	BaseURL      string
 	APIKey       string
 	ExtraHeaders map[string]string
+	// APIType is the provider's wire protocol (e.g. openai-compat,
+	// anthropic). Enrichers that only make sense for one protocol use
+	// it to no-op for the others.
+	APIType string
 	// Existing models from config — IDs present in this list are skipped
 	// during discovery (user-specified models win).
 	ExistingModels []catwalk.Model
