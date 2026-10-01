@@ -112,7 +112,7 @@ func TestReloadModelDiscovery(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, added)
 
-	p, ok := cfg.Providers.Get("custom")
+	p, ok := store.Config().Providers.Get("custom")
 	require.True(t, ok)
 	require.Len(t, p.Models, 1)
 
@@ -126,7 +126,7 @@ func TestReloadModelDiscovery(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, added)
 
-	p, ok = cfg.Providers.Get("custom")
+	p, ok = store.Config().Providers.Get("custom")
 	require.True(t, ok)
 	require.Len(t, p.Models, 2)
 	require.Equal(t, "existing-model", p.Models[0].ID)
@@ -167,7 +167,7 @@ func TestReloadModelDiscovery_RespectsOptOut(t *testing.T) {
 	require.Equal(t, 0, added)
 	require.False(t, called.Load(), "provider opted out of discovery should not be queried")
 
-	p, ok := cfg.Providers.Get("custom")
+	p, ok := store.Config().Providers.Get("custom")
 	require.True(t, ok)
 	require.Len(t, p.Models, 1)
 	require.Equal(t, "listed-model", p.Models[0].ID)
@@ -209,7 +209,7 @@ func TestReloadModelDiscovery_SkipsCuratedProviders(t *testing.T) {
 	require.Equal(t, 0, added)
 	require.False(t, called.Load(), "curated provider must not be re-discovered on reload")
 
-	p, ok := cfg.Providers.Get("curated")
+	p, ok := store.Config().Providers.Get("curated")
 	require.True(t, ok)
 	require.Len(t, p.Models, 1)
 	require.Equal(t, "hand-picked", p.Models[0].ID)
@@ -252,7 +252,7 @@ func TestReloadModelDiscovery_ResurrectsFailedProvider(t *testing.T) {
 
 	require.NoError(t, cfg.configureProviders(context.Background(), store, testEnv, resolver, nil))
 
-	_, ok := cfg.Providers.Get("flaky")
+	_, ok := store.Config().Providers.Get("flaky")
 	require.False(t, ok, "provider with failed discovery and no models is dropped at load")
 	require.Contains(t, store.failedDiscoveryProviders, "flaky")
 
@@ -263,7 +263,7 @@ func TestReloadModelDiscovery_ResurrectsFailedProvider(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, added, "resurrected provider's models count as added")
 
-	p, ok := cfg.Providers.Get("flaky")
+	p, ok := store.Config().Providers.Get("flaky")
 	require.True(t, ok, "provider is resurrected once its endpoint answers")
 	require.Len(t, p.Models, 2)
 	require.NotContains(t, store.failedDiscoveryProviders, "flaky")
@@ -305,7 +305,7 @@ func TestReloadModelDiscovery_PrunesRemovedModels(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 2, added, "added is the set difference, not a length delta")
 
-		p, ok := cfg.Providers.Get("custom")
+		p, ok := store.Config().Providers.Get("custom")
 		require.True(t, ok)
 		require.Len(t, p.Models, 2)
 		require.Equal(t, "fresh-a", p.Models[0].ID)
@@ -350,7 +350,7 @@ func TestReloadModelDiscovery_PrunesRemovedModels(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 1, added)
 
-		p, ok := cfg.Providers.Get("custom")
+		p, ok := store.Config().Providers.Get("custom")
 		require.True(t, ok)
 		require.Len(t, p.Models, 2)
 		require.Equal(t, "user-model", p.Models[0].ID)
@@ -450,7 +450,7 @@ func TestReloadModelDiscovery_DisableDefaultProviders(t *testing.T) {
 		require.Equal(t, 1, added)
 		require.True(t, called.Load(), "with disable_default_providers every provider is custom")
 
-		p, ok := cfg.Providers.Get("myprov")
+		p, ok := store.Config().Providers.Get("myprov")
 		require.True(t, ok)
 		require.Len(t, p.Models, 1)
 		require.Equal(t, "found-model", p.Models[0].ID)
@@ -687,4 +687,43 @@ func TestDiscoverProviderModels_FillsCatalogMetadata(t *testing.T) {
 		require.Zero(t, models[0].ContextWindow)
 		require.False(t, models[0].CanReason)
 	})
+}
+
+// TestCloneForWrite_IsolatesProviderModels pins the clone's Providers
+// isolation, which the model-discovery merge depends on.
+//
+// cloneForWrite used to hand back the same *csync.Map, and csync.Map.Get
+// returns a struct whose Models slice aliases the map's own backing array.
+// ReloadModelDiscovery reads a provider out of the clone and fills model
+// metadata in place, so the write landed in the LIVE, published map while
+// readers were reading it: a data race, plus torn metadata in the running
+// config. Copying Providers in the clone is what keeps the merge private.
+func TestCloneForWrite_IsolatesProviderModels(t *testing.T) {
+	t.Parallel()
+
+	live := csync.NewMapFrom(map[string]ProviderConfig{
+		"custom": {
+			ID:     "custom",
+			Models: []catwalk.Model{{ID: "glm-5.3", Name: "glm-5.3"}},
+		},
+	})
+	cfg := &Config{Providers: live}
+	cfg.setDefaults(t.TempDir(), "")
+
+	clone := cfg.cloneForWrite()
+	require.NotSame(t, cfg.Providers, clone.Providers,
+		"the clone must not share the live provider map")
+
+	// Mutate through the clone the way the discovery merge does.
+	pc, ok := clone.Providers.Get("custom")
+	require.True(t, ok)
+	pc.Models[0].ContextWindow = 1_000_000
+	pc.Models = append(pc.Models, catwalk.Model{ID: "added"})
+	clone.Providers.Set("custom", pc)
+
+	published, ok := cfg.Providers.Get("custom")
+	require.True(t, ok)
+	require.Len(t, published.Models, 1, "the live map must not gain the clone's models")
+	require.Zero(t, published.Models[0].ContextWindow,
+		"the live map's model must not be written through the clone")
 }
