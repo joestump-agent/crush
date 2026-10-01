@@ -186,5 +186,8 @@ func TestIsKnownCustomProvider(t *testing.T) {
 	require.False(t, IsKnownCustomProvider("openai"))
 	require.False(t, IsKnownCustomProvider("anthropic"))
 	require.False(t, IsKnownCustomProvider(""))
-	require.False(t, IsKnownCustomProvider("hyper"), "a provider ID is not a type")
+	// hyper registers by ID, but Crush also accepts `type: hyper` (load.go's
+	// type validation, the schema enum, and the coordinator's wire handling
+	// all accept it), so the OpenAI-compat handling must stay on for it.
+	require.True(t, IsKnownCustomProvider("hyper"), "hyper is an accepted type value, not only a provider ID")
 }

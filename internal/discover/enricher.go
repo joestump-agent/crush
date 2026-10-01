@@ -31,7 +31,7 @@ var typeEnrichers = map[string]Enricher{}
 // types in the schema or type validation.
 var idEnrichers = map[string]Enricher{}
 
-// knownCustomTypes is the subset of registered types that Crush treats
+// knownCustomTypes is the set of provider type strings that Crush treats
 // as known custom provider types: the local gateways that speak
 // OpenAI-compat under the hood and get the corresponding wire handling
 // in the coordinator. Kept separate from typeEnrichers so that a future
@@ -49,8 +49,17 @@ func RegisterEnricher(providerType string, e Enricher) {
 
 // RegisterProviderEnricher registers an Enricher for a single provider
 // ID. It takes precedence over any type-keyed enricher when both match.
+//
+// The ID is also marked as a known custom provider type. Crush accepts
+// some of these IDs as a `type` value in their own right (hyper is the
+// worked example: load.go's type validation, the schema enum, and the
+// coordinator's wire handling all accept `type: hyper`), and the wire
+// handling behind that acceptance is what marks a provider OpenAI-compat
+// under the hood. Registering the ID without the mark would leave a
+// `type: hyper` provider with no OpenAI-compat request construction.
 func RegisterProviderEnricher(providerID string, e Enricher) {
 	idEnrichers[providerID] = e
+	knownCustomTypes[providerID] = true
 }
 
 // GetEnricher returns the Enricher for the given provider, looking up
@@ -66,8 +75,9 @@ func GetEnricher(providerID, providerType string) Enricher {
 // IsKnownCustomProvider reports whether the given provider type is one
 // of the recognized local gateway types that speak OpenAI-compat
 // protocol, without exposing the enrichers themselves to callers that
-// only need the compatibility check. ID-keyed enrichers never count:
-// a provider ID is not a type.
+// only need the compatibility check. ID-keyed enrichers count only for
+// the IDs Crush already accepts as a `type` value (hyper); an ID that is
+// not also a type never gains the wire handling by being registered.
 func IsKnownCustomProvider(providerType string) bool {
 	return knownCustomTypes[providerType]
 }
