@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
+	"charm.land/catwalk/pkg/embedded"
+	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/discover"
 )
 
@@ -68,6 +70,50 @@ func knownProviderNameSet(known []catwalk.Provider, disableDefaults bool) map[st
 	return names
 }
 
+// embeddedCatalog indexes the catwalk catalog bundled with Crush by
+// provider ID. It is parsed once, on first use.
+var embeddedCatalog = sync.OnceValue(func() map[string]catwalk.Provider {
+	all := embedded.GetAll()
+	index := make(map[string]catwalk.Provider, len(all))
+	for _, p := range all {
+		index[string(p.ID)] = p
+	}
+	return index
+})
+
+// catalogModels returns the catalog models describing a custom provider's
+// discovered models, or nil when Crush has no catalog for it. A custom
+// provider is matched to a catalog entry by ID, the same key the
+// coordinator already uses for provider-specific request handling, and
+// only when both speak the same API type: metadata for one wire protocol
+// (Gemini's native API, say) does not describe another (its
+// OpenAI-compatible endpoint).
+//
+// Hyper's catalog is read live from the provider feed on the endpoint
+// discovery just listed. The copy bundled with Crush is only as new as the
+// build and lags Hyper's model list, so it is just the fallback. Every
+// other catalog comes from catwalk's embedded snapshot: under
+// disable_default_providers Crush never contacts catwalk, and filling in
+// metadata is no reason to start.
+func catalogModels(ctx context.Context, cfg discover.Config, providerType catwalk.Type, resolver VariableResolver) []catwalk.Model {
+	if cfg.ID == hyper.Name {
+		if providerType != catwalk.TypeOpenAICompat && providerType != hyper.Name {
+			return nil
+		}
+		feed, err := discover.FetchProviderFeed(ctx, cfg, resolver)
+		if err != nil {
+			slog.Warn("Could not read Hyper's model feed, using the bundled copy", "provider", cfg.ID, "error", err)
+			return hyper.Embedded().Models
+		}
+		return feed.Models
+	}
+	p, ok := embeddedCatalog()[cfg.ID]
+	if !ok || p.Type != providerType {
+		return nil
+	}
+	return p.Models
+}
+
 // discoverProviderModels runs model discovery concurrently for the custom
 // (non-known) candidates that are eligible for it (see
 // providerWantsDiscovery). Each candidate's Models field must hold only
@@ -113,8 +159,9 @@ func discoverProviderModels(
 		}
 		providerType := cmp.Or(pc.Type, catwalk.TypeOpenAICompat)
 		wg.Go(func() {
-			// Each provider gets its own deadline. Enrichment shares it
-			// with the probe: together they are this provider's budget.
+			// Each provider gets its own deadline. Enrichment and the
+			// catalog lookup share it with the probe: together they are
+			// this provider's budget.
 			pctx, pcancel := context.WithTimeout(ctx, perProviderTimeout)
 			defer pcancel()
 
@@ -130,6 +177,7 @@ func discoverProviderModels(
 				if enricher := discover.GetEnricher(string(providerType)); enricher != nil {
 					models, _ = enricher.EnrichModels(pctx, cfg, resolver, models)
 				}
+				models = discover.MergeCatalog(models, catalogModels(pctx, cfg, providerType, resolver))
 			}
 			mu.Lock()
 			results[id] = models
