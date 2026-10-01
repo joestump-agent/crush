@@ -155,9 +155,22 @@ func TestLitellmEnricher(t *testing.T) {
 func TestGetEnricher(t *testing.T) {
 	t.Parallel()
 
-	require.NotNil(t, GetEnricher("litellm"))
-	require.Nil(t, GetEnricher("openai-compat"))
-	require.Nil(t, GetEnricher(""))
+	require.NotNil(t, GetEnricher("litellm", "litellm"))
+	require.NotNil(t, GetEnricher("my-litellm", "litellm"))
+	// Standard types have no enricher: using one is a configuration
+	// choice, not something discovery guesses at.
+	require.Nil(t, GetEnricher("my-gateway", "openai-compat"))
+	require.Nil(t, GetEnricher("my-gateway", "openai"))
+	require.Nil(t, GetEnricher("my-gateway", "anthropic"))
+	require.Nil(t, GetEnricher("", ""))
+}
+
+func TestGetEnricherIDBeatsType(t *testing.T) {
+	t.Parallel()
+
+	e := GetEnricher("hyper", "openai-compat")
+	require.NotNil(t, e)
+	require.IsType(t, &hyperEnricher{}, e, "the ID-keyed enricher must win over the type lookup")
 }
 
 func TestIsKnownCustomProvider(t *testing.T) {
@@ -167,7 +180,14 @@ func TestIsKnownCustomProvider(t *testing.T) {
 	require.True(t, IsKnownCustomProvider("ollama"))
 	require.True(t, IsKnownCustomProvider("omlx"))
 	require.True(t, IsKnownCustomProvider("lmstudio"))
+	// Standard types are ordinary catwalk types and must not gain the
+	// custom-provider wire handling.
 	require.False(t, IsKnownCustomProvider("openai-compat"))
+	require.False(t, IsKnownCustomProvider("openai"))
 	require.False(t, IsKnownCustomProvider("anthropic"))
 	require.False(t, IsKnownCustomProvider(""))
+	// hyper registers by ID, but Crush also accepts `type: hyper` (load.go's
+	// type validation, the schema enum, and the coordinator's wire handling
+	// all accept it), so the OpenAI-compat handling must stay on for it.
+	require.True(t, IsKnownCustomProvider("hyper"), "hyper is an accepted type value, not only a provider ID")
 }
