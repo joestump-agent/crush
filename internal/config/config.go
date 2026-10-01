@@ -915,15 +915,36 @@ type Config struct {
 // mutator must never write through the live pointer. Instead it clones,
 // mutates the clone, and atomically swaps it in. The clone gives fresh
 // copies of every field a typed mutator touches in place — Models,
-// RecentModels, MCP, and Options (with its nested TUI pointer). Providers
-// is a *csync.Map (internally synchronized) and is shared by reference;
-// the remaining fields are immutable after load from the mutators'
-// standpoint and are likewise shared.
+// RecentModels, MCP, Options (with its nested TUI pointer), and Providers.
+// The remaining fields are immutable after load from the mutators'
+// standpoint and are shared.
+//
+// Providers needs its own copy, and not merely for the map itself. Its
+// values carry a Models slice, and csync.Map.Get hands back a struct whose
+// slice aliases the map's own backing array, so a mutator that writes
+// through a value it read out of the map — which is exactly what a merge
+// over discovered models does — would write into the live, published
+// map's memory while readers are reading it. Sharing the *csync.Map is
+// safe only against a map-level data race, not against this one.
+//
+// @joestump-agent 10/01/2026 - Copied Providers instead of sharing the
+// *csync.Map by reference. ReloadModelDiscovery merged discovered models
+// through a value read out of the shared map, racing every concurrent
+// reader of a published Config (found in review of #307).
 func (c *Config) cloneForWrite() *Config {
 	nc := *c
 	nc.Models = maps.Clone(c.Models)
 	nc.RecentModels = maps.Clone(c.RecentModels)
 	nc.MCP = maps.Clone(c.MCP)
+	if c.Providers != nil {
+		providers := csync.NewMap[string, ProviderConfig]()
+		for pc := range c.Providers.Seq() {
+			pc.Models = slices.Clone(pc.Models)
+			pc.ChatGPTModels = slices.Clone(pc.ChatGPTModels)
+			providers.Set(pc.ID, pc)
+		}
+		nc.Providers = providers
+	}
 	if c.Options != nil {
 		opts := *c.Options
 		if c.Options.TUI != nil {
