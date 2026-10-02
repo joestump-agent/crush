@@ -88,7 +88,7 @@ func TestBuildDispatchToolchainRootsToolsAtWorkspaceDir(t *testing.T) {
 	globResp := runTool(t, byName[tools.GlobToolName], tools.GlobToolName, map[string]any{
 		"pattern": "**/*.md",
 	})
-	require.Contains(t, globResp.Content, filepath.Join("a", "b", "one.md"))
+	require.Contains(t, globResp.Content, "a/b/one.md")
 	require.NotContains(t, globResp.Content, "decoy.md", "glob escaped the dispatch workspace")
 
 	viewResp := runTool(t, byName[tools.ViewToolName], tools.ViewToolName, map[string]any{
@@ -97,13 +97,16 @@ func TestBuildDispatchToolchainRootsToolsAtWorkspaceDir(t *testing.T) {
 	require.Contains(t, viewResp.Content, "dispatched notes")
 
 	// Bash inherits the parent's skip-permissions setting through the
-	// bridge (env.permissions is skip=true), so the command runs and
-	// reports the workspace as its working directory.
+	// bridge (env.permissions is skip=true), so the command runs with
+	// the workspace as its working directory: a relative redirect lands
+	// inside the workspace. (A `pwd` content match would not survive
+	// Windows path rendering.)
 	bashResp := runTool(t, byName[tools.BashToolName], tools.BashToolName, map[string]any{
-		"command":     "pwd",
-		"description": "print the dispatch working directory",
+		"command":     "echo marker > marker.txt",
+		"description": "write a marker into the dispatch working directory",
 	})
-	require.Contains(t, bashResp.Content, workspace)
+	require.NotContains(t, bashResp.Content, "User denied permission")
+	require.FileExists(t, filepath.Join(workspace, "marker.txt"))
 }
 
 // The default (non-dispatch) toolchain is unchanged: buildTools roots
