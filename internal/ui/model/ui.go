@@ -35,6 +35,7 @@ import (
 	"github.com/charmbracelet/crush/internal/clipboard"
 	"github.com/charmbracelet/crush/internal/commands"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/history"
@@ -1150,6 +1151,11 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.renderPills()
 	case pubsub.Event[history.File]:
 		cmds = append(cmds, m.handleFileEvent(msg.Payload))
+	case pubsub.Event[dispatch.TodoSnapshot]:
+		// Per-dispatch progress snapshots from the todo collector (#65):
+		// they update the dispatch agent block wherever it renders, not
+		// only for the loaded session.
+		m.handleDispatchTodos(msg.Payload)
 	case pubsub.Event[app.LSPEvent]:
 		// Refresh the memoized LSP state off-thread: LSPGetStates is a
 		// synchronous HTTP round-trip in client/server mode and diagnostics
@@ -1733,6 +1739,7 @@ func (m *UI) setSessionMessages(msgs []message.Message) tea.Cmd {
 	// Load nested tool calls for agent/agentic_fetch tools.
 	m.loadNestedToolCalls(items)
 	m.setMessagePlanFlags(items)
+	m.seedDispatchSnapshots(items)
 
 	// If the user switches between sessions while the agent is working we
 	// want to make sure the animations are shown. Gate on the agent actually
@@ -2135,6 +2142,61 @@ func (m *UI) handleChildSessionMessage(event pubsub.Event[message.Message]) tea.
 	}
 
 	return tea.Sequence(cmds...)
+}
+
+// handleDispatchTodos feeds one reduced dispatch snapshot (#65) into the
+// matching agent block. The snapshot's session ID is the child task
+// session the dispatch_agent tool call created, and it parses back to
+// that tool call's ID — the block's list ID. The block lives in the
+// parent session's transcript, so snapshots are applied even when the
+// loaded session is not the parent.
+func (m *UI) handleDispatchTodos(snap dispatch.TodoSnapshot) {
+	if m.session == nil || snap.Entry.SessionID == "" {
+		return
+	}
+	_, toolCallID, ok := m.com.Workspace.ParseAgentToolSessionID(snap.Entry.SessionID)
+	if !ok {
+		return
+	}
+	item := m.chat.MessageItem(toolCallID)
+	if item == nil {
+		return
+	}
+	setter, ok := item.(chat.DispatchSnapshotSetter)
+	if !ok {
+		return
+	}
+	// Live dispatch activity means the animation clock must run even
+	// when the loaded session is idle — a reloaded parent session keeps
+	// its dispatch blocks animating.
+	m.chat.SetAnimationsAllowed(true)
+	setter.SetDispatchSnapshot(snap)
+	if m.chat.Follow() {
+		m.chat.ScrollToBottom()
+		m.chat.SelectLast()
+	}
+}
+
+// seedDispatchSnapshots attaches live registry state to dispatch blocks
+// built from persisted messages (#65): a reloaded session's stored
+// dispatch_agent result is the running handle, so without this the block
+// would render its provisioning-time state forever. Dispatches the
+// registry does not know — client/server mode, or an earlier process —
+// keep their persisted state.
+func (m *UI) seedDispatchSnapshots(items []chat.MessageItem) {
+	for _, item := range items {
+		block, ok := item.(*chat.DispatchToolMessageItem)
+		if !ok {
+			continue
+		}
+		sessionID := block.DispatchSessionID()
+		if sessionID == "" {
+			continue
+		}
+		if snap, ok := m.com.Workspace.DispatchStatus(sessionID); ok {
+			block.SetDispatchSnapshot(snap)
+		}
+	}
 }
 
 func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
