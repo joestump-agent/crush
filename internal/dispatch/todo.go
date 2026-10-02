@@ -199,23 +199,26 @@ func (c *TodoCollector) mergeEntry(entry Entry) TodoSnapshot {
 }
 
 // emit stores the snapshot, delivers it to every sink, and forwards it
-// to every per-session listener for the snapshot's session.
+// to every per-session listener for the snapshot's session. Listener
+// delivery runs under c.mu and is non-blocking, so it can never race the
+// unsubscribe goroutine's close of a channel it has already removed from
+// the listener map: a send on a closed channel is impossible because
+// closing only happens after removal, under the same mutex.
 func (c *TodoCollector) emit(snap TodoSnapshot) {
 	c.mu.Lock()
 	c.latest[snap.Entry.ID] = snap
-	sinks := c.sinks
-	listeners := c.listenersFor(snap.Entry.SessionID)
-	c.mu.Unlock()
-	for _, sink := range sinks {
-		sink.DispatchTodos(snap)
-	}
-	for _, ch := range listeners {
+	for _, ch := range c.listenersFor(snap.Entry.SessionID) {
 		select {
 		case ch <- snap:
 		default:
 			// Listener is slow — skip this snapshot; the next one
 			// carries the newer state anyway.
 		}
+	}
+	sinks := c.sinks
+	c.mu.Unlock()
+	for _, sink := range sinks {
+		sink.DispatchTodos(snap)
 	}
 }
 
