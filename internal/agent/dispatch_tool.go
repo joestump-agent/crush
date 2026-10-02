@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/message"
 )
 
 //go:embed templates/dispatch_tool.md
@@ -257,9 +258,8 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 
 // runDispatch runs one dispatched agent to completion in the background
 // (#64): it drives the ephemeral session's turn, keeps the registry's
-// status current, and propagates the dispatched session's cost to the
-// parent. The terminal result payload — diff summary and key findings —
-// is #66.
+// status current, propagates the dispatched session's cost to the parent,
+// and delivers the terminal DispatchResult back to the main agent (#66).
 func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	defer func() {
 		// The toolchain outlives the turn: Close stops the permission
@@ -294,22 +294,95 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// is a failure, never a success. One dispatch = one turn, so the
 	// queued-behind-a-busy-session path cannot produce a late result
 	// either.
-	status := dispatch.StatusCompleted
-	switch {
-	case err != nil:
-		status = dispatch.StatusFailed
+	if err != nil {
 		slog.Error("Dispatched agent run failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)
-	case result == nil:
-		status = dispatch.StatusFailed
+	} else if result == nil {
 		slog.Error("Dispatched agent ran no turn", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
 	}
-	run.workspace.SetStatus(run.entry.ID, status)
+
+	terminal := c.assembleDispatchResult(ctx, run, result, err)
+	run.workspace.SetStatus(run.entry.ID, terminal.Status)
 
 	// Cost propagation is best-effort, mirroring runSubAgent: a failure
 	// here must not lose the run's outcome.
 	if err := c.updateParentSessionCost(ctx, run.sessionID, run.parentSessionID); err != nil {
 		slog.Warn("Failed to update parent session cost", "child_session", run.sessionID, "parent_session", run.parentSessionID, "error", err)
 	}
+
+	c.deliverDispatchResult(ctx, run.parentSessionID, terminal)
+}
+
+// assembleDispatchResult builds the terminal DispatchResult (#66) from a
+// finished dispatched run: the run outcome maps to the status, the
+// agent's final text to the key findings, and Workspace.Diff's output —
+// condensed — to the diff summary. A completed run stays completed even
+// when diff capture fails; the failure is recorded in the summary so the
+// main agent knows why it is missing.
+func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRun, result *fantasy.AgentResult, runErr error) dispatch.DispatchResult {
+	terminal := dispatch.DispatchResult{
+		DispatchID:    run.entry.ID,
+		Branch:        run.entry.Branch,
+		WorkspacePath: run.entry.Path,
+		SessionID:     run.sessionID,
+	}
+	switch {
+	case runErr != nil:
+		terminal.Status = dispatch.StatusFailed
+		terminal.Error = runErr.Error()
+	case result == nil:
+		terminal.Status = dispatch.StatusFailed
+		terminal.Error = "agent session did not start a turn (busy or canceled)"
+	default:
+		terminal.Status = dispatch.StatusCompleted
+		terminal.KeyFindings = subAgentOutput(result)
+		diff, diffErr := run.workspace.Diff(ctx, run.entry.ID)
+		switch {
+		case diffErr != nil:
+			terminal.DiffSummary = fmt.Sprintf("(diff unavailable: %s)", diffErr)
+		case diff == "":
+			terminal.DiffSummary = "(no changes)"
+		default:
+			terminal.DiffSummary = dispatch.SummarizeDiff(diff)
+		}
+	}
+	return terminal
+}
+
+// deliverDispatchResult hands the terminal payload to the main agent
+// (#66). The tool call that started the dispatch returned its running
+// handle long ago, so the payload is delivered as a follow-up turn on
+// the parent session — hidden, so it reads as dispatch output rather
+// than a user message — through the same path a scheduled task fires
+// (fireScheduledTask): a normal run that respects the session's busy
+// queue. This is the in-process Phase 1 stand-in for #71's A2A terminal
+// status message; the payload shape is identical either way.
+//
+// Delivery is dropped, logged, when there is nothing to deliver into: a
+// parent session that no longer exists (deleted, or a `crush run`
+// process that already exited), or no runnable main agent.
+func (c *coordinator) deliverDispatchResult(ctx context.Context, parentSessionID string, terminal dispatch.DispatchResult) {
+	if _, err := c.sessions.Get(ctx, parentSessionID); err != nil {
+		slog.Debug("Dispatch result dropped: parent session is gone", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
+		return
+	}
+	if c.currentAgent() == nil {
+		slog.Debug("Dispatch result dropped: no main agent", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
+		return
+	}
+
+	payload := terminal.TerminalMessage()
+	go func() {
+		// Detached: the dispatch goroutine's context ends when this
+		// function returns, and the delivered turn must outlive it. The
+		// hidden marker keeps the injected prompt out of the chat UI —
+		// the agent block (#65) is the visible surface for dispatch
+		// state, and the parent's own reply to the payload is the
+		// visible outcome.
+		runCtx := message.WithHiddenUserMessage(context.WithoutCancel(ctx))
+		if _, err := c.run(runCtx, nil, parentSessionID, payload); err != nil {
+			slog.Error("Dispatch result delivery failed", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID, "error", err)
+		}
+	}()
 }
 
 // dispatchWorkspace returns the coordinator's dispatch workspace

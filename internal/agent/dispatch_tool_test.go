@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/scheduler"
+	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/stretchr/testify/require"
 )
 
@@ -455,4 +458,168 @@ func toolNamesOf(a SessionAgent) []string {
 		names = append(names, tool.Info().Name)
 	}
 	return names
+}
+
+// fakeMainAgent stands in for the coordinator's main agent when a test
+// drives the full delivery path: it records the turns it is given and
+// answers with a fixed result. The runs are mutex-guarded because the
+// delivery turn runs on its own goroutine.
+type fakeMainAgent struct {
+	SessionAgent
+	model Model
+	mu    sync.Mutex
+	runs  []SessionAgentCall
+}
+
+func (f *fakeMainAgent) Run(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+	f.mu.Lock()
+	f.runs = append(f.runs, call)
+	f.mu.Unlock()
+	return &fantasy.AgentResult{
+		Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "reviewed"}}},
+	}, nil
+}
+
+func (f *fakeMainAgent) runCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.runs)
+}
+
+func (f *fakeMainAgent) lastRun() SessionAgentCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runs[len(f.runs)-1]
+}
+
+func (f *fakeMainAgent) Model() Model                   { return f.model }
+func (f *fakeMainAgent) WaitReady() error               { return nil }
+func (f *fakeMainAgent) SetModels(_, _ Model)           {}
+func (f *fakeMainAgent) SetTools(_ []fantasy.AgentTool) {}
+
+// assembleDispatchResult maps a finished run onto the terminal
+// DispatchResult (#66): completed runs carry the agent's final text as
+// key findings and the workspace diff as the summary, failed runs carry
+// the error, and a no-turn run fails with the reason.
+func TestAssembleDispatchResult(t *testing.T) {
+	agent := &dispatchTestAgent{model: dispatchTestModel()}
+	c, _ := newDispatchToolEnv(t, agent)
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
+	require.NoError(t, err)
+
+	// Uncommitted work in the workspace: the work product the diff
+	// summary must surface.
+	require.NoError(t, os.WriteFile(filepath.Join(entry.Path, "new.txt"), []byte("work\n"), 0o644))
+
+	run := dispatchRun{
+		workspace:       ws,
+		entry:           entry,
+		sessionID:       "dispatch-child-session",
+		parentSessionID: "dispatch-parent-session",
+	}
+
+	completed := c.assembleDispatchResult(t.Context(), run, &fantasy.AgentResult{
+		Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "fixed the bug"}}},
+	}, nil)
+	require.Equal(t, dispatch.StatusCompleted, completed.Status)
+	require.Equal(t, "fixed the bug", completed.KeyFindings)
+	require.Equal(t, entry.ID, completed.DispatchID)
+	require.Equal(t, entry.Branch, completed.Branch)
+	require.Equal(t, entry.Path, completed.WorkspacePath)
+	require.Equal(t, "dispatch-child-session", completed.SessionID)
+	require.Empty(t, completed.Error)
+	require.Contains(t, completed.DiffSummary, "new.txt | +1 -0")
+
+	failed := c.assembleDispatchResult(t.Context(), run, nil, errors.New("provider exploded"))
+	require.Equal(t, dispatch.StatusFailed, failed.Status)
+	require.Equal(t, "provider exploded", failed.Error)
+	require.Empty(t, failed.KeyFindings)
+	require.Empty(t, failed.DiffSummary)
+
+	noTurn := c.assembleDispatchResult(t.Context(), run, nil, nil)
+	require.Equal(t, dispatch.StatusFailed, noTurn.Status)
+	require.Contains(t, noTurn.Error, "did not start a turn")
+}
+
+// The terminal payload is delivered to the parent session as a hidden
+// follow-up turn on the main agent (#66): the main agent receives the
+// DispatchResult JSON as its prompt, marked hidden so it does not render
+// as a user message.
+func TestDeliverDispatchResultToParentSession(t *testing.T) {
+	env := testEnv(t)
+	initGitRepo(t, env.workingDir)
+
+	cfg, err := config.Init(env.workingDir, "", false)
+	require.NoError(t, err)
+	const providerID = "test-openai-compat"
+	cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+		ID:      providerID,
+		Name:    "Test",
+		Type:    openaicompat.Name,
+		BaseURL: "http://127.0.0.1:0/v1",
+		APIKey:  "test",
+		Models:  []catwalk.Model{{ID: "test-model", DefaultMaxTokens: 4096}},
+	})
+	selected := config.SelectedModel{Provider: providerID, Model: "test-model"}
+	cfg.OverridePreferredModel(config.SelectedModelTypeLarge, selected)
+	cfg.OverridePreferredModel(config.SelectedModelTypeSmall, selected)
+	cfg.SetupAgents()
+	coderCfg := cfg.Config().Agents[config.AgentCoder]
+	coderCfg.AllowedTools = nil // keep the delivery run's tool build cheap
+	cfg.Config().Agents[config.AgentCoder] = coderCfg
+
+	mainModel := Model{
+		CatwalkCfg: catwalk.Model{ContextWindow: 200000, DefaultMaxTokens: 4096},
+		ModelCfg:   config.SelectedModel{Provider: providerID, Model: "test-model"},
+	}
+	main := &fakeMainAgent{model: mainModel}
+	c := &coordinator{
+		cfg:           cfg,
+		sessions:      env.sessions,
+		messages:      env.messages,
+		permissions:   env.permissions,
+		history:       env.history,
+		filetracker:   *env.filetracker,
+		cronStore:     scheduler.NewStore(""),
+		skillTracker:  skills.NewTracker(nil),
+		agents:        map[string]SessionAgent{config.AgentCoder: main},
+		mainAgent:     main,
+		mainAgentName: config.AgentCoder,
+	}
+
+	parent, err := env.sessions.Create(t.Context(), "parent")
+	require.NoError(t, err)
+
+	terminal := dispatch.DispatchResult{
+		DispatchID:  "d-deliver",
+		Branch:      "crush-dispatch-d-deliver",
+		SessionID:   "s-deliver",
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "fixed the bug",
+		DiffSummary: "a.go | +2 -1",
+	}
+	c.deliverDispatchResult(t.Context(), parent.ID, terminal)
+
+	require.Eventually(t, func() bool {
+		return main.runCount() == 1
+	}, 10*time.Second, 50*time.Millisecond)
+	run := main.lastRun()
+	require.Equal(t, parent.ID, run.SessionID)
+	require.True(t, run.HiddenUserMessage)
+	require.Contains(t, run.Prompt, `"dispatch_id": "d-deliver"`)
+	require.Contains(t, run.Prompt, `"key_findings": "fixed the bug"`)
+	require.Contains(t, run.Prompt, "Review the diff and decide whether to merge or dismiss")
+}
+
+// Delivery is dropped, not panicked on, when the parent session is gone
+// (deleted, or a `crush run` process that already exited).
+func TestDeliverDispatchResultDroppedForMissingParent(t *testing.T) {
+	agent := &dispatchTestAgent{model: dispatchTestModel()}
+	c, _ := newDispatchToolEnv(t, agent)
+	c.deliverDispatchResult(t.Context(), "no-such-parent-session", dispatch.DispatchResult{
+		DispatchID: "d-gone",
+		Status:     dispatch.StatusCompleted,
+	})
 }
