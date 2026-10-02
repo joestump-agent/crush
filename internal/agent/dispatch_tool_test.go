@@ -58,7 +58,10 @@ func initGitRepo(t *testing.T, dir string) {
 		require.NoError(t, err, "git %s: %s", strings.Join(args, " "), out)
 	}
 	require.NoError(t, os.MkdirAll(dir, 0o755))
-	git("init", "-q")
+	// -b main pins the branch name: CI runners default to master, the
+	// local machine to whatever init.defaultBranch says, and the tests
+	// below dispatch against the "main" base.
+	git("init", "-q", "-b", "main")
 	git("config", "user.email", "dispatch-test@example.com")
 	git("config", "user.name", "dispatch test")
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "f.txt"), []byte("one"), 0o644))
