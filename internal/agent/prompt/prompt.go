@@ -23,13 +23,14 @@ import (
 
 // Prompt represents a template-based prompt generator.
 type Prompt struct {
-	name       string
-	template   string
-	now        func() time.Time
-	platform   string
-	workingDir string
-	a2ui       bool
-	scheduling bool
+	name        string
+	template    string
+	now         func() time.Time
+	platform    string
+	workingDir  string
+	skillFilter []string
+	a2ui        bool
+	scheduling  bool
 }
 
 type PromptDat struct {
@@ -75,6 +76,17 @@ func WithWorkingDir(workingDir string) Option {
 	}
 }
 
+// WithSkills restricts the available-skills section of the rendered
+// prompt to the named skills. The default (nil or empty) includes every
+// discovered skill. Dispatched agents take their skill set per dispatch
+// (#64's skills parameter) through this option; unknown names are
+// dropped, so callers validate them first.
+func WithSkills(names []string) Option {
+	return func(p *Prompt) {
+		p.skillFilter = names
+	}
+}
+
 // WithA2UI enables the template's A2UI section, which tells the model it may
 // emit <a2ui-json> surfaces. Crush's chat TUI renders those blocks via a2tea;
 // consumers that only ever see plain text (scripted crush run, headless serve
@@ -97,6 +109,20 @@ func WithScheduling() Option {
 	return func(p *Prompt) {
 		p.scheduling = true
 	}
+}
+
+// filterSkillsByName keeps only the skills whose names are in names.
+func filterSkillsByName(all []*skills.Skill, names []string) []*skills.Skill {
+	var filtered []*skills.Skill
+	for _, s := range all {
+		for _, name := range names {
+			if s.Name == name {
+				filtered = append(filtered, s)
+				break
+			}
+		}
+	}
+	return filtered
 }
 
 func NewPrompt(name, promptTemplate string, opts ...Option) (*Prompt, error) {
@@ -231,6 +257,11 @@ func (p *Prompt) promptData(ctx context.Context, provider, model string, store *
 
 	// Filter out disabled skills.
 	allSkills = skills.Filter(allSkills, cfg.Options.DisabledSkills)
+
+	// Restrict to the caller's skill set when one was given.
+	if len(p.skillFilter) > 0 {
+		allSkills = filterSkillsByName(allSkills, p.skillFilter)
+	}
 
 	if len(allSkills) > 0 {
 		availSkillXML = skills.ToPromptXML(allSkills)

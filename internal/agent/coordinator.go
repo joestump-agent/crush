@@ -27,6 +27,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/discover"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/filetracker"
 	"github.com/charmbracelet/crush/internal/history"
@@ -167,6 +168,17 @@ type coordinator struct {
 
 	cronStore *scheduler.Store
 
+	// Worktree dispatch (#61): the Workspace registry is created lazily
+	// on first dispatch because a non-git working directory must not
+	// fail coordinator construction, and the failure is cached so later
+	// dispatches report it instead of retrying. dispatchAgentBuilder is
+	// the dispatched-agent constructor the DispatchAgent tool uses; nil
+	// means the real one, and tests substitute a fake through it.
+	dispatchMu           sync.Mutex
+	dispatchWS           *dispatch.Workspace
+	dispatchWSErr        error
+	dispatchAgentBuilder func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error)
+
 	// semanticStore and semanticClient back the semantic_search and
 	// semantic_index tools. Both are nil unless an embedding provider is
 	// configured and the store initialised, in which case neither tool
@@ -297,6 +309,11 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 
 	cronScheduler := scheduler.NewScheduler(c.cronStore, c.fireScheduledTask)
 	go cronScheduler.Run(ctx)
+
+	// Dispatch session-end backstop: sweep every workspace dispatch
+	// created when the coordinator's context ends (#63's Sweep, wired
+	// here per #64).
+	go c.sweepDispatchOnDone(ctx)
 
 	c.mainAgent = agent
 	c.mainAgentName = config.AgentCoder
@@ -908,6 +925,13 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 			return nil, err
 		}
 		allTools = append(allTools, agenticFetchTool)
+	}
+
+	// Worktree dispatch (#64) is a coder-level tool. Sub-agents never
+	// get it: dispatching from inside a dispatch would recurse across
+	// the isolation boundary the dispatch toolchain enforces.
+	if !isSubAgent && slices.Contains(agent.AllowedTools, DispatchAgentToolName) {
+		allTools = append(allTools, c.dispatchTool())
 	}
 
 	// Get the model name for the agent

@@ -173,6 +173,23 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 	return t, nil
 }
 
+// dispatchWriteTools are the tools every dispatched agent gets on top of
+// the task agent's AllowedTools (#64). The task agent's default set is
+// deliberately read-only — it exists to answer research prompts — but a
+// dispatch's whole point is producing work, so bash, the edit tools, and
+// write are non-negotiable, and the todo enforcement ladder
+// (interaction model, #315) needs the todos tool. The union keeps
+// everything the task agent was already allowed: narrowing via config
+// still works for read tools, it just cannot remove write capability
+// from a dispatch.
+var dispatchWriteTools = []string{
+	tools.BashToolName,
+	tools.EditToolName,
+	tools.MultiEditToolName,
+	tools.WriteToolName,
+	tools.TodosToolName,
+}
+
 // buildDispatchTools constructs the dispatched agent's tools against the
 // scoped toolchain, mirroring buildTools for everything that is rooted at
 // a directory. The parent's session-scoped services (todos) and data-dir
@@ -235,9 +252,13 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 		)
 	}
 
+	// The task agent's set widened with the dispatch write tools: a
+	// dispatched agent must be able to edit, not just read (#64).
+	allowed := slices.Concat(agentCfg.AllowedTools, dispatchWriteTools)
+
 	var filtered []fantasy.AgentTool
 	for _, tool := range allTools {
-		if slices.Contains(agentCfg.AllowedTools, tool.Info().Name) {
+		if slices.Contains(allowed, tool.Info().Name) {
 			filtered = append(filtered, tool)
 		}
 	}
