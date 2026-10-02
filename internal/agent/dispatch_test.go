@@ -32,6 +32,10 @@ func newDispatchTestCoordinator(t *testing.T, env fakeEnv) *coordinator {
 		history:     env.history,
 		filetracker: *env.filetracker,
 		cronStore:   scheduler.NewStore(""),
+		// The todo collector (#65) runs on this context when the first
+		// dispatch provisions the registry; t.Context() ends it with the
+		// test instead of leaking a Background subscription.
+		dispatchCtx: t.Context(),
 	}
 }
 
