@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/backend"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -742,4 +743,8 @@ func TestE2E_CancelOfActiveRunAlsoCancelsAcceptedFollowUp(t *testing.T) {
 		return e.Payload.SessionID == sid && e.Payload.Role == proto.Assistant && has && r == proto.FinishReasonEndTurn
 	})
 	require.False(t, gotEnd, "the accepted follow-up must not stream model output after the cancel")
+}
+
+func (c *scriptedCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
+	return dispatch.TodoSnapshot{}, false
 }

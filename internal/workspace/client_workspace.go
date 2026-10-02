@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/crush/internal/client"
 	"github.com/charmbracelet/crush/internal/commands"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/herdr"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/log"
@@ -507,6 +508,16 @@ func (w *ClientWorkspace) ListSessionHistory(ctx context.Context, sessionID stri
 		return nil, err
 	}
 	return protoToFiles(files), nil
+}
+
+// -- Dispatch --
+
+// DispatchStatus always reports not-found in client/server mode: the
+// dispatch registry and its todo collector run in the server process,
+// and no wire surface carries their snapshots yet. The TUI renders the
+// dispatch agent block from its persisted tool result instead (#65).
+func (w *ClientWorkspace) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
+	return dispatch.TodoSnapshot{}, false
 }
 
 // -- LSP --

@@ -14,6 +14,7 @@ import (
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/scheduler"
 	"github.com/charmbracelet/crush/internal/session"
@@ -352,4 +353,8 @@ func TestRouteChannelMessage_ConfigEnabled(t *testing.T) {
 		t.Fatal("expected the config-enabled workspace to receive the channel push")
 	}
 	ws.runWG.Wait()
+}
+
+func (c *recordingCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
+	return dispatch.TodoSnapshot{}, false
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/backend"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/scheduler"
@@ -234,4 +235,8 @@ func TestPostAgent_DetachesRequestContext(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return coord.ranCount.Load() == 1
 	}, 2*time.Second, 10*time.Millisecond)
+}
+
+func (s *runCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
+	return dispatch.TodoSnapshot{}, false
 }
