@@ -3,9 +3,11 @@ package a2a
 import (
 	"context"
 	"errors"
+	"fmt"
 	"iter"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"charm.land/fantasy"
@@ -13,6 +15,8 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/session"
 )
 
 // Runner is the slice of [agent.SessionAgent] the [Executor] drives. The full
@@ -32,18 +36,40 @@ var _ Runner = agent.SessionAgent(nil)
 // string or an error yields no artifact (the run still completes).
 type DiffFunc func(ctx context.Context) (string, error)
 
+// TodoSource supplies per-session todo snapshots while a dispatched run is
+// in flight (#174): the dispatch registry's [dispatch.TodoCollector]
+// satisfies it — its reduction of the session event stream is the single
+// subscription, and this executor is its second consumer after the agent
+// block (#65). A nil source disables todo progress events; the run
+// lifecycle is unchanged.
+type TodoSource interface {
+	SubscribeSessionTodos(ctx context.Context, sessionID string) <-chan dispatch.TodoSnapshot
+}
+
+// Compile-time proof that the collector is a TodoSource.
+var _ TodoSource = (*dispatch.TodoCollector)(nil)
+
+// todoMetadataKey is the TaskStatusUpdateEvent metadata key carrying the
+// structured todo snapshot, so consumers (#71) can render a checklist
+// without parsing the message prose.
+const todoMetadataKey = "todos"
+
 // Executor adapts a Crush [agent.SessionAgent] to the [a2asrv.AgentExecutor]
 // interface: it runs one dispatched agent turn, maps the run lifecycle onto
 // A2A task states (submitted -> working -> completed/failed), and emits the git
 // diff as the terminal artifact.
 //
-// Phase 1 emits a single Working status before the run and a terminal status
-// after it; richer per-todo progress streaming is wired in #71, where the
-// SessionAgent's progress broker is bridged to SSE.
+// While the run is in flight it also streams progress: one non-terminal
+// Working TaskStatusUpdateEvent per todo-list change (#174), with the
+// current activity as the message text and the structured todo snapshot in
+// the event metadata. Terminal semantics (Completed/Failed/Rejected/Canceled,
+// artifact emission) are unchanged, and todo events never race the terminal
+// status — both are yielded from this iterator's single goroutine.
 type Executor struct {
 	runner    Runner
 	sessionID string
 	diff      DiffFunc
+	todos     TodoSource
 }
 
 // Option configures an [Executor].
@@ -54,6 +80,14 @@ type Option func(*Executor)
 // output and no artifact. See [GitDiff] for the default production collector.
 func WithDiff(fn DiffFunc) Option {
 	return func(e *Executor) { e.diff = fn }
+}
+
+// WithTodos sets the source of per-session todo snapshots streamed as
+// non-terminal Working TaskStatusUpdateEvents while the run is in flight
+// (#174). The production source is the dispatch registry's todo collector;
+// without it, runs emit only the initial Working status.
+func WithTodos(source TodoSource) Option {
+	return func(e *Executor) { e.todos = source }
 }
 
 // NewExecutor builds an Executor that drives runner against sessionID — the
@@ -99,11 +133,12 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			return
 		}
 
-		result, err := e.runner.Run(ctx, agent.SessionAgentCall{
-			SessionID: e.sessionID,
-			Prompt:    prompt,
-		})
+		result, err := e.runWithTodos(ctx, execCtx, prompt, yield)
 		switch {
+		case errors.Is(err, errConsumerStopped):
+			// The consumer stopped consuming mid-run: nothing further can
+			// be delivered, and the run's own outcome is dropped with it.
+			return
 		case errors.Is(err, context.Canceled):
 			// The run was canceled — by this executor's Cancel, which
 			// emits the terminal Canceled status itself. A Failed status
@@ -135,6 +170,91 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted,
 			agentMessage(execCtx, result.Response.Content.Text())), nil)
 	}
+}
+
+// errConsumerStopped reports that the event consumer stopped consuming
+// mid-run: no further events can be delivered and the run's outcome is
+// dropped with the stream.
+var errConsumerStopped = errors.New("a2a: event consumer stopped")
+
+// runWithTodos invokes the runner while streaming the run's todo progress
+// (#174): the run executes on its own goroutine and the todo subscription
+// is drained inline on the iterator's goroutine, so Working progress events
+// and the terminal status share one yield path and can never race. The
+// subscription is bounded by the run — created after the initial Working
+// status, dropped on run end, consumer stop, and cancel — and a snapshot is
+// only emitted when the todo list actually changed, so usage-only session
+// saves stay silent.
+func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorContext, prompt string, yield func(a2aspec.Event, error) bool) (*fantasy.AgentResult, error) {
+	var todoCh <-chan dispatch.TodoSnapshot
+	if e.todos != nil {
+		// The subscription ends with this call: run end, consumer stop,
+		// and cancel all return through the deferred cancel.
+		subCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		todoCh = e.todos.SubscribeSessionTodos(subCtx, e.sessionID)
+	}
+
+	type runOutcome struct {
+		result *fantasy.AgentResult
+		err    error
+	}
+	done := make(chan runOutcome, 1)
+	go func() {
+		result, err := e.runner.Run(ctx, agent.SessionAgentCall{
+			SessionID: e.sessionID,
+			Prompt:    prompt,
+		})
+		done <- runOutcome{result, err}
+	}()
+
+	var lastTodos []session.Todo
+	for {
+		// Check cancellation before selecting: a canceled context and a
+		// queued snapshot are both ready, and select would pick either,
+		// so the pre-check keeps the guarantee that no todo event is
+		// emitted after cancel.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			// Canceled — the executor's Cancel emits the terminal Canceled
+			// status itself, and the runner is aborting on this same
+			// context; reporting anything here would race it.
+			return nil, context.Canceled
+		case out := <-done:
+			return out.result, out.err
+		case snap, ok := <-todoCh:
+			if !ok {
+				todoCh = nil
+				continue
+			}
+			if len(snap.Todos) == 0 || slices.Equal(snap.Todos, lastTodos) {
+				continue
+			}
+			lastTodos = slices.Clone(snap.Todos)
+			if !yield(todoStatusUpdate(execCtx, snap), nil) {
+				return nil, errConsumerStopped
+			}
+		}
+	}
+}
+
+// todoStatusUpdate maps one todo snapshot onto a non-terminal Working
+// TaskStatusUpdateEvent (#174): the current activity — the in-progress
+// todo's active form or content — as the message text, falling back to an
+// N/M completed summary, and the structured todo list under
+// [todoMetadataKey] in the event metadata so consumers can render a
+// checklist without parsing the prose.
+func todoStatusUpdate(execCtx *a2asrv.ExecutorContext, snap dispatch.TodoSnapshot) *a2aspec.TaskStatusUpdateEvent {
+	text := snap.CurrentTodo
+	if text == "" {
+		text = fmt.Sprintf("%d/%d completed", snap.TodoCompleted, snap.TodoTotal)
+	}
+	ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateWorking, agentMessage(execCtx, text))
+	ev.SetMeta(todoMetadataKey, snap.Todos)
+	return ev
 }
 
 // Cancel stops the in-flight dispatched run for this executor's session and
