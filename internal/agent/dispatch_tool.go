@@ -411,7 +411,10 @@ func (c *coordinator) dispatchWorkspace() (*dispatch.Workspace, error) {
 				// context would panic the collector's subscription.
 				ctx = context.Background()
 			}
-			go c.dispatchCollector.Run(ctx)
+			// Start subscribes synchronously before returning, so the
+			// session and entry events of the dispatch being provisioned
+			// right now are already observed.
+			c.dispatchCollector.Start(ctx)
 		}
 	}
 	return c.dispatchWS, c.dispatchWSErr

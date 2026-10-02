@@ -625,21 +625,42 @@ func TestDeliverDispatchResultDroppedForMissingParent(t *testing.T) {
 	})
 }
 
-// agentSink is a dispatch.TodoSink that records snapshots with a
-// buffered channel, for asserting the collector's delivery.
+// agentSink is a dispatch.TodoSink that records snapshots as history,
+// for asserting the collector's delivery: assertions scan the history
+// rather than consuming a queue, so one stage's wait cannot steal a
+// snapshot a later stage is waiting for when the registry and session
+// streams interleave differently under load.
 type agentSink struct {
-	snapshots chan dispatch.TodoSnapshot
+	mu        sync.Mutex
+	snapshots []dispatch.TodoSnapshot
 }
 
 func newAgentSink() *agentSink {
-	return &agentSink{snapshots: make(chan dispatch.TodoSnapshot, 64)}
+	return &agentSink{}
 }
 
 func (s *agentSink) DispatchTodos(snap dispatch.TodoSnapshot) {
-	select {
-	case s.snapshots <- snap:
-	default:
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapshots = append(s.snapshots, snap)
+}
+
+// until waits (bounded) for a snapshot matching cond and returns it.
+func (s *agentSink) until(t *testing.T, cond func(dispatch.TodoSnapshot) bool) dispatch.TodoSnapshot {
+	t.Helper()
+	var found dispatch.TodoSnapshot
+	require.Eventually(t, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, snap := range s.snapshots {
+			if cond(snap) {
+				found = snap
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 50*time.Millisecond)
+	return found
 }
 
 // Progress flows end to end (#65): the collector — created with the
@@ -661,21 +682,9 @@ func TestDispatchProgressFlowsToSinksAndDispatchStatus(t *testing.T) {
 	handle := decodeDispatchHandle(t, resp)
 
 	// The first snapshots carry the session and the running state.
-	var running dispatch.TodoSnapshot
-	require.Eventually(t, func() bool {
-		for {
-			select {
-			case snap := <-sink.snapshots:
-				if snap.Entry.SessionID == handle.SessionID &&
-					snap.Entry.Status == dispatch.StatusRunning {
-					running = snap
-					return true
-				}
-			default:
-				return false
-			}
-		}
-	}, 10*time.Second, 50*time.Millisecond)
+	running := sink.until(t, func(s dispatch.TodoSnapshot) bool {
+		return s.Entry.SessionID == handle.SessionID && s.Entry.Status == dispatch.StatusRunning
+	})
 	require.False(t, running.Entry.StartedAt.IsZero())
 
 	// The dispatched session's saves reduce into snapshots: publish one
@@ -690,41 +699,18 @@ func TestDispatchProgressFlowsToSinksAndDispatchStatus(t *testing.T) {
 	_, err = c.sessions.Save(t.Context(), sess)
 	require.NoError(t, err)
 
-	var reduced dispatch.TodoSnapshot
-	require.Eventually(t, func() bool {
-		for {
-			select {
-			case snap := <-sink.snapshots:
-				if snap.Entry.SessionID == handle.SessionID && snap.TodoTotal == 1 {
-					reduced = snap
-					return true
-				}
-			default:
-				return false
-			}
-		}
-	}, 10*time.Second, 50*time.Millisecond)
+	reduced := sink.until(t, func(s dispatch.TodoSnapshot) bool {
+		return s.Entry.SessionID == handle.SessionID && s.TodoTotal == 1
+	})
 	require.Equal(t, "fixing the bug", reduced.CurrentTodo)
 	require.Equal(t, int64(900), reduced.PromptTokens)
 	require.Equal(t, int64(100), reduced.CompletionTokens)
 
 	// The terminal snapshot carries the DispatchResult, and the pull
 	// answers with the same durable record.
-	var terminal dispatch.TodoSnapshot
-	require.Eventually(t, func() bool {
-		for {
-			select {
-			case snap := <-sink.snapshots:
-				if snap.Entry.SessionID == handle.SessionID &&
-					snap.Entry.Status == dispatch.StatusCompleted {
-					terminal = snap
-					return true
-				}
-			default:
-				return false
-			}
-		}
-	}, 10*time.Second, 50*time.Millisecond)
+	terminal := sink.until(t, func(s dispatch.TodoSnapshot) bool {
+		return s.Entry.SessionID == handle.SessionID && s.Entry.Status == dispatch.StatusCompleted
+	})
 	require.NotNil(t, terminal.Entry.Result)
 	require.Equal(t, "done", terminal.Entry.Result.KeyFindings)
 

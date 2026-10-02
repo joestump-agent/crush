@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -9,45 +10,55 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// recordingSink records every snapshot it receives, with a buffered
-// channel so tests can await delivery deterministically.
+// recordingSink records every snapshot it receives. Assertions scan the
+// history rather than consuming a queue, so one stage's wait cannot
+// steal a snapshot a later stage is waiting for.
 type recordingSink struct {
-	snapshots chan TodoSnapshot
+	mu        sync.Mutex
+	snapshots []TodoSnapshot
 }
 
 func newRecordingSink() *recordingSink {
-	return &recordingSink{snapshots: make(chan TodoSnapshot, 64)}
+	return &recordingSink{}
 }
 
 func (s *recordingSink) DispatchTodos(snap TodoSnapshot) {
-	select {
-	case s.snapshots <- snap:
-	default:
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapshots = append(s.snapshots, snap)
 }
 
-// next returns the next snapshot or fails the test after a timeout.
-func (s *recordingSink) next(t *testing.T) TodoSnapshot {
-	t.Helper()
-	select {
-	case snap := <-s.snapshots:
-		return snap
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for a snapshot")
-		return TodoSnapshot{}
-	}
+// count returns the number of recorded snapshots.
+func (s *recordingSink) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.snapshots)
 }
 
-// until returns the first snapshot matching cond, skipping snapshots
-// the collector emitted for earlier transitions.
-func (s *recordingSink) until(t *testing.T, cond func(TodoSnapshot) bool) TodoSnapshot {
-	t.Helper()
-	for {
-		snap := s.next(t)
+// find returns the first recorded snapshot matching cond.
+func (s *recordingSink) find(cond func(TodoSnapshot) bool) (TodoSnapshot, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, snap := range s.snapshots {
 		if cond(snap) {
-			return snap
+			return snap, true
 		}
 	}
+	return TodoSnapshot{}, false
+}
+
+// until waits (bounded) for a snapshot matching cond and returns it.
+func (s *recordingSink) until(t *testing.T, cond func(TodoSnapshot) bool) TodoSnapshot {
+	t.Helper()
+	var found TodoSnapshot
+	require.Eventually(t, func() bool {
+		snap, ok := s.find(cond)
+		if ok {
+			found = snap
+		}
+		return ok
+	}, 5*time.Second, 10*time.Millisecond)
+	return found
 }
 
 func testTodos() []session.Todo {
@@ -119,7 +130,7 @@ func TestTodoCollectorDualSink(t *testing.T) {
 	defer sessions.Shutdown()
 	sinkA, sinkB := newRecordingSink(), newRecordingSink()
 	collector := NewTodoCollector(ws, sessions, sinkA, sinkB)
-	go collector.Run(t.Context())
+	collector.Start(t.Context())
 
 	entry, err := ws.Provision(t.Context(), ProvisionOptions{})
 	require.NoError(t, err)
@@ -127,13 +138,12 @@ func TestTodoCollectorDualSink(t *testing.T) {
 	// The dispatched session is recorded before the run starts; the
 	// registry transition alone must emit a snapshot with the state.
 	ws.SetSession(entry.ID, "msg$$call")
-	snap := sinkA.next(t)
-	require.Equal(t, StatusProvisioned, snap.Entry.Status)
-	require.Equal(t, "msg$$call", snap.Entry.SessionID)
+	snap := sinkA.until(t, func(s TodoSnapshot) bool {
+		return s.Entry.SessionID == "msg$$call" && s.Entry.Status == StatusProvisioned
+	})
 
 	ws.SetStatus(entry.ID, StatusRunning)
-	snap = sinkA.next(t)
-	require.Equal(t, StatusRunning, snap.Entry.Status)
+	snap = sinkA.until(t, func(s TodoSnapshot) bool { return s.Entry.Status == StatusRunning })
 	require.False(t, snap.Entry.StartedAt.IsZero())
 
 	// A session save carrying todos produces the reduced snapshot: same
@@ -144,7 +154,10 @@ func TestTodoCollectorDualSink(t *testing.T) {
 		PromptTokens:     1200,
 		CompletionTokens: 300,
 	})
-	snap = sinkB.until(t, func(s TodoSnapshot) bool { return s.TodoTotal == 3 })
+	snap = sinkB.until(t, func(s TodoSnapshot) bool {
+		return s.Entry.SessionID == "msg$$call" && s.CurrentTodo != ""
+	})
+	require.Equal(t, StatusRunning, snap.Entry.Status)
 	require.Equal(t, StatusRunning, snap.Entry.Status)
 	require.Equal(t, "writing the fix", snap.CurrentTodo)
 	require.Equal(t, 3, snap.TodoTotal)
@@ -187,7 +200,7 @@ func TestTodoCollectorIgnoresUnknownSessions(t *testing.T) {
 		Type:    pubsub.UpdatedEvent,
 		Payload: session.Session{ID: "not-a-dispatch", Todos: testTodos()},
 	})
-	require.Empty(t, sink.snapshots)
+	require.Equal(t, 0, sink.count())
 }
 
 // Snapshot answers a pull for a dispatched session even when the last

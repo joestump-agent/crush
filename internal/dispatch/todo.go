@@ -69,7 +69,7 @@ type TodoCollector struct {
 
 // NewTodoCollector returns a collector reducing progress for the
 // workspaces in ws, reading session state from sessions, and delivering
-// snapshots to sinks. Call [TodoCollector.Run] to start it.
+// snapshots to sinks. Call [TodoCollector.Start] to run it.
 func NewTodoCollector(ws *Workspace, sessions pubsub.Subscriber[session.Session], sinks ...TodoSink) *TodoCollector {
 	return &TodoCollector{
 		ws:       ws,
@@ -79,14 +79,22 @@ func NewTodoCollector(ws *Workspace, sessions pubsub.Subscriber[session.Session]
 	}
 }
 
-// Run subscribes to both streams and reduces until ctx is cancelled.
-// Events published before Run starts are not replayed; the registry
-// entry for a dispatch is always re-emitted on its next transition, and
-// session saves are frequent while an agent works, so a late-starting
-// collector converges without a replay log.
-func (c *TodoCollector) Run(ctx context.Context) {
+// Start subscribes to both streams and spawns the reduce loop. It
+// returns once the subscriptions are live, so every event published
+// after it returns is observed; events published before Start (e.g. the
+// registry transitions of a dispatch already running) are not replayed
+// — the registry re-emits an entry on its next transition, and session
+// saves are frequent while an agent works, so the collector converges
+// without a replay log.
+func (c *TodoCollector) Start(ctx context.Context) {
 	sessionCh := c.sessions.Subscribe(ctx)
 	entryCh := c.ws.Subscribe(ctx)
+	go c.loop(ctx, sessionCh, entryCh)
+}
+
+// loop reduces both streams until ctx is cancelled or a channel
+// closes.
+func (c *TodoCollector) loop(ctx context.Context, sessionCh <-chan pubsub.Event[session.Session], entryCh <-chan pubsub.Event[Entry]) {
 	for ctx.Err() == nil {
 		select {
 		case <-ctx.Done():
