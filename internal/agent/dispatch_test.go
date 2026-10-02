@@ -80,7 +80,12 @@ func TestBuildDispatchToolchainRootsToolsAtWorkspaceDir(t *testing.T) {
 	for _, tool := range tc.Tools() {
 		byName[tool.Info().Name] = tool
 	}
-	require.Len(t, byName, 3)
+	// The task agent's set is widened with the dispatch write tools
+	// (#64): a dispatched agent must be able to produce work, not just
+	// read.
+	for _, name := range dispatchWriteTools {
+		require.Contains(t, byName, name)
+	}
 	require.Contains(t, byName, tools.GlobToolName)
 	require.Contains(t, byName, tools.ViewToolName)
 	require.Contains(t, byName, tools.BashToolName)
