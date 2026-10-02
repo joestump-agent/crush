@@ -88,19 +88,27 @@ func SummarizeDiff(diff string) string {
 	var order []string
 	stats := make(map[string]*fileStat)
 	current := ""
+	oldSide := ""
 	for _, line := range strings.Split(strings.TrimSuffix(diff, "\n"), "\n") {
+		if after, ok := strings.CutPrefix(line, "--- "); ok {
+			// The "--- a/file" half of the header, not a removal. Kept
+			// for the deletion case below.
+			oldSide = strings.TrimPrefix(after, "a/")
+			continue
+		}
 		if after, ok := strings.CutPrefix(line, "+++ "); ok {
 			// "+++ b/path" (and "+++ /dev/null" for deletions); the b/
-			// prefix is cosmetic, drop it.
+			// prefix is cosmetic, drop it. A deletion names /dev/null as
+			// its new side, so the stat falls back to the old side's
+			// path: the deleted file is what the parent agent reads.
 			current = strings.TrimPrefix(after, "b/")
+			if current == "/dev/null" {
+				current = oldSide
+			}
 			if _, ok := stats[current]; !ok {
 				stats[current] = &fileStat{}
 				order = append(order, current)
 			}
-			continue
-		}
-		if strings.HasPrefix(line, "--- ") {
-			// The "--- a/file" half of the header, not a removal.
 			continue
 		}
 		s, ok := stats[current]

@@ -55,6 +55,25 @@ func TestSummarizeDiffTruncates(t *testing.T) {
 	require.Contains(t, summary, "(54 more diff lines truncated")
 }
 
+func TestSummarizeDiffDeletionNamesDeletedFile(t *testing.T) {
+	deletion := `diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+index 111..000
+--- a/gone.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-gone
+-content
+`
+
+	summary := SummarizeDiff(deletion)
+
+	// A deletion's new side is /dev/null; the stat must carry the
+	// deleted file's own path, not the placeholder.
+	require.Contains(t, summary, "gone.txt | +0 -2")
+	require.NotContains(t, summary, "/dev/null |")
+}
+
 func TestSummarizeDiffWithoutFileHeaders(t *testing.T) {
 	summary := SummarizeDiff("Binary files a/x and b/x differ\n")
 
