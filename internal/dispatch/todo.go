@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -26,6 +27,10 @@ type TodoSnapshot struct {
 	// active form when set, its content otherwise. Empty when the agent
 	// has no todo in progress.
 	CurrentTodo string
+	// Todos is the full structured todo list — content, status, and
+	// active form — so consumers can render a checklist without parsing
+	// prose (#174 carries it in TaskStatusUpdateEvent metadata).
+	Todos []session.Todo
 	// TodoCompleted and TodoTotal count the dispatched agent's todos.
 	TodoCompleted int
 	TodoTotal     int
@@ -65,6 +70,10 @@ type TodoCollector struct {
 	// registry transition can re-emit a snapshot without waiting for
 	// the next session save, and Snapshot can answer a pull.
 	latest map[string]TodoSnapshot
+	// sessionListeners holds the per-session snapshot subscriptions
+	// (#174): each receives every snapshot reduced for its session,
+	// until its context ends.
+	sessionListeners map[string]map[chan TodoSnapshot]struct{}
 }
 
 // NewTodoCollector returns a collector reducing progress for the
@@ -72,10 +81,11 @@ type TodoCollector struct {
 // snapshots to sinks. Call [TodoCollector.Start] to run it.
 func NewTodoCollector(ws *Workspace, sessions pubsub.Subscriber[session.Session], sinks ...TodoSink) *TodoCollector {
 	return &TodoCollector{
-		ws:       ws,
-		sessions: sessions,
-		sinks:    sinks,
-		latest:   make(map[string]TodoSnapshot),
+		ws:               ws,
+		sessions:         sessions,
+		sinks:            sinks,
+		latest:           make(map[string]TodoSnapshot),
+		sessionListeners: make(map[string]map[chan TodoSnapshot]struct{}),
 	}
 }
 
@@ -111,6 +121,38 @@ func (c *TodoCollector) loop(ctx context.Context, sessionCh <-chan pubsub.Event[
 			c.processEntryEvent(ev)
 		}
 	}
+}
+
+// SubscribeSessionTodos returns a snapshot stream for one dispatched
+// session (#174): every snapshot the collector reduces for sessionID,
+// until ctx ends. It is the collector's second consumption surface
+// after the sink fan-out — the A2A executor subscribes for the lifetime
+// of a run — and it is deliberately per-session, so an in-flight
+// consumer never sees another dispatch's progress. Delivery is buffered
+// and lossy under back-pressure; the stream carries Working-state
+// progress only, so a dropped snapshot is corrected by the next one.
+// The channel closes when ctx is cancelled.
+func (c *TodoCollector) SubscribeSessionTodos(ctx context.Context, sessionID string) <-chan TodoSnapshot {
+	ch := make(chan TodoSnapshot, 16)
+	c.mu.Lock()
+	if c.sessionListeners[sessionID] == nil {
+		c.sessionListeners[sessionID] = make(map[chan TodoSnapshot]struct{})
+	}
+	c.sessionListeners[sessionID][ch] = struct{}{}
+	c.mu.Unlock()
+
+	go func() {
+		<-ctx.Done()
+		c.mu.Lock()
+		delete(c.sessionListeners[sessionID], ch)
+		if len(c.sessionListeners[sessionID]) == 0 {
+			delete(c.sessionListeners, sessionID)
+		}
+		c.mu.Unlock()
+		close(ch)
+	}()
+
+	return ch
 }
 
 // Snapshot returns the current snapshot for the dispatched agent
@@ -156,15 +198,39 @@ func (c *TodoCollector) mergeEntry(entry Entry) TodoSnapshot {
 	return prev
 }
 
-// emit stores the snapshot and delivers it to every sink.
+// emit stores the snapshot, delivers it to every sink, and forwards it
+// to every per-session listener for the snapshot's session.
 func (c *TodoCollector) emit(snap TodoSnapshot) {
 	c.mu.Lock()
 	c.latest[snap.Entry.ID] = snap
 	sinks := c.sinks
+	listeners := c.listenersFor(snap.Entry.SessionID)
 	c.mu.Unlock()
 	for _, sink := range sinks {
 		sink.DispatchTodos(snap)
 	}
+	for _, ch := range listeners {
+		select {
+		case ch <- snap:
+		default:
+			// Listener is slow — skip this snapshot; the next one
+			// carries the newer state anyway.
+		}
+	}
+}
+
+// listenersFor returns the listener channels for sessionID. The caller
+// must hold c.mu.
+func (c *TodoCollector) listenersFor(sessionID string) []chan TodoSnapshot {
+	subs := c.sessionListeners[sessionID]
+	if len(subs) == 0 {
+		return nil
+	}
+	listeners := make([]chan TodoSnapshot, 0, len(subs))
+	for ch := range subs {
+		listeners = append(listeners, ch)
+	}
+	return listeners
 }
 
 // Reduce builds the snapshot for one dispatched session: the registry
@@ -190,5 +256,6 @@ func Reduce(entry Entry, sess session.Session) TodoSnapshot {
 			}
 		}
 	}
+	snap.Todos = slices.Clone(sess.Todos)
 	return snap
 }

@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -234,4 +235,79 @@ func TestTodoCollectorSnapshotPull(t *testing.T) {
 
 	_, ok = collector.Snapshot("unknown")
 	require.False(t, ok)
+}
+
+// SubscribeSessionTodos (#174) delivers every snapshot for its session —
+// from session saves and registry transitions alike — and only for its
+// session; the channel closes when its context ends.
+func TestTodoCollectorSubscribeSessionTodos(t *testing.T) {
+	ws, err := NewWorkspace(newTestRepo(t))
+	require.NoError(t, err)
+
+	sessions := pubsub.NewBroker[session.Session]()
+	collector := NewTodoCollector(ws, sessions)
+	collector.Start(t.Context())
+
+	entry, err := ws.Provision(t.Context(), ProvisionOptions{})
+	require.NoError(t, err)
+	ws.SetSession(entry.ID, "msg$$call")
+
+	ch := collector.SubscribeSessionTodos(t.Context(), "msg$$call")
+	other := collector.SubscribeSessionTodos(t.Context(), "other-session")
+
+	// A session save with todos reaches this session's subscriber.
+	// Snapshots are awaited by condition, not position: the collector
+	// may deliver the entry transition registered before the
+	// subscription before the session reduction.
+	sessions.Publish(pubsub.UpdatedEvent, session.Session{
+		ID:    "msg$$call",
+		Todos: testTodos(),
+	})
+	var snap TodoSnapshot
+	require.Eventually(t, func() bool {
+		select {
+		case s, ok := <-ch:
+			if !ok {
+				return false
+			}
+			if s.TodoTotal == 3 {
+				snap = s
+				return true
+			}
+			return false
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
+	require.Equal(t, "writing the fix", snap.CurrentTodo)
+	require.Len(t, snap.Todos, 3)
+	require.Equal(t, "write the fix", snap.Todos[1].Content)
+
+	// A registry transition is forwarded too, merged with the session state.
+	ws.SetStatus(entry.ID, StatusRunning)
+	require.Eventually(t, func() bool {
+		select {
+		case s, ok := <-ch:
+			return ok && s.Entry.Status == StatusRunning && s.TodoTotal == 3
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
+
+	// Another session's subscriber never sees this dispatch's progress.
+	select {
+	case <-other:
+		t.Fatal("snapshot delivered to another session's subscription")
+	default:
+	}
+
+	// Cancelling the subscription context closes the channel.
+	subCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bounded := collector.SubscribeSessionTodos(subCtx, "msg$$call")
+	cancel()
+	require.Eventually(t, func() bool {
+		_, ok := <-bounded
+		return !ok
+	}, 5*time.Second, 10*time.Millisecond)
 }
