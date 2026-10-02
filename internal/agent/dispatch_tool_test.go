@@ -191,7 +191,7 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 		model:  dispatchTestModel(),
 		result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
 	}
-	c, env := newDispatchToolEnv(t, agent)
+	c, _ := newDispatchToolEnv(t, agent)
 	tool := c.dispatchTool()
 
 	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"})
@@ -200,7 +200,13 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 	require.Equal(t, dispatch.StatusRunning, handle.Status)
 	require.NotEmpty(t, handle.DispatchID)
 	require.Equal(t, dispatch.BranchPrefix+handle.DispatchID, handle.Branch)
-	require.Equal(t, filepath.Join(env.workingDir, ".crush", "worktrees", handle.Branch), handle.WorkspacePath)
+	// Path-form-agnostic: the workspace is the worktrees dir + branch,
+	// under the repo root (which the Workspace absolutizes — on Windows
+	// the test env's /tmp prefix gains a drive letter).
+	require.True(t, strings.HasSuffix(
+		filepath.ToSlash(handle.WorkspacePath),
+		"/.crush/worktrees/"+handle.Branch,
+	), "workspace path %q is not the worktrees dir + branch", handle.WorkspacePath)
 	require.NotEmpty(t, handle.SessionID)
 	require.DirExists(t, handle.WorkspacePath)
 
@@ -209,7 +215,10 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 	entry, ok := ws.Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Equal(t, handle.SessionID, entry.SessionID)
-	require.Equal(t, env.workingDir, filepath.Dir(filepath.Dir(filepath.Dir(entry.Path))))
+	require.True(t, strings.HasSuffix(
+		filepath.ToSlash(entry.Path),
+		"/.crush/worktrees/"+entry.Branch,
+	))
 
 	// The background run completes and records the terminal status in
 	// the registry.
