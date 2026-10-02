@@ -23,6 +23,7 @@ import (
 	"github.com/charmbracelet/crush/internal/clipboard"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/db"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/filetracker"
 	"github.com/charmbracelet/crush/internal/format"
@@ -91,6 +92,13 @@ type App struct {
 	// instead of guessing from message finish parts.
 	runCompletions *pubsub.Broker[notify.RunComplete]
 
+	// dispatchTodos carries the per-dispatch progress snapshots the
+	// coordinator's todo collector reduces (#65). The App is the
+	// collector's first sink (DispatchTodos) and re-publishes here;
+	// setupEvents fans this broker into app.events so every TUI
+	// receives snapshots as tea.Msgs and renders the agent block.
+	dispatchTodos *pubsub.Broker[dispatch.TodoSnapshot]
+
 	// herdrClient reports agent state to herdr when running inside
 	// a herdr-managed pane. Nil when not in a herdr environment.
 	herdrClient *herdr.Client
@@ -132,6 +140,7 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 		tuiWG:              &sync.WaitGroup{},
 		agentNotifications: pubsub.NewBroker[notify.Notification](),
 		runCompletions:     pubsub.NewBroker[notify.RunComplete](),
+		dispatchTodos:      pubsub.NewBroker[dispatch.TodoSnapshot](),
 	}
 
 	app.setupEvents()
@@ -673,6 +682,7 @@ func (app *App) setupEvents() {
 	app.subscribeMustDeliver(ctx, "question-notifications", app.Questions.SubscribeNotifications)
 	app.subscribe(ctx, "history", app.History.Subscribe)
 	app.subscribe(ctx, "agent-notifications", app.agentNotifications.Subscribe)
+	app.subscribe(ctx, "dispatch-todos", app.dispatchTodos.Subscribe)
 	app.subscribeMustDeliver(ctx, "run-completions", app.runCompletions.Subscribe)
 	app.subscribe(ctx, "mcp", mcp.SubscribeEvents)
 	app.subscribe(ctx, "lsp", SubscribeLSPEvents)
@@ -750,6 +760,24 @@ func (app *App) InitCoderAgent(ctx context.Context) error {
 	return app.initCoderAgent(ctx, true)
 }
 
+// DispatchTodos implements dispatch.TodoSink (#65): it re-publishes each
+// reduced snapshot onto the dispatchTodos broker, which setupEvents
+// fans into the shared events stream, so every TUI receives it as a
+// tea.Msg and renders the dispatch agent block.
+func (app *App) DispatchTodos(snap dispatch.TodoSnapshot) {
+	app.dispatchTodos.Publish(pubsub.UpdatedEvent, snap)
+}
+
+// DispatchStatus returns the current progress snapshot for the
+// dispatched agent running on sessionID (#65). Delegates to the agent
+// coordinator; ok=false when no dispatch is known for the session.
+func (app *App) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
+	if app.AgentCoordinator == nil {
+		return dispatch.TodoSnapshot{}, false
+	}
+	return app.AgentCoordinator.DispatchStatus(sessionID)
+}
+
 // InitCoderAgentNonInteractive initializes the coder agent without
 // interactive-only tools (e.g. question).
 func (app *App) InitCoderAgentNonInteractive(ctx context.Context) error {
@@ -775,6 +803,10 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		RunComplete: app.runCompletions,
 		Skills:      app.Skills,
 		Interactive: interactive,
+		// #65: the app is the todo collector's first sink, bridging
+		// snapshots to the TUI. #174's A2A TaskStatusUpdateEvent bridge
+		// attaches as a second sink over the same reduction.
+		DispatchSinks: []dispatch.TodoSink{app},
 	}
 
 	// Semantic search is opt-in: only wire the store and client when an

@@ -14,6 +14,7 @@ import (
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/commands"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
@@ -203,6 +204,17 @@ type Workspace interface {
 
 	// History
 	ListSessionHistory(ctx context.Context, sessionID string) ([]history.File, error)
+
+	// Dispatch
+	//
+	// DispatchStatus returns the current progress snapshot for the
+	// dispatched agent running on sessionID — the task session a
+	// dispatch_agent tool call created (#65). ok=false when no dispatch
+	// is known: in-process dispatches from an earlier process, or any
+	// dispatch in client/server mode (the registry lives in the server
+	// process; surfacing it over the wire is later work). Callers render
+	// the block from its persisted tool result in that case.
+	DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool)
 
 	// LSP
 	LSPStart(ctx context.Context, path string)

@@ -9,6 +9,7 @@ import (
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/app"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/scheduler"
@@ -163,4 +164,8 @@ func TestRunAgent_CancellationPublishesNoErrorTerminal(t *testing.T) {
 		t.Fatalf("cancellation must not publish a terminal RunComplete: %+v", ev.Payload)
 	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+func (c *errorCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
+	return dispatch.TodoSnapshot{}, false
 }

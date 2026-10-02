@@ -301,6 +301,10 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	}
 
 	terminal := c.assembleDispatchResult(ctx, run, result, err)
+	// Record the terminal payload before the terminal status so the
+	// terminal entry event carries it: the completed agent block (#65)
+	// renders its durable record from the registry.
+	run.workspace.SetResult(run.entry.ID, terminal)
 	run.workspace.SetStatus(run.entry.ID, terminal.Status)
 
 	// Cost propagation is best-effort, mirroring runSubAgent: a failure
@@ -389,14 +393,46 @@ func (c *coordinator) deliverDispatchResult(ctx context.Context, parentSessionID
 // registry, creating it on first use. Creation can fail — the working
 // directory may not be a git repository — and the failure is cached so
 // every later dispatch reports it instead of retrying, while coordinator
-// construction stays git-agnostic.
+// construction stays git-agnostic. The first successful creation also
+// starts the todo collector (#65): one subscription to the session
+// event stream and the registry's own transitions, reduced once and
+// sunk to every configured sink (the agent block now, #174's A2A
+// bridge later).
 func (c *coordinator) dispatchWorkspace() (*dispatch.Workspace, error) {
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
 	if c.dispatchWS == nil && c.dispatchWSErr == nil {
 		c.dispatchWS, c.dispatchWSErr = dispatch.NewWorkspace(c.cfg.WorkingDir())
+		if c.dispatchWS != nil {
+			c.dispatchCollector = dispatch.NewTodoCollector(c.dispatchWS, c.sessions, c.dispatchSinks...)
+			ctx := c.dispatchCtx
+			if ctx == nil {
+				// Tests construct the coordinator struct directly; a nil
+				// context would panic the collector's subscription.
+				ctx = context.Background()
+			}
+			// Start subscribes synchronously before returning, so the
+			// session and entry events of the dispatch being provisioned
+			// right now are already observed.
+			c.dispatchCollector.Start(ctx)
+		}
 	}
 	return c.dispatchWS, c.dispatchWSErr
+}
+
+// DispatchStatus returns the current progress snapshot for the
+// dispatched agent running on sessionID (#65). It backs the UI's
+// seed-on-load path: a reloaded session's persisted dispatch_agent
+// result is the running handle, and this is how the block learns the
+// dispatch's real state without waiting for the next event.
+func (c *coordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
+	c.dispatchMu.Lock()
+	collector := c.dispatchCollector
+	c.dispatchMu.Unlock()
+	if collector == nil {
+		return dispatch.TodoSnapshot{}, false
+	}
+	return collector.Snapshot(sessionID)
 }
 
 // sweepDispatchOnDone is the session-end backstop (#63's Sweep): when the

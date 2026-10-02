@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/backend"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/scheduler"
@@ -334,4 +335,8 @@ func TestSessionGetIncludesAttachedClients(t *testing.T) {
 	var got proto.Session
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 	require.Equal(t, 1, got.AttachedClients)
+}
+
+func (s *stubCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
+	return dispatch.TodoSnapshot{}, false
 }

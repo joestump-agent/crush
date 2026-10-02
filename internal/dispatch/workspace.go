@@ -31,7 +31,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/google/uuid"
 )
 
@@ -91,6 +93,17 @@ type Entry struct {
 	// AgentCard is the dispatched agent's A2A AgentCard (#70). Opaque to
 	// this package to keep it import-cycle-free of internal/a2a.
 	AgentCard any
+	// StartedAt is when the dispatch's agent started running; zero
+	// until then. FinishedAt is when it reached a terminal state. The
+	// agent block (#65) renders elapsed time from the pair.
+	StartedAt  time.Time
+	FinishedAt time.Time
+	// Result is the terminal DispatchResult (#66) recorded when the run
+	// finished; nil until then. It is written once and read-only after,
+	// so sharing the pointer between entry copies is safe. The
+	// completed agent block (#65) renders its durable record — the
+	// findings summary and diff stat — from it.
+	Result *DispatchResult
 }
 
 // clone returns a copy of the entry.
@@ -104,6 +117,11 @@ type Workspace struct {
 	// worktreesDir is the directory provisioned workspaces are created
 	// under, <repoRoot>/.crush/worktrees.
 	worktreesDir string
+
+	// events re-publishes every registry mutation as an entry event, so
+	// the todo collector (#65) and later sinks observe lifecycle
+	// transitions without the mutation call sites knowing about them.
+	events *pubsub.Broker[Entry]
 
 	mu      sync.Mutex
 	entries map[string]Entry
@@ -135,6 +153,7 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 	return &Workspace{
 		repoRoot:     root,
 		worktreesDir: dir,
+		events:       pubsub.NewBroker[Entry](),
 		entries:      make(map[string]Entry),
 	}, nil
 }
@@ -242,8 +261,10 @@ func (w *Workspace) List() []Entry {
 
 // Update applies fn to the entry for id under the registry lock and
 // reports whether the entry exists. Later phases use it for the fields
-// they own: #64 stamps the session and status, #313 the handle, #70 the
-// endpoint and card.
+// they own: #64 stamps the session and status, #65 the timestamps and
+// terminal result, #313 the handle, #70 the endpoint and card. Every
+// successful mutation is published as an UpdatedEvent on the entry
+// stream ([Workspace.Subscribe]) so the todo collector can re-emit.
 func (w *Workspace) Update(id string, fn func(*Entry)) bool {
 	if fn == nil {
 		return false
@@ -256,12 +277,39 @@ func (w *Workspace) Update(id string, fn func(*Entry)) bool {
 	}
 	fn(&e)
 	w.entries[id] = e
+	w.events.Publish(pubsub.UpdatedEvent, e)
 	return true
 }
 
-// SetStatus updates the entry's lifecycle state.
+// SetStatus updates the entry's lifecycle state, stamping the run's
+// time bounds as it goes: StartedAt on the first transition to
+// running, FinishedAt on the first terminal state. Both are stamped at
+// most once, so re-setting the same state does not restart the clock.
 func (w *Workspace) SetStatus(id string, status Status) bool {
-	return w.Update(id, func(e *Entry) { e.Status = status })
+	return w.Update(id, func(e *Entry) {
+		e.Status = status
+		switch status {
+		case StatusRunning:
+			if e.StartedAt.IsZero() {
+				e.StartedAt = time.Now()
+			}
+		case StatusCompleted, StatusFailed, StatusKilled:
+			if e.FinishedAt.IsZero() {
+				e.FinishedAt = time.Now()
+			}
+		}
+	})
+}
+
+// SetResult records the terminal DispatchResult (#66) on the entry, so
+// the completed agent block (#65) can render the durable record from
+// the registry rather than from a transient event. Record it before the
+// terminal SetStatus so the terminal entry event carries it.
+func (w *Workspace) SetResult(id string, result DispatchResult) bool {
+	return w.Update(id, func(e *Entry) {
+		r := result
+		e.Result = &r
+	})
 }
 
 // SetSession records the ephemeral session backing the dispatched agent.
@@ -281,6 +329,15 @@ func (w *Workspace) SetEndpoint(id, endpoint string, card any) bool {
 		e.Endpoint = endpoint
 		e.AgentCard = card
 	})
+}
+
+// Subscribe returns the registry's entry event stream: one
+// UpdatedEvent per successful mutation, carrying the entry by value.
+// The todo collector (#65) is its first subscriber; anything else that
+// needs dispatch lifecycle state (#174's A2A bridge) reads the same
+// stream rather than polling the registry.
+func (w *Workspace) Subscribe(ctx context.Context) <-chan pubsub.Event[Entry] {
+	return w.events.Subscribe(ctx)
 }
 
 // Diff returns the dispatched agent's work product as one unified diff:

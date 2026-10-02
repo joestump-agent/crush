@@ -143,6 +143,11 @@ type Coordinator interface {
 	Model() Model
 	UpdateModels(ctx context.Context) error
 	GenerateTitle(ctx context.Context, sessionID, prompt string)
+	// DispatchStatus returns the current progress snapshot for the
+	// dispatched agent running on sessionID (#65) — the task session a
+	// dispatch_agent tool call created. ok=false when no dispatch is
+	// known for the session.
+	DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool)
 }
 
 type coordinator struct {
@@ -178,6 +183,16 @@ type coordinator struct {
 	dispatchWS           *dispatch.Workspace
 	dispatchWSErr        error
 	dispatchAgentBuilder func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error)
+	// dispatchCollector reduces dispatched-session state into
+	// per-dispatch snapshots for the configured sinks (#65); created
+	// with the registry and run on the coordinator's lifetime context.
+	dispatchCollector *dispatch.TodoCollector
+	// dispatchCtx is the NewCoordinator context the collector's
+	// subscriptions run on; nil-safe (tests construct the coordinator
+	// struct directly) — dispatchWorkspace falls back to
+	// context.Background.
+	dispatchCtx   context.Context
+	dispatchSinks []dispatch.TodoSink
 
 	// semanticStore and semanticClient back the semantic_search and
 	// semantic_index tools. Both are nil unless an embedding provider is
@@ -216,6 +231,13 @@ type CoordinatorOptions struct {
 	// from the configured embedding provider.
 	SemanticStore  *semantic.Store
 	SemanticClient *semantic.Client
+
+	// DispatchSinks receive the per-dispatch todo snapshots the
+	// collector reduces (#65). The app passes the broker sink that
+	// feeds the agent block; #174's A2A TaskStatusUpdateEvent bridge
+	// will attach as a second sink over the same reduction. Empty in
+	// callers that do not observe progress.
+	DispatchSinks []dispatch.TodoSink
 }
 
 func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, error) {
@@ -257,6 +279,8 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		semanticStore:   opts.SemanticStore,
 		semanticClient:  opts.SemanticClient,
 		semanticSymbols: symbols.NewExtractor(),
+		dispatchCtx:     ctx,
+		dispatchSinks:   opts.DispatchSinks,
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]
