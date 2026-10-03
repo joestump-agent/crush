@@ -261,13 +261,16 @@ func (s *ConfigStore) RefetchHyperProvider(ctx context.Context) error {
 		}
 		nc.Providers.Set(string(hyperProvider.ID), pc)
 	}
+	// Finish building the clone before publishing it: the store's
+	// contract forbids in-place mutation of the live snapshot, which is
+	// exactly what s.SetupAgents did after the setConfig below.
+	nc.SetupAgents()
 	s.setConfig(nc)
 
 	// Also update the memoized provider list so callers of
 	// config.Providers() (e.g. the models dialog) see fresh data.
 	UpdateProviderInList(hyperProvider)
 
-	s.SetupAgents()
 	return nil
 }
 
@@ -1393,15 +1396,12 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		return fmt.Errorf("failed to configure providers during reload: %w", err)
 	}
 
-	// Update store state BEFORE running model/agent setup (so they see new config)
-	s.setConfig(cfg)
-	s.loadedPaths = loadedPaths
-	s.resolver = resolver
-	s.knownProviders = providers
-	s.overrides = overrides
-	s.workspacePath = workspacePath
-
-	// Mirror startup flow: setup models and agents against NEW config.
+	// Setup models and agents against the NEW config BEFORE publishing it.
+	// The store's contract forbids in-place mutation of the live snapshot:
+	// readers may hold the published pointer the moment it swaps in, and a
+	// coordinator goroutine reading Config().Agents has raced exactly the
+	// old publish-then-SetupAgents window. s.SetupAgents reads the live
+	// pointer, so run setup directly on cfg instead.
 	var setupErr error
 	if !cfg.IsConfigured() {
 		slog.Warn("No providers configured after reload")
@@ -1412,7 +1412,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		} else {
 			cfg.Models[SelectedModelTypeLarge] = resolved.Large
 			cfg.Models[SelectedModelTypeSmall] = resolved.Small
-			s.SetupAgents()
+			cfg.SetupAgents()
 		}
 	}
 
@@ -1426,6 +1426,15 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 		s.workspacePath = oldWorkspacePath
 		return setupErr
 	}
+
+	// Publish the fully built config only after setup has succeeded, so
+	// the snapshot readers get is never mutated in place.
+	s.setConfig(cfg)
+	s.loadedPaths = loadedPaths
+	s.resolver = resolver
+	s.knownProviders = providers
+	s.overrides = overrides
+	s.workspacePath = workspacePath
 
 	// Rebuild staleness tracking. Track every discovered config path, not
 	// just the ones that loaded, so a config file created after this reload
