@@ -70,10 +70,23 @@ type Executor struct {
 	sessionID string
 	diff      DiffFunc
 	todos     TodoSource
+	// call is the template production dispatches stamp their turns with
+	// (#71): model options, token budget, content width, NonInteractive.
+	// Zero value keeps the minimal call — enough for tests, not for a
+	// real dispatched turn.
+	call agent.SessionAgentCall
 }
 
 // Option configures an [Executor].
 type Option func(*Executor)
+
+// WithCallTemplate stamps every turn the executor runs with call's
+// shaping, overriding just the prompt per message (#71): the dispatched
+// agent's turns must carry the dispatch's model options, token budget,
+// content width, and NonInteractive flag, not the minimal test call.
+func WithCallTemplate(call agent.SessionAgentCall) Option {
+	return func(e *Executor) { e.call = call }
+}
 
 // WithDiff sets the function used to collect the completion artifact — the git
 // diff of the dispatched worktree. Without it, runs complete with their text
@@ -201,10 +214,10 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 	}
 	done := make(chan runOutcome, 1)
 	go func() {
-		result, err := e.runner.Run(ctx, agent.SessionAgentCall{
-			SessionID: e.sessionID,
-			Prompt:    prompt,
-		})
+		call := e.call
+		call.SessionID = e.sessionID
+		call.Prompt = prompt
+		result, err := e.runner.Run(ctx, call)
 		done <- runOutcome{result, err}
 	}()
 
@@ -253,8 +266,27 @@ func todoStatusUpdate(execCtx *a2asrv.ExecutorContext, snap dispatch.TodoSnapsho
 		text = fmt.Sprintf("%d/%d completed", snap.TodoCompleted, snap.TodoTotal)
 	}
 	ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateWorking, agentMessage(execCtx, text))
-	ev.SetMeta(todoMetadataKey, snap.Todos)
+	ev.SetMeta(todoMetadataKey, todoMetadata(snap.Todos))
 	return ev
+}
+
+// todoMetadata converts the structured todo list into the JSON-shaped
+// values A2A metadata permits ([]any of map[string]any). A typed Go
+// slice here is silently valid to SetMeta and fatal one layer down: the
+// SDK's task store only round-trips nil, bools, numbers, strings, and
+// their slices/maps, so a []session.Todo fails the task-state save and
+// the whole task moves to failed. Same wire shape as before — every
+// field keeps its json tag name — so consumers are unaffected.
+func todoMetadata(todos []session.Todo) []any {
+	out := make([]any, 0, len(todos))
+	for _, todo := range todos {
+		out = append(out, map[string]any{
+			"content":     todo.Content,
+			"status":      string(todo.Status),
+			"active_form": todo.ActiveForm,
+		})
+	}
+	return out
 }
 
 // Cancel stops the in-flight dispatched run for this executor's session and

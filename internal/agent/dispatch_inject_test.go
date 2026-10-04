@@ -26,9 +26,14 @@ type gatedDispatchAgent struct {
 	enterOnce sync.Once
 	mu        sync.Mutex
 	queued    []SessionAgentCall
+	lastCall  *SessionAgentCall
 }
 
 func (f *gatedDispatchAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+	f.mu.Lock()
+	callCopy := call
+	f.lastCall = &callCopy
+	f.mu.Unlock()
 	f.enterOnce.Do(func() { close(f.entered) })
 	select {
 	case <-f.gate:
@@ -36,6 +41,23 @@ func (f *gatedDispatchAgent) Run(ctx context.Context, call SessionAgentCall) (*f
 		return nil, ctx.Err()
 	}
 	return f.result, nil
+}
+
+// lastRunCall returns a copy of the call the dispatched agent ran with,
+// for asserting the call shaping (#71).
+func (f *gatedDispatchAgent) lastRunCall() (SessionAgentCall, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lastCall == nil {
+		return SessionAgentCall{}, false
+	}
+	return *f.lastCall, true
+}
+
+// ranOnce reports whether the agent's Run was entered.
+func (f *gatedDispatchAgent) ranOnce() bool {
+	_, ok := f.lastRunCall()
+	return ok
 }
 
 // waitRunning blocks until the dispatched run has entered the agent's Run

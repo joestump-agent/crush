@@ -22,7 +22,11 @@
 // path, and [Resolve] reads a dispatch's card and endpoint back from its
 // registry entry — in-memory discovery over the dispatch registry, no
 // network hop. The DispatchAgent A2A client + SSE progress (#71) build on
-// these. See the A2A Coordination epic (#67) for the full plan.
+// these: [ServerFactory.StreamDispatch] is the client half — prompt out
+// as a streaming message, the SSE event stream back to its terminal
+// state, the artifact (diff) and the agent's final text assembled into
+// the transport outcome the coordinator maps onto its DispatchResult.
+// See the A2A Coordination epic (#67) for the full plan.
 //
 // The SDK's core type package is imported as a2aspec throughout to avoid
 // colliding with this package's own name.

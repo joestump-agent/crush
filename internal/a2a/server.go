@@ -53,6 +53,9 @@ type ServerParams struct {
 	Skills []*skills.Skill
 	// Version advertised on the card. Defaults to the build version.
 	Version string
+	// Call is the template every served turn runs with (#71) — the
+	// dispatch's full call shaping; the prompt is overridden per message.
+	Call agent.SessionAgentCall
 }
 
 // Server is one dispatched agent's in-process A2A server (#70): JSON-RPC
@@ -118,6 +121,7 @@ func StartServer(ctx context.Context, p ServerParams) (*Server, error) {
 	if p.Todos != nil {
 		opts = append(opts, WithTodos(p.Todos))
 	}
+	opts = append(opts, WithCallTemplate(p.Call))
 	executor := NewExecutor(p.Runner, p.SessionID, opts...)
 
 	handler := a2asrv.NewHandler(executor)
@@ -179,6 +183,7 @@ func (f *ServerFactory) StartDispatchServer(ctx context.Context, p agent.Dispatc
 		Description: p.Description,
 		Skills:      p.Skills,
 		Version:     version.Version,
+		Call:        p.Call,
 	})
 	if err != nil {
 		return "", nil, nil, err
