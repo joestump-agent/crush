@@ -257,5 +257,5 @@ func TestMessageAgentToolDeliversAndRefuses(t *testing.T) {
 
 	resp = runTool(t, messageTool, MessageAgentToolName, MessageAgentParams{Message: "no session"})
 	require.True(t, resp.IsError)
-	require.Contains(t, resp.Content, "session id is required")
+	require.Contains(t, resp.Content, "session id or handle is required")
 }

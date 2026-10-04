@@ -169,11 +169,18 @@ func (c *Completions) Open(depth, limit int) tea.Cmd {
 	}
 }
 
-// SetItems sets the files and MCP resources and rebuilds the merged list.
-func (c *Completions) SetItems(files []FileCompletionValue, resources []ResourceCompletionValue) {
-	items := make([]list.FilterableItem, 0, len(files)+len(resources))
+// SetItems sets the files, MCP resources, and live dispatched agents
+// (#313) and rebuilds the merged list.
+func (c *Completions) SetItems(files []FileCompletionValue, resources []ResourceCompletionValue, agents []AgentCompletionValue) {
+	items := make([]list.FilterableItem, 0, len(files)+len(resources)+len(agents))
 
-	// Add files first.
+	// Live agents lead: an @handle routes a message, so it outranks a
+	// file path when both match what the user typed.
+	for _, agent := range agents {
+		items = append(items, c.completionRow("@"+agent.Handle, agent.Detail, agent))
+	}
+
+	// Add files.
 	for _, file := range files {
 		item := NewCompletionItem(
 			file.Path,

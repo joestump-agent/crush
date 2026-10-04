@@ -245,3 +245,15 @@ func (s *runCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot
 func (s *runCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
 	return errors.New("not implemented")
 }
+
+func (s *runCoordinator) DispatchLive() []dispatch.TodoSnapshot {
+	return nil
+}
+
+func (s *runCoordinator) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+	return dispatch.TodoSnapshot{}, false
+}
+
+func (s *runCoordinator) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+	return errors.New("not implemented")
+}

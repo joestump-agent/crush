@@ -149,7 +149,7 @@ func TestSkillItemsDoNotAffectFileSelectionDispatch(t *testing.T) {
 	// Regression: file/resource values must still dispatch their own
 	// SelectionMsg types after the skill case was added.
 	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
-	c.SetItems([]FileCompletionValue{{Path: "foo.go"}}, nil)
+	c.SetItems([]FileCompletionValue{{Path: "foo.go"}}, nil, nil)
 
 	msg := c.selectCurrent(false)
 	sel, ok := msg.(SelectionMsg[FileCompletionValue])
