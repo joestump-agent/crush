@@ -405,3 +405,30 @@ func matchesCtrl(b key.Binding, r rune) bool {
 func parentMessageID(i int) string {
 	return "p" + strconv.Itoa(i)
 }
+
+// TestInspectEscIsBackOnLegacyTerminals pins ctrl+[ on terminals without
+// key disambiguation, which send it as the same byte as esc: while
+// inspecting, that esc must leave inspect mode instead of reaching the
+// cancel handler, where a second press cancels the parent's run. A
+// terminal that tells the two keys apart keeps esc's own meaning.
+func TestInspectEscIsBackOnLegacyTerminals(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	require.True(t, m.isInspecting())
+
+	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	runInspectCmds(m, cmd)
+	require.False(t, m.isInspecting(),
+		"ctrl+[ arrives as esc on a legacy terminal and must leave inspect mode")
+	require.False(t, m.isCanceling, "the back press must not arm the parent's cancel")
+
+	m.keyenh = tea.KeyboardEnhancementsMsg{Flags: 1}
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	require.True(t, m.isInspecting())
+	handled, _ := m.handleInspectKeys(tea.KeyPressMsg{Code: tea.KeyEscape})
+	require.False(t, handled, "with key disambiguation esc is not ctrl+[")
+	require.True(t, m.isInspecting())
+}

@@ -5,7 +5,8 @@ package model
 // while the parent stays the active session. ctrl+] enters from an agent
 // block (or opens the live-agents cycle when no block is focused) and
 // cycles live agents; ctrl+[ returns to the chat with the scroll position
-// preserved. Esc is untouched. Viewed ≠ active: nothing in this file ever
+// preserved. Esc is untouched wherever the terminal can tell it apart from
+// ctrl+[ (see escIsInspectBack). Viewed ≠ active: nothing in this file ever
 // assigns m.session, so prompts typed while inspecting land in the parent
 // and a task session can never become the active/continuable session.
 
@@ -163,18 +164,28 @@ func (m *UI) handleSelectSession(sess session.Session) tea.Cmd {
 // dialog routing in handleKeyPressMsg, so open dialogs keep their keys,
 // and before every other handler, so the bindings work from both editor
 // and chat focus. Only these two chords match; Esc and every other key
-// fall through untouched.
+// fall through untouched, except where Esc is ctrl+[ (escIsInspectBack).
 func (m *UI) handleInspectKeys(msg tea.KeyPressMsg) (handled bool, cmd tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keyMap.InspectDrill):
 		return true, m.handleInspectDrill()
-	case key.Matches(msg, m.keyMap.InspectBack):
+	case key.Matches(msg, m.keyMap.InspectBack), m.escIsInspectBack(msg):
 		if !m.isInspecting() {
 			return false, nil
 		}
 		return true, m.exitInspect()
 	}
 	return false, nil
+}
+
+// escIsInspectBack reports whether an esc press is really ctrl+[. A
+// terminal without key disambiguation sends the same byte for both, so
+// there ctrl+[ only ever arrives as esc; read as esc it reaches the
+// cancel handler, and a second press would cancel the parent's run.
+// Terminals that tell the two apart keep esc's own meaning.
+func (m *UI) escIsInspectBack(msg tea.KeyPressMsg) bool {
+	return msg.Code == tea.KeyEscape && msg.Mod == 0 &&
+		!m.keyenh.SupportsKeyDisambiguation()
 }
 
 // handleInspectDrill implements ctrl+]: while inspecting, cycle to the
