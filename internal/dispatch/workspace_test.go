@@ -327,6 +327,79 @@ func TestWorkspaceExplicitBaseAndFallback(t *testing.T) {
 	require.NoError(t, ws.Remove(ctx, entry.ID))
 }
 
+// Bases a model could supply that git would otherwise read as options,
+// plus a ref that does not exist: Provision must fail without leaving a
+// worktree, branch, or registry entry behind.
+func TestWorkspaceProvisionRejectsBadBases(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	worktreesBefore := gitIn(t, repo, "worktree", "list", "--porcelain")
+	branchesBefore := gitIn(t, repo, "branch", "--list", BranchPrefix+"*")
+
+	tests := []struct {
+		base string
+		err  string
+	}{
+		{"--lock", `invalid base "--lock"`},
+		{"--no-checkout", `invalid base "--no-checkout"`},
+		{"-b", `invalid base "-b"`},
+		{"no-such-ref", "unknown revision"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.base, func(t *testing.T) {
+			_, err := ws.Provision(ctx, ProvisionOptions{Base: tt.base})
+			require.ErrorContains(t, err, tt.err)
+		})
+	}
+
+	require.Equal(t, worktreesBefore, gitIn(t, repo, "worktree", "list", "--porcelain"))
+	require.Equal(t, branchesBefore, gitIn(t, repo, "branch", "--list", BranchPrefix+"*"))
+	require.Empty(t, ws.List())
+}
+
+// Branch, tag, full SHA, and HEAD~1 bases still work: BaseSHA is the
+// commit git says the ref points at, and the worktree is cut from it.
+func TestWorkspaceProvisionValidBases(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	gitIn(t, repo, "tag", "v1")
+	write(t, filepath.Join(repo, "f.txt"), "two")
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "-c", "commit.gpgsign=false", "commit", "-qm", "second")
+	headSHA := strings.TrimSpace(gitIn(t, repo, "rev-parse", "HEAD"))
+	gitIn(t, repo, "branch", "stable", "v1")
+	baseSHA := strings.TrimSpace(gitIn(t, repo, "rev-parse", "v1^{commit}"))
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		base string
+		want string
+	}{
+		{"branch", "stable", baseSHA},
+		{"tag", "v1", baseSHA},
+		{"full sha", headSHA, headSHA},
+		{"head tilde one", "HEAD~1", baseSHA},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry, err := ws.Provision(ctx, ProvisionOptions{Base: tt.base})
+			require.NoError(t, err)
+			require.Equal(t, tt.base, entry.Base)
+			require.Equal(t, tt.want, entry.BaseSHA)
+			require.Equal(t, tt.want, strings.TrimSpace(gitIn(t, entry.Path, "rev-parse", "HEAD")))
+			require.NoError(t, ws.Remove(ctx, entry.ID))
+		})
+	}
+}
+
 func TestWorkspaceDiffUnknownID(t *testing.T) {
 	repo := newTestRepo(t)
 	ws, err := NewWorkspace(repo)

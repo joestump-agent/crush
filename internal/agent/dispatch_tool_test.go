@@ -186,6 +186,24 @@ func TestDispatchAgentToolUnknownSkill(t *testing.T) {
 	require.Empty(t, ws.List())
 }
 
+// A model-supplied branch that git would read as an option is a tool
+// error: no running handle, no provisioned workspace.
+func TestDispatchAgentToolRejectsOptionLikeBranch(t *testing.T) {
+	agent := &dispatchTestAgent{model: dispatchTestModel()}
+	c, _ := newDispatchToolEnv(t, agent)
+	tool := c.dispatchTool()
+
+	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work", Branch: "--lock"})
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "provision dispatch workspace")
+
+	// The rejected branch never became a dispatch.
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	require.Empty(t, ws.List())
+	require.Empty(t, agent.calls)
+}
+
 // The happy path: the tool provisions a workspace, bootstraps the
 // toolchain, registers the ephemeral session, and returns a running
 // handle immediately; the background run then flips the registry entry to
