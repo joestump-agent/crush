@@ -225,3 +225,83 @@ func TestDispatchCardNestedTools(t *testing.T) {
 	item.SetNestedTools(nil)
 	require.Empty(t, item.NestedTools())
 }
+
+// Mid-run injection (#312): an injected message recorded on the block
+// renders as a steer with the agent's streaming answer beneath it, and
+// the initial dispatch prompt is never mistaken for a steer.
+func TestDispatchCardRendersSteerConversation(t *testing.T) {
+	t.Parallel()
+
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
+		Entry: dispatch.Entry{
+			ID:        "dispatch-1",
+			SessionID: "msg$$call-dispatch-1",
+			Status:    dispatch.StatusRunning,
+		},
+	})
+
+	// The dispatch's own prompt is not a steer.
+	require.True(t, item.IsInitialDispatchPrompt("implement the login form with validation"))
+	// Any other text before the first steer is not the prompt either.
+	require.False(t, item.IsInitialDispatchPrompt("stop writing Rust"))
+
+	item.AddSteer("stop writing Rust and use Go")
+	item.UpdateSteerAnswer("assistant-1", "understood, switching to Go")
+	// A later assistant message retargets the answer: the block shows the
+	// agent's most recent reply.
+	item.UpdateSteerAnswer("assistant-2", "done, go.mod updated")
+
+	out := dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), true))
+	require.Contains(t, out, "stop writing Rust and use Go")
+	require.Contains(t, out, "done, go.mod updated")
+	require.NotContains(t, out, "understood, switching to Go")
+
+	// The second steer starts a fresh answer slot; the first keeps its
+	// final text.
+	item.AddSteer("also run the linter")
+	item.UpdateSteerAnswer("assistant-3", "lint clean")
+	out = dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), true))
+	require.Contains(t, out, "also run the linter")
+	require.Contains(t, out, "lint clean")
+	require.Contains(t, out, "done, go.mod updated")
+
+	require.Len(t, item.Steers(), 2)
+	// After the first steer, nothing is ever treated as the initial
+	// prompt again.
+	require.False(t, item.IsInitialDispatchPrompt("implement the login form with validation"))
+}
+
+// Steers survive into the terminal record view: the block keeps the
+// conversation next to the findings once the run completes.
+func TestDispatchCardKeepsSteersOnCompletion(t *testing.T) {
+	t.Parallel()
+
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
+		Entry: dispatch.Entry{
+			ID:        "dispatch-1",
+			SessionID: "msg$$call-dispatch-1",
+			Status:    dispatch.StatusCompleted,
+			Result: &dispatch.DispatchResult{
+				Status:      dispatch.StatusCompleted,
+				KeyFindings: "Switched to Go.",
+			},
+		},
+	})
+	item.AddSteer("stop writing Rust")
+	item.UpdateSteerAnswer("assistant-1", "switched")
+
+	out := dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), false))
+	require.Contains(t, out, "stop writing Rust")
+	require.Contains(t, out, "Switched to Go.")
+}
+
+// UpdateSteerAnswer without any recorded steer is a no-op.
+func TestDispatchCardSteerAnswerWithoutSteer(t *testing.T) {
+	t.Parallel()
+
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	require.False(t, item.UpdateSteerAnswer("assistant-1", "orphan"))
+	require.Empty(t, item.Steers())
+}
