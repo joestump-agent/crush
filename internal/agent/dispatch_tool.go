@@ -368,13 +368,6 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	result, err := run.agent.Run(ctx, call)
 	watchStop()
 
-	// Drop the injection target before the terminal status lands so the
-	// registry never says finished while the target still accepts: a
-	// delivery racing the teardown must meet a refusal, not a target
-	// whose run is already over. The deferred unregister stays as panic
-	// safety; the double delete is harmless.
-	c.unregisterDispatchRun(run.sessionID)
-
 	// A nil result with a nil error means no turn ran — the session was
 	// busy or a cancel landed during dispatch (#173 review note on #64).
 	// With one ephemeral session per dispatch it should not fire, but it
@@ -388,6 +381,18 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	}
 
 	terminal := c.assembleTerminalDispatchResult(ctx, run, result, err)
+
+	// Drop the injection target before the terminal status lands so the
+	// registry never says finished while the target still accepts: a
+	// delivery that sees the terminal entry must meet the "finished"
+	// refusal, not a target whose run is already over. Not earlier:
+	// while the result is assembled (diff capture can be slow) the entry
+	// still reads running, and the registered target's EnqueueWhenBusy
+	// refuses with "no longer running" rather than the unknown-session
+	// refusal. The deferred unregister stays as panic safety; the double
+	// delete is harmless.
+	c.unregisterDispatchRun(run.sessionID)
+
 	// Record the terminal payload before the terminal status so the
 	// terminal entry event carries it: the completed agent block (#65)
 	// renders its durable record from the registry.
