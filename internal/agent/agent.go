@@ -801,7 +801,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// agents, the only ones built with a todoKill observer, because only
 	// a dispatched run has a parent that can re-dispatch it. Every other
 	// agent (the main coder, plan mode, agent-tool sub-agents, crush run)
-	// gets a nil hook and tops out at the escalating nudge (#393).
+	// gets a nil hook and tops out at the escalating nudge (#393). A run
+	// whose tools leave out the todos tool gets no ladder at all, since
+	// every rung asks for a call the model cannot make.
 	var onKill func(reason string)
 	if a.todoKill != nil {
 		todoKillFn := a.todoKill
@@ -811,7 +813,10 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			a.Cancel(call.SessionID)
 		}
 	}
-	todoRun := a.todoEnforcement.newRun(len(currentSession.Todos) > 0, onKill)
+	var todoRun *todoEnforcementRun
+	if hasTodosTool(agentTools) {
+		todoRun = a.todoEnforcement.newRun(len(currentSession.Todos) > 0, onKill)
+	}
 
 	msgs, err := a.getSessionMessages(ctx, currentSession)
 	if err != nil {
