@@ -24,7 +24,10 @@ package dispatch
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +36,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/lock"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/google/uuid"
 )
@@ -140,8 +144,15 @@ type Workspace struct {
 	// transitions without the mutation call sites knowing about them.
 	events *pubsub.Broker[Entry]
 
+	// instanceID identifies this Workspace instance in the owner
+	// markers it writes, so humans can tell concurrent processes apart.
+	instanceID string
+
 	mu      sync.Mutex
 	entries map[string]Entry
+	// leases holds the release function for the ownership lease of
+	// every registered entry, keyed by entry ID.
+	leases map[string]func()
 }
 
 // NewWorkspace returns a Workspace managing isolated workspaces for the
@@ -172,6 +183,8 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 		worktreesDir: dir,
 		events:       pubsub.NewBroker[Entry](),
 		entries:      make(map[string]Entry),
+		instanceID:   uuid.New().String(),
+		leases:       make(map[string]func()),
 	}, nil
 }
 
@@ -208,6 +221,19 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 		return Entry{}, fmt.Errorf("create worktree: %w", err)
 	}
 
+	// The lease and marker live next to the worktree, never inside it,
+	// because Diff stages the whole workspace with git add -A.
+	release, err := lock.TryFile(w.leasePath(branch))
+	if err != nil {
+		w.removeEntry(ctx, Entry{Path: path, Branch: branch}, nil)
+		return Entry{}, fmt.Errorf("take ownership lease: %w", err)
+	}
+	if err := w.writeOwnerMarker(branch); err != nil {
+		release()
+		w.removeEntry(ctx, Entry{Path: path, Branch: branch}, nil)
+		return Entry{}, fmt.Errorf("write owner marker: %w", err)
+	}
+
 	entry := Entry{
 		ID:      id,
 		Path:    path,
@@ -219,8 +245,61 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 
 	w.mu.Lock()
 	w.entries[id] = entry
+	w.leases[id] = release
 	w.mu.Unlock()
 	return entry, nil
+}
+
+// leasePath is the flock file guarding branch's workspace. It lives
+// next to the worktree, never inside it, and the kernel releases the
+// lock when the owning process dies — no stale-lock recovery needed.
+func (w *Workspace) leasePath(branch string) string {
+	return filepath.Join(w.worktreesDir, branch+".lock")
+}
+
+// ownerPath is the human-readable owner marker for branch. It carries
+// no authority: the lock file is what ownership is proven with.
+func (w *Workspace) ownerPath(branch string) string {
+	return filepath.Join(w.worktreesDir, branch+".owner.json")
+}
+
+// ownerMarker records who holds a workspace's lease.
+type ownerMarker struct {
+	InstanceID string    `json:"instance_id"`
+	PID        int       `json:"pid"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// writeOwnerMarker atomically records this workspace instance as the
+// owner of branch.
+func (w *Workspace) writeOwnerMarker(branch string) error {
+	data, err := json.Marshal(ownerMarker{
+		InstanceID: w.instanceID,
+		PID:        os.Getpid(),
+		CreatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(w.worktreesDir, ".*.owner.json.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, w.ownerPath(branch)); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return nil
 }
 
 // Get returns a copy of the entry for id.
@@ -492,30 +571,38 @@ func (w *Workspace) Diff(ctx context.Context, id string) (string, error) {
 func (w *Workspace) Remove(ctx context.Context, id string) error {
 	w.mu.Lock()
 	entry, ok := w.entries[id]
+	release := w.leases[id]
 	delete(w.entries, id)
+	delete(w.leases, id)
 	w.mu.Unlock()
 	if !ok {
 		return nil
 	}
-	return w.removeEntry(ctx, entry)
+	return w.removeEntry(ctx, entry, release)
 }
 
-// Sweep removes every tracked workspace plus any orphaned
-// crush-dispatch-* directories under the worktrees directory (from a
-// crashed run whose registry was lost). It is the session-end backstop:
-// nothing dispatch created survives it, and no dangling branches or
-// .crush/worktrees/ entries are left behind.
+// Sweep removes every tracked workspace plus every orphaned
+// crush-dispatch-* directory whose ownership lease is free (from a
+// crashed run whose registry was lost). Orphans a live process still
+// holds — another Workspace on the same repository — and orphans with
+// no lease file at all, whose ownership cannot be proven, are left
+// alone (#369 is the explicit cleanup tool for those).
 func (w *Workspace) Sweep(ctx context.Context) error {
 	w.mu.Lock()
-	entries := make([]Entry, 0, len(w.entries))
-	for _, e := range w.entries {
-		entries = append(entries, e)
+	type sweepEntry struct {
+		entry   Entry
+		release func()
+	}
+	items := make([]sweepEntry, 0, len(w.entries))
+	for id, e := range w.entries {
+		items = append(items, sweepEntry{e, w.leases[id]})
+		delete(w.leases, id)
 	}
 	w.entries = make(map[string]Entry)
 	w.mu.Unlock()
 
-	for _, entry := range entries {
-		if err := w.removeEntry(ctx, entry); err != nil {
+	for _, item := range items {
+		if err := w.removeEntry(ctx, item.entry, item.release); err != nil {
 			return err
 		}
 	}
@@ -535,11 +622,31 @@ func (w *Workspace) Sweep(ctx context.Context) error {
 		if !d.IsDir() || !strings.HasPrefix(d.Name(), BranchPrefix) {
 			continue
 		}
+		lockPath := w.leasePath(d.Name())
+		if _, err := os.Stat(lockPath); err != nil {
+			if os.IsNotExist(err) {
+				// Without a lease file ownership cannot be proven,
+				// so the directory is not ours to take.
+				slog.Debug("Skipping dispatch worktree without a lease file", "path", filepath.Join(w.worktreesDir, d.Name()))
+				continue
+			}
+			return err
+		}
+		release, err := lock.TryFile(lockPath)
+		if err != nil {
+			if errors.Is(err, lock.ErrContended) {
+				// A live process — another Workspace on this
+				// repository — still owns this workspace.
+				slog.Debug("Skipping dispatch worktree with a held lease", "path", filepath.Join(w.worktreesDir, d.Name()))
+				continue
+			}
+			return err
+		}
 		entry := Entry{
 			Path:   filepath.Join(w.worktreesDir, d.Name()),
 			Branch: d.Name(),
 		}
-		if err := w.removeEntry(ctx, entry); err != nil {
+		if err := w.removeEntry(ctx, entry, release); err != nil {
 			return err
 		}
 	}
@@ -547,9 +654,12 @@ func (w *Workspace) Sweep(ctx context.Context) error {
 }
 
 // removeEntry tears down one workspace on disk: the worktree (forced if
-// it is dirty), the branch, and the admin entry. Missing artifacts are
-// not errors.
-func (w *Workspace) removeEntry(ctx context.Context, entry Entry) error {
+// it is dirty), the branch, the ownership artifacts, and the admin
+// entry. Missing artifacts are not errors. When lease is not nil the
+// lock file is unlinked while the lease is still held — dispatch IDs
+// are never reused, so no other holder can appear in between — and the
+// lease is released last.
+func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) error {
 	if entry.Path != "" {
 		if err := runGit(ctx, w.repoRoot, nil, "worktree", "remove", entry.Path); err != nil {
 			// A dirty workspace still removes with --force; a missing
@@ -570,6 +680,13 @@ func (w *Workspace) removeEntry(ctx context.Context, entry Entry) error {
 				return fmt.Errorf("delete branch %s: %w", entry.Branch, err)
 			}
 		}
+	}
+	if entry.Branch != "" {
+		os.Remove(w.ownerPath(entry.Branch))
+	}
+	if lease != nil {
+		os.Remove(w.leasePath(entry.Branch))
+		lease()
 	}
 	return nil
 }
