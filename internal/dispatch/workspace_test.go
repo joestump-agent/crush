@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -269,9 +270,10 @@ func TestHandleSlug(t *testing.T) {
 }
 
 // AssignHandle assigns the requested handle, derives one from the role,
-// falls back to "agent", and suffixes collisions numerically — including
-// against finished dispatches, which keep their handles until their
-// registry entries are removed.
+// falls back to "agent", and suffixes collisions numerically against the
+// running agents only (#399): a finished dispatch releases its handle for
+// reuse. Reserved names are suffixed like collisions, and the 32-byte
+// cap holds even with a suffix.
 func TestAssignHandle(t *testing.T) {
 	repo := newTestRepo(t)
 	ws, err := NewWorkspace(repo)
@@ -316,14 +318,40 @@ func TestAssignHandle(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "tester-2", handle)
 
-	// Finished dispatches keep their handles: the registry is the
-	// namespace until Remove.
+	// A finished dispatch releases its handle: the next dispatch asking
+	// for it gets the bare handle again, even though the finished entry
+	// still carries it (#399).
 	ws.SetStatus(a.ID, StatusCompleted)
 	e, err := ws.Provision(ctx, ProvisionOptions{})
 	require.NoError(t, err)
 	handle, ok = ws.AssignHandle(e.ID, "tester", "")
 	require.True(t, ok)
-	require.Equal(t, "tester-3", handle)
+	require.Equal(t, "tester", handle)
+
+	// A reserved name is never assigned outright: it is suffixed like a
+	// collision (#399).
+	f, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	handle, ok = ws.AssignHandle(f.ID, "task", "")
+	require.True(t, ok)
+	require.Equal(t, "task-2", handle)
+
+	// A 60-character role yields a handle of at most 32 bytes (#399).
+	g, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	long := strings.Repeat("x", 60)
+	handle, ok = ws.AssignHandle(g.ID, long, "")
+	require.True(t, ok)
+	require.Equal(t, strings.Repeat("x", MaxHandleLength), handle)
+
+	// A collision on an already-capped handle suffixes with the base
+	// truncated so "-2" fits: the result stays within the cap.
+	h, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	handle, ok = ws.AssignHandle(h.ID, long, "")
+	require.True(t, ok)
+	require.Equal(t, strings.Repeat("x", MaxHandleLength-2)+"-2", handle)
+	require.LessOrEqual(t, len(handle), MaxHandleLength)
 
 	// A removed entry releases its handle for reuse.
 	require.NoError(t, ws.Remove(ctx, b.ID))
@@ -346,4 +374,64 @@ func TestStatusIsTerminal(t *testing.T) {
 	for _, s := range []Status{StatusProvisioned, StatusRunning} {
 		require.False(t, s.IsTerminal(), "%s must not be terminal", s)
 	}
+}
+
+// HandleSlug caps a slug at MaxHandleLength bytes (#399), trimming a
+// trailing dash the cap leaves.
+func TestHandleSlugLengthCap(t *testing.T) {
+	t.Parallel()
+
+	capped := HandleSlug(strings.Repeat("a", 60))
+	require.Len(t, capped, MaxHandleLength)
+	require.Equal(t, strings.Repeat("a", MaxHandleLength), capped)
+
+	// The cap lands after a dash run: the trailing dash is trimmed.
+	dashed := HandleSlug(strings.Repeat("a", 30) + "-" + strings.Repeat("b", 30))
+	require.LessOrEqual(t, len(dashed), MaxHandleLength)
+	require.False(t, strings.HasSuffix(dashed, "-"), "a capped slug never ends with a dash")
+	require.Equal(t, strings.Repeat("a", 30)+"-b", dashed)
+}
+
+// ByHandle prefers the live entry carrying the handle; when only
+// finished entries carry it, the most recently finished one answers
+// (#399), so a mention of a finished @handle still renders its card
+// until the handle is reused.
+func TestByHandlePrefersLiveEntry(t *testing.T) {
+	repo := newTestRepo(t)
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	ctx := t.Context()
+
+	a, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	_, ok := ws.AssignHandle(a.ID, "tester", "")
+	require.True(t, ok)
+
+	// Finish a; its handle still resolves, as the finished fallback.
+	require.True(t, ws.SetStatus(a.ID, StatusCompleted))
+	require.True(t, ws.Update(a.ID, func(e *Entry) { e.FinishedAt = time.Now().Add(-time.Minute) }))
+	got, ok := ws.ByHandle("tester")
+	require.True(t, ok, "a finished handle still resolves")
+	require.Equal(t, a.ID, got.ID)
+
+	// A newer finished entry wins the fallback over an older one.
+	b, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	_, ok = ws.AssignHandle(b.ID, "tester", "")
+	require.True(t, ok)
+	require.True(t, ws.SetStatus(b.ID, StatusKilled))
+	require.True(t, ws.Update(b.ID, func(e *Entry) { e.FinishedAt = time.Now() }))
+	got, ok = ws.ByHandle("tester")
+	require.True(t, ok)
+	require.Equal(t, b.ID, got.ID, "the most recently finished entry answers")
+
+	// A new dispatch reuses the released handle; the live entry now wins.
+	c, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	handle, ok := ws.AssignHandle(c.ID, "tester", "")
+	require.True(t, ok)
+	require.Equal(t, "tester", handle, "the handle was free again")
+	got, ok = ws.ByHandle("tester")
+	require.True(t, ok)
+	require.Equal(t, c.ID, got.ID, "the live entry answers over finished ones")
 }

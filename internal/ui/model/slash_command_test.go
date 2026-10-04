@@ -31,7 +31,7 @@ func (w *slashCommandWorkspace) AgentIsReady() bool { return w.ready }
 // DispatchLive reports no live dispatches: the slash-command stub has no
 // dispatch registry (#313's completion source stays empty in these
 // tests).
-func (w *slashCommandWorkspace) DispatchLive() []dispatch.TodoSnapshot {
+func (w *slashCommandWorkspace) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	return nil
 }
 

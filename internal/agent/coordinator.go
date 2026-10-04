@@ -152,20 +152,24 @@ type Coordinator interface {
 	// running on the message's session as its next input (#312) — the
 	// transport-agnostic injection seam shared by the message_agent tool,
 	// the editor's @handle routing (#313), and #71's A2A follow-up
-	// messages. Addressing a finished session returns a refusal.
+	// messages. Addressing a finished session returns a refusal; so does
+	// a message whose FromSessionID does not own the dispatch (#399).
 	DeliverAgentMessage(ctx context.Context, msg AgentMessage) error
 	// DispatchLive returns the snapshots of every non-terminal dispatch
-	// (#313) — the editor's live-agents @ completion source. Finished
-	// handles never appear.
-	DispatchLive() []dispatch.TodoSnapshot
+	// created from sessionID (#313/#399) — the editor's live-agents @
+	// completion source. Finished handles and other sessions' dispatches
+	// never appear.
+	DispatchLive(sessionID string) []dispatch.TodoSnapshot
 	// DispatchByHandle resolves an @handle to its dispatch snapshot
 	// (#313), finished dispatches included; the caller decides what a
-	// finished handle means.
-	DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool)
+	// finished handle means. A handle dispatched from another session
+	// does not resolve (#399).
+	DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool)
 	// DeliverAgentMessageByHandle delivers a message to the running
 	// dispatched agent carrying handle (#313) — the editor's leading
-	// @handle routing. A finished or unknown handle refuses cleanly.
-	DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error
+	// @handle routing. A finished, unknown, or foreign-session handle
+	// refuses cleanly (#399).
+	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error
 }
 
 type coordinator struct {

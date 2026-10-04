@@ -345,14 +345,14 @@ func (s *stubCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.Age
 	return errors.New("not implemented")
 }
 
-func (s *stubCoordinator) DispatchLive() []dispatch.TodoSnapshot {
+func (s *stubCoordinator) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	return nil
 }
 
-func (s *stubCoordinator) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+func (s *stubCoordinator) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (s *stubCoordinator) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+func (s *stubCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
 	return errors.New("not implemented")
 }

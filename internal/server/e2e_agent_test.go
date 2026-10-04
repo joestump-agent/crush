@@ -754,14 +754,14 @@ func (c *scriptedCoordinator) DeliverAgentMessage(ctx context.Context, msg agent
 	return errors.New("not implemented")
 }
 
-func (c *scriptedCoordinator) DispatchLive() []dispatch.TodoSnapshot {
+func (c *scriptedCoordinator) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	return nil
 }
 
-func (c *scriptedCoordinator) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+func (c *scriptedCoordinator) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (c *scriptedCoordinator) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+func (c *scriptedCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
 	return errors.New("not implemented")
 }

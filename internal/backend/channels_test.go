@@ -363,14 +363,14 @@ func (c *recordingCoordinator) DeliverAgentMessage(ctx context.Context, msg agen
 	return errors.New("not implemented")
 }
 
-func (c *recordingCoordinator) DispatchLive() []dispatch.TodoSnapshot {
+func (c *recordingCoordinator) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	return nil
 }
 
-func (c *recordingCoordinator) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+func (c *recordingCoordinator) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (c *recordingCoordinator) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+func (c *recordingCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
 	return errors.New("not implemented")
 }

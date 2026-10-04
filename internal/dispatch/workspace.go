@@ -54,6 +54,22 @@ func (s Status) IsTerminal() bool {
 // matter how they were left behind.
 const BranchPrefix = "crush-dispatch-"
 
+// MaxHandleLength caps a handle slug in bytes (#399), so a long role
+// can never balloon the @ completions or a prompt line. A suffix is
+// included in the cap: the base truncates so "-2" still fits.
+const MaxHandleLength = 32
+
+// ReservedHandles are the names a dispatch may never claim outright:
+// the built-in agent ids, plus "all". A request for one is suffixed
+// like a collision (#399): task, task-2.
+var ReservedHandles = map[string]bool{
+	"coder":  true,
+	"plan":   true,
+	"task":   true,
+	"worker": true,
+	"all":    true,
+}
+
 // Status is the lifecycle state of a dispatched workspace.
 type Status string
 
@@ -94,6 +110,11 @@ type Entry struct {
 	// SessionID is the ephemeral session backing the dispatched agent
 	// (#48/#50); empty until the dispatch starts running.
 	SessionID string
+	// ParentSessionID is the session the dispatch was created from
+	// (#399): the scope handle and session-ID addressing are validated
+	// against, so only the dispatching session can address the agent.
+	// Empty until the dispatch tool records it.
+	ParentSessionID string
 	// Handle is the workspace's @handle for agent addressing (#313);
 	// empty until one is assigned by [Workspace.AssignHandle].
 	Handle string
@@ -231,17 +252,33 @@ func (w *Workspace) Get(id string) (Entry, bool) {
 	return e.clone(), ok
 }
 
-// ByHandle returns the entry currently carrying handle, if any.
+// ByHandle returns the entry currently carrying handle, if any. A
+// non-terminal entry always wins: handles live as long as their run
+// (#399). When no live entry carries the handle, the most recently
+// finished one answers (max FinishedAt), so a mention of a finished
+// @handle still renders its read-only card until the handle is reused.
 func (w *Workspace) ByHandle(handle string) (Entry, bool) {
 	if handle == "" {
 		return Entry{}, false
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	var finished Entry
+	haveFinished := false
 	for _, e := range w.entries {
-		if e.Handle == handle {
+		if e.Handle != handle {
+			continue
+		}
+		if !e.Status.IsTerminal() {
 			return e.clone(), true
 		}
+		if !haveFinished || e.FinishedAt.After(finished.FinishedAt) {
+			finished = e
+			haveFinished = true
+		}
+	}
+	if haveFinished {
+		return finished.clone(), true
 	}
 	return Entry{}, false
 }
@@ -334,6 +371,13 @@ func (w *Workspace) SetSession(id, sessionID string) bool {
 	return w.Update(id, func(e *Entry) { e.SessionID = sessionID })
 }
 
+// SetParentSessionID records the session the dispatch was created from
+// (#399): the scope handle and session-ID addressing are validated
+// against, so another session cannot address this dispatch.
+func (w *Workspace) SetParentSessionID(id, parentSessionID string) bool {
+	return w.Update(id, func(e *Entry) { e.ParentSessionID = parentSessionID })
+}
+
 // SetHandle records the @handle the dispatched agent is addressable by.
 func (w *Workspace) SetHandle(id, handle string) bool {
 	return w.Update(id, func(e *Entry) { e.Handle = handle })
@@ -344,10 +388,12 @@ func (w *Workspace) SetHandle(id, handle string) bool {
 // leading "@" and any surrounding space are tolerated); role is the
 // one-line role label recorded alongside it. When requested is empty the
 // handle is derived from the role, and when that is empty too it falls
-// back to "agent". A handle that collides with one already claimed by
-// any registered dispatch — live or finished, since the registry is the
-// handle namespace until the entry is removed — is suffixed numerically:
-// tester, tester-2, tester-3. The assignment is atomic under the registry
+// back to "agent". A handle lives as long as its run (#399): a handle
+// that collides with one claimed by a non-terminal dispatch — or with a
+// name in [ReservedHandles] — is suffixed numerically: tester, tester-2,
+// tester-3. A finished dispatch's handle is free for reuse, and the
+// suffixing truncates the base so the result never exceeds
+// [MaxHandleLength]. The assignment is atomic under the registry
 // lock, so two concurrent dispatches asking for the same handle get
 // distinct suffixed ones, and it publishes the usual entry event so the
 // dispatch block and @ completions observe the handle immediately.
@@ -375,11 +421,17 @@ func (w *Workspace) AssignHandle(id, requested, role string) (string, bool) {
 }
 
 // uniqueHandle returns handle, or its first free numeric suffix, against
-// every handle claimed in entries. Callers must hold w.mu.
+// every handle claimed by a non-terminal entry and every reserved name
+// (#399): a finished dispatch releases its handle for reuse. Suffixing
+// truncates the base so the result fits MaxHandleLength. Callers must
+// hold w.mu.
 func uniqueHandle(entries map[string]Entry, handle string) string {
-	taken := make(map[string]bool, len(entries))
+	taken := make(map[string]bool, len(entries)+len(ReservedHandles))
+	for name := range ReservedHandles {
+		taken[name] = true
+	}
 	for _, e := range entries {
-		if e.Handle != "" {
+		if e.Handle != "" && !e.Status.IsTerminal() {
 			taken[e.Handle] = true
 		}
 	}
@@ -387,24 +439,39 @@ func uniqueHandle(entries map[string]Entry, handle string) string {
 		return handle
 	}
 	for n := 2; ; n++ {
-		candidate := fmt.Sprintf("%s-%d", handle, n)
+		candidate := suffixedHandle(handle, n)
 		if !taken[candidate] {
 			return candidate
 		}
 	}
 }
 
+// suffixedHandle appends -n to base, truncating the base (and any
+// trailing dash the truncation leaves) so the result fits
+// MaxHandleLength.
+func suffixedHandle(base string, n int) string {
+	suffix := fmt.Sprintf("-%d", n)
+	if len(base)+len(suffix) > MaxHandleLength {
+		base = strings.TrimRight(base[:MaxHandleLength-len(suffix)], "-")
+	}
+	return base + suffix
+}
+
 // HandleSlug normalizes a candidate handle or role into handle form:
-// lowercase, runs of non-alphanumerics collapsed to single dashes, and
-// no leading or trailing dash. "@Team Lead" becomes "team-lead"; a
-// candidate that slugs to nothing ("@__"), or an empty one, stays empty
-// so the caller can fall through to its next fallback.
+// lowercase, runs of non-alphanumerics collapsed to single dashes, no
+// leading or trailing dash, and capped at MaxHandleLength bytes (#399) —
+// a trailing dash the cap leaves is trimmed. "@Team Lead" becomes
+// "team-lead"; a candidate that slugs to nothing ("@__"), or an empty
+// one, stays empty so the caller can fall through to its next fallback.
 func HandleSlug(candidate string) string {
 	candidate = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(candidate), "@"))
 	candidate = strings.ToLower(candidate)
 	var b strings.Builder
 	dash := false
 	for _, r := range candidate {
+		if b.Len() >= MaxHandleLength {
+			break
+		}
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)
@@ -414,7 +481,7 @@ func HandleSlug(candidate string) string {
 			dash = true
 		}
 	}
-	return strings.Trim(b.String(), "-")
+	return strings.TrimRight(b.String(), "-")
 }
 
 // SetEndpoint records the A2A endpoint and AgentCard serving the

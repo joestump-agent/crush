@@ -4,4 +4,4 @@ Use this for subtasks that are independent of your own work and touch different 
 
 The prompt should be a self-contained task description: the dispatched agent cannot ask you questions, and it starts from the repository's current state on the base branch, not from your uncommitted changes. It cannot merge or push; you review its diff when the result arrives and decide what to do with it.
 
-Give the agent a short role ("tester", "docs writer") and, when useful, an explicit handle: the user steers a running agent by starting a message with its @handle, and the handle appears with live status in the editor's @ completions. Handles are unique per run — a collision is suffixed automatically.
+Give the agent a short role ("tester", "docs writer") and, when useful, an explicit handle: the user steers a running agent by starting a message with its @handle, and the handle appears with live status in the editor's @ completions. Handles are unique among running agents — a collision with another running agent or a reserved name is suffixed automatically, and a finished agent's handle is free again for the next dispatch.

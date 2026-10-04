@@ -332,10 +332,10 @@ func TestMessageAgentToolDeliversAndRefuses(t *testing.T) {
 	agent.waitRunning(t)
 	messageTool := c.messageAgentTool()
 
-	resp := runTool(t, messageTool, MessageAgentToolName, MessageAgentParams{
+	resp := runToolAsSession(t, messageTool, MessageAgentToolName, MessageAgentParams{
 		SessionID: handle.SessionID,
 		Message:   "please add tests",
-	})
+	}, "dispatch-parent-session")
 	require.False(t, resp.IsError, "unexpected tool error: %s", resp.Content)
 	require.Contains(t, resp.Content, handle.SessionID)
 	require.Contains(t, resp.Content, "next input")
@@ -348,10 +348,10 @@ func TestMessageAgentToolDeliversAndRefuses(t *testing.T) {
 		return ok && entry.Status == dispatch.StatusCompleted
 	}, 10*time.Second, 50*time.Millisecond)
 
-	resp = runTool(t, messageTool, MessageAgentToolName, MessageAgentParams{
+	resp = runToolAsSession(t, messageTool, MessageAgentToolName, MessageAgentParams{
 		SessionID: handle.SessionID,
 		Message:   "too late",
-	})
+	}, "dispatch-parent-session")
 	require.True(t, resp.IsError)
 	require.Contains(t, resp.Content, "dispatch a new agent")
 	require.Len(t, agent.injected(), 1, "a completed dispatch must never enqueue a message")

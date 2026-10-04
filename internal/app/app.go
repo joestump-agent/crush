@@ -780,30 +780,33 @@ func (app *App) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
 }
 
 // DispatchLive returns the snapshots of every non-terminal dispatch
-// (#313) — the editor's live-agents @ completion source.
-func (app *App) DispatchLive() []dispatch.TodoSnapshot {
+// created from sessionID (#313/#399) — the editor's live-agents @
+// completion source.
+func (app *App) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	if app.AgentCoordinator == nil {
 		return nil
 	}
-	return app.AgentCoordinator.DispatchLive()
+	return app.AgentCoordinator.DispatchLive(sessionID)
 }
 
 // DispatchByHandle resolves an @handle to its dispatch snapshot (#313),
-// finished dispatches included.
-func (app *App) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+// finished dispatches included. A handle another session dispatched does
+// not resolve (#399).
+func (app *App) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
 	if app.AgentCoordinator == nil {
 		return dispatch.TodoSnapshot{}, false
 	}
-	return app.AgentCoordinator.DispatchByHandle(handle)
+	return app.AgentCoordinator.DispatchByHandle(sessionID, handle)
 }
 
 // DeliverAgentMessageByHandle routes an editor @handle message to the
-// running dispatched agent's injection queue (#312/#313).
-func (app *App) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+// running dispatched agent's injection queue (#312/#313). A handle
+// another session dispatched refuses (#399).
+func (app *App) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
 	if app.AgentCoordinator == nil {
 		return errors.New("no agent coordinator")
 	}
-	return app.AgentCoordinator.DeliverAgentMessageByHandle(ctx, handle, text)
+	return app.AgentCoordinator.DeliverAgentMessageByHandle(ctx, sessionID, handle, text)
 }
 
 // InitCoderAgentNonInteractive initializes the coder agent without
