@@ -254,6 +254,7 @@ func TestMessageAgentToolDeliversAndRefuses(t *testing.T) {
 	})
 	require.True(t, resp.IsError)
 	require.Contains(t, resp.Content, "dispatch a new agent")
+	require.Len(t, agent.injected(), 1, "a completed dispatch must never enqueue a message")
 
 	resp = runTool(t, messageTool, MessageAgentToolName, MessageAgentParams{Message: "no session"})
 	require.True(t, resp.IsError)

@@ -316,6 +316,14 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 
 	result, err := run.agent.Run(ctx, call)
 
+	// Drop the injection target as soon as the run returns, before the
+	// terminal status is published below: relying on the deferred
+	// unregister alone left a window in which a terminal entry still
+	// resolved to a live target and accepted a message into a session
+	// whose run had ended. unregisterDispatchRun is idempotent; the
+	// deferred call above stays for the early-return paths.
+	c.unregisterDispatchRun(run.sessionID)
+
 	// A nil result with a nil error means no turn ran — the session was
 	// busy or a cancel landed during dispatch (#173 review note on #64).
 	// With one ephemeral session per dispatch it should not fire, but it
