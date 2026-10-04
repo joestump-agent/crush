@@ -245,6 +245,11 @@ type sessionAgent struct {
 	// dispatchMu so two goroutines can't race to lock different mutex
 	// instances for the same session.
 	dispatchMuCreate sync.Mutex
+	// todoEnforcement carries this agent's resolved todo enforcement
+	// settings (#315): the nudge ladder and the opt-in mutating-tool
+	// gate. Nil when the ladder is off (the no-op fast path every
+	// method checks for).
+	todoEnforcement *todoEnforcement
 	// acceptedMu serializes increments/decrements of acceptedRuns and
 	// the assignment of accept sequence numbers from acceptSeqGen. It
 	// is separate from dispatchMu so AcceptedRun.Close (which may run
@@ -278,6 +283,13 @@ type SessionAgentOptions struct {
 	Tools                []fantasy.AgentTool
 	Notify               pubsub.Publisher[notify.Notification]
 	RunComplete          pubsub.Publisher[notify.RunComplete]
+
+	// TodoEnforcement carries this agent's resolved todo enforcement
+	// settings (#315): nudge injection and the opt-in mutating-tool
+	// gate. The zero value disables the ladder (Enabled and HardGate
+	// both false), which keeps direct constructors — tests and the
+	// default agents — unchanged.
+	TodoEnforcement config.TodoEnforcementSettings
 }
 
 func NewSessionAgent(
@@ -290,6 +302,7 @@ func NewSessionAgent(
 // inside the package use it so they can arm the agent's readiness latch before
 // handing the agent out; see coordinator.buildAgent.
 func newSessionAgent(opts SessionAgentOptions) *sessionAgent {
+	enforcement := newTodoEnforcement(opts.TodoEnforcement, opts.Sessions)
 	return &sessionAgent{
 		largeModel:           csync.NewValue(opts.LargeModel),
 		smallModel:           csync.NewValue(opts.SmallModel),
@@ -300,7 +313,7 @@ func newSessionAgent(opts SessionAgentOptions) *sessionAgent {
 		messages:             opts.Messages,
 		cfg:                  opts.Cfg,
 		disableAutoSummarize: opts.DisableAutoSummarize,
-		tools:                csync.NewSliceFrom(opts.Tools),
+		tools:                csync.NewSliceFrom(wrapTodoGate(opts.Tools, enforcement)),
 		isYolo:               opts.IsYolo,
 		notify:               opts.Notify,
 		runComplete:          opts.RunComplete,
@@ -309,6 +322,7 @@ func newSessionAgent(opts SessionAgentOptions) *sessionAgent {
 		dispatchMu:           csync.NewMap[string, *sync.Mutex](),
 		acceptedRuns:         csync.NewMap[string, int](),
 		cancelMark:           csync.NewMap[string, uint64](),
+		todoEnforcement:      enforcement,
 		ready:                readyNow(),
 	}
 }
@@ -751,6 +765,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		return nil, fmt.Errorf("failed to get session: %w", err)
 	}
 
+	// The todo enforcement ladder's state for this run (#315): seeded
+	// with whether the session already carries a todo list, advanced by
+	// OnToolCall, consulted by PrepareStep. Nil (ladder off) makes every
+	// method a no-op.
+	todoRun := a.todoEnforcement.newRun(len(currentSession.Todos) > 0)
+
 	msgs, err := a.getSessionMessages(ctx, currentSession)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session messages: %w", err)
@@ -894,6 +914,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 				prepared.Messages = append(prepared.Messages, userMessage.ToAIMessage()...)
 			}
 
+			// The todo enforcement nudge (#315): after the queued
+			// follow-ups, so it is the most recent thing the model
+			// reads. Persisted on the session, so the nudge is visible
+			// in the transcript and carries into later turns' history.
+			prepared.Messages = a.injectTodoNudge(callContext, call.SessionID, todoRun, prepared.Messages)
+
 			prepared.Messages = a.workaroundProviderMediaLimitations(prepared.Messages, largeModel)
 
 			lastSystemRoleInx := 0
@@ -1009,6 +1035,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			return m.Model
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
+			todoRun.recordToolCall(tc.ToolName)
 			input, wasSanitized := sanitizeToolInput(tc.ToolName, tc.ToolCallID, tc.Input)
 			if wasSanitized {
 				sanitizedToolCalls[tc.ToolCallID] = true
@@ -2202,7 +2229,7 @@ func (a *sessionAgent) SetModels(large Model, small Model) {
 }
 
 func (a *sessionAgent) SetTools(tools []fantasy.AgentTool) {
-	a.tools.SetSlice(tools)
+	a.tools.SetSlice(wrapTodoGate(tools, a.todoEnforcement))
 }
 
 func (a *sessionAgent) SetSystemPrompt(systemPrompt string) {
