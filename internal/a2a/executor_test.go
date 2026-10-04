@@ -253,22 +253,106 @@ func TestExecuteNilResultFails(t *testing.T) {
 	require.Contains(t, statusMessageText(t, evs[2]), "did not start a turn")
 }
 
-func TestExecuteCanceledRunEmitsNoTerminalStatus(t *testing.T) {
+// blockingCancelRunner blocks in Run until its kill channel fires, then
+// returns context.Canceled — a kill delivered behind the executor's back
+// unless the test calls Cancel itself.
+type blockingCancelRunner struct {
+	started chan struct{}
+	kill    chan struct{}
+}
+
+func (f *blockingCancelRunner) Run(_ context.Context, call agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	if f.started != nil {
+		close(f.started)
+	}
+	<-f.kill
+	return nil, context.Canceled
+}
+
+func (f *blockingCancelRunner) Cancel(sessionID string) {
+	close(f.kill)
+}
+
+func TestExecuteOutOfBandCancelEmitsCanceled(t *testing.T) {
 	t.Parallel()
 
-	// A canceled run is reported by Cancel's own Canceled status; Execute
-	// must not race it with a Failed status.
-	runner := &fakeRunner{err: context.Canceled}
+	// A runner killed behind the SDK's back — the wander ladder or the
+	// watchdog canceling the agent directly — returns context.Canceled
+	// on a live context with no executor Cancel in play. The executor
+	// must surface exactly one terminal Canceled carrying the kill
+	// reason, or the consumer waits forever (#342).
+	tests := []struct {
+		name   string
+		opts   []Option
+		reason string
+	}{
+		{
+			name:   "default reason",
+			reason: "canceled",
+		},
+		{
+			name:   "kill reason",
+			opts:   []Option{WithCancelReason(func() string { return "wander kill: no todo progress" })},
+			reason: "wander kill: no todo progress",
+		},
+		{
+			name:   "empty reason falls back",
+			opts:   []Option{WithCancelReason(func() string { return "" })},
+			reason: "canceled",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			runner := &fakeRunner{err: context.Canceled}
+			exec := NewExecutor(runner, "sess-1", tt.opts...)
+
+			msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+			evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+
+			want := []a2aspec.TaskState{
+				a2aspec.TaskStateSubmitted,
+				a2aspec.TaskStateWorking,
+				a2aspec.TaskStateCanceled,
+			}
+			require.Equal(t, want, states(t, evs), "an out-of-band cancel must end the task canceled")
+			require.Equal(t, tt.reason, statusMessageText(t, evs[2]))
+		})
+	}
+}
+
+func TestExecuteOwnCancelEmitsOneTerminal(t *testing.T) {
+	t.Parallel()
+
+	// The executor's own Cancel emits the terminal Canceled status; the
+	// run ending on that same cancel must not emit a second one.
+	runner := &blockingCancelRunner{started: make(chan struct{}), kill: make(chan struct{})}
 	exec := NewExecutor(runner, "sess-1")
 
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
-	evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+	evsCh := make(chan []a2aspec.Event, 1)
+	go func() {
+		evsCh <- collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+	}()
 
-	want := []a2aspec.TaskState{
-		a2aspec.TaskStateSubmitted,
-		a2aspec.TaskStateWorking,
+	<-runner.started
+	cancelEvs := collect(t, exec.Cancel(context.Background(), newExecCtx(nil)))
+
+	var executeEvs []a2aspec.Event
+	select {
+	case executeEvs = <-evsCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the canceled run to end")
 	}
-	require.Equal(t, want, states(t, evs), "no terminal status for a canceled run")
+
+	canceled := 0
+	for _, st := range append(states(t, cancelEvs), states(t, executeEvs)...) {
+		if st == a2aspec.TaskStateCanceled {
+			canceled++
+		}
+	}
+	require.Equal(t, 1, canceled, "exactly one Canceled across the Execute and Cancel sequences")
 }
 
 func TestExecuteEmptyPromptRejects(t *testing.T) {

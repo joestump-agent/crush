@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/stretchr/testify/require"
@@ -83,6 +84,41 @@ func TestStreamDispatchFailedRun(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusFailed, outcome.Status)
 	require.Contains(t, outcome.Text, "provider exploded")
+}
+
+// An out-of-band kill — the ladder or watchdog canceling the agent
+// directly, no A2A CancelTask, live server context — must end the SSE
+// stream quickly with the canceled outcome and the kill reason, never at
+// the caller's deadline (#342).
+func TestStreamDispatchOutOfBandCancelEnds(t *testing.T) {
+	runner := &blockingCancelRunner{started: make(chan struct{}), kill: make(chan struct{})}
+	server, err := StartServer(t.Context(), ServerParams{
+		Runner:    runner,
+		SessionID: "dispatch-session",
+		CancelReason: func() string {
+			return "wander kill: hard timeout"
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+
+	go func() {
+		<-runner.started
+		close(runner.kill)
+	}()
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	outcome, err := NewServerFactory().StreamDispatch(ctx, agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "fix the bug",
+	})
+	require.NoError(t, err)
+	require.Less(t, time.Since(start), 5*time.Second, "the stream must end well before the caller's deadline")
+	require.Equal(t, DispatchStatusCanceled, outcome.Status)
+	require.Equal(t, "wander kill: hard timeout", outcome.Text)
 }
 
 // An unreachable or bogus endpoint is a transport error before any

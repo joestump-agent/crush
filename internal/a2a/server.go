@@ -62,6 +62,11 @@ type ServerParams struct {
 	// when set, the SDK's own inactivity guard also runs, one minute
 	// later, as an outer net for a wedged executor.
 	InactivityTimeout time.Duration
+	// CancelReason reports why the dispatched run was killed (#316), for
+	// the Canceled status an out-of-band cancel emits (#342). Optional;
+	// the production value is the dispatch run's kill reason. A nil func
+	// or an empty string falls back to "canceled".
+	CancelReason func() string
 }
 
 // Server is one dispatched agent's in-process A2A server (#70): JSON-RPC
@@ -129,6 +134,9 @@ func StartServer(ctx context.Context, p ServerParams) (*Server, error) {
 	}
 	if p.InactivityTimeout > 0 {
 		opts = append(opts, WithInactivityTimeout(p.InactivityTimeout))
+	}
+	if p.CancelReason != nil {
+		opts = append(opts, WithCancelReason(p.CancelReason))
 	}
 	opts = append(opts, WithCallTemplate(p.Call))
 	executor := NewExecutor(p.Runner, p.SessionID, opts...)
@@ -202,6 +210,7 @@ func (f *ServerFactory) StartDispatchServer(ctx context.Context, p agent.Dispatc
 		Version:           version.Version,
 		Call:              p.Call,
 		InactivityTimeout: p.InactivityTimeout,
+		CancelReason:      p.CancelReason,
 	})
 	if err != nil {
 		return "", nil, nil, err
