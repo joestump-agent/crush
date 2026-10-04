@@ -797,21 +797,21 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// The todo enforcement ladder's state for this run (#315): seeded
 	// with whether the session already carries a todo list, advanced by
 	// OnToolCall, consulted by PrepareStep. Nil (ladder off) makes every
-	// method a no-op. When the ladder tops out on a dispatched agent
-	// (#316), the hook records the reason with the coordinator and the
-	// run cancels itself; the cancel is intrinsic so the escalation can
-	// never be dropped by a missing observer.
-	var todoKillFn func(sessionID, reason string)
+	// method a no-op. The kill rung (#316) is wired only for dispatched
+	// agents, the only ones built with a todoKill observer, because only
+	// a dispatched run has a parent that can re-dispatch it. Every other
+	// agent (the main coder, plan mode, agent-tool sub-agents, crush run)
+	// gets a nil hook and tops out at the escalating nudge (#393).
+	var onKill func(reason string)
 	if a.todoKill != nil {
-		todoKillFn = a.todoKill
-	}
-	todoRun := a.todoEnforcement.newRun(len(currentSession.Todos) > 0, func(reason string) {
-		if todoKillFn != nil {
+		todoKillFn := a.todoKill
+		onKill = func(reason string) {
 			todoKillFn(call.SessionID, reason)
+			slog.Warn("Todo enforcement killed the run", "session_id", call.SessionID, "reason", reason)
+			a.Cancel(call.SessionID)
 		}
-		slog.Warn("Todo enforcement killed the run", "session_id", call.SessionID, "reason", reason)
-		a.Cancel(call.SessionID)
-	})
+	}
+	todoRun := a.todoEnforcement.newRun(len(currentSession.Todos) > 0, onKill)
 
 	msgs, err := a.getSessionMessages(ctx, currentSession)
 	if err != nil {

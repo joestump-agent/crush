@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -129,31 +130,53 @@ func TestTodoKill_DisabledWhenZero(t *testing.T) {
 	require.Zero(t, calls, "kill_after_nudges=0 must disable the kill")
 }
 
-// TestTodoKill_RunCancelsItself pins the intrinsic half of the kill: the
-// run's own hook cancels the session, so the run returns canceled even
-// with no observer wired.
-func TestTodoKill_RunCancelsItself(t *testing.T) {
+// TestTodoKill_NonDispatchedAgentNeverCanceled pins the kill's scope
+// (#393): an agent built without a TodoKill observer (the main coder,
+// plan mode, agent-tool sub-agents, crush run) tops out at the escalating
+// nudge under the production defaults, however many tool calls it makes,
+// and its run finishes normally. Inputs vary so loop detection stays out
+// of the way.
+func TestTodoKill_NonDispatchedAgentNeverCanceled(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	var steps []scriptedStep
+	for i := range 14 {
+		steps = append(steps, scriptedStep{toolCalls: []scriptedToolCall{{
+			name:  "probe",
+			input: fmt.Sprintf(`{"n":%d}`, i),
+		}}})
+	}
+	steps = append(steps, scriptedStep{text: "done"})
+	model := &scriptedModel{steps: steps}
+	sa := newTodoTestAgent(t, env, model, config.ResolveTodoEnforcement(nil, nil), probeTool())
+
+	sess := runWithScript(t, env, sa, model)
+
+	require.Len(t, nudgeMessages(t, env, model, sess.ID, todoNudgeMessage), 1,
+		"the first nudge must still be injected")
+	require.Len(t, nudgeMessages(t, env, model, sess.ID, todoEscalatingNudgeMessage), 1,
+		"the escalating nudge must still be injected, and nothing past it")
+}
+
+// TestTodoKill_NonDispatchedMutatingNeverCanceled is the mutating-tool
+// variant: bash trips the ladder on every window, so with the default
+// kill-after-two a dispatched agent would be killed on the third call.
+// Without an observer the run must still finish.
+func TestTodoKill_NonDispatchedMutatingNeverCanceled(t *testing.T) {
 	t.Parallel()
 	env := testEnv(t)
 	model := &scriptedModel{steps: []scriptedStep{
-		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
-		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
-		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "bash", input: `{"n":1}`}}},
+		{toolCalls: []scriptedToolCall{{name: "bash", input: `{"n":2}`}}},
+		{toolCalls: []scriptedToolCall{{name: "bash", input: `{"n":3}`}}},
 		{text: "done"},
 	}}
-	sa := newTodoTestAgent(t, env, model, config.TodoEnforcementSettings{
-		Enabled:         true,
-		NudgeThreshold:  1,
-		KillAfterNudges: 1,
-	}, probeTool())
+	sa := newTodoTestAgent(t, env, model, config.ResolveTodoEnforcement(nil, nil), mutatingTool("bash"))
 
-	sess, err := env.sessions.Create(t.Context(), "session")
-	require.NoError(t, err)
-	_, err = sa.Run(t.Context(), SessionAgentCall{
-		SessionID: sess.ID,
-		Prompt:    "do the work",
-	})
-	require.ErrorIs(t, err, context.Canceled, "the killed run must end canceled")
+	sess := runWithScript(t, env, sa, model)
+
+	require.Len(t, nudgeMessages(t, env, model, sess.ID, todoEscalatingNudgeMessage), 1,
+		"the ladder must still escalate before topping out")
 }
 
 // blockingScriptedModel holds every Stream call until released (or the
