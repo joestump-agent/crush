@@ -105,15 +105,32 @@ names: `permissions deny` writes `options.disabled_tools`, and several
 
 The top-level `options` object also carries a few keys with no `crushrc`
 builtin yet: `allowed_commands`, `allow_all_commands` (see
-[Permissions](/configuration/permissions#blocked-commands)) and `disable_a2ui`
-(see [A2UI](/features/a2ui)). Top-level `tools` tunes the `glob`, `grep`, and
-`ls` tool limits.
+[Permissions](/configuration/permissions#blocked-commands)), `disable_a2ui`
+(see [A2UI](/features/a2ui)), and `todo_enforcement` (see
+[Todo enforcement](/agents/todo-enforcement)). Top-level `tools` tunes the
+`glob`, `grep`, and `ls` tool limits.
+
+For `todo_enforcement` that makes `crush.json` the only place to set it — the
+`option` builtin rejects it as an unknown key. Both formats merge, so a small
+`crush.json` beside your `crushrc` works:
+
+```json
+{
+  "$schema": "https://charm.land/crush.json",
+  "options": {
+    "todo_enforcement": { "nudge_threshold": 8, "kill_after_nudges": 0 }
+  }
+}
+```
+
+Tracked as [#403](https://github.com/joestump-agent/crush/issues/403).
 
 :::info[Fork feature]
 These `crush.json` keys do not exist upstream: `options.allowed_commands`,
-`options.allow_all_commands`, `options.disable_a2ui`, the top-level
-`embeddings` block ([semantic search](/features/semantic-search)), and the
-per-server `channel_enabled` ([channels](/features/channels)). See
+`options.allow_all_commands`, `options.disable_a2ui`,
+`options.todo_enforcement` ([multi-agent](/agents/todo-enforcement)), the
+top-level `embeddings` block ([semantic search](/features/semantic-search)),
+and the per-server `channel_enabled` ([channels](/features/channels)). See
 [What this fork adds](/fork#configuration).
 :::
 
