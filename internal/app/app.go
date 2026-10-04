@@ -17,6 +17,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
+	"github.com/charmbracelet/crush/internal/a2a"
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/notify"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
@@ -778,6 +779,33 @@ func (app *App) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
 	return app.AgentCoordinator.DispatchStatus(sessionID)
 }
 
+// DispatchLive returns the snapshots of every non-terminal dispatch
+// (#313) — the editor's live-agents @ completion source.
+func (app *App) DispatchLive() []dispatch.TodoSnapshot {
+	if app.AgentCoordinator == nil {
+		return nil
+	}
+	return app.AgentCoordinator.DispatchLive()
+}
+
+// DispatchByHandle resolves an @handle to its dispatch snapshot (#313),
+// finished dispatches included.
+func (app *App) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+	if app.AgentCoordinator == nil {
+		return dispatch.TodoSnapshot{}, false
+	}
+	return app.AgentCoordinator.DispatchByHandle(handle)
+}
+
+// DeliverAgentMessageByHandle routes an editor @handle message to the
+// running dispatched agent's injection queue (#312/#313).
+func (app *App) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+	if app.AgentCoordinator == nil {
+		return errors.New("no agent coordinator")
+	}
+	return app.AgentCoordinator.DeliverAgentMessageByHandle(ctx, handle, text)
+}
+
 // InitCoderAgentNonInteractive initializes the coder agent without
 // interactive-only tools (e.g. question).
 func (app *App) InitCoderAgentNonInteractive(ctx context.Context) error {
@@ -807,6 +835,9 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		// snapshots to the TUI. #174's A2A TaskStatusUpdateEvent bridge
 		// attaches as a second sink over the same reduction.
 		DispatchSinks: []dispatch.TodoSink{app},
+		// #70: every dispatch gets an in-process A2A server on loopback,
+		// registered on the dispatch registry for in-memory discovery.
+		DispatchServer: a2a.NewServerFactory(),
 	}
 
 	// Semantic search is opt-in: only wire the store and client when an

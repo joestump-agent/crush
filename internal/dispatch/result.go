@@ -41,6 +41,10 @@ type DispatchResult struct {
 	// DispatchID is the dispatch identifier — the registry key and the
 	// suffix of the branch and directory names.
 	DispatchID string `json:"dispatch_id"`
+	// Handle is the dispatch's @handle (#313): the address the human
+	// uses in the editor and the model uses with the message tool.
+	// Empty for results from before handles existed.
+	Handle string `json:"handle,omitempty"`
 	// Branch is the workspace branch, crush-dispatch-{id}.
 	Branch string `json:"branch"`
 	// WorkspacePath is the absolute workspace directory the dispatched

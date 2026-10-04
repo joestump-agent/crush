@@ -25,6 +25,11 @@ const (
 	// AttachmentKindMCPPrompt is a resolved MCP prompt, attached by the
 	// inline "/server:prompt" completion.
 	AttachmentKindMCPPrompt AttachmentKind = "mcp_prompt"
+	// AttachmentKindAgentCard is a dispatched-agent card attached by a
+	// mid-sentence @handle mention (#313): the agent's status, current
+	// todo, and session pointer — or, for a finished agent, its read-only
+	// transcript record. A mention informs the turn; it never routes.
+	AttachmentKindAgentCard AttachmentKind = "agent_card"
 )
 
 type Attachment struct {
