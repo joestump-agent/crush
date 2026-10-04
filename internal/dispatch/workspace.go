@@ -654,13 +654,13 @@ func (w *Workspace) Sweep(ctx context.Context) error {
 }
 
 // removeEntry tears down one workspace on disk: the worktree (forced if
-// it is dirty), the branch, the ownership artifacts, and the admin
-// entry. Missing artifacts are not errors. When lease is not nil the
-// lock file is unlinked while the lease is still held — dispatch IDs
-// are never reused, so no other holder can appear in between — and the
-// lease is released last. Windows cannot unlink a file its own process
-// holds open, so there the lease is dropped first and the unlink
-// retried.
+// it is dirty), the branch, and the admin entry. Missing artifacts are
+// not errors. The lock file is never unlinked: flock is keyed by inode,
+// so removing it can let two processes lock different inodes at the
+// same path and both believe they own the workspace. When lease is not
+// nil the owner marker is removed — only a lease holder may touch
+// ownership artifacts — and the lease is released last, after
+// everything else is gone.
 func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) error {
 	if entry.Path != "" {
 		if err := runGit(ctx, w.repoRoot, nil, "worktree", "remove", entry.Path); err != nil {
@@ -683,15 +683,8 @@ func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) 
 			}
 		}
 	}
-	if entry.Branch != "" {
+	if entry.Branch != "" && lease != nil {
 		os.Remove(w.ownerPath(entry.Branch))
-	}
-	if lease != nil {
-		if os.Remove(w.leasePath(entry.Branch)) != nil {
-			lease()
-			os.Remove(w.leasePath(entry.Branch))
-			return nil
-		}
 		lease()
 	}
 	return nil

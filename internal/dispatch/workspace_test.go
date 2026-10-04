@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -146,9 +147,13 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	require.False(t, ok)
 	require.NoError(t, ws.Remove(ctx, entry.ID))
 
-	// Remove takes the ownership artifacts with the workspace.
-	require.NoFileExists(t, ws.leasePath(entry.Branch))
+	// The owner marker goes with the workspace. The lock file stays on
+	// disk — flock is keyed by inode, so it is never unlinked — but
+	// nobody holds it.
 	require.NoFileExists(t, ws.ownerPath(entry.Branch))
+	rel, err := lock.TryFile(ws.leasePath(entry.Branch))
+	require.NoError(t, err)
+	rel()
 }
 
 // Sweep is the session-end backstop: it removes every tracked
@@ -225,6 +230,7 @@ func TestSweepLeavesOtherInstancesLiveWorkspaces(t *testing.T) {
 	require.NoError(t, err)
 	b, err := NewWorkspace(repo)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Sweep(context.Background()) })
 
 	entry, err := b.Provision(ctx, ProvisionOptions{})
 	require.NoError(t, err)
@@ -273,7 +279,10 @@ func TestSweepReclaimsDeadOwnersWorkspace(t *testing.T) {
 	_, err = os.Stat(entry.Path)
 	require.True(t, os.IsNotExist(err), "sweep left a dead owner's workspace behind")
 	require.False(t, branchExists(t, repo, entry.Branch))
-	require.NoFileExists(t, b.leasePath(entry.Branch))
+	require.FileExists(t, b.leasePath(entry.Branch))
+	rel, err := lock.TryFile(b.leasePath(entry.Branch))
+	require.NoError(t, err)
+	rel()
 	require.NoFileExists(t, b.ownerPath(entry.Branch))
 }
 
@@ -380,6 +389,7 @@ func TestAssignHandle(t *testing.T) {
 	repo := newTestRepo(t)
 	ws, err := NewWorkspace(repo)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 	ctx := t.Context()
 
 	a, err := ws.Provision(ctx, ProvisionOptions{})
