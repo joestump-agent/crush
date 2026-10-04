@@ -70,6 +70,13 @@ type dispatchAgentOptions struct {
 	// the coordinator can record the reason against this dispatch. The
 	// run's cancellation is intrinsic; this only observes.
 	TodoKill func(sessionID string, reason string)
+	// LoopStop observes the loop-detection stop (#343): invoked when the
+	// dispatched run's step loop ends on the loop-detection stop
+	// condition, so the coordinator can record the tool-loop kill reason
+	// against this dispatch. The run's own end is intrinsic; this only
+	// observes — over the served transport path it is the only signal a
+	// loop stop ever happened.
+	LoopStop func(sessionID string)
 }
 
 // dispatchKill records the deterministic-kill outcome of one dispatched
@@ -243,6 +250,9 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				TodoKill: func(sessionID string, reason string) {
 					kill.kill(reason)
 				},
+				LoopStop: func(sessionID string) {
+					kill.kill(dispatch.ReasonToolLoop)
+				},
 			})
 			if err != nil {
 				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
@@ -372,9 +382,11 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 		RunComplete:          c.runComplete,
 		TodoEnforcement:      config.ResolveTodoEnforcement(c.cfg.Config().Options.TodoEnforcement, nil),
 		// The dispatched agent is the one agent whose run may be killed
-		// (#316): the observer hands the reason to the coordinator's kill
-		// state so the terminal result carries it.
+		// (#316): the observers hand the reasons to the coordinator's kill
+		// state so the terminal result carries them — the ladder's
+		// escalation and the loop-detection stop alike (#343).
 		TodoKill: opts.TodoKill,
+		LoopStop: opts.LoopStop,
 	})
 
 	return &dispatchedAgent{agent: agent, model: model, providerCfg: providerCfg}, nil
@@ -441,7 +453,15 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 			slog.Error("Dispatched agent ran no turn", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
 		}
 
-		terminal = c.assembleTerminalDispatchResult(ctx, run, result, err)
+		terminal = c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcome{
+			completed:     err == nil && result != nil,
+			findings:      subAgentOutput(result),
+			runErr:        err,
+			stoppedInLoop: dispatchRunStoppedInLoop(result),
+			diff: func(ctx context.Context) (string, error) {
+				return run.workspace.Diff(ctx, run.entry.ID)
+			},
+		})
 	}
 	// The kill watch ends with the run on both paths, before terminal
 	// assembly fires the escalation hook against a finished dispatch.
@@ -474,26 +494,57 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	c.deliverDispatchResult(ctx, run.parentSessionID, terminal)
 }
 
+// dispatchNaturalOutcome is the path-neutral natural outcome of one
+// dispatched run (#343): what the run did, before the kill and loop
+// rules are applied. The direct path fills it from Run's (result, err);
+// the transport path fills it from the DispatchTransportOutcome — so
+// both paths assemble through one set of rules and read the same.
+type dispatchNaturalOutcome struct {
+	// completed reports whether the run finished its turn naturally —
+	// false for failed, canceled, and runs that never started a turn.
+	completed bool
+	// findings is the run's final assistant text.
+	findings string
+	// runErr is the run's error; nil when the turn ran to a natural end
+	// or was stopped by the loop-detection stop condition.
+	runErr error
+	// stoppedInLoop reports that the run ended on the loop-detection
+	// stop condition, detected from the result's steps. The transport
+	// path carries no steps: there a loop stop arrives as the kill
+	// state's tool-loop reason instead, recorded in-process by the
+	// served agent's observer.
+	stoppedInLoop bool
+	// diff resolves the run's diff-vs-base on demand. The direct path
+	// captures in-process after the run; the transport path prefers the
+	// diff that arrived on the wire and falls back to an in-process
+	// capture when none did, so a capture error surfaces as "(diff
+	// unavailable: ...)" instead of "(no changes)" (#361 puts the error
+	// on the wire and deletes this).
+	diff func(ctx context.Context) (string, error)
+}
+
 // assembleTerminalDispatchResult maps a finished dispatched run onto its
 // terminal DispatchResult, preferring the kill outcome (#316) over the
-// natural one: a run the ladder or watchdog killed is killed, a run that
-// stopped on loop detection is killed as a tool loop, and everything
-// else falls through to the completed/failed mapping.
-func (c *coordinator) assembleTerminalDispatchResult(ctx context.Context, run dispatchRun, result *fantasy.AgentResult, runErr error) dispatch.DispatchResult {
+// natural one: a run the ladder or watchdog killed — or one the
+// loop-detection stop ended — is killed, and everything else falls
+// through to the completed/failed mapping. A run that completed
+// naturally before the kill's cancel took effect delivers its natural
+// completion (the late kill is discarded).
+func (c *coordinator) assembleTerminalDispatchResult(ctx context.Context, run dispatchRun, natural dispatchNaturalOutcome) dispatch.DispatchResult {
 	if reason := run.kill.current(); reason != "" {
 		// The kill's cancel either ended the run (error) or stopped it on
-		// loop detection; a run that completed naturally before the
-		// kill's cancel took effect delivers its natural completion (the
-		// late kill is discarded).
-		if runErr != nil || dispatchRunStoppedInLoop(result) {
+		// loop detection — recorded as the tool-loop kill reason by the
+		// served agent's observer, or visible in the direct path's
+		// result steps.
+		if natural.runErr != nil || reason == dispatch.ReasonToolLoop || natural.stoppedInLoop {
 			return c.assembleKilledDispatchResult(ctx, run, reason)
 		}
-	} else if dispatchRunStoppedInLoop(result) {
-		// Loop detection's StopWhen ended the run in-process; the
-		// block records it as the tool-loop kill reason.
+	} else if natural.stoppedInLoop {
+		// Loop detection's StopWhen ended the run in-process with no kill
+		// recorded; the block records it as the tool-loop kill reason.
 		return c.assembleKilledDispatchResult(ctx, run, dispatch.ReasonToolLoop)
 	}
-	return c.assembleDispatchResult(ctx, run, result, runErr)
+	return c.assembleDispatchResult(ctx, run, natural)
 }
 
 // dispatchRunStoppedInLoop reports whether a finished run ended on the
@@ -628,6 +679,12 @@ func (c *coordinator) assembleKilledDispatchResult(ctx context.Context, run disp
 		KilledReason:  reason,
 		KeyFindings:   c.dispatchLastAssistantText(ctx, run.sessionID),
 	}
+	// The handle was assigned after the dispatchRun's entry snapshot was
+	// taken, so read it back from the registry like the natural result:
+	// the killed payload is what the parent re-dispatches against.
+	if entry, ok := run.workspace.Get(run.entry.ID); ok {
+		terminal.Handle = entry.Handle
+	}
 	diff, diffErr := run.workspace.Diff(ctx, run.entry.ID)
 	switch {
 	case diffErr != nil:
@@ -661,12 +718,12 @@ func (c *coordinator) dispatchLastAssistantText(ctx context.Context, sessionID s
 }
 
 // assembleDispatchResult builds the terminal DispatchResult (#66) from a
-// finished dispatched run: the run outcome maps to the status, the
-// agent's final text to the key findings, and Workspace.Diff's output —
+// dispatched run's natural outcome: the outcome maps to the status, the
+// agent's final text to the key findings, and the diff-vs-base —
 // condensed — to the diff summary. A completed run stays completed even
 // when diff capture fails; the failure is recorded in the summary so the
 // main agent knows why it is missing.
-func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRun, result *fantasy.AgentResult, runErr error) dispatch.DispatchResult {
+func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRun, natural dispatchNaturalOutcome) dispatch.DispatchResult {
 	terminal := dispatch.DispatchResult{
 		DispatchID:    run.entry.ID,
 		Branch:        run.entry.Branch,
@@ -680,16 +737,16 @@ func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRu
 		terminal.Handle = entry.Handle
 	}
 	switch {
-	case runErr != nil:
+	case natural.runErr != nil:
 		terminal.Status = dispatch.StatusFailed
-		terminal.Error = runErr.Error()
-	case result == nil:
+		terminal.Error = natural.runErr.Error()
+	case !natural.completed:
 		terminal.Status = dispatch.StatusFailed
 		terminal.Error = "agent session did not start a turn (busy or canceled)"
 	default:
 		terminal.Status = dispatch.StatusCompleted
-		terminal.KeyFindings = subAgentOutput(result)
-		diff, diffErr := run.workspace.Diff(ctx, run.entry.ID)
+		terminal.KeyFindings = natural.findings
+		diff, diffErr := natural.diff(ctx)
 		switch {
 		case diffErr != nil:
 			terminal.DiffSummary = fmt.Sprintf("(diff unavailable: %s)", diffErr)
