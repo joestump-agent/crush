@@ -99,6 +99,32 @@ type dispatchRun struct {
 	stopServer func()
 }
 
+// call builds the full SessionAgentCall a dispatch's turns run with:
+// the chosen model's shaping, the parent turn's content width, and the
+// non-interactive flag. Built per consumer — the server stamps its
+// executor's template with it at start (#71), and the direct run and the
+// injection queue clone it at run time.
+func (r dispatchRun) call(c *coordinator) SessionAgentCall {
+	maxTokens := r.model.CatwalkCfg.DefaultMaxTokens
+	if r.model.ModelCfg.MaxTokens != 0 {
+		maxTokens = r.model.ModelCfg.MaxTokens
+	}
+	return SessionAgentCall{
+		SessionID:        r.sessionID,
+		ContentWidth:     r.contentWidth,
+		Prompt:           r.prompt,
+		MaxOutputTokens:  maxTokens,
+		ProviderOptions:  getProviderOptions(r.model, r.providerCfg),
+		Temperature:      r.model.ModelCfg.Temperature,
+		TopP:             r.model.ModelCfg.TopP,
+		TopK:             callTopK(r.providerCfg, r.model.ModelCfg.TopK),
+		FrequencyPenalty: r.model.ModelCfg.FrequencyPenalty,
+		PresencePenalty:  r.model.ModelCfg.PresencePenalty,
+		NonInteractive:   true,
+		OnAuthRefresh:    c.makeAuthRefreshCallback(r.providerCfg),
+	}
+}
+
 // dispatchTool builds the DispatchAgent tool (#64): provision a clean
 // workspace (#63), bootstrap the dispatched agent's toolchain rooted at
 // it (#62), run a backgrounded SessionAgent on an ephemeral session
@@ -190,16 +216,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse("assign dispatch handle: registry entry vanished"), nil
 			}
 
-			// Stand up the dispatch's in-process A2A server (#70) and stamp
-			// its endpoint and card on the registry entry — the in-memory
-			// discovery surface. The server dies with the run; runDispatch
-			// owns the stop.
-			stopServer := c.startDispatchServer(ctx, workspace, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills))
-
-			// The dispatch must outlive the parent turn that started it:
-			// the main agent keeps working, and its tool-call context is
-			// canceled as soon as the turn ends.
-			go c.runDispatch(context.WithoutCancel(ctx), dispatchRun{
+			run := dispatchRun{
 				workspace:       workspace,
 				entry:           entry,
 				toolchain:       toolchain,
@@ -210,8 +227,19 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				sessionID:       taskSession.ID,
 				parentSessionID: sessionID,
 				contentWidth:    tools.GetContentWidthFromContext(ctx),
-				stopServer:      stopServer,
-			})
+			}
+
+			// Stand up the dispatch's in-process A2A server (#70) and stamp
+			// its endpoint and card on the registry entry — the in-memory
+			// discovery surface. The executor's served turns run with the
+			// dispatch's own call shaping (#71); the server dies with the
+			// run, and runDispatch owns the stop.
+			run.stopServer = c.startDispatchServer(ctx, workspace, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c))
+
+			// The dispatch must outlive the parent turn that started it:
+			// the main agent keeps working, and its tool-call context is
+			// canceled as soon as the turn ends.
+			go c.runDispatch(context.WithoutCancel(ctx), run)
 
 			handle := dispatch.DispatchResult{
 				DispatchID:    entry.ID,
@@ -303,25 +331,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		run.toolchain.Close(ctx)
 	}()
 
-	maxTokens := run.model.CatwalkCfg.DefaultMaxTokens
-	if run.model.ModelCfg.MaxTokens != 0 {
-		maxTokens = run.model.ModelCfg.MaxTokens
-	}
-
-	call := SessionAgentCall{
-		SessionID:        run.sessionID,
-		ContentWidth:     run.contentWidth,
-		Prompt:           run.prompt,
-		MaxOutputTokens:  maxTokens,
-		ProviderOptions:  getProviderOptions(run.model, run.providerCfg),
-		Temperature:      run.model.ModelCfg.Temperature,
-		TopP:             run.model.ModelCfg.TopP,
-		TopK:             callTopK(run.providerCfg, run.model.ModelCfg.TopK),
-		FrequencyPenalty: run.model.ModelCfg.FrequencyPenalty,
-		PresencePenalty:  run.model.ModelCfg.PresencePenalty,
-		NonInteractive:   true,
-		OnAuthRefresh:    c.makeAuthRefreshCallback(run.providerCfg),
-	}
+	call := run.call(c)
 
 	// Make the running agent addressable for mid-run injection (#312)
 	// for exactly the run's lifetime: injected messages clone this call's
@@ -332,29 +342,43 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		defer c.unregisterDispatchRun(run.sessionID)
 	}
 
-	result, err := run.agent.Run(ctx, call)
+	// The transport swap (#71): a served dispatch — an endpoint and card
+	// stamped on its registry entry, and a transport wired with the
+	// server factory — runs over the A2A client, its SSE stream consumed
+	// to the terminal state. Everything else (an unserved dispatch, no
+	// factory wired) keeps the direct in-process run. Either way the
+	// injection target above is the same: the agent behind the session
+	// is one and the same object on both paths.
+	var terminal dispatch.DispatchResult
+	if transported, ok := c.runDispatchOverTransport(ctx, run); ok {
+		terminal = transported
+	} else {
+		result, err := run.agent.Run(ctx, call)
+
+		// A nil result with a nil error means no turn ran — the session was
+		// busy or a cancel landed during dispatch (#173 review note on #64).
+		// With one ephemeral session per dispatch it should not fire, but it
+		// is a failure, never a success. One dispatch = one turn, so the
+		// queued-behind-a-busy-session path cannot produce a late result
+		// either.
+		if err != nil {
+			slog.Error("Dispatched agent run failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)
+		} else if result == nil {
+			slog.Error("Dispatched agent ran no turn", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
+		}
+
+		terminal = c.assembleDispatchResult(ctx, run, result, err)
+	}
 
 	// Drop the injection target as soon as the run returns, before the
 	// terminal status is published below: relying on the deferred
 	// unregister alone left a window in which a terminal entry still
 	// resolved to a live target and accepted a message into a session
 	// whose run had ended. unregisterDispatchRun is idempotent; the
-	// deferred call above stays for the early-return paths.
+	// deferred call above stays for the early-return paths. The
+	// transported path returns only once the served turn reached its
+	// terminal state, so the run has ended here on both paths.
 	c.unregisterDispatchRun(run.sessionID)
-
-	// A nil result with a nil error means no turn ran — the session was
-	// busy or a cancel landed during dispatch (#173 review note on #64).
-	// With one ephemeral session per dispatch it should not fire, but it
-	// is a failure, never a success. One dispatch = one turn, so the
-	// queued-behind-a-busy-session path cannot produce a late result
-	// either.
-	if err != nil {
-		slog.Error("Dispatched agent run failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)
-	} else if result == nil {
-		slog.Error("Dispatched agent ran no turn", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
-	}
-
-	terminal := c.assembleDispatchResult(ctx, run, result, err)
 	// Record the terminal payload before the terminal status so the
 	// terminal entry event carries it: the completed agent block (#65)
 	// renders its durable record from the registry.
