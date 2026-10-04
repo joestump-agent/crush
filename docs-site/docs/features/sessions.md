@@ -21,6 +21,45 @@ started in.
 Sessions are titled automatically by the **small** model as soon as there is
 enough to title.
 
+## Sub-agent sessions
+
+:::info[Fork feature]
+The sub-agent tree in the session picker is an addition in the
+`joestump-agent/crush` fork, part of
+[multi-agent dispatch](/agents/overview).
+:::
+
+Every sub-agent run — `agent`, `agentic_fetch`, and
+[dispatched agents](/agents/overview) — records its work in a **task
+session**, a child of the session that started it. The picker lists only
+top-level sessions; one that started sub-agents shows a `▸N` count before its
+timestamp.
+
+| Keys (in the picker) | Does |
+| --- | --- |
+| <kbd>enter</kbd> | Open the selected session itself |
+| <kbd>ctrl+]</kbd> | Open its sub-agent list |
+| <kbd>esc</kbd> | Back from the sub-agent list to the full list |
+
+Rename and delete are off inside the sub-agent list.
+
+Picking a sub-agent opens it read-only in
+[inspect mode](/agents/handles-and-inspect): its transcript fills the chat, but
+its parent stays the active session — Crush loads the parent first if it is
+not already on screen — so anything you type goes to the parent.
+<kbd>ctrl+[</kbd> returns to the parent's chat.
+
+Task sessions are never continuable. To follow up on a finished dispatched
+agent, dispatch a new one.
+
+:::warning[Known issue]
+- `crush run --continue` can resume a task session, because "most recent"
+  includes sub-agents, and `crush --session` accepts a task-session ID and
+  makes it the active session. Tracked as [#413](https://github.com/joestump-agent/crush/issues/413).
+- Deleting a parent leaves its task sessions behind, with nothing left that
+  lists them. Tracked as [#418](https://github.com/joestump-agent/crush/issues/418).
+:::
+
 ## Resuming from the CLI
 
 ```bash

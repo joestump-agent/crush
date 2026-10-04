@@ -66,6 +66,27 @@ A non-zero `AttachedClients` — often together with `IsBusy` — is the cue tha
 session is in progress on another client, and that joining it will mirror that
 view live.
 
+### Sub-agent sessions
+
+:::info[Fork feature]
+The sub-agent tree and the `children` endpoint are additions in the
+`joestump-agent/crush` fork.
+:::
+
+Every sub-agent run — `agent`, `agentic_fetch`, and
+[dispatched agents](/agents/overview) — gets a task session that is a child of
+the session that started it. The picker nests them under their parent (see
+[Sessions](/features/sessions#sub-agent-sessions)), and a client lists them
+with:
+
+```text
+GET /v1/workspaces/{id}/sessions/{sid}/children
+```
+
+It returns the child sessions of `{sid}`, oldest update first. The server
+describes the rest of its HTTP API at `/v1/docs/`, with the OpenAPI spec at
+`/v1/docs/openapi.json`.
+
 ## First-wins flags
 
 The first client to create a workspace fixes its process-wide flags. In
@@ -104,3 +125,35 @@ when none exists.
 That holds even with no clients connected, so a headless server still processes
 channel pushes. Attached clients see the injected turn arrive through the normal
 event stream.
+
+## Dispatched agents against a server
+
+:::info[Fork feature]
+[Multi-agent dispatch](/agents/overview) is an addition in the
+`joestump-agent/crush` fork.
+:::
+
+Dispatch is built for the in-process TUI. A client talking to a server —
+`crush --host …`, or `CRUSH_CLIENT_SERVER=1` — reads none of the live dispatch
+state, so:
+
+- an agent block shows the state its tool call recorded at dispatch and never
+  updates live — no status changes, todo line, or elapsed time;
+- the `@` completions list no agents;
+- a prompt that starts with `@handle` is **not** routed to the agent — it goes
+  to the main agent as an ordinary prompt;
+- a mid-sentence `@handle` attaches no agent card.
+
+Transcripts still come from the session store, so the
+[sub-agent session tree](#sub-agent-sessions) and inspect mode can open a
+sub-agent's transcript. Making the TUI a real A2A client of the server is
+tracked as [#421](https://github.com/joestump-agent/crush/issues/421).
+
+:::warning[Known issue]
+Even the server-side half is unreliable today. The server builds the agent
+coordinator on the client's init request context, which ends as soon as that
+request returns, so dispatch progress stops being tracked
+(tracked as [#419](https://github.com/joestump-agent/crush/issues/419)). And every client attach replaces the coordinator,
+orphaning dispatches that are already running (tracked as [#420](https://github.com/joestump-agent/crush/issues/420)). Use
+dispatch from a plain in-process `crush` for now.
+:::

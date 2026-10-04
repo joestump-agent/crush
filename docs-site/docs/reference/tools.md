@@ -127,17 +127,63 @@ See [Scheduled tasks](/features/scheduled-tasks).
 
 | Tool | Does |
 | --- | --- |
-| `todos` | A structured task list for multi-step work; each task is pending, in progress, or completed |
+| `todos` | A structured task list for multi-step work; each task is pending, in progress, or completed. In the fork, an agent that works without one is nudged to start one — see [Todo enforcement](/agents/todo-enforcement) |
 | `question` | Ask you a structured question and wait for the answer. Interactive sessions only; never available to sub-agents |
 | `crush_info` | Crush's live runtime state: active model and provider, LSP/MCP status, skills, hooks, permissions, disabled tools |
 | `crush_logs` | Read Crush's internal application logs — useful when debugging Crush itself |
 | `agent` | Launch a sub-agent with `glob`, `grep`, `ls`, and `view`, for searches that need several tries |
+
+## Dispatched agents
+
+:::info[Fork feature]
+See [Multi-agent dispatch](/agents/overview).
+:::
+
+| Tool | Does |
+| --- | --- |
+| `dispatch_agent` | Start an independent agent in its own git worktree, on a fresh `crush-dispatch-*` branch cut from a committed revision. It runs in the background and the tool returns a running handle at once; the result — findings plus a diff summary — arrives as a follow-up turn when it finishes. Parameters: `prompt` (required), `model` (`large` or `small`; default `small`), `skills` (default: every discovered skill), `branch` (base revision; default the current branch), `handle`, and `role` |
+| `message_agent` | Steer a running dispatched agent: the message lands as its next input, and the reply appears on the agent's block in the chat, not as the tool's result. Address it by `session_id` or `handle`, with the text in `message`. A finished agent refuses — dispatch a new one |
+
+Both are main-agent tools: neither sub-agents nor dispatched agents get them,
+so delegation is one level deep. Both are on by default; deny them to turn
+dispatch off:
+
+```bash
+permissions deny dispatch_agent message_agent
+```
+
+`dispatch_agent` needs a git repository — anywhere else it returns
+`dispatch unavailable`. The `message_agent` schema currently marks
+`session_id` as required even when the model addresses the agent by handle.
+Tracked as [#400](https://github.com/joestump-agent/crush/issues/400).
 
 ## What sub-agents get
 
 Sub-agents (`agent`, `agentic_fetch`) run with a restricted tool set and are
 **not** intercepted by `PreToolUse` hooks, so a single delegated turn doesn't
 fire your hooks N times. The outer sub-agent tool call itself *is* hooked.
+
+## What dispatched agents get
+
+A dispatched agent gets the `agent` sub-agent's read-only set — `glob`,
+`grep`, `ls`, `view`, and, when language servers are on, `lsp_definition`,
+`lsp_symbols`, and `lsp_call_hierarchy` — plus `bash`, `edit`, `multiedit`,
+`write`, and `todos`. Every path-based tool is rooted at the agent's worktree.
+
+It never gets `agent`, `agentic_fetch`, `question`, MCP tools, semantic
+search, `dispatch_agent`, or `message_agent`. The outer `dispatch_agent` and
+`message_agent` calls are hooked like any top-level tool call.
+
+:::warning[Known issue]
+- Dispatched agents are **not** intercepted by `PreToolUse` hooks, although
+  unlike sub-agents they can run `bash` and write files. A hook that blocks
+  `git push -f` does not stop one. Tracked as [#377](https://github.com/joestump-agent/crush/issues/377).
+- `permissions deny` and `options.disabled_tools` can narrow the read-only
+  tools, but a dispatched agent always gets `bash`, `edit`, `multiedit`,
+  `write`, and `todos` back. Tracked as [#376](https://github.com/joestump-agent/crush/issues/376).
+- `job_output` and `job_kill` are missing, so a long-running command that
+  `bash` moves to the background cannot be read back. Tracked as [#384](https://github.com/joestump-agent/crush/issues/384).
+:::
 
 ## Checking what's live
 
