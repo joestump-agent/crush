@@ -920,6 +920,19 @@ func (m *Chat) MessageItem(id string) chat.MessageItem {
 	return item
 }
 
+// ItemAt returns the message item at the given list index, or nil when
+// the index is out of bounds or holds a non-message item.
+func (m *Chat) ItemAt(index int) chat.MessageItem {
+	if index < 0 || index >= m.list.Len() {
+		return nil
+	}
+	item, ok := m.list.ItemAt(index).(chat.MessageItem)
+	if !ok {
+		return nil
+	}
+	return item
+}
+
 // RetireA2UISurface finds the assistant message holding the live A2UI
 // surface with the given ID, reads its current field values, and retires the
 // surface so the form cannot be re-submitted (#45). It reports the gathered

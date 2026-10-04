@@ -378,6 +378,18 @@ type UI struct {
 	// Chat components
 	chat *Chat
 
+	// Inspect mode (#314): viewing a sub-agent's session read-only in
+	// the chat while the parent stays the active session. inspecting is
+	// nil when not inspecting. The scroll pair is the parent chat
+	// position captured on entry and restored on exit. inspectRing
+	// enumerates the live agent blocks (in transcript order) at the
+	// moment inspect mode was entered; ctrl+] cycles it.
+	inspecting      *session.Session
+	inspectScroll   [2]int
+	inspectRing     []string
+	inspectRingPos  int
+	inspectLoadBusy bool
+
 	// onboarding state
 	onboarding struct {
 		yesInitializeSelected bool
@@ -921,6 +933,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.forceCompactMode {
 			m.isCompact = true
 		}
+		// The active session is changing: any inspect view belonged to
+		// the previous transcript and must not survive the switch (#314).
+		m.clearInspectState()
 		// Plan mode is scoped to the session it was enabled in: switching
 		// to another session falls back to code mode and drops any pending
 		// plan handoff. (Loading the session that was just created for the
@@ -988,6 +1003,18 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			paths = append(paths, f.LatestVersion.Path)
 		}
 		cmds = append(cmds, m.startLSPs(paths))
+
+	case inspectSessionLoadedMsg:
+		// Inspect mode (#314): the child transcript fetch came back.
+		if cmd := m.handleInspectLoaded(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
+	case inspectRestoreMsg:
+		// Inspect mode exit (#314): the parent transcript came back.
+		if cmd := m.handleInspectRestore(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 
 	case modeSwitchedMsg:
 		m.modeSwitching = false
@@ -1110,9 +1137,34 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		if msg.Payload.SessionID != m.session.ID {
+			// While inspecting, the viewed child's own messages feed the
+			// chat (live follow, #314) instead of only nesting into the
+			// parent's block.
+			if m.isInspecting() && msg.Payload.SessionID == m.inspectingSessionID() {
+				if cmd := m.handleInspectChildMessage(msg); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+				break
+			}
 			// This might be a child session message from an agent tool.
 			if cmd := m.handleChildSessionMessage(msg); cmd != nil {
 				cmds = append(cmds, cmd)
+			}
+			break
+		}
+		if m.isInspecting() {
+			// Parent activity while inspecting: keep busy/queue state
+			// fresh, but leave the chat alone. It shows the inspected
+			// child; the parent transcript is rebuilt on exit.
+			if msg.Type == pubsub.CreatedEvent {
+				m.invalidateBusyCaches()
+				m.invalidatePromptQueue()
+				if cmd := m.dispatchBusyRefresh(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+				if cmd := m.dispatchPromptQueueRefresh(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
 			}
 			break
 		}
@@ -1636,6 +1688,11 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Textarea placeholder logic
 		if m.bangMode {
 			m.textarea.Placeholder = "Run a shell command"
+		} else if m.isInspecting() {
+			// Inspecting a sub-agent (#314): the editor still edits the
+			// parent's prompt, so say where a submission will land and
+			// how to leave.
+			m.textarea.Placeholder = m.inspectPlaceholder()
 		} else if m.isAgentBusy() {
 			m.textarea.Placeholder = m.workingPlaceholder
 		} else if m.mode == uiInputModePlan {
@@ -2315,7 +2372,7 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 	// Session dialog messages.
 	case dialog.ActionSelectSession:
 		m.dialog.CloseDialog(dialog.SessionsID)
-		cmds = append(cmds, m.loadSession(msg.Session.ID))
+		cmds = append(cmds, m.handleSelectSession(msg.Session))
 
 	// Open dialog message.
 	case dialog.ActionOpenDialog:
@@ -3285,6 +3342,15 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 	// Route all messages to dialog if one is open.
 	if m.dialog.HasDialogs() {
 		return m.handleDialogMsg(msg)
+	}
+
+	// Inspect mode navigation (#314): bound globally so it works from
+	// both editor and chat focus, but never underneath a dialog.
+	if handled, cmd := m.handleInspectKeys(msg); handled {
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return tea.Batch(cmds...)
 	}
 
 	// Tab always toggles focus between editor and chat, even when
@@ -7018,6 +7084,7 @@ func (m *UI) newSession() tea.Cmd {
 
 	planCmd := m.resetPlanModeState()
 	m.session = nil
+	m.clearInspectState()
 	m.sidebarScroll = 0
 	m.sessionFiles = nil
 	m.sessionFileReads = nil
