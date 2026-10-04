@@ -295,7 +295,15 @@ func buildCrushBinary(t *testing.T, repoRoot string) string {
 
 	binPath := filepath.Join(binDir, "crush")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Budget for the build below. On the macos-latest CI runner the
+	// CGO_ENABLED=0 build of the full binary takes 4-6 minutes from a
+	// cold cache (it is a different build flavor from the workflow's
+	// "go build -race ./..." step, so it cannot reuse that cache).
+	// 9 minutes leaves headroom over the observed worst case while
+	// keeping the whole package under go test's default 10-minute
+	// per-package timeout, so a genuinely stuck build fails with this
+	// clear message instead of a "test timed out" goroutine dump.
+	ctx, cancel := context.WithTimeout(context.Background(), 9*time.Minute)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, ".")
