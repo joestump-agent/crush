@@ -443,14 +443,17 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// assembly fires the escalation hook against a finished dispatch.
 	watchStop()
 
-	// Drop the injection target as soon as the run returns, before the
-	// terminal status is published below: relying on the deferred
-	// unregister alone left a window in which a terminal entry still
-	// resolved to a live target and accepted a message into a session
-	// whose run had ended. unregisterDispatchRun is idempotent; the
-	// deferred call above stays for the early-return paths. The
-	// transported path returns only once the served turn reached its
-	// terminal state, so the run has ended here on both paths.
+	// Drop the injection target before the terminal status is published
+	// below: relying on the deferred unregister alone left a window in
+	// which a terminal entry still resolved to a live target and accepted
+	// a message into a session whose run had ended. Not earlier: while
+	// the result is assembled (diff capture can be slow) the entry still
+	// reads running, and the registered target's refusal stays the
+	// informative "no longer running" rather than the unknown-session
+	// one. unregisterDispatchRun is idempotent; the deferred call above
+	// stays for the early-return paths. The transported path returns only
+	// once the served turn reached its terminal state, so the run has
+	// ended here on both paths.
 	c.unregisterDispatchRun(run.sessionID)
 	// Record the terminal payload before the terminal status so the
 	// terminal entry event carries it: the completed agent block (#65)
