@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
@@ -58,6 +59,15 @@ type DispatchServerParams struct {
 	// message. Without it the server's executor runs a minimal call,
 	// which is enough for tests, not for a production dispatched turn.
 	Call SessionAgentCall
+	// InactivityTimeout is the A2A-level backstop (#360): a served run
+	// that yields no events for this long is ended with a Failed status
+	// carrying the reason. 0 disables it.
+	InactivityTimeout time.Duration
+	// CancelReason reports why the dispatched run was killed (#316), for
+	// the Canceled status an out-of-band cancel emits (#342). Nil-safe:
+	// the production value is the run's kill reason, and a nil func or
+	// an empty string falls back to "canceled".
+	CancelReason func() string
 }
 
 // DispatchTransport drives one dispatch's initial task over the A2A
@@ -194,21 +204,23 @@ func (c *coordinator) dispatchServerStarter() DispatchServerStarter {
 // dispatch itself does not depend on being served, and Phase 1 has no
 // A2A client in the loop yet (#71 adds it); failing the dispatch over a
 // loopback server would trade working dispatches for protocol purity.
-func (c *coordinator) startDispatchServer(ctx context.Context, workspace *dispatch.Workspace, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall) (stop func()) {
+func (c *coordinator) startDispatchServer(ctx context.Context, workspace *dispatch.Workspace, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string) (stop func()) {
 	starter := c.dispatchServerStarter()
 	if starter == nil {
 		return nil
 	}
 
 	endpoint, card, stop, err := starter.StartDispatchServer(ctx, DispatchServerParams{
-		SessionID:   sessionID,
-		Runner:      runner,
-		Diff:        func(ctx context.Context) (string, error) { return workspace.Diff(ctx, entryID) },
-		Todos:       c.dispatchCollector,
-		Name:        handle,
-		Description: role,
-		Skills:      loaded,
-		Call:        call,
+		SessionID:         sessionID,
+		Runner:            runner,
+		Diff:              func(ctx context.Context) (string, error) { return workspace.Diff(ctx, entryID) },
+		Todos:             c.dispatchCollector,
+		Name:              handle,
+		Description:       role,
+		Skills:            loaded,
+		Call:              call,
+		InactivityTimeout: inactivityTimeout,
+		CancelReason:      cancelReason,
 	})
 	if err != nil {
 		slog.Warn("Dispatch A2A server failed to start", "dispatch_id", entryID, "error", err)

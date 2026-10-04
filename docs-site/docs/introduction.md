@@ -30,6 +30,8 @@ through language servers, and extends through MCP servers and Agent Skills.
 - **Channel-ready.** MCP servers can push real-time events into your session —
   CI failures, webhooks, chat messages — and Crush acts on them without you
   typing a thing.
+- **Multi-agent.** Dispatch background agents into their own git worktrees,
+  steer them with `@handles`, and review their diffs when they finish.
 - **Works everywhere.** First-class support in every terminal on macOS, Linux,
   Windows (PowerShell and WSL), Android, FreeBSD, OpenBSD, and NetBSD.
 - **Industrial grade.** Built on the Charm ecosystem, powering 25k+
@@ -57,6 +59,7 @@ The additions, in brief:
 | [Semantic search](/features/semantic-search) | A local sqlite-vec index over the repo, searched by meaning |
 | [Channels](/features/channels) | The push mechanism is upstream; the fork adds the `channel_enabled` config key, the `channel_reply` tool, and deterministic reply routing |
 | [MCP prompts](/features/mcp#prompts-and-resources) | MCP prompts offered in the `/` completions and the command palette |
+| [Multi-agent dispatch](/agents/overview) | A `dispatch_agent` tool that runs background agents in isolated git worktrees over in-process A2A, steered with `@handles` and readable live in inspect mode |
 
 Plus a long tail of quality-of-life work — click-to-copy, clickable
 hyperlinks, a syntax-highlighted composer, text-file attachments, Skills, MCP

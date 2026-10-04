@@ -102,6 +102,15 @@ interception, so one delegated turn doesn't trigger your hook N times. The outer
 sub-agent tool call itself *is* hooked, so a policy like "never let the agent
 spawn sub-agents" still works.
 
+:::warning[Known issue]
+[Dispatched agents](/agents/overview) — the fork's `dispatch_agent` tool — also
+run without hook interception, and unlike `agent` and `agentic_fetch` they have
+`bash`, `edit`, `multiedit`, and `write`. A hook that blocks `git push -f` or
+`rm -rf` does not stop a dispatched agent. The top-level `dispatch_agent` and
+`message_agent` calls *are* hooked, so a `^dispatch_agent$` matcher that exits
+`2` keeps the main agent from dispatching at all. Tracked as [#377](https://github.com/joestump-agent/crush/issues/377).
+:::
+
 ## Execution model
 
 Hooks run through Crush's embedded POSIX shell

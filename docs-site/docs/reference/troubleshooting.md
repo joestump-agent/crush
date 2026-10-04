@@ -47,6 +47,8 @@ causes:
   lookup of the base name and logs it at debug level.
 - Sub-agent tool calls are not hooked by design. See
   [scope](/features/hooks#pretooluse).
+- Dispatched agents' tool calls are not hooked either — including their
+  `bash`, `edit`, and `write` calls. That one is a bug, tracked as [#377](https://github.com/joestump-agent/crush/issues/377).
 
 ## An MCP server won't start
 
@@ -79,7 +81,7 @@ Three separate things hide a tool:
 | --- | --- |
 | `permissions deny <tool>` | Remove it — a denied tool is invisible to the model |
 | Per-server `--disabled-tools` / `--enabled-tools` | Adjust the MCP server config |
-| The tool is conditionally registered | LSP tools need an LSP or `auto-lsp`; MCP resource/prompt tools need a configured server; `question` is interactive-only; |
+| The tool is conditionally registered | LSP tools need an LSP or `auto-lsp`; MCP resource/prompt tools need a configured server; `question` is interactive-only; `dispatch_agent` and `message_agent` are main-agent only, and a [dispatched agent](/reference/tools#what-dispatched-agents-get) gets a fixed set |
 
 `crush_info` reports what is actually registered right now — ask the agent.
 
@@ -118,6 +120,24 @@ Ask the agent to restart the server (`lsp_restart`), and turn on
 client to create a workspace fixes them; a later client at the same `--cwd`
 does not change them. A debug log line records the mismatch. See
 [first-wins flags](/features/server-and-workspaces#first-wins-flags).
+
+## Dispatched agents misbehave
+
+:::info[Fork feature]
+[Multi-agent dispatch](/agents/overview) has its own
+[troubleshooting page](/agents/troubleshooting). The most common symptoms:
+:::
+
+| Symptom | Short answer |
+| --- | --- |
+| `dispatch unavailable: … is not a git repository` | Dispatch needs a git repository. The failure is remembered until Crush restarts |
+| A dispatched agent's work vanished | When Crush exits it force-removes every `crush-dispatch-*` worktree and branch in the repository — finished, killed, or another Crush instance's. Merge what you want to keep first. Tracked as [#367](https://github.com/joestump-agent/crush/issues/367) and [#365](https://github.com/joestump-agent/crush/issues/365) |
+| An agent shows **Killed** | The wander kill stopped it: ignored todo nudges, stalled todos, a hard timeout, or a tool loop. See [Todo enforcement](/agents/todo-enforcement) |
+| The main agent's turn was canceled after two todo reminders | The todo ladder's kill reaches more than dispatched agents today. Set `options.todo_enforcement.kill_after_nudges` to `0` in `crush.json`. Tracked as [#393](https://github.com/joestump-agent/crush/issues/393) |
+| `@tester …` went to the main agent | The handle must be the very first token and match a running agent, and routing does not work against a [server](/features/server-and-workspaces#dispatched-agents-against-a-server) |
+| <kbd>esc</kbd> canceled the main agent while inspecting | Leave inspect mode with <kbd>ctrl+[</kbd> — see [Inspect mode](/reference/keybindings#inspect-mode). Tracked as [#404](https://github.com/joestump-agent/crush/issues/404) |
+| A dispatched agent ran a command a hook should have blocked | Dispatched agents are not hooked. Tracked as [#377](https://github.com/joestump-agent/crush/issues/377) |
+| A dispatched agent still auto-approves after yolo was toggled off | It follows the startup `--yolo`. Tracked as [#378](https://github.com/joestump-agent/crush/issues/378) |
 
 ## Reporting a bug
 

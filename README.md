@@ -20,6 +20,7 @@
 - **Extensible:** add capabilities via MCPs (`http`, `stdio`, and `sse`)
 - **UI-Fluent:** models can speak [A2UI](https://a2ui.org) via [a2tea](https://github.com/charmbracelet/a2tea) and Crush will draw it — cards, lists, buttons, and dashboards rendered right in the chat
 - **Channel-Ready:** MCP servers can push real-time events into your session via [Claude Channels](https://code.claude.com/docs/en/channels-reference) — CI failures, webhooks, and more, acting on them without you typing a thing
+- **Multi-Agent:** dispatch background agents into their own git worktrees, steer them with `@handles`, and review their diffs when they finish — see the [multi-agent docs](https://joestump-agent.github.io/crush/agents/overview)
 - **Works Everywhere:** first-class support in every terminal on macOS, Linux, Windows (PowerShell and WSL), Android, FreeBSD, OpenBSD, and NetBSD
 - **Industrial Grade:** built on the Charm ecosystem, powering 25k+ applications, from leading open source projects to business-critical infrastructure
 

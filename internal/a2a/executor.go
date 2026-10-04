@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log/slog"
 	"os"
 	"os/exec"
+	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"charm.land/fantasy"
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
@@ -75,6 +79,30 @@ type Executor struct {
 	// Zero value keeps the minimal call — enough for tests, not for a
 	// real dispatched turn.
 	call agent.SessionAgentCall
+	// inactivityTimeout is the A2A-level backstop (#360): a run that
+	// yields no events for this long while in flight is canceled by
+	// the executor and failed with the reason. Zero (the default)
+	// disables the backstop.
+	inactivityTimeout time.Duration
+	// endedByExecutor holds the task IDs whose terminal status the
+	// executor itself has already emitted (the inactivity backstop's
+	// Failed, #360). #342's out-of-band cancel branch consults the set
+	// so a run the executor ended is not also reported Canceled.
+	mu              sync.Mutex
+	endedByExecutor map[string]struct{}
+	// cancelMu guards canceledTasks: the task IDs this executor's own
+	// Cancel has touched (#342). A run that returns context.Canceled
+	// while its task is in the set was ended by that Cancel — which
+	// emits the terminal Canceled status itself — while the same error
+	// from an out-of-band kill (the wander ladder, the watchdog) must
+	// surface as this executor's own Canceled, or the task never
+	// reaches a terminal state.
+	cancelMu      sync.Mutex
+	canceledTasks map[string]struct{}
+	// cancelReason reports why the current run was killed (#316), for
+	// the Canceled status an out-of-band cancel emits. Optional; a nil
+	// func or an empty string falls back to "canceled".
+	cancelReason func() string
 }
 
 // Option configures an [Executor].
@@ -103,6 +131,24 @@ func WithTodos(source TodoSource) Option {
 	return func(e *Executor) { e.todos = source }
 }
 
+// WithInactivityTimeout sets the A2A-level backstop (#360): while the
+// run is in flight, every event the executor yields to the consumer
+// resets the timer; when it fires with no progress, the executor marks
+// the task as ended by the executor, cancels the runner, and ends the
+// run with exactly one Failed carrying the reason. A zero or negative
+// duration (the default) disables the backstop.
+func WithInactivityTimeout(d time.Duration) Option {
+	return func(e *Executor) { e.inactivityTimeout = d }
+}
+
+// WithCancelReason sets the reporter for why the dispatched run was killed
+// (#316): the reason text carried by the Canceled status an out-of-band
+// cancel emits (#342). A nil func or an empty string falls back to
+// "canceled".
+func WithCancelReason(fn func() string) Option {
+	return func(e *Executor) { e.cancelReason = fn }
+}
+
 // NewExecutor builds an Executor that drives runner against sessionID — the
 // (ephemeral) session backing the dispatched agent.
 func NewExecutor(runner Runner, sessionID string, opts ...Option) *Executor {
@@ -123,6 +169,15 @@ var _ a2asrv.AgentExecutor = (*Executor)(nil)
 // as events, not as a returned error.
 func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
+		// The backstop's terminal is the task's last word: drop the
+		// "ended by the executor" mark when this sequence ends, so a
+		// later run of the same executor starts clean.
+		defer e.clearEndedByExecutor(execCtx.TaskID)
+		// The task ID leaves the own-cancel set when this sequence ends,
+		// so the silent return of an already-emitted Canceled cannot
+		// outlive the task it belongs to.
+		defer e.forgetCanceledTask(string(execCtx.TaskID))
+
 		// A message that referenced no existing task starts a new one:
 		// announce it submitted before transitioning to working.
 		if execCtx.StoredTask == nil {
@@ -153,9 +208,23 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			// be delivered, and the run's own outcome is dropped with it.
 			return
 		case errors.Is(err, context.Canceled):
-			// The run was canceled — by this executor's Cancel, which
-			// emits the terminal Canceled status itself. A Failed status
-			// here would race it.
+			// A canceled run is either this executor's own Cancel — which
+			// emits the terminal Canceled status itself, and a second one
+			// here would race it — or the SDK canceling the producer's
+			// context, in which case the consumer is gone with the stream.
+			// The same silence holds for a task the inactivity backstop
+			// already failed (#360): its reason-bearing Failed is the
+			// task's last word. Any other cancel is out of band (#342):
+			// the wander ladder or the watchdog killed the agent behind
+			// the SDK's back, nothing else will emit a terminal state, and
+			// this stream is the consumer's only way out — so yield
+			// exactly one Canceled carrying the kill reason.
+			if e.ownCancel(string(execCtx.TaskID)) ||
+				e.endedByExecutorHas(string(execCtx.TaskID)) || ctx.Err() != nil {
+				return
+			}
+			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled,
+				agentMessage(execCtx, e.canceledStatusText())), nil)
 			return
 		case err != nil:
 			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
@@ -214,12 +283,47 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 	}
 	done := make(chan runOutcome, 1)
 	go func() {
+		// A panic in a tool or provider adapter must fail this task, not
+		// the whole process (#345): recover it, log it, and hand a run
+		// error back so Execute yields its single Failed status. The
+		// error uses %v and never wraps, so it cannot be
+		// context.Canceled and the canceled branch of Execute cannot
+		// swallow it (#342).
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("Dispatched run panicked", "session_id", e.sessionID, "panic", r, "stack", string(debug.Stack()))
+				done <- runOutcome{err: fmt.Errorf("dispatched run panicked: %v", r)}
+			}
+		}()
 		call := e.call
 		call.SessionID = e.sessionID
 		call.Prompt = prompt
 		result, err := e.runner.Run(ctx, call)
 		done <- runOutcome{result, err}
 	}()
+
+	// The inactivity backstop (#360): a timer that every event the
+	// executor yields resets, so a run making visible progress never
+	// trips it and a silent one is ended with a reason. Disabled when
+	// the duration is zero or negative.
+	var inactC <-chan time.Time
+	var inactReset func()
+	if e.inactivityTimeout > 0 {
+		inactTimer := time.NewTimer(e.inactivityTimeout)
+		defer inactTimer.Stop()
+		inactC = inactTimer.C
+		inactReset = func() {
+			if inactTimer.Reset(e.inactivityTimeout) {
+				// The timer fired but its value was not consumed:
+				// drain it, or it would trip the backstop again on
+				// the next loop pass.
+				select {
+				case <-inactTimer.C:
+				default:
+				}
+			}
+		}
+	}
 
 	var lastTodos []session.Todo
 	for {
@@ -238,6 +342,21 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 			return nil, context.Canceled
 		case out := <-done:
 			return out.result, out.err
+		case <-inactC:
+			// The backstop fired: no event was yielded for the whole
+			// window. End the run with exactly one Failed carrying the
+			// reason — never a Canceled, which is reserved for the
+			// executor's Cancel (#360, coordinated with #342).
+			e.markEndedByExecutor(execCtx.TaskID)
+			e.runner.Cancel(e.sessionID)
+			// Give the runner a brief window to observe the cancel and
+			// settle; a truly wedged run ignores it, and the outcome is
+			// discarded either way — the task fails with the reason.
+			select {
+			case <-done:
+			case <-time.After(inactivitySettleWindow):
+			}
+			return nil, fmt.Errorf("inactivity timeout: no progress for %s", e.inactivityTimeout)
 		case snap, ok := <-todoCh:
 			if !ok {
 				todoCh = nil
@@ -250,8 +369,39 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 			if !yield(todoStatusUpdate(execCtx, snap), nil) {
 				return nil, errConsumerStopped
 			}
+			if inactReset != nil {
+				inactReset()
+			}
 		}
 	}
+}
+
+// inactivitySettleWindow bounds the backstop's wait for the run goroutine
+// after canceling the runner (#360): long enough for a responsive runner
+// to observe the cancel, short enough that a wedged one delays the
+// terminal Failed by seconds, not minutes.
+const inactivitySettleWindow = 2 * time.Second
+
+// markEndedByExecutor records that the executor itself has emitted the
+// task's terminal status — the inactivity backstop's Failed (#360) — so
+// #342's out-of-band cancel branch, which lands separately, does not
+// also emit a Canceled status for the same task.
+func (e *Executor) markEndedByExecutor(taskID a2aspec.TaskID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.endedByExecutor == nil {
+		e.endedByExecutor = make(map[string]struct{})
+	}
+	e.endedByExecutor[string(taskID)] = struct{}{}
+}
+
+// clearEndedByExecutor drops the mark: each run ends with at most one
+// terminal of the executor's own, so a finished task's ID is safe to
+// forget before the next run.
+func (e *Executor) clearEndedByExecutor(taskID a2aspec.TaskID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.endedByExecutor, string(taskID))
 }
 
 // todoStatusUpdate maps one todo snapshot onto a non-terminal Working
@@ -289,13 +439,67 @@ func todoMetadata(todos []session.Todo) []any {
 	return out
 }
 
-// Cancel stops the in-flight dispatched run for this executor's session and
-// reports the task canceled.
+// Cancel stops the in-flight dispatched run for this executor's session
+// and reports the task canceled. The task is marked as this executor's own
+// cancel before the runner aborts (#342), so the run's returning
+// context.Canceled takes the silent path and this Canceled status stays
+// the only terminal one.
 func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
+		e.markOwnCancel(string(execCtx.TaskID))
 		e.runner.Cancel(e.sessionID)
 		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled, nil), nil)
 	}
+}
+
+// markOwnCancel records taskID as canceled by this executor's own Cancel.
+func (e *Executor) markOwnCancel(taskID string) {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	if e.canceledTasks == nil {
+		e.canceledTasks = make(map[string]struct{})
+	}
+	e.canceledTasks[taskID] = struct{}{}
+}
+
+// ownCancel reports whether taskID was canceled by this executor's own
+// Cancel.
+func (e *Executor) ownCancel(taskID string) bool {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	_, ok := e.canceledTasks[taskID]
+	return ok
+}
+
+// forgetCanceledTask drops taskID from the own-cancel set: the task's
+// execution sequence has ended, one way or the other.
+func (e *Executor) forgetCanceledTask(taskID string) {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	delete(e.canceledTasks, taskID)
+}
+
+// endedByExecutorHas reports whether the executor itself already emitted
+// the task's terminal status (the inactivity backstop's Failed, #360):
+// that Failed is the task's last word, and a cancel that observes it
+// stays silent.
+func (e *Executor) endedByExecutorHas(taskID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.endedByExecutor[taskID]
+	return ok
+}
+
+// canceledStatusText is the message text for an out-of-band Canceled
+// status: the kill reason when one is wired and non-empty, else the
+// generic "canceled".
+func (e *Executor) canceledStatusText() string {
+	if e.cancelReason != nil {
+		if reason := e.cancelReason(); reason != "" {
+			return reason
+		}
+	}
+	return "canceled"
 }
 
 // GitDiff returns a [DiffFunc] that captures the full uncommitted state of

@@ -78,6 +78,75 @@ func TestTodoKill_FiresAfterIgnoredNudges(t *testing.T) {
 	assert.Equal(t, dispatch.ReasonIgnoredNudges, reason)
 }
 
+// TestTodoKill_KillAfterNudgesHonored pins the kill threshold above the
+// old nudge cap (#401): with kill-after-three and a wired kill, the run
+// gets the nudge, an escalating nudge, and a second escalating nudge,
+// then the kill on the next window.
+func TestTodoKill_KillAfterNudgesHonored(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	var killed killRecorder
+	sa := newTodoTestAgentOpts(t, env, model, config.TodoEnforcementSettings{
+		Enabled:         true,
+		NudgeThreshold:  1,
+		KillAfterNudges: 3,
+	}, []todoAgentOpt{withTodoKill(killed.observe)}, probeTool())
+
+	// The run is expected to end canceled: the kill is what ends it.
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+	_, err = sa.Run(t.Context(), SessionAgentCall{
+		SessionID: sess.ID,
+		Prompt:    "do the work",
+	})
+	require.ErrorIs(t, err, context.Canceled, "the killed run must end canceled")
+
+	calls, killID, reason := killed.recorded()
+	require.Equal(t, 1, calls, "the kill must fire exactly once")
+	assert.Equal(t, sess.ID, killID)
+	assert.Equal(t, dispatch.ReasonIgnoredNudges, reason)
+
+	require.Len(t, nudgeMessages(t, env, model, sess.ID, todoNudgeMessage), 1,
+		"the first nudge must be injected")
+	require.Len(t, nudgeMessages(t, env, model, sess.ID, todoEscalatingNudgeMessage), 2,
+		"two escalating nudges must precede the kill")
+}
+
+// TestTodoKill_AboveCapWithoutObserver pins the no-kill contract (#401):
+// a kill threshold above the nudge cap means nothing without a wired kill
+// observer; the ladder still tops out at the nudge and the escalating
+// nudge, and the run finishes normally.
+func TestTodoKill_AboveCapWithoutObserver(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	sa := newTodoTestAgent(t, env, model, config.TodoEnforcementSettings{
+		Enabled:         true,
+		NudgeThreshold:  1,
+		KillAfterNudges: 5,
+	}, probeTool())
+
+	sess := runWithScript(t, env, sa, model)
+
+	require.Len(t, nudgeMessages(t, env, model, sess.ID, todoNudgeMessage), 1,
+		"the first nudge must still be injected")
+	require.Len(t, nudgeMessages(t, env, model, sess.ID, todoEscalatingNudgeMessage), 1,
+		"the ladder must cap at the escalating nudge without a kill hook")
+}
+
 // TestTodoKill_NotBeforeNudges pins the escalation ordering: with the
 // default kill-after-two, a run that gets both nudges and then finishes
 // is never killed. The kill needs the window after the last allowed
@@ -128,6 +197,32 @@ func TestTodoKill_DisabledWhenZero(t *testing.T) {
 
 	calls, _, _ := killed.recorded()
 	require.Zero(t, calls, "kill_after_nudges=0 must disable the kill")
+}
+
+// TestTodoKill_NoTodosToolNeverKilled pins that a dispatched agent
+// without the todos tool is never killed for ignoring nudges it could not
+// act on: the script that TestTodoKill_FiresAfterIgnoredNudges kills runs
+// to completion.
+func TestTodoKill_NoTodosToolNeverKilled(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	var killed killRecorder
+	sa := newTodoTestAgentOpts(t, env, model, config.TodoEnforcementSettings{
+		Enabled:         true,
+		NudgeThreshold:  1,
+		KillAfterNudges: 1,
+	}, []todoAgentOpt{withTodoKill(killed.observe), withoutTodosTool()}, probeTool())
+
+	runWithScript(t, env, sa, model)
+
+	calls, _, _ := killed.recorded()
+	require.Zero(t, calls, "an agent without the todos tool must never be killed by the ladder")
 }
 
 // TestTodoKill_NonDispatchedAgentNeverCanceled pins the kill's scope
@@ -335,7 +430,7 @@ func (f *wanderKillFixture) wireTransport(t *testing.T, rt *runnerTransport) {
 	t.Helper()
 	run := f.buildRun()
 	f.c.SetDispatchServerStarter(rt)
-	stop := f.c.startDispatchServer(context.Background(), f.ws, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c))
+	stop := f.c.startDispatchServer(context.Background(), f.ws, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current)
 	t.Cleanup(func() {
 		if stop != nil {
 			stop()

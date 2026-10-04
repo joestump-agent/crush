@@ -34,7 +34,7 @@ makes the [sidebar focusable](/fork#sidebar-and-header).
 | <kbd>enter</kbd> | Send |
 | <kbd>shift+enter</kbd> / <kbd>ctrl+j</kbd> | Newline |
 | <kbd>ctrl+o</kbd> | Open your `$EDITOR` for the prompt |
-| <kbd>@</kbd> | Mention a file |
+| <kbd>@</kbd> | Mention a file, or a live dispatched agent by `@handle` |
 | <kbd>/</kbd> | Commands |
 | <kbd>ctrl+f</kbd> | Add a file |
 | <kbd>ctrl+v</kbd> / <kbd>super+v</kbd> | Paste an image from the clipboard |
@@ -92,6 +92,43 @@ clicks on hyperlinks open them in your browser.
 Both the click-to-copy icon and click-to-open hyperlinks are fork additions.
 :::
 
+## Inspect mode
+
+:::info[Fork feature]
+Inspect mode is part of [multi-agent dispatch](/agents/overview). See
+[Handles and inspect](/agents/handles-and-inspect).
+:::
+
+Read a sub-agent's full transcript — reasoning, tool calls, results — in the
+chat window while the parent stays the active session. These keys work from
+both the editor and the chat; an open dialog keeps its own keys.
+
+| Keys | Does |
+| --- | --- |
+| <kbd>ctrl+]</kbd> | On a focused agent block, open that agent's transcript. With no block focused, open the first live agent. While inspecting, cycle to the next live agent |
+| <kbd>ctrl+[</kbd> | Return to the chat, with the scroll position restored |
+| <kbd>esc</kbd> | Depends on the terminal — see the warning below |
+| <kbd>ctrl+]</kbd> in the session picker | Open the selected session's sub-agent list. See [Sessions](/features/sessions#sub-agent-sessions) |
+
+A live agent's transcript follows its stream. Prompts you type while
+inspecting go to the parent session, never to the agent — to steer a running
+agent, start the prompt with its `@handle`. The cycle covers the agents that
+were live when you entered; agents dispatched later join on your next entry.
+
+:::warning[Known issue]
+Whether <kbd>esc</kbd> leaves inspect mode depends on the terminal. A terminal
+that cannot tell <kbd>ctrl+[</kbd> from <kbd>esc</kbd> — macOS Terminal.app,
+or tmux and screen by default — sends the same byte for both, so there
+<kbd>esc</kbd> returns to the chat. A terminal that supports the kitty keyboard
+protocol, such as Ghostty, kitty, or WezTerm, keeps <kbd>esc</kbd>'s chat
+meaning while you inspect: if the parent is busy, it clears queued prompts,
+and two presses cancel the parent's turn. Leave with <kbd>ctrl+[</kbd>.
+Tracked as [#404](https://github.com/joestump-agent/crush/issues/404).
+
+The inspect keys are also missing from the <kbd>ctrl+g</kbd> help. Tracked as
+[#412](https://github.com/joestump-agent/crush/issues/412).
+:::
+
 ## Initialization prompt
 
 | Keys | Does |
@@ -107,13 +144,19 @@ Typing certain characters opens an inline completion list:
 
 | Trigger | Completes |
 | --- | --- |
-| <kbd>@</kbd> | Files in the project |
+| <kbd>@</kbd> | Files in the project, and live [dispatched agents](/agents/handles-and-inspect) by handle, each shown with its role, status, and current todo |
 | <kbd>/</kbd> | Commands, [user-invocable skills](/features/skills#user-invocable-skills), and MCP prompts |
 
+A prompt that *starts* with a live agent's `@handle` is delivered to that agent
+instead of the main agent; a `@handle` later in the prompt attaches the agent's
+status card. A handle-shaped token (no `.` or `/`) that matches a dispatched
+agent wins over a file of the same name.
+
 :::info[Fork feature]
-Skill and MCP-prompt completions, the token highlighting that makes them
-visually distinct, and the atomic-backspace behaviour below are all fork
-additions. Upstream completes files and commands only.
+Skill, MCP-prompt, and agent completions, `@handle` routing, the token
+highlighting that makes them visually distinct, and the atomic-backspace
+behaviour below are all fork additions. Upstream completes files and commands
+only.
 :::
 
 Completion list size is tunable:

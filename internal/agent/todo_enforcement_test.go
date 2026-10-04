@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -193,6 +194,16 @@ func withTodoKill(fn func(sessionID, reason string)) todoAgentOpt {
 // withLoopStop wires the loop-stop observer (#343) onto the agent.
 func withLoopStop(fn func(sessionID string)) todoAgentOpt {
 	return func(o *SessionAgentOptions) { o.LoopStop = fn }
+}
+
+// withoutTodosTool drops the todos tool the helper otherwise adds, as
+// options.disabled_tools does for a real agent.
+func withoutTodosTool() todoAgentOpt {
+	return func(o *SessionAgentOptions) {
+		o.Tools = slices.DeleteFunc(o.Tools, func(t fantasy.AgentTool) bool {
+			return t.Info().Name == tools.TodosToolName
+		})
+	}
 }
 
 // newTodoTestAgent builds a session agent with the ladder resolved from
@@ -460,6 +471,66 @@ func TestTodoNudge_DisabledByConfig(t *testing.T) {
 	assert.Empty(t, nudgeMessages(t, env, model, sess.ID, todoNudgeMessage))
 }
 
+// TestTodoNudge_NoTodosToolNoNudge pins that the ladder stays off for an
+// agent without the todos tool: the run that would be nudged on the third
+// call with the tool present (TestTodoNudge_NoTodosRunGetsNudged) is never
+// asked to call a tool it does not have.
+func TestTodoNudge_NoTodosToolNoNudge(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "bash", input: "{}"}}},
+		{text: "done"},
+	}}
+	sa := newTodoTestAgentOpts(t, env, model, config.TodoEnforcementSettings{
+		Enabled:        true,
+		NudgeThreshold: 2,
+	}, []todoAgentOpt{withoutTodosTool()}, probeTool(), mutatingTool("bash"))
+
+	sess := runWithScript(t, env, sa, model)
+
+	for _, call := range model.promptTexts() {
+		joined := strings.Join(call, "\n")
+		assert.NotContains(t, joined, todoNudgeMessage)
+		assert.NotContains(t, joined, todoEscalatingNudgeMessage)
+	}
+	assert.Empty(t, nudgeMessages(t, env, model, sess.ID, todoNudgeMessage))
+	assert.Empty(t, nudgeMessages(t, env, model, sess.ID, todoEscalatingNudgeMessage))
+}
+
+// TestTodoHardGate_NoTodosToolNoGate pins that the hard gate stays off
+// for an agent without the todos tool. With nothing to open it, the gate
+// would refuse every mutating call for the rest of the run.
+func TestTodoHardGate_NoTodosToolNoGate(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	var bashCalls int
+	bash := fantasy.NewAgentTool(
+		"bash",
+		"Run a command.",
+		func(ctx context.Context, params struct{}, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			bashCalls++
+			return fantasy.NewTextResponse("ran"), nil
+		},
+	)
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "bash", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "bash", input: "{}"}}},
+		{text: "done"},
+	}}
+	sa := newTodoTestAgentOpts(t, env, model, config.TodoEnforcementSettings{
+		Enabled:        true,
+		NudgeThreshold: 10,
+		HardGate:       true,
+	}, []todoAgentOpt{withoutTodosTool()}, bash)
+
+	runWithScript(t, env, sa, model)
+
+	assert.Equal(t, 2, bashCalls, "no call may be gated without a todos tool")
+}
+
 // TestTodoHardGate_OffByDefault pins the gate's opt-in contract: with the
 // gate off, a mutating tool runs without any todo list.
 func TestTodoHardGate_OffByDefault(t *testing.T) {
@@ -595,10 +666,17 @@ func TestWrapTodoGate_LeavesNonMutatingToolsAlone(t *testing.T) {
 		Enabled:  false,
 		HardGate: true,
 	}, env.sessions)
-	wrapped := wrapTodoGate([]fantasy.AgentTool{probe, bash}, e)
+	todos := tools.NewTodosTool(env.sessions)
+	wrapped := wrapTodoGate([]fantasy.AgentTool{probe, bash, todos}, e)
 
 	assert.Same(t, probe, wrapped[0], "non-mutating tools must not be wrapped")
 	assert.NotSame(t, bash, wrapped[1], "mutating tools must be wrapped")
 	_, ok := wrapped[1].(*todoGateTool)
 	assert.True(t, ok)
+	assert.Same(t, todos, wrapped[2], "the todos tool must not be wrapped")
+
+	// Without the todos tool nothing could open the gate, so nothing is
+	// wrapped.
+	bare := []fantasy.AgentTool{probe, bash}
+	assert.Equal(t, bare, wrapTodoGate(bare, e))
 }

@@ -32,6 +32,7 @@ New subsystems — each one has its own page.
 | **[Semantic search](/features/semantic-search)** | A local vector index over the repo — chunked by symbol, embedded through any OpenAI-compatible endpoint, stored in the project's own SQLite via `sqlite-vec`. Adds the `semantic_search` and `semantic_index` tools and a symbol-extraction package. |
 | **[Channel reply routing](/features/channels)** | The channel *push* mechanism is upstream. The fork adds the `channel_enabled` config key, a `channel_reply` tool, server-side routing that delivers each event exactly once per workspace, auto-creation of a session for an inbound event, and replies that go back only to the channel they came from. |
 | **[MCP prompts](/features/mcp#prompts-and-resources)** | `list_mcp_prompts` and `call_mcp_prompt` tools, prompts offered in the inline `/` completions and the command palette, and prompts loaded at startup rather than on first use. |
+| **[Multi-agent dispatch over A2A](/agents/overview)** | A `dispatch_agent` tool that starts independent agents in the background, each in its own git worktree on a fresh `crush-dispatch-*` branch, while the main agent keeps working. Each dispatch is served in-process over A2A on the [a2a-go](https://github.com/a2aproject/a2a-go) SDK. Steer a running agent with a leading `@handle` (the model uses `message_agent`), read its live transcript in inspect mode, and review its diff when the result comes back — Crush never merges. A todo ladder nudges agents to keep a todo list, and a deterministic wander kill stops dispatched agents that ignore it. On by default inside a git repository. Where it is heading, and why it is built this way, is in [design decisions](/agents/design-decisions). |
 
 ## Quality-of-life improvements
 
@@ -44,6 +45,7 @@ Smaller things you notice in the terminal rather than in a config file.
 | Click-to-copy | Finished assistant *and* user messages carry a right-aligned `⎘` icon that copies the message. Shown on focus, pinned to the item's right edge. |
 | Clickable hyperlinks | A plain click on a link in the transcript opens it in your browser. |
 | Channel message styling | Channel-originated messages render with a `sender / via / at` metadata line below the body, so you can tell a webhook from a human. |
+| Inspect mode | <kbd>ctrl+]</kbd> on an agent block opens that sub-agent's full transcript in the chat window, following it live; <kbd>ctrl+]</kbd> again cycles live agents and <kbd>ctrl+[</kbd> returns with the scroll position restored. The parent stays the active session. See [Handles and inspect](/agents/handles-and-inspect). |
 
 ### Composer
 
@@ -54,6 +56,7 @@ Smaller things you notice in the terminal rather than in a config file.
 | Text-file attachments | Attach JSON, YAML, Markdown, and source files, not just images. One shared text predicate everywhere, with binary sniffing to reject the rest. |
 | Attachment chips | A clickable remove button on each chip, correct hit zones, and chips that survive sending. |
 | `/skill` completions | Skills complete inline from `/`, alongside commands and MCP prompts. |
+| `@handle` completions and routing | `@` completes live dispatched agents — role, status, current todo — alongside files. A prompt that *starts* with `@handle` steers that agent instead of going to the main agent; a mid-sentence `@handle` attaches the agent's status card. |
 
 ### Dialogs and palette
 
@@ -64,6 +67,7 @@ Smaller things you notice in the terminal rather than in a config file.
 | **Channels dialog** | Palette entry **Channels** — see and manage active channels. |
 | Hierarchical sub-menus | The command palette nests related commands instead of one flat list, with `back`/`backspace` navigation. |
 | Model discovery reload | Re-run provider/model discovery from the `/models` dialog without restarting. |
+| Sub-agent session tree | The session picker shows a `▸N` count on sessions that started sub-agents; <kbd>ctrl+]</kbd> lists them, and each opens read-only in inspect mode. See [Sessions](/features/sessions#sub-agent-sessions). |
 
 ### Sidebar and header
 
@@ -118,13 +122,14 @@ built by [Charm](https://charm.land) — bugs in them belong
 | **Clipboard image paste** | <kbd>ctrl+v</kbd> attaching an image, with the clipboard-text-as-path fallback. Upstream; the fork only fixed the empty-paste case above. |
 | **Channel push** | The `claude/channel` MCP capability and the `--channels` flag are upstream. Only the routing, config key, and reply tool are the fork's. |
 | **MCP OAuth** | HTTP MCP servers authenticating over OAuth. Now upstream; the fork carries hardening fixes on top. |
-| **Hooks, Skills, `crushrc`, LSP, sessions, workspaces, notifications, `/clear`, `/compact`, the pills panel, the sidebar itself** | All upstream. |
+| **Hooks, Skills, `crushrc`, LSP, sessions, workspaces, notifications, `/clear`, `/compact`, the pills panel, the sidebar itself** | All upstream — except the sub-agent tree in the session picker and the server's `/sessions/{sid}/children` endpoint behind it, which are part of the fork's [multi-agent dispatch](/agents/overview). |
 
 ## Landed but not yet wired up
 
 | Thing | Status |
 | --- | --- |
-| A2A (`internal/a2a`) | Agent Card and `AgentExecutor` foundation on the [a2a-go](https://github.com/a2aproject/a2a-go) SDK. Compiled but not yet reachable from the CLI or config — no flag, no config key, no docs page. Do not plan around it yet. |
+| A2A as an external interface | Every dispatch is served over A2A on a loopback port, but only Crush's own in-process client talks to it. There is no authentication and the endpoint is not shown anywhere, so third-party A2A clients are not a supported interface yet. See [the A2A protocol page](/agents/a2a-protocol). |
+| Per-agent `todo_enforcement` | The config types carry a per-agent override, but agent definitions are not configurable yet, so every agent uses the global `options.todo_enforcement`. Tracked as [#402](https://github.com/joestump-agent/crush/issues/402). |
 
 ## Reporting bugs
 
