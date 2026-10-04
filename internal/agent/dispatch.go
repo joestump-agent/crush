@@ -150,14 +150,21 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 	lspManager := lsp.NewManager(scoped)
 
 	// Scoped permissions, mirroring app.New's construction: rooted at the
-	// workspace directory, inheriting the parent's skip setting and
-	// allowed-tools so a dispatched agent starts from the same policy.
-	skip := c.cfg.Overrides().SkipPermissionRequests
+	// workspace directory and inheriting the parent's allowed-tools so a
+	// dispatched agent starts from the same policy. With a parent
+	// service, skip approval follows the parent's live state so a
+	// runtime yolo toggle reaches dispatched agents; the startup flag is
+	// only a fallback for callers with no parent service.
 	var allowedTools []string
 	if scoped.Config().Permissions != nil && scoped.Config().Permissions.AllowedTools != nil {
 		allowedTools = scoped.Config().Permissions.AllowedTools
 	}
-	permissions := permission.NewPermissionService(dir, skip, allowedTools)
+	var permissions permission.Service
+	if c.permissions != nil {
+		permissions = permission.NewScopedPermissionService(c.permissions, dir, allowedTools)
+	} else {
+		permissions = permission.NewPermissionService(dir, c.cfg.Overrides().SkipPermissionRequests, allowedTools)
+	}
 
 	var cancel context.CancelFunc
 	if c.permissions != nil {
