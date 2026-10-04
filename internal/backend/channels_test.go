@@ -358,3 +358,7 @@ func TestRouteChannelMessage_ConfigEnabled(t *testing.T) {
 func (c *recordingCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
 }
+
+func (c *recordingCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
+	return errors.New("not implemented")
+}

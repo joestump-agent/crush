@@ -169,3 +169,7 @@ func TestRunAgent_CancellationPublishesNoErrorTerminal(t *testing.T) {
 func (c *errorCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
 }
+
+func (c *errorCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
+	return errors.New("not implemented")
+}

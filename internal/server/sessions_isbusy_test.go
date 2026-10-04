@@ -340,3 +340,7 @@ func TestSessionGetIncludesAttachedClients(t *testing.T) {
 func (s *stubCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
 }
+
+func (s *stubCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
+	return errors.New("not implemented")
+}

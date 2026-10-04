@@ -228,3 +228,7 @@ func TestSetMainAgent_PropagatesCoordinatorError(t *testing.T) {
 func (c *blockingCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
 }
+
+func (c *blockingCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
+	return errors.New("not implemented")
+}

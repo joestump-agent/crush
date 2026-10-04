@@ -430,6 +430,25 @@ func (a *sessionAgent) enqueueCall(call SessionAgentCall) {
 	a.messageQueue.Set(call.SessionID, existing)
 }
 
+// EnqueueWhenBusy enqueues call on the session's queue only while a run
+// is active, atomically against the run's own dispatch decision and its
+// post-turn queue handoff, and reports whether it was enqueued. It is the
+// delivery primitive behind mid-run message injection (#312): a message
+// to a running agent lands as its next input — folded into the active
+// turn at the next step, or picked up as the immediate follow-up turn —
+// while a message to an agent whose run has ended is refused instead of
+// starting a fresh turn on a task session that is never continuable.
+func (a *sessionAgent) EnqueueWhenBusy(call SessionAgentCall) bool {
+	sessMu := a.sessionMu(call.SessionID)
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	if !a.IsSessionBusy(call.SessionID) {
+		return false
+	}
+	a.enqueueCall(call)
+	return true
+}
+
 // drainQueueForStep partitions the session's queued calls for the current
 // streaming step under the per-session dispatch mutex so the filtering is
 // atomic against a concurrent Cancel: canceledBySeq requires the caller to
