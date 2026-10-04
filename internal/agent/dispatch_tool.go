@@ -93,6 +93,10 @@ type dispatchRun struct {
 	// call time so the dispatched agent's turns render at the right size
 	// (the PrepareStep stamp would otherwise clobber it with zero).
 	contentWidth int
+	// stopServer tears the dispatch's A2A server down (#70); nil when no
+	// server was started. The run owns it: the server serves exactly as
+	// long as the dispatch runs.
+	stopServer func()
 }
 
 // dispatchTool builds the DispatchAgent tool (#64): provision a clean
@@ -186,6 +190,12 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse("assign dispatch handle: registry entry vanished"), nil
 			}
 
+			// Stand up the dispatch's in-process A2A server (#70) and stamp
+			// its endpoint and card on the registry entry — the in-memory
+			// discovery surface. The server dies with the run; runDispatch
+			// owns the stop.
+			stopServer := c.startDispatchServer(ctx, workspace, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills))
+
 			// The dispatch must outlive the parent turn that started it:
 			// the main agent keeps working, and its tool-call context is
 			// canceled as soon as the turn ends.
@@ -200,6 +210,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				sessionID:       taskSession.ID,
 				parentSessionID: sessionID,
 				contentWidth:    tools.GetContentWidthFromContext(ctx),
+				stopServer:      stopServer,
 			})
 
 			handle := dispatch.DispatchResult{
@@ -279,6 +290,13 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 // and delivers the terminal DispatchResult back to the main agent (#66).
 func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	defer func() {
+		// The A2A server dies with the run (#70): teardown clears the
+		// registry's endpoint and card too, so discovery never hands out
+		// a dead endpoint. It stops before the toolchain closes, which
+		// ends the shared process-wide resources underneath it.
+		if run.stopServer != nil {
+			c.stopDispatchServer(run.workspace, run.entry.ID, run.stopServer)
+		}
 		// The toolchain outlives the turn: Close stops the permission
 		// bridge and the scoped LSP clients once nothing runs in the
 		// workspace anymore.

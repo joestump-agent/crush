@@ -16,9 +16,13 @@
 //     interface, mapping the agent run lifecycle onto A2A task states
 //     (issue #69).
 //
-// The in-process A2A servers + discovery (#70) and the DispatchAgent A2A
-// client + SSE progress (#71) build on these. See the A2A Coordination epic
-// (#67) for the full plan.
+// On top of those foundations, #70 serves each dispatched agent as an
+// in-process A2A server: [StartServer] binds a loopback JSON-RPC endpoint,
+// wires the Executor behind a2asrv with the agent card at the well-known
+// path, and [Resolve] reads a dispatch's card and endpoint back from its
+// registry entry — in-memory discovery over the dispatch registry, no
+// network hop. The DispatchAgent A2A client + SSE progress (#71) build on
+// these. See the A2A Coordination epic (#67) for the full plan.
 //
 // The SDK's core type package is imported as a2aspec throughout to avoid
 // colliding with this package's own name.

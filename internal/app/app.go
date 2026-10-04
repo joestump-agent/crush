@@ -17,6 +17,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
+	"github.com/charmbracelet/crush/internal/a2a"
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/notify"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
@@ -834,6 +835,9 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		// snapshots to the TUI. #174's A2A TaskStatusUpdateEvent bridge
 		// attaches as a second sink over the same reduction.
 		DispatchSinks: []dispatch.TodoSink{app},
+		// #70: every dispatch gets an in-process A2A server on loopback,
+		// registered on the dispatch registry for in-memory discovery.
+		DispatchServer: a2a.NewServerFactory(),
 	}
 
 	// Semantic search is opt-in: only wire the store and client when an
