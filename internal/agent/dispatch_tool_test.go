@@ -521,9 +521,13 @@ func TestAssembleDispatchResult(t *testing.T) {
 		parentSessionID: "dispatch-parent-session",
 	}
 
-	completed := c.assembleDispatchResult(t.Context(), run, &fantasy.AgentResult{
-		Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "fixed the bug"}}},
-	}, nil)
+	completed := c.assembleDispatchResult(t.Context(), run, dispatchNaturalOutcome{
+		completed: true,
+		findings:  "fixed the bug",
+		diff: func(ctx context.Context) (string, error) {
+			return run.workspace.Diff(ctx, run.entry.ID)
+		},
+	})
 	require.Equal(t, dispatch.StatusCompleted, completed.Status)
 	require.Equal(t, "fixed the bug", completed.KeyFindings)
 	require.Equal(t, entry.ID, completed.DispatchID)
@@ -533,13 +537,15 @@ func TestAssembleDispatchResult(t *testing.T) {
 	require.Empty(t, completed.Error)
 	require.Contains(t, completed.DiffSummary, "new.txt | +1 -0")
 
-	failed := c.assembleDispatchResult(t.Context(), run, nil, errors.New("provider exploded"))
+	failed := c.assembleDispatchResult(t.Context(), run, dispatchNaturalOutcome{
+		runErr: errors.New("provider exploded"),
+	})
 	require.Equal(t, dispatch.StatusFailed, failed.Status)
 	require.Equal(t, "provider exploded", failed.Error)
 	require.Empty(t, failed.KeyFindings)
 	require.Empty(t, failed.DiffSummary)
 
-	noTurn := c.assembleDispatchResult(t.Context(), run, nil, nil)
+	noTurn := c.assembleDispatchResult(t.Context(), run, dispatchNaturalOutcome{})
 	require.Equal(t, dispatch.StatusFailed, noTurn.Status)
 	require.Contains(t, noTurn.Error, "did not start a turn")
 }

@@ -190,6 +190,11 @@ func withTodoKill(fn func(sessionID, reason string)) todoAgentOpt {
 	return func(o *SessionAgentOptions) { o.TodoKill = fn }
 }
 
+// withLoopStop wires the loop-stop observer (#343) onto the agent.
+func withLoopStop(fn func(sessionID string)) todoAgentOpt {
+	return func(o *SessionAgentOptions) { o.LoopStop = fn }
+}
+
 // newTodoTestAgent builds a session agent with the ladder resolved from
 // settings, plus the given tools.
 func newTodoTestAgent(t *testing.T, env fakeEnv, model fantasy.LanguageModel, settings config.TodoEnforcementSettings, ts ...fantasy.AgentTool) *sessionAgent {

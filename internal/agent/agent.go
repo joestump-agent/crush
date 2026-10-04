@@ -253,6 +253,9 @@ type sessionAgent struct {
 	// todoKill observes the wander-kill escalation (#316). Nil except
 	// for dispatched agents; see SessionAgentOptions.TodoKill.
 	todoKill func(sessionID string, reason string)
+	// loopStop observes the loop-detection stop (#343). Nil except for
+	// dispatched agents; see SessionAgentOptions.LoopStop.
+	loopStop func(sessionID string)
 	// acceptedMu serializes increments/decrements of acceptedRuns and
 	// the assignment of accept sequence numbers from acceptSeqGen. It
 	// is separate from dispatchMu so AcceptedRun.Close (which may run
@@ -299,6 +302,14 @@ type SessionAgentOptions struct {
 	// chance to record the reason. Nil everywhere but dispatched agents,
 	// so only they can be killed.
 	TodoKill func(sessionID string, reason string)
+	// LoopStop observes the loop-detection stop (#343): invoked when the
+	// run's step loop ends on the loop-detection stop condition. The
+	// stop itself is intrinsic to the run; this is the coordinator's
+	// chance to record the reason — over the served transport path the
+	// result's steps never reach the parent, so this observer is the
+	// only signal a loop stop ever happened. Nil everywhere but
+	// dispatched agents.
+	LoopStop func(sessionID string)
 }
 
 func NewSessionAgent(
@@ -333,6 +344,7 @@ func newSessionAgent(opts SessionAgentOptions) *sessionAgent {
 		cancelMark:           csync.NewMap[string, uint64](),
 		todoEnforcement:      enforcement,
 		todoKill:             opts.TodoKill,
+		loopStop:             opts.LoopStop,
 		ready:                readyNow(),
 	}
 }
@@ -1191,7 +1203,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 				return false
 			},
 			func(steps []fantasy.StepResult) bool {
-				return hasRepeatedToolCalls(steps, loopDetectionWindowSize, loopDetectionMaxRepeats)
+				if !hasRepeatedToolCalls(steps, loopDetectionWindowSize, loopDetectionMaxRepeats) {
+					return false
+				}
+				if a.loopStop != nil {
+					a.loopStop(call.SessionID)
+				}
+				return true
 			},
 		},
 	})
