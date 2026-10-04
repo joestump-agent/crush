@@ -81,6 +81,125 @@ func TestSummarizeDiffWithoutFileHeaders(t *testing.T) {
 	require.Contains(t, summary, "Binary files a/x and b/x differ")
 }
 
+func TestSummarizeDiffExtendedHeaders(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		diff    string
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "content lines with dash-dash and plus-plus prefixes",
+			diff: "diff --git a/script.lua b/script.lua\n" +
+				"index 111..222 100644\n" +
+				"--- a/script.lua\n" +
+				"+++ b/script.lua\n" +
+				"@@ -1,3 +1,3 @@\n" +
+				" local x = 1\n" +
+				"--- old comment\n" +
+				"+++ new comment\n" +
+				" local y = 2\n",
+			// The removed "-- old comment" and added "++ new comment"
+			// lines count against the enclosing file and open no phantom
+			// rows of their own.
+			want:    []string{"script.lua | +1 -1"},
+			notWant: []string{"old comment |", "new comment |"},
+		},
+		{
+			name: "binary file change",
+			diff: "diff --git a/logo.png b/logo.png\n" +
+				"index 111..222 100644\n" +
+				"Binary files a/logo.png and b/logo.png differ\n",
+			want:    []string{"logo.png | binary"},
+			notWant: []string{"no per-file stats"},
+		},
+		{
+			name: "git binary patch",
+			diff: "diff --git a/data.bin b/data.bin\n" +
+				"index 111..222 100644\n" +
+				"GIT binary patch\n" +
+				"literal 0\n" +
+				"zc21ZQ\n",
+			want:    []string{"data.bin | binary"},
+			notWant: []string{"no per-file stats"},
+		},
+		{
+			name: "rename only",
+			diff: "diff --git a/old_name.txt b/new_name.txt\n" +
+				"similarity index 100%\n" +
+				"rename from old_name.txt\n" +
+				"rename to new_name.txt\n",
+			want:    []string{"old_name.txt \u2192 new_name.txt | renamed"},
+			notWant: []string{"+0 -0"},
+		},
+		{
+			name: "rename with edits",
+			diff: "diff --git a/old_name.txt b/new_name.txt\n" +
+				"similarity index 50%\n" +
+				"rename from old_name.txt\n" +
+				"rename to new_name.txt\n" +
+				"--- a/old_name.txt\n" +
+				"+++ b/new_name.txt\n" +
+				"@@ -1 +1 @@\n" +
+				"-old line\n" +
+				"+new line\n",
+			// A rename with content changes renders the new path with its
+			// counts, not the rename marker.
+			want:    []string{"new_name.txt | +1 -1"},
+			notWant: []string{"renamed", "old_name.txt \u2192"},
+		},
+		{
+			name: "deletion",
+			diff: "diff --git a/gone.txt b/gone.txt\n" +
+				"deleted file mode 100644\n" +
+				"index 111..000\n" +
+				"--- a/gone.txt\n" +
+				"+++ /dev/null\n" +
+				"@@ -1,2 +0,0 @@\n" +
+				"-gone\n" +
+				"-content\n",
+			want:    []string{"gone.txt | +0 -2"},
+			notWant: []string{"/dev/null |"},
+		},
+		{
+			name: "mixed multi-file diff",
+			diff: "diff --git a/a.go b/a.go\n" +
+				"index 111..222 100644\n" +
+				"--- a/a.go\n" +
+				"+++ b/a.go\n" +
+				"@@ -1 +1,2 @@\n" +
+				" func a() {\n" +
+				"+\treturn 1\n" +
+				" }\n" +
+				"diff --git a/img.png b/img.png\n" +
+				"index 333..444 100644\n" +
+				"Binary files a/img.png and b/img.png differ\n" +
+				"diff --git a/old.txt b/new.txt\n" +
+				"similarity index 100%\n" +
+				"rename from old.txt\n" +
+				"rename to new.txt\n",
+			want: []string{
+				"a.go | +1 -0",
+				"img.png | binary",
+				"old.txt \u2192 new.txt | renamed",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			summary := SummarizeDiff(tt.diff)
+			for _, w := range tt.want {
+				require.Contains(t, summary, w)
+			}
+			for _, nw := range tt.notWant {
+				require.NotContains(t, summary, nw)
+			}
+		})
+	}
+}
+
 func TestDispatchResultTerminalMessage(t *testing.T) {
 	r := DispatchResult{
 		DispatchID:    "d-1",
