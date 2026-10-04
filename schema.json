@@ -1045,6 +1045,30 @@
           "type": "boolean",
           "description": "Reject mutating tools (write, edit, multiedit, bash) until a todo list exists",
           "default": false
+        },
+        "kill_after_nudges": {
+          "type": "integer",
+          "description": "Wander kill: nudges a dispatched agent may ignore before it is killed; 0 disables",
+          "default": 2,
+          "examples": [
+            3
+          ]
+        },
+        "stall_window": {
+          "type": "integer",
+          "description": "Wander kill: seconds without a todo update that mark a dispatched run as stalled; 0 disables",
+          "default": 0,
+          "examples": [
+            300
+          ]
+        },
+        "hard_timeout": {
+          "type": "integer",
+          "description": "Wander kill: seconds after which a dispatched run is killed outright; 0 disables",
+          "default": 0,
+          "examples": [
+            1800
+          ]
         }
       },
       "additionalProperties": false,

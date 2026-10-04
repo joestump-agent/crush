@@ -557,6 +557,20 @@ type TodoEnforcementConfig struct {
 	// the session has a todo list. Deterministic but brittle; off by
 	// default.
 	HardGate *bool `json:"hard_gate,omitempty" jsonschema:"description=Reject mutating tools (write\\, edit\\, multiedit\\, bash) until a todo list exists,default=false"`
+	// KillAfterNudges is the wander-kill rung (#316): how many nudges a
+	// run may ignore before the coordinator kills it deterministically.
+	// The default of 2 kills after both the nudge and the escalating
+	// nudge are ignored; 0 disables the kill. It only wires up for
+	// dispatched agents (the parent must be able to re-dispatch); the
+	// main agent's ladder stays capped at nudging.
+	KillAfterNudges *int `json:"kill_after_nudges,omitempty" jsonschema:"description=Wander kill: nudges a dispatched agent may ignore before it is killed; 0 disables,default=2,example=3"`
+	// StallWindow kills a dispatched run whose todo list has not been
+	// updated for this many seconds while it keeps running ("stalled
+	// todos"). 0 (the default) disables the stall check.
+	StallWindow *int `json:"stall_window,omitempty" jsonschema:"description=Wander kill: seconds without a todo update that mark a dispatched run as stalled; 0 disables,default=0,example=300"`
+	// HardTimeout kills a dispatched run after this many seconds,
+	// whatever its progress. 0 (the default) disables the timeout.
+	HardTimeout *int `json:"hard_timeout,omitempty" jsonschema:"description=Wander kill: seconds after which a dispatched run is killed outright; 0 disables,default=0,example=1800"`
 }
 
 // TodoEnforcementSettings is the resolved enforcement ladder: the per-agent
@@ -565,9 +579,20 @@ type TodoEnforcementSettings struct {
 	Enabled        bool
 	NudgeThreshold int
 	HardGate       bool
+	// Wander kill (#316). KillAfterNudges is the number of ignored
+	// nudges that trip the kill; StallWindow and HardTimeout are 0 when
+	// disabled.
+	KillAfterNudges int
+	StallWindow     time.Duration
+	HardTimeout     time.Duration
 }
 
-const defaultTodoNudgeThreshold = 4
+const (
+	defaultTodoNudgeThreshold = 4
+	// defaultTodoKillAfterNudges kills a dispatched agent after both the
+	// nudge and the escalating nudge have been ignored.
+	defaultTodoKillAfterNudges = 2
+)
 
 // ResolveTodoEnforcement layers the per-agent config over over the global
 // one, field by field, and applies defaults. Nil layers resolve to the
@@ -587,10 +612,20 @@ func ResolveTodoEnforcement(global, over *TodoEnforcementConfig) TodoEnforcement
 		if over.HardGate != nil {
 			merged.HardGate = over.HardGate
 		}
+		if over.KillAfterNudges != nil {
+			merged.KillAfterNudges = over.KillAfterNudges
+		}
+		if over.StallWindow != nil {
+			merged.StallWindow = over.StallWindow
+		}
+		if over.HardTimeout != nil {
+			merged.HardTimeout = over.HardTimeout
+		}
 	}
 	settings := TodoEnforcementSettings{
-		Enabled:        true,
-		NudgeThreshold: defaultTodoNudgeThreshold,
+		Enabled:         true,
+		NudgeThreshold:  defaultTodoNudgeThreshold,
+		KillAfterNudges: defaultTodoKillAfterNudges,
 	}
 	if merged.Enabled != nil {
 		settings.Enabled = *merged.Enabled
@@ -600,6 +635,15 @@ func ResolveTodoEnforcement(global, over *TodoEnforcementConfig) TodoEnforcement
 	}
 	if merged.HardGate != nil {
 		settings.HardGate = *merged.HardGate
+	}
+	if merged.KillAfterNudges != nil {
+		settings.KillAfterNudges = max(*merged.KillAfterNudges, 0)
+	}
+	if merged.StallWindow != nil && *merged.StallWindow > 0 {
+		settings.StallWindow = time.Duration(*merged.StallWindow) * time.Second
+	}
+	if merged.HardTimeout != nil && *merged.HardTimeout > 0 {
+		settings.HardTimeout = time.Duration(*merged.HardTimeout) * time.Second
 	}
 	return settings
 }

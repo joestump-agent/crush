@@ -2,6 +2,7 @@ package config
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -81,4 +82,51 @@ func TestAgentResolvedTodoEnforcement(t *testing.T) {
 	bare := Agent{}
 	assert.Equal(t, 3, bare.ResolvedTodoEnforcement(global).NudgeThreshold)
 	assert.Equal(t, 4, bare.ResolvedTodoEnforcement(nil).NudgeThreshold)
+}
+
+// TestResolveTodoEnforcementKillDefaults pins the wander-kill knobs
+// (#316): kill after two ignored nudges by default, stall window and
+// hard timeout off.
+func TestResolveTodoEnforcementKillDefaults(t *testing.T) {
+	t.Parallel()
+
+	settings := ResolveTodoEnforcement(nil, nil)
+	assert.Equal(t, 2, settings.KillAfterNudges)
+	assert.Zero(t, settings.StallWindow)
+	assert.Zero(t, settings.HardTimeout)
+}
+
+// TestResolveTodoEnforcementKillKnobs pins the kill knobs' layering,
+// their disable-by-zero semantics, and the negative-value guards.
+func TestResolveTodoEnforcementKillKnobs(t *testing.T) {
+	t.Parallel()
+
+	global := &TodoEnforcementConfig{
+		KillAfterNudges: intPtr(3),
+		StallWindow:     intPtr(300),
+		HardTimeout:     intPtr(1800),
+	}
+	settings := ResolveTodoEnforcement(global, nil)
+	assert.Equal(t, 3, settings.KillAfterNudges)
+	assert.Equal(t, 300*time.Second, settings.StallWindow)
+	assert.Equal(t, 1800*time.Second, settings.HardTimeout)
+
+	// The per-agent override replaces each knob field by field.
+	settings = ResolveTodoEnforcement(global, &TodoEnforcementConfig{
+		KillAfterNudges: intPtr(1),
+		StallWindow:     intPtr(0),
+	})
+	assert.Equal(t, 1, settings.KillAfterNudges)
+	assert.Zero(t, settings.StallWindow, "an explicit 0 must disable the stall window")
+	assert.Equal(t, 1800*time.Second, settings.HardTimeout, "fields the override does not set carry over")
+
+	// Negative values are guards, not settings.
+	settings = ResolveTodoEnforcement(&TodoEnforcementConfig{
+		KillAfterNudges: intPtr(-1),
+		StallWindow:     intPtr(-5),
+		HardTimeout:     intPtr(-5),
+	}, nil)
+	assert.Equal(t, 0, settings.KillAfterNudges)
+	assert.Zero(t, settings.StallWindow)
+	assert.Zero(t, settings.HardTimeout)
 }

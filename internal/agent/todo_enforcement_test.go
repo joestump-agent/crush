@@ -65,6 +65,11 @@ func (m *scriptedModel) StreamObject(ctx context.Context, call fantasy.ObjectCal
 const titlePromptMarker = "You will generate a short title"
 
 func (m *scriptedModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
+	// A canceled context (the wander kill, mostly) must end the stream
+	// deterministically, not let the script run on.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	for _, msg := range call.Prompt {
 		for _, part := range msg.Content {
 			if text, ok := part.(fantasy.TextPart); ok && strings.Contains(text.Text, titlePromptMarker) {
@@ -94,7 +99,9 @@ func (m *scriptedModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.
 	m.mu.Unlock()
 
 	return func(yield func(fantasy.StreamPart) bool) {
-		if step.text != "" && len(step.toolCalls) == 0 {
+		if step.text != "" {
+			// A step may carry its state text before tool calls, so a
+			// run's last assistant message can be captured mid-script.
 			if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextStart, ID: "1"}) {
 				return
 			}
@@ -104,6 +111,8 @@ func (m *scriptedModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.
 			if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextEnd, ID: "1"}) {
 				return
 			}
+		}
+		if len(step.toolCalls) == 0 {
 			yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeFinish, FinishReason: fantasy.FinishReasonStop})
 			return
 		}
@@ -173,9 +182,21 @@ func mutatingTool(name string) fantasy.AgentTool {
 	)
 }
 
+// todoAgentOpt tweaks the session agent options the test helper builds.
+type todoAgentOpt func(*SessionAgentOptions)
+
+// withTodoKill wires the wander-kill observer (#316) onto the agent.
+func withTodoKill(fn func(sessionID, reason string)) todoAgentOpt {
+	return func(o *SessionAgentOptions) { o.TodoKill = fn }
+}
+
 // newTodoTestAgent builds a session agent with the ladder resolved from
 // settings, plus the given tools.
-func newTodoTestAgent(t *testing.T, env fakeEnv, model *scriptedModel, settings config.TodoEnforcementSettings, ts ...fantasy.AgentTool) *sessionAgent {
+func newTodoTestAgent(t *testing.T, env fakeEnv, model fantasy.LanguageModel, settings config.TodoEnforcementSettings, ts ...fantasy.AgentTool) *sessionAgent {
+	return newTodoTestAgentOpts(t, env, model, settings, nil, ts...)
+}
+
+func newTodoTestAgentOpts(t *testing.T, env fakeEnv, model fantasy.LanguageModel, settings config.TodoEnforcementSettings, opts []todoAgentOpt, ts ...fantasy.AgentTool) *sessionAgent {
 	t.Helper()
 	largeModel := Model{
 		Model:      model,
@@ -186,7 +207,7 @@ func newTodoTestAgent(t *testing.T, env fakeEnv, model *scriptedModel, settings 
 		CatwalkCfg: catwalkModelCfg(),
 	}
 	ts = append(ts, tools.NewTodosTool(env.sessions))
-	return NewSessionAgent(SessionAgentOptions{
+	options := SessionAgentOptions{
 		LargeModel:      largeModel,
 		SmallModel:      smallModel,
 		SystemPrompt:    "system",
@@ -195,7 +216,11 @@ func newTodoTestAgent(t *testing.T, env fakeEnv, model *scriptedModel, settings 
 		Messages:        env.messages,
 		Tools:           ts,
 		TodoEnforcement: settings,
-	}).(*sessionAgent)
+	}
+	for _, opt := range opts {
+		opt(&options)
+	}
+	return NewSessionAgent(options).(*sessionAgent)
 }
 
 func catwalkModelCfg() catwalk.Model {

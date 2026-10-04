@@ -3,10 +3,12 @@ package agent
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/fantasy"
@@ -54,6 +56,42 @@ type dispatchAgentOptions struct {
 	// Skills restricts the rendered available-skills set; empty means
 	// every skill discovered in the workspace.
 	Skills []string
+	// TodoKill observes the wander-kill escalation (#316): invoked when
+	// the dispatched run ignores its nudges past the kill threshold, so
+	// the coordinator can record the reason against this dispatch. The
+	// run's cancellation is intrinsic; this only observes.
+	TodoKill func(sessionID string, reason string)
+}
+
+// dispatchKill records the deterministic-kill outcome of one dispatched
+// run (#316). The enforcement ladder's hook and the run's watchdog both
+// feed it; runDispatch reads it once, after the run returns, to decide
+// the terminal result. First reason wins. A nil kill is the no-op fast
+// path, so runs without kill wiring (existing callers, tests) never
+// branch on it.
+type dispatchKill struct {
+	mu     sync.Mutex
+	reason string
+}
+
+func (k *dispatchKill) kill(reason string) {
+	if k == nil {
+		return
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.reason == "" {
+		k.reason = reason
+	}
+}
+
+func (k *dispatchKill) current() string {
+	if k == nil {
+		return ""
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.reason
 }
 
 // dispatchedAgent is the agent one dispatch runs, plus the model and
@@ -84,6 +122,13 @@ type dispatchRun struct {
 	// call time so the dispatched agent's turns render at the right size
 	// (the PrepareStep stamp would otherwise clobber it with zero).
 	contentWidth int
+	// kill accumulates the wander-kill reason (#316) from the
+	// enforcement ladder's hook and the watchdog; empty when the run is
+	// never killed.
+	kill *dispatchKill
+	// killSettings are the resolved wander-kill thresholds for this
+	// dispatch: nudges-before-kill, todos stall window, hard timeout.
+	killSettings config.TodoEnforcementSettings
 }
 
 // dispatchTool builds the DispatchAgent tool (#64): provision a clean
@@ -146,10 +191,18 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			if builder == nil {
 				builder = c.buildDispatchedAgent
 			}
+			// The wander-kill state (#316): the enforcement ladder's hook
+			// and the run's watchdog both feed it; the run goroutine reads
+			// it to assemble the terminal result.
+			kill := &dispatchKill{}
+			killSettings := config.ResolveTodoEnforcement(c.cfg.Config().Options.TodoEnforcement, nil)
 			dispatched, err := builder(ctx, dispatchAgentOptions{
 				Toolchain: toolchain,
 				ModelType: modelType,
 				Skills:    params.Skills,
+				TodoKill: func(sessionID string, reason string) {
+					kill.kill(reason)
+				},
 			})
 			if err != nil {
 				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
@@ -184,6 +237,8 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				sessionID:       taskSession.ID,
 				parentSessionID: sessionID,
 				contentWidth:    tools.GetContentWidthFromContext(ctx),
+				kill:            kill,
+				killSettings:    killSettings,
 			})
 
 			handle := dispatch.DispatchResult{
@@ -255,6 +310,10 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 		Notify:               c.notify,
 		RunComplete:          c.runComplete,
 		TodoEnforcement:      config.ResolveTodoEnforcement(c.cfg.Config().Options.TodoEnforcement, nil),
+		// The dispatched agent is the one agent whose run may be killed
+		// (#316): the observer hands the reason to the coordinator's kill
+		// state so the terminal result carries it.
+		TodoKill: opts.TodoKill,
 	})
 
 	return &dispatchedAgent{agent: agent, model: model, providerCfg: providerCfg}, nil
@@ -264,6 +323,8 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 // (#64): it drives the ephemeral session's turn, keeps the registry's
 // status current, propagates the dispatched session's cost to the parent,
 // and delivers the terminal DispatchResult back to the main agent (#66).
+// The wander-kill watchdog (#316) runs alongside the turn and cancels it
+// deterministically when a kill threshold trips.
 func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	defer func() {
 		// The toolchain outlives the turn: Close stops the permission
@@ -271,6 +332,9 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		// workspace anymore.
 		run.toolchain.Close(ctx)
 	}()
+
+	watchStop := c.startDispatchKillWatch(ctx, run)
+	defer watchStop()
 
 	maxTokens := run.model.CatwalkCfg.DefaultMaxTokens
 	if run.model.ModelCfg.MaxTokens != 0 {
@@ -291,6 +355,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		NonInteractive:   true,
 		OnAuthRefresh:    c.makeAuthRefreshCallback(run.providerCfg),
 	})
+	watchStop()
 
 	// A nil result with a nil error means no turn ran — the session was
 	// busy or a cancel landed during dispatch (#173 review note on #64).
@@ -304,7 +369,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		slog.Error("Dispatched agent ran no turn", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
 	}
 
-	terminal := c.assembleDispatchResult(ctx, run, result, err)
+	terminal := c.assembleTerminalDispatchResult(ctx, run, result, err)
 	// Record the terminal payload before the terminal status so the
 	// terminal entry event carries it: the completed agent block (#65)
 	// renders its durable record from the registry.
@@ -318,6 +383,192 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	}
 
 	c.deliverDispatchResult(ctx, run.parentSessionID, terminal)
+}
+
+// assembleTerminalDispatchResult maps a finished dispatched run onto its
+// terminal DispatchResult, preferring the kill outcome (#316) over the
+// natural one: a run the ladder or watchdog killed is killed, a run that
+// stopped on loop detection is killed as a tool loop, and everything
+// else falls through to the completed/failed mapping.
+func (c *coordinator) assembleTerminalDispatchResult(ctx context.Context, run dispatchRun, result *fantasy.AgentResult, runErr error) dispatch.DispatchResult {
+	if reason := run.kill.current(); reason != "" {
+		// The kill's cancel either ended the run (error) or stopped it on
+		// loop detection; a run that completed naturally before the
+		// kill's cancel took effect delivers its natural completion (the
+		// late kill is discarded).
+		if runErr != nil || dispatchRunStoppedInLoop(result) {
+			return c.assembleKilledDispatchResult(ctx, run, reason)
+		}
+	} else if dispatchRunStoppedInLoop(result) {
+		// Loop detection's StopWhen ended the run in-process; the
+		// block records it as the tool-loop kill reason.
+		return c.assembleKilledDispatchResult(ctx, run, dispatch.ReasonToolLoop)
+	}
+	return c.assembleDispatchResult(ctx, run, result, runErr)
+}
+
+// dispatchRunStoppedInLoop reports whether a finished run ended on the
+// loop-detection stop condition (#316's tool-loop kill reason): the same
+// signature check the StopWhen in Run uses, applied to the result's
+// steps.
+func dispatchRunStoppedInLoop(result *fantasy.AgentResult) bool {
+	if result == nil {
+		return false
+	}
+	return hasRepeatedToolCalls(result.Steps, loopDetectionWindowSize, loopDetectionMaxRepeats)
+}
+
+// startDispatchKillWatch runs the time-based kill reasons (#316) for one
+// dispatched run: the hard timeout kills outright; the todos stall window
+// kills a run whose todo list has not been updated for the configured
+// window while it keeps working. It returns a stop func that ends the
+// watch; the deferred stop plus the explicit one after Run bound the
+// watchdog to the run's lifetime.
+func (c *coordinator) startDispatchKillWatch(ctx context.Context, run dispatchRun) (stop func()) {
+	settings := run.killSettings
+	if settings.HardTimeout <= 0 && settings.StallWindow <= 0 {
+		return func() {}
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	killFromWatch := func(reason string) {
+		run.kill.kill(reason)
+		slog.Warn("Dispatch run killed by watchdog", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "reason", reason)
+		run.agent.Cancel(run.sessionID)
+	}
+
+	if settings.HardTimeout > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			timer := time.NewTimer(settings.HardTimeout)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				killFromWatch(dispatch.ReasonHardTimeout)
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	if settings.StallWindow > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.watchTodosStall(ctx, run, settings.StallWindow, killFromWatch)
+		}()
+	}
+
+	return func() {
+		cancel()
+		wg.Wait()
+	}
+}
+
+// watchTodosStall polls the dispatched session's todo list and kills the
+// run once an existing list goes untouched for the stall window ("stalled
+// todos"). The poll cadence is a quarter of the window, clamped so tiny
+// windows still poll and huge ones do not hammer the DB.
+func (c *coordinator) watchTodosStall(ctx context.Context, run dispatchRun, window time.Duration, kill func(string)) {
+	tick := window / 4
+	if tick < 50*time.Millisecond {
+		tick = 50 * time.Millisecond
+	}
+	if tick > 30*time.Second {
+		tick = 30 * time.Second
+	}
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	fingerprint, ok := c.dispatchTodosFingerprint(ctx, run.sessionID)
+	if !ok {
+		return
+	}
+	stalledSince := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		current, ok := c.dispatchTodosFingerprint(ctx, run.sessionID)
+		if !ok {
+			continue
+		}
+		if current != fingerprint {
+			fingerprint = current
+			stalledSince = time.Now()
+			continue
+		}
+		if time.Since(stalledSince) >= window {
+			kill(dispatch.ReasonStalledTodos)
+			return
+		}
+	}
+}
+
+// dispatchTodosFingerprint returns a comparable form of the session's
+// current todo list, ok=false while the session has no todos (an absent
+// list is the nudge ladder's problem, not a stall).
+func (c *coordinator) dispatchTodosFingerprint(ctx context.Context, sessionID string) (string, bool) {
+	sess, err := c.sessions.Get(ctx, sessionID)
+	if err != nil || len(sess.Todos) == 0 {
+		return "", false
+	}
+	b, err := json.Marshal(sess.Todos)
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
+// assembleKilledDispatchResult builds the structured failure result a
+// killed run delivers to its parent (#316): the kill reason, the run's
+// last assistant state as the findings, and the salvageable diff-vs-base
+// as the summary. The workspace is deliberately left alone: cleanup
+// defers to the parent's re-dispatch-or-dismiss decision, and the
+// session-end sweep remains the only automatic teardown.
+func (c *coordinator) assembleKilledDispatchResult(ctx context.Context, run dispatchRun, reason string) dispatch.DispatchResult {
+	terminal := dispatch.DispatchResult{
+		DispatchID:    run.entry.ID,
+		Branch:        run.entry.Branch,
+		WorkspacePath: run.entry.Path,
+		SessionID:     run.sessionID,
+		Status:        dispatch.StatusKilled,
+		KilledReason:  reason,
+		KeyFindings:   c.dispatchLastAssistantText(ctx, run.sessionID),
+	}
+	diff, diffErr := run.workspace.Diff(ctx, run.entry.ID)
+	switch {
+	case diffErr != nil:
+		terminal.DiffSummary = fmt.Sprintf("(diff unavailable: %s)", diffErr)
+	case diff == "":
+		terminal.DiffSummary = "(no changes)"
+	default:
+		terminal.DiffSummary = dispatch.SummarizeDiff(diff)
+	}
+	return terminal
+}
+
+// dispatchLastAssistantText returns the dispatched session's final
+// non-empty assistant text, the "last state" a killed run's parent
+// reasons over when deciding whether to re-dispatch.
+func (c *coordinator) dispatchLastAssistantText(ctx context.Context, sessionID string) string {
+	msgs, err := c.messages.List(ctx, sessionID)
+	if err != nil {
+		return ""
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		msg := msgs[i]
+		if msg.Role != message.Assistant {
+			continue
+		}
+		if text := strings.TrimSpace(msg.Content().String()); text != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 // assembleDispatchResult builds the terminal DispatchResult (#66) from a

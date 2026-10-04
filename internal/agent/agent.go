@@ -250,6 +250,9 @@ type sessionAgent struct {
 	// gate. Nil when the ladder is off (the no-op fast path every
 	// method checks for).
 	todoEnforcement *todoEnforcement
+	// todoKill observes the wander-kill escalation (#316). Nil except
+	// for dispatched agents; see SessionAgentOptions.TodoKill.
+	todoKill func(sessionID string, reason string)
 	// acceptedMu serializes increments/decrements of acceptedRuns and
 	// the assignment of accept sequence numbers from acceptSeqGen. It
 	// is separate from dispatchMu so AcceptedRun.Close (which may run
@@ -290,6 +293,12 @@ type SessionAgentOptions struct {
 	// both false), which keeps direct constructors — tests and the
 	// default agents — unchanged.
 	TodoEnforcement config.TodoEnforcementSettings
+	// TodoKill observes the wander-kill escalation (#316): invoked when
+	// a run ignores its nudges past the resolved kill threshold. The
+	// cancel itself is intrinsic to the run; this is the coordinator's
+	// chance to record the reason. Nil everywhere but dispatched agents,
+	// so only they can be killed.
+	TodoKill func(sessionID string, reason string)
 }
 
 func NewSessionAgent(
@@ -323,6 +332,7 @@ func newSessionAgent(opts SessionAgentOptions) *sessionAgent {
 		acceptedRuns:         csync.NewMap[string, int](),
 		cancelMark:           csync.NewMap[string, uint64](),
 		todoEnforcement:      enforcement,
+		todoKill:             opts.TodoKill,
 		ready:                readyNow(),
 	}
 }
@@ -768,8 +778,21 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// The todo enforcement ladder's state for this run (#315): seeded
 	// with whether the session already carries a todo list, advanced by
 	// OnToolCall, consulted by PrepareStep. Nil (ladder off) makes every
-	// method a no-op.
-	todoRun := a.todoEnforcement.newRun(len(currentSession.Todos) > 0)
+	// method a no-op. When the ladder tops out on a dispatched agent
+	// (#316), the hook records the reason with the coordinator and the
+	// run cancels itself; the cancel is intrinsic so the escalation can
+	// never be dropped by a missing observer.
+	var todoKillFn func(sessionID, reason string)
+	if a.todoKill != nil {
+		todoKillFn = a.todoKill
+	}
+	todoRun := a.todoEnforcement.newRun(len(currentSession.Todos) > 0, func(reason string) {
+		if todoKillFn != nil {
+			todoKillFn(call.SessionID, reason)
+		}
+		slog.Warn("Todo enforcement killed the run", "session_id", call.SessionID, "reason", reason)
+		a.Cancel(call.SessionID)
+	})
 
 	msgs, err := a.getSessionMessages(ctx, currentSession)
 	if err != nil {

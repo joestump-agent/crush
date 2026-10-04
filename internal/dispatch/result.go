@@ -12,6 +12,22 @@ import (
 // parent agent can always read the workspace files for full detail.
 const MaxDiffLines = 250
 
+// Kill reasons recorded on a killed dispatch (#316). A killed run is
+// deterministic cancellation, and the reason is the parent agent's (and
+// the human's) explanation of why.
+const (
+	// ReasonIgnoredNudges: the run ignored the enforcement ladder's
+	// nudges past the configured kill threshold (#315's escalation).
+	ReasonIgnoredNudges = "ignored nudges"
+	// ReasonStalledTodos: the run kept working but its todo list went
+	// untouched for the configured stall window.
+	ReasonStalledTodos = "stalled todos"
+	// ReasonToolLoop: the run ended on the loop-detection stop condition.
+	ReasonToolLoop = "tool loop"
+	// ReasonHardTimeout: the run outlived the configured hard timeout.
+	ReasonHardTimeout = "hard timeout"
+)
+
 // DispatchResult is the model-facing result of a dispatch: the running
 // handle the DispatchAgent tool returns immediately (#64), and — once the
 // dispatched agent finishes — the terminal payload carrying the work
@@ -33,20 +49,24 @@ type DispatchResult struct {
 	// SessionID is the ephemeral session backing the dispatched agent.
 	SessionID string `json:"session_id"`
 	// Status is the dispatch's lifecycle state: running while the agent
-	// works, completed or failed as its terminal state.
+	// works, completed, failed, or killed as its terminal state.
 	Status Status `json:"status"`
 	// KeyFindings is the dispatched agent's final message — the
-	// terminal status message text in the A2A mapping. Populated only
-	// on completion.
+	// terminal status message text in the A2A mapping. Populated on
+	// completion; on a killed run it carries the run's last assistant
+	// state instead.
 	KeyFindings string `json:"key_findings,omitempty"`
 	// DiffSummary is the condensed work product: a per-file change stat
 	// followed by the diff itself, truncated at MaxDiffLines. Populated
-	// only on completion; a capture failure is recorded inline rather
-	// than failing the result.
+	// on completion and on kill (the salvageable work product); a
+	// capture failure is recorded inline rather than failing the result.
 	DiffSummary string `json:"diff_summary,omitempty"`
 	// Error carries the failure reason when Status is failed. A
-	// completed run leaves it empty.
+	// completed or killed run leaves it empty.
 	Error string `json:"error,omitempty"`
+	// KilledReason is why the run was deterministically canceled when
+	// Status is killed (#316): one of the Reason* constants.
+	KilledReason string `json:"killed_reason,omitempty"`
 }
 
 // Render returns the result as indented JSON, the stable wire shape the
@@ -67,6 +87,15 @@ func (r DispatchResult) Render() string {
 // the workspace up through Remove (#63).
 func (r DispatchResult) TerminalMessage() string {
 	var b strings.Builder
+	if r.Status == StatusKilled {
+		// Wander kill (#316): the workspace is deliberately preserved (a
+		// kill never auto-discards work-in-progress a human might want),
+		// so the instruction points the parent at the
+		// re-dispatch-or-dismiss decision instead of plain review.
+		fmt.Fprintf(&b, "A dispatched agent was killed (reason: %q; dispatch %s, branch %s). Its workspace is preserved: nothing was discarded, and cleanup still waits on your decision. The agent's last state and the salvageable diff are below. Decide whether to re-dispatch the task or dismiss the workspace (git worktree remove and branch delete).\n\n", r.KilledReason, r.DispatchID, r.Branch)
+		b.WriteString(r.Render())
+		return b.String()
+	}
 	fmt.Fprintf(&b, "A dispatched agent finished with status %q (dispatch %s, branch %s). Its result is below. Review the diff and decide whether to merge or dismiss it — the dispatch never merges itself; dismissal should clean up the workspace (git worktree remove and branch delete).\n\n", r.Status, r.DispatchID, r.Branch)
 	b.WriteString(r.Render())
 	return b.String()

@@ -10,6 +10,7 @@ import (
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
 )
@@ -93,6 +94,11 @@ func newTodoEnforcement(settings config.TodoEnforcementSettings, sessions sessio
 // goroutine.
 type todoEnforcementRun struct {
 	enforcement *todoEnforcement
+	// onKill is the wander-kill escalation (#316), wired only for
+	// dispatched agents: invoked once, when the run ignores its nudges
+	// past the kill threshold. Nil elsewhere, so the ladder tops out at
+	// nudging for the main agent and agent-tool sub-agents.
+	onKill func(reason string)
 
 	mu sync.Mutex
 	// todosSatisfied records that the run's todos are alive: the session
@@ -105,17 +111,21 @@ type todoEnforcementRun struct {
 	mutatingCall bool
 	// nudges counts nudges injected this run.
 	nudges int
+	// killed records that the kill already fired, so later windows do
+	// not re-invoke the hook.
+	killed bool
 }
 
 // newRun starts the ladder for one run, seeded with whether the session
 // already carries a todo list. A nil enforcement yields a nil run, the
 // no-op fast path every method also guards for.
-func (e *todoEnforcement) newRun(sessionHasTodos bool) *todoEnforcementRun {
+func (e *todoEnforcement) newRun(sessionHasTodos bool, onKill func(reason string)) *todoEnforcementRun {
 	if e == nil {
 		return nil
 	}
 	return &todoEnforcementRun{
 		enforcement:    e,
+		onKill:         onKill,
 		todosSatisfied: sessionHasTodos,
 	}
 }
@@ -144,25 +154,44 @@ func (r *todoEnforcementRun) recordToolCall(toolName string) {
 // was called; escalating on the second nudge, capped at maxNudgesPerRun.
 // Counters reset on injection so escalation needs another full window of
 // ignoring, not the next tool call.
+//
+// This is also the kill rung (#316): when the configured number of
+// nudges has been given and the window after the last one completes with
+// still no todos activity, the wander-kill hook fires (ignored nudges)
+// and the run is canceled. With no hook wired the ladder stays capped at
+// nudging, which is the main agent's and sub-agents' contract.
 func (r *todoEnforcementRun) pendingNudge() string {
 	if r == nil || !r.enforcement.settings.Enabled {
 		return ""
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.todosSatisfied || r.nudges >= maxNudgesPerRun {
+	if r.todosSatisfied || r.killed {
 		return ""
 	}
 	if r.toolCalls < r.enforcement.settings.NudgeThreshold && !r.mutatingCall {
 		return ""
 	}
-	r.nudges++
 	r.toolCalls = 0
 	r.mutatingCall = false
-	if r.nudges == 1 {
-		return todoNudgeMessage
+	// The kill rung (#316) comes first: if the ladder has already
+	// delivered killAfterNudges nudges, this window is the ignored-nudges
+	// kill, not another nudge. Clamp the threshold to the ladder's cap,
+	// since no further nudges are coming past it.
+	if r.onKill != nil && r.enforcement.settings.KillAfterNudges > 0 &&
+		r.nudges >= min(r.enforcement.settings.KillAfterNudges, maxNudgesPerRun) {
+		r.killed = true
+		r.onKill(dispatch.ReasonIgnoredNudges)
+		return ""
 	}
-	return todoEscalatingNudgeMessage
+	if r.nudges < maxNudgesPerRun {
+		r.nudges++
+		if r.nudges == 1 {
+			return todoNudgeMessage
+		}
+		return todoEscalatingNudgeMessage
+	}
+	return ""
 }
 
 // gate check: the hard gate rejects mutating tool calls until the session
