@@ -264,7 +264,9 @@ func TestDispatchAgentToolCleansUpFailedSetup(t *testing.T) {
 	require.Empty(t, strings.TrimSpace(string(out)), "dispatch branch left behind")
 	entries, err := os.ReadDir(filepath.Join(env.workingDir, ".crush", "worktrees"))
 	require.NoError(t, err)
-	require.Empty(t, entries, "worktree directory left behind")
+	for _, e := range entries {
+		require.False(t, e.IsDir(), "worktree directory left behind: %s", e.Name())
+	}
 }
 
 // runDispatch maps the run outcome onto the registry status: a completed

@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/charmbracelet/crush/internal/lock"
 )
 
 // newTestRepo creates a git repository with one commit on a file, with
@@ -31,7 +34,7 @@ func newTestRepo(t *testing.T) string {
 	run("config", "user.name", "dispatch test")
 	require.NoError(t, os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644))
 	run("add", "-A")
-	run("commit", "-qm", "initial")
+	run("-c", "commit.gpgsign=false", "commit", "-qm", "initial")
 	return repo
 }
 
@@ -81,6 +84,12 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	require.True(t, dirInfo.IsDir())
 	require.True(t, branchExists(t, repo, entry.Branch))
 
+	// Every provisioned workspace holds a lease and carries an owner
+	// marker, both next to the worktree so they never appear in a
+	// diff.
+	require.FileExists(t, ws.leasePath(entry.Branch))
+	require.FileExists(t, ws.ownerPath(entry.Branch))
+
 	// The registry tracks the entry and answers the later-phase
 	// queries: by handle, by session, and the flat list.
 	got, ok := ws.Get(entry.ID)
@@ -120,6 +129,8 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	require.Contains(t, diff, "untracked.txt")
 	require.Contains(t, diff, "-one")
 	require.Contains(t, diff, "+one edited")
+	require.NotContains(t, diff, ".lock")
+	require.NotContains(t, diff, ".owner.json")
 
 	// The temp-index approach must not stage anything into the
 	// workspace's real index (the unstaged f.txt edit is expected; a
@@ -135,6 +146,14 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	_, ok = ws.Get(entry.ID)
 	require.False(t, ok)
 	require.NoError(t, ws.Remove(ctx, entry.ID))
+
+	// The owner marker goes with the workspace. The lock file stays on
+	// disk — flock is keyed by inode, so it is never unlinked — but
+	// nobody holds it.
+	require.NoFileExists(t, ws.ownerPath(entry.Branch))
+	rel, err := lock.TryFile(ws.leasePath(entry.Branch))
+	require.NoError(t, err)
+	rel()
 }
 
 // Sweep is the session-end backstop: it removes every tracked
@@ -155,10 +174,22 @@ func TestWorkspaceSweepRemovesTrackedAndOrphans(t *testing.T) {
 	require.True(t, ws.SetStatus(abandoned.ID, StatusRunning))
 
 	// An orphan: a worktree this process did not register, as a crashed
-	// run would leave behind.
+	// run would leave behind. Its lease file survives the crash — the
+	// kernel releases the lock, not the file — so the orphan here gets
+	// a lock file nobody holds, and is still reclaimed.
 	orphanBranch := BranchPrefix + "orphaned"
 	orphanPath := filepath.Join(ws.worktreesDir, orphanBranch)
 	out, err := exec.CommandContext(t.Context(), "git", "-C", repo, "worktree", "add", "-b", orphanBranch, orphanPath).CombinedOutput()
+	require.NoError(t, err, string(out))
+	orphanRelease, err := lock.TryFile(ws.leasePath(orphanBranch))
+	require.NoError(t, err)
+	orphanRelease()
+
+	// A worktree with no lease file at all: ownership cannot be
+	// proven, so Sweep must leave it alone.
+	unmarkedBranch := BranchPrefix + "unmarked"
+	unmarkedPath := filepath.Join(ws.worktreesDir, unmarkedBranch)
+	out, err = exec.CommandContext(t.Context(), "git", "-C", repo, "worktree", "add", "-b", unmarkedBranch, unmarkedPath).CombinedOutput()
 	require.NoError(t, err, string(out))
 
 	require.NoError(t, ws.Sweep(ctx))
@@ -170,7 +201,89 @@ func TestWorkspaceSweepRemovesTrackedAndOrphans(t *testing.T) {
 	for _, branch := range []string{tracked.Branch, abandoned.Branch, orphanBranch} {
 		require.False(t, branchExists(t, repo, branch), "sweep left branch %s behind", branch)
 	}
+	_, err = os.Stat(unmarkedPath)
+	require.NoError(t, err, "sweep removed a worktree with no lease file")
+	require.True(t, branchExists(t, repo, unmarkedBranch))
 	require.Empty(t, ws.List())
+}
+
+// dropLeases simulates process exit: it releases every lease the
+// workspace holds without removing any workspace, leaving the lock
+// files on disk unheld — exactly what a crashed run leaves behind.
+func dropLeases(ws *Workspace) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	for _, release := range ws.leases {
+		release()
+	}
+	ws.leases = make(map[string]func())
+}
+
+// A second Workspace on the same repository is a live peer: its
+// provisioned workspaces — committed and uncommitted work included —
+// survive another instance's Sweep, and keep diffing.
+func TestSweepLeavesOtherInstancesLiveWorkspaces(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	a, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	b, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Sweep(context.Background()) })
+
+	entry, err := b.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	write(t, filepath.Join(entry.Path, "committed.txt"), "committed")
+	gitIn(t, entry.Path, "add", "-A")
+	gitIn(t, entry.Path, "-c", "commit.gpgsign=false", "commit", "-qm", "dispatched work")
+	write(t, filepath.Join(entry.Path, "f.txt"), "one edited")
+
+	require.NoError(t, a.Sweep(ctx))
+
+	_, err = os.Stat(entry.Path)
+	require.NoError(t, err, "sweep removed another instance's live workspace")
+	require.True(t, branchExists(t, repo, entry.Branch))
+	require.FileExists(t, filepath.Join(entry.Path, "committed.txt"))
+	require.FileExists(t, filepath.Join(entry.Path, "f.txt"))
+
+	diff, err := b.Diff(ctx, entry.ID)
+	require.NoError(t, err)
+	require.Contains(t, diff, "committed.txt")
+	require.Contains(t, diff, "+one edited")
+	require.NotContains(t, diff, ".lock")
+	require.NotContains(t, diff, ".owner.json")
+
+	_, ok := b.Get(entry.ID)
+	require.True(t, ok)
+}
+
+// A workspace whose owner died — the lock file remains but nobody
+// holds the lease — is an orphan like any other, and Sweep reclaims
+// it: directory, branch, and ownership artifacts.
+func TestSweepReclaimsDeadOwnersWorkspace(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	b, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	entry, err := b.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	a, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	dropLeases(b)
+
+	require.NoError(t, a.Sweep(ctx))
+
+	_, err = os.Stat(entry.Path)
+	require.True(t, os.IsNotExist(err), "sweep left a dead owner's workspace behind")
+	require.False(t, branchExists(t, repo, entry.Branch))
+	require.FileExists(t, b.leasePath(entry.Branch))
+	rel, err := lock.TryFile(b.leasePath(entry.Branch))
+	require.NoError(t, err)
+	rel()
+	require.NoFileExists(t, b.ownerPath(entry.Branch))
 }
 
 // Provisioning from an explicit base cuts the workspace at that
@@ -276,6 +389,7 @@ func TestAssignHandle(t *testing.T) {
 	repo := newTestRepo(t)
 	ws, err := NewWorkspace(repo)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 	ctx := t.Context()
 
 	a, err := ws.Provision(ctx, ProvisionOptions{})
