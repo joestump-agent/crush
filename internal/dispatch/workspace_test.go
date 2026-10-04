@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -346,4 +347,87 @@ func TestStatusIsTerminal(t *testing.T) {
 	for _, s := range []Status{StatusProvisioned, StatusRunning} {
 		require.False(t, s.IsTerminal(), "%s must not be terminal", s)
 	}
+}
+
+// TestDiffIgnoresUserDiffConfig verifies Workspace.Diff returns a plain
+// unified diff even when the user's global git config forces an external
+// diff driver and always-on color: the parsed diff keeps its a/ b/
+// headers and carries no external-tool output or escape sequences.
+func TestDiffIgnoresUserDiffConfig(t *testing.T) {
+	// A shell script only runs on Unix; on Windows git would fail to
+	// invoke it, so the external-diff half of the test cannot apply.
+	if runtime.GOOS == "windows" {
+		t.Skip("diff.external script requires a Unix shell")
+	}
+
+	repo := newTestRepo(t)
+
+	// A global config that forces an external diff driver (a script
+	// that prints EXTERNAL) and always-on color.
+	dir := t.TempDir()
+	script := filepath.Join(dir, "ext-diff.sh")
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\necho EXTERNAL\n"), 0o755))
+	global := filepath.Join(dir, "gitconfig")
+	require.NoError(t, os.WriteFile(global,
+		[]byte("[diff]\n\texternal = "+script+"\n[color]\n\tui = always\n"), 0o644))
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+
+	ctx := t.Context()
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	entry, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	// A committed change and an uncommitted edit: both must appear.
+	write(t, filepath.Join(entry.Path, "committed.txt"), "committed")
+	gitIn(t, entry.Path, "add", "-A")
+	gitIn(t, entry.Path, "commit", "-qm", "dispatched work")
+	write(t, filepath.Join(entry.Path, "f.txt"), "one edited")
+
+	diff, err := ws.Diff(ctx, entry.ID)
+	require.NoError(t, err)
+	require.Contains(t, diff, "+++ b/")
+	require.Contains(t, diff, "committed.txt")
+	require.NotContains(t, diff, "EXTERNAL")
+	require.NotContains(t, diff, "\x1b")
+
+	require.NoError(t, ws.Remove(ctx, entry.ID))
+}
+
+// TestGitEnvScrubbed verifies the workspace lifecycle ignores git
+// variables inherited from the environment (here GIT_DIR, GIT_WORK_TREE
+// and GIT_INDEX_FILE all pointing at a different repository) and acts
+// only on the repository the workspace was given, leaving the other one
+// untouched.
+func TestGitEnvScrubbed(t *testing.T) {
+	decoy := newTestRepo(t)
+	repo := newTestRepo(t)
+
+	// Point every inherited git variable at the decoy repository. A
+	// command that honoured them would act on the decoy, not repo.
+	t.Setenv("GIT_DIR", filepath.Join(decoy, ".git"))
+	t.Setenv("GIT_WORK_TREE", decoy)
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(decoy, ".git", "index"))
+
+	ctx := t.Context()
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	entry, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	// An uncommitted change in the dispatch worktree must appear in the
+	// diff, proving the diff acted on the dispatch repository.
+	write(t, filepath.Join(entry.Path, "dispatched.txt"), "dispatched")
+
+	diff, err := ws.Diff(ctx, entry.ID)
+	require.NoError(t, err)
+	require.Contains(t, diff, "dispatched.txt")
+	require.Contains(t, diff, "+dispatched")
+
+	require.NoError(t, ws.Remove(ctx, entry.ID))
+
+	// The decoy was never touched: no dispatch branch and a clean tree.
+	require.False(t, branchExists(t, decoy, entry.Branch))
+	require.Empty(t, strings.TrimSpace(gitIn(t, decoy, "status", "--porcelain")),
+		"decoy repository was modified")
 }
