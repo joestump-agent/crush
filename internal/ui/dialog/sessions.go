@@ -341,7 +341,7 @@ func (s *Session) pushMenu(parent *SessionItem) {
 	s.list.SetFilter("")
 
 	s.menuStack = append(s.menuStack, sessionsMenuLevel{items: s.list.FilteredItems()})
-	s.breadcrumb = append(s.breadcrumb, parent.Session.Title)
+	s.breadcrumb = append(s.breadcrumb, parent.Title)
 
 	children := s.children[parent.Session.ID]
 	kids := make([]list.FilterableItem, len(children))
