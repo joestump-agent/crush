@@ -52,6 +52,11 @@ type SessionItem struct {
 	updateTitleInput textinput.Model
 	focused          bool
 	hideInfo         bool
+	// child marks a sub-agent task session rendered inside its parent's
+	// sub-menu (#314); agentCount is the number of such children when
+	// this row is a parent.
+	child      bool
+	agentCount int
 }
 
 // Finished implements list.Item. Session items are render-stable
@@ -107,7 +112,11 @@ func (s *SessionItem) Cursor() *tea.Cursor {
 
 // InfoText returns the secondary text shown on the right of the item.
 func (s *SessionItem) InfoText() string {
-	return humanize.Time(time.Unix(s.UpdatedAt, 0))
+	info := humanize.Time(time.Unix(s.UpdatedAt, 0))
+	if s.agentCount > 0 {
+		info = fmt.Sprintf("%d agents · %s", s.agentCount, info)
+	}
+	return info
 }
 
 // SetHideInfo controls whether the timestamp info column is shown. The
@@ -152,7 +161,12 @@ func (s *SessionItem) Render(width int) string {
 		}
 	}
 
-	return renderItem(styles, s.Title, info, s.focused, width, s.cache, &s.m)
+	title := s.Title
+	if s.child {
+		// Sub-agent rows render nested under their parent (#314).
+		title = "└ " + title
+	}
+	return renderItem(styles, title, info, s.focused, width, s.cache, &s.m)
 }
 
 type ListItemStyles struct {
@@ -252,24 +266,34 @@ func (s *SessionItem) SetFocused(focused bool) {
 }
 
 // sessionItems takes a slice of [session.Session]s and convert them to a slice
-// of [ListItem]s.
-func sessionItems(t *styles.Styles, mode sessionsMode, sessions ...session.Session) []list.FilterableItem {
+// of [ListItem]s. childCount reports each session's sub-agent count for
+// the parent rows (#314); nil means no child information.
+func sessionItems(t *styles.Styles, mode sessionsMode, childCount func(id string) int, sessions ...session.Session) []list.FilterableItem {
 	items := make([]list.FilterableItem, len(sessions))
 	for i, s := range sessions {
-		item := &SessionItem{Versioned: list.NewVersioned(), Session: s, t: t, sessionsMode: mode}
-		if mode == sessionsModeUpdating {
-			item.updateTitleInput = textinput.New()
-			item.updateTitleInput.SetVirtualCursor(false)
-			item.updateTitleInput.Prompt = ""
-			inputStyle := t.TextInput
-			inputStyle.Focused.Placeholder = t.Dialog.Sessions.RenamingPlaceholder
-			item.updateTitleInput.SetStyles(inputStyle)
-			item.updateTitleInput.SetValue(s.Title)
-			item.updateTitleInput.Focus()
+		item := newSessionItem(t, mode, s)
+		if childCount != nil {
+			item.agentCount = childCount(s.ID)
 		}
 		items[i] = item
 	}
 	return items
+}
+
+// newSessionItem builds one session row.
+func newSessionItem(t *styles.Styles, mode sessionsMode, s session.Session) *SessionItem {
+	item := &SessionItem{Versioned: list.NewVersioned(), Session: s, t: t, sessionsMode: mode}
+	if mode == sessionsModeUpdating {
+		item.updateTitleInput = textinput.New()
+		item.updateTitleInput.SetVirtualCursor(false)
+		item.updateTitleInput.Prompt = ""
+		inputStyle := t.TextInput
+		inputStyle.Focused.Placeholder = t.Dialog.Sessions.RenamingPlaceholder
+		item.updateTitleInput.SetStyles(inputStyle)
+		item.updateTitleInput.SetValue(s.Title)
+		item.updateTitleInput.Focus()
+	}
+	return item
 }
 
 func matchedRanges(in []int) [][2]int {

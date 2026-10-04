@@ -1,0 +1,178 @@
+package dialog
+
+// Tests for the sessions picker tree (#314): inspectable sub-agent task
+// sessions nest under their parent through the sub-menu pattern, and
+// selecting one hands the task session to the caller (which opens it in
+// inspect mode).
+//
+// Assertions are on dialog state (item counts, IDs, returned actions),
+// never on rendered strings, so they hold on Windows terminals too.
+
+import (
+	"context"
+	"testing"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/stretchr/testify/require"
+
+	"github.com/charmbracelet/crush/internal/session"
+	"github.com/charmbracelet/crush/internal/ui/common"
+
+	"github.com/charmbracelet/crush/internal/ui/styles"
+	"github.com/charmbracelet/crush/internal/workspace"
+)
+
+// sessionsTreeWorkspace serves a fixed parent/child session layout.
+type sessionsTreeWorkspace struct {
+	workspace.Workspace
+
+	parents  []session.Session
+	children map[string][]session.Session
+}
+
+func (w *sessionsTreeWorkspace) ListSessions(context.Context) ([]session.Session, error) {
+	return w.parents, nil
+}
+
+func (w *sessionsTreeWorkspace) ListChildSessions(_ context.Context, parentID string) ([]session.Session, error) {
+	return w.children[parentID], nil
+}
+
+func (w *sessionsTreeWorkspace) ParseAgentToolSessionID(sessionID string) (string, string, bool) {
+	for i := 0; i+1 < len(sessionID); i++ {
+		if sessionID[i] == '$' && sessionID[i+1] == '$' {
+			return sessionID[:i], sessionID[i+2:], true
+		}
+	}
+	return "", "", false
+}
+
+// workspaceShim is unused; the tree tests only touch the three session
+// methods they override.
+
+func newSessionsTreeDialog(t *testing.T, ws *sessionsTreeWorkspace) *Session {
+	t.Helper()
+	sty := styles.CharmtonePantera()
+	dialog, err := NewSessions(&common.Common{
+		Workspace: ws,
+		Styles:    &sty,
+	}, "")
+	require.NoError(t, err)
+	return dialog
+}
+
+func treeTestWorkspace() *sessionsTreeWorkspace {
+	ws := &sessionsTreeWorkspace{
+		parents: []session.Session{
+			{ID: "p1", Title: "Parent One"},
+			{ID: "p2", Title: "Parent Two"},
+		},
+		children: map[string][]session.Session{
+			"p1": {
+				{ID: "m1$$t1", ParentSessionID: "p1", Title: "Dispatched Agent"},
+				// A title-generation helper session: never inspectable.
+				{ID: "title-p1", ParentSessionID: "p1", Title: "Generate a title"},
+			},
+		},
+	}
+	return ws
+}
+
+// TestSessionsTreeNestsInspectableChildren pins the tree: only
+// agent-tool task sessions nest under a parent, the parent row advertises
+// the count, and parents without children stay plain rows.
+func TestSessionsTreeNestsInspectableChildren(t *testing.T) {
+	ws := treeTestWorkspace()
+	dialog := newSessionsTreeDialog(t, ws)
+
+	require.Len(t, dialog.children["p1"], 1,
+		"only the agent-tool task session is nestable; title sessions are excluded")
+	require.Empty(t, dialog.children["p2"])
+
+	items := dialog.list.FilteredItems()
+	require.Len(t, items, 2)
+	p1, ok := items[0].(*SessionItem)
+	require.True(t, ok)
+	require.Equal(t, "p1", p1.ID())
+	require.Equal(t, 1, p1.agentCount, "the parent row advertises its sub-agent count")
+
+	p2, ok := items[1].(*SessionItem)
+	require.True(t, ok)
+	require.Zero(t, p2.agentCount)
+	require.False(t, p2.child)
+}
+
+// TestSessionsTreeSubMenu pins the navigation: enter on a parent with
+// children pushes a sub-menu of its task sessions; enter on a child
+// returns the child for inspect mode; esc pops back to the parent list.
+func TestSessionsTreeSubMenu(t *testing.T) {
+	ws := treeTestWorkspace()
+	dialog := newSessionsTreeDialog(t, ws)
+
+	// Enter on the parent with children pushes the sub-menu, it does
+	// not select the parent.
+	dialog.list.SetSelected(0)
+	action := dialog.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.Nil(t, action, "a parent with children must open its sub-menu, not select")
+	require.True(t, dialog.inSubMenu())
+	require.Equal(t, []string{"Parent One"}, dialog.breadcrumb)
+
+	kids := dialog.list.FilteredItems()
+	require.Len(t, kids, 1)
+	child, ok := kids[0].(*SessionItem)
+	require.True(t, ok)
+	require.Equal(t, "m1$$t1", child.ID())
+	require.True(t, child.child, "child rows are marked for nested rendering")
+
+	// Enter on the child returns it; the caller decides the mode and a
+	// task session can only ever reach inspect.
+	action = dialog.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.NotNil(t, action)
+	sel, ok := action.(ActionSelectSession)
+	require.True(t, ok)
+	require.Equal(t, "m1$$t1", sel.Session.ID)
+	require.Equal(t, "p1", sel.Session.ParentSessionID)
+
+	// Esc pops back to the parent list.
+	dialog.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEscape})
+	require.False(t, dialog.inSubMenu())
+	require.Len(t, dialog.list.FilteredItems(), 2)
+
+	// Enter on a childless parent selects it directly.
+	dialog.list.SetSelected(1)
+	action = dialog.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.NotNil(t, action)
+	sel, ok = action.(ActionSelectSession)
+	require.True(t, ok)
+	require.Equal(t, "p2", sel.Session.ID)
+}
+
+// TestSessionsTreeRenameDeleteGuardedAtTopLevel pins that rename and
+// delete stay top-level operations: inside a sub-menu they do nothing
+// rather than acting on a task session row.
+func TestSessionsTreeRenameDeleteGuardedAtTopLevel(t *testing.T) {
+	ws := treeTestWorkspace()
+	dialog := newSessionsTreeDialog(t, ws)
+
+	dialog.list.SetSelected(0)
+	dialog.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.True(t, dialog.inSubMenu())
+
+	dialog.HandleMsg(ctrlKey(t, 'r'))
+	require.False(t, dialog.sessionsMode == sessionsModeUpdating,
+		"rename must not engage inside a sub-menu")
+	dialog.HandleMsg(ctrlKey(t, 'x'))
+	require.False(t, dialog.sessionsMode == sessionsModeDeleting,
+		"delete must not engage inside a sub-menu")
+
+	// Esc pops the sub-menu; at the top level the same keys engage.
+	dialog.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEscape})
+	require.False(t, dialog.inSubMenu())
+	dialog.HandleMsg(ctrlKey(t, 'r'))
+	require.True(t, dialog.sessionsMode == sessionsModeUpdating)
+}
+
+func ctrlKey(t *testing.T, r rune) tea.KeyPressMsg {
+	t.Helper()
+	return tea.KeyPressMsg{Code: r, Mod: tea.ModCtrl}
+}
