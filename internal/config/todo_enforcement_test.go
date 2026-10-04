@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -94,6 +95,7 @@ func TestResolveTodoEnforcementKillDefaults(t *testing.T) {
 	assert.Equal(t, 2, settings.KillAfterNudges)
 	assert.Zero(t, settings.StallWindow)
 	assert.Zero(t, settings.HardTimeout)
+	assert.Zero(t, settings.InactivityTimeout)
 }
 
 // TestResolveTodoEnforcementKillKnobs pins the kill knobs' layering,
@@ -102,31 +104,54 @@ func TestResolveTodoEnforcementKillKnobs(t *testing.T) {
 	t.Parallel()
 
 	global := &TodoEnforcementConfig{
-		KillAfterNudges: intPtr(3),
-		StallWindow:     intPtr(300),
-		HardTimeout:     intPtr(1800),
+		KillAfterNudges:   intPtr(3),
+		StallWindow:       intPtr(300),
+		HardTimeout:       intPtr(1800),
+		InactivityTimeout: intPtr(900),
 	}
 	settings := ResolveTodoEnforcement(global, nil)
 	assert.Equal(t, 3, settings.KillAfterNudges)
 	assert.Equal(t, 300*time.Second, settings.StallWindow)
 	assert.Equal(t, 1800*time.Second, settings.HardTimeout)
+	assert.Equal(t, 900*time.Second, settings.InactivityTimeout)
 
 	// The per-agent override replaces each knob field by field.
 	settings = ResolveTodoEnforcement(global, &TodoEnforcementConfig{
-		KillAfterNudges: intPtr(1),
-		StallWindow:     intPtr(0),
+		KillAfterNudges:   intPtr(1),
+		StallWindow:       intPtr(0),
+		InactivityTimeout: intPtr(60),
 	})
 	assert.Equal(t, 1, settings.KillAfterNudges)
 	assert.Zero(t, settings.StallWindow, "an explicit 0 must disable the stall window")
 	assert.Equal(t, 1800*time.Second, settings.HardTimeout, "fields the override does not set carry over")
+	assert.Equal(t, 60*time.Second, settings.InactivityTimeout)
 
 	// Negative values are guards, not settings.
 	settings = ResolveTodoEnforcement(&TodoEnforcementConfig{
-		KillAfterNudges: intPtr(-1),
-		StallWindow:     intPtr(-5),
-		HardTimeout:     intPtr(-5),
+		KillAfterNudges:   intPtr(-1),
+		StallWindow:       intPtr(-5),
+		HardTimeout:       intPtr(-5),
+		InactivityTimeout: intPtr(-5),
 	}, nil)
 	assert.Equal(t, 0, settings.KillAfterNudges)
 	assert.Zero(t, settings.StallWindow)
 	assert.Zero(t, settings.HardTimeout)
+	assert.Zero(t, settings.InactivityTimeout, "a non-positive inactivity timeout disables the backstop")
+}
+
+// TestTodoEnforcementInactivityTimeoutFromJSON pins the A2A backstop
+// knob (#360) parsing from the config file: seconds in JSON, a resolved
+// duration out, zero when the key is absent.
+func TestTodoEnforcementInactivityTimeoutFromJSON(t *testing.T) {
+	t.Parallel()
+
+	var cfg Config
+	require.NoError(t, json.Unmarshal([]byte(`{"options":{"todo_enforcement":{"inactivity_timeout":900}}}`), &cfg))
+	require.NotNil(t, cfg.Options.TodoEnforcement)
+	require.Equal(t, 900, *cfg.Options.TodoEnforcement.InactivityTimeout)
+	assert.Equal(t, 15*time.Minute, ResolveTodoEnforcement(cfg.Options.TodoEnforcement, nil).InactivityTimeout)
+
+	var bare Config
+	require.NoError(t, json.Unmarshal([]byte(`{"options":{"todo_enforcement":{"stall_window":300}}}`), &bare))
+	assert.Zero(t, ResolveTodoEnforcement(bare.Options.TodoEnforcement, nil).InactivityTimeout, "the backstop stays off unless the key is set")
 }

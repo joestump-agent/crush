@@ -289,8 +289,10 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// its endpoint and card on the registry entry — the in-memory
 			// discovery surface. The executor's served turns run with the
 			// dispatch's own call shaping (#71); the server dies with the
-			// run, and runDispatch owns the stop.
-			run.stopServer = c.startDispatchServer(ctx, workspace, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c))
+			// run, and runDispatch owns the stop. The inactivity backstop
+			// (#360) is armed with the dispatch's resolved enforcement
+			// settings.
+			run.stopServer = c.startDispatchServer(ctx, workspace, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout)
 
 			// The dispatch must outlive the parent turn that started it:
 			// the main agent keeps working, and its tool-call context is

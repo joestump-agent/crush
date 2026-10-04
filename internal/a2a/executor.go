@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"charm.land/fantasy"
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
@@ -75,6 +77,17 @@ type Executor struct {
 	// Zero value keeps the minimal call — enough for tests, not for a
 	// real dispatched turn.
 	call agent.SessionAgentCall
+	// inactivityTimeout is the A2A-level backstop (#360): a run that
+	// yields no events for this long while in flight is canceled by
+	// the executor and failed with the reason. Zero (the default)
+	// disables the backstop.
+	inactivityTimeout time.Duration
+	// endedByExecutor holds the task IDs whose terminal status the
+	// executor itself has already emitted (the inactivity backstop's
+	// Failed, #360). #342's out-of-band cancel branch consults the set
+	// so a run the executor ended is not also reported Canceled.
+	mu              sync.Mutex
+	endedByExecutor map[string]struct{}
 }
 
 // Option configures an [Executor].
@@ -103,6 +116,16 @@ func WithTodos(source TodoSource) Option {
 	return func(e *Executor) { e.todos = source }
 }
 
+// WithInactivityTimeout sets the A2A-level backstop (#360): while the
+// run is in flight, every event the executor yields to the consumer
+// resets the timer; when it fires with no progress, the executor marks
+// the task as ended by the executor, cancels the runner, and ends the
+// run with exactly one Failed carrying the reason. A zero or negative
+// duration (the default) disables the backstop.
+func WithInactivityTimeout(d time.Duration) Option {
+	return func(e *Executor) { e.inactivityTimeout = d }
+}
+
 // NewExecutor builds an Executor that drives runner against sessionID — the
 // (ephemeral) session backing the dispatched agent.
 func NewExecutor(runner Runner, sessionID string, opts ...Option) *Executor {
@@ -123,6 +146,11 @@ var _ a2asrv.AgentExecutor = (*Executor)(nil)
 // as events, not as a returned error.
 func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
+		// The backstop's terminal is the task's last word: drop the
+		// "ended by the executor" mark when this sequence ends, so a
+		// later run of the same executor starts clean.
+		defer e.clearEndedByExecutor(execCtx.TaskID)
+
 		// A message that referenced no existing task starts a new one:
 		// announce it submitted before transitioning to working.
 		if execCtx.StoredTask == nil {
@@ -221,6 +249,29 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 		done <- runOutcome{result, err}
 	}()
 
+	// The inactivity backstop (#360): a timer that every event the
+	// executor yields resets, so a run making visible progress never
+	// trips it and a silent one is ended with a reason. Disabled when
+	// the duration is zero or negative.
+	var inactC <-chan time.Time
+	var inactReset func()
+	if e.inactivityTimeout > 0 {
+		inactTimer := time.NewTimer(e.inactivityTimeout)
+		defer inactTimer.Stop()
+		inactC = inactTimer.C
+		inactReset = func() {
+			if inactTimer.Reset(e.inactivityTimeout) {
+				// The timer fired but its value was not consumed:
+				// drain it, or it would trip the backstop again on
+				// the next loop pass.
+				select {
+				case <-inactTimer.C:
+				default:
+				}
+			}
+		}
+	}
+
 	var lastTodos []session.Todo
 	for {
 		// Check cancellation before selecting: a canceled context and a
@@ -238,6 +289,21 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 			return nil, context.Canceled
 		case out := <-done:
 			return out.result, out.err
+		case <-inactC:
+			// The backstop fired: no event was yielded for the whole
+			// window. End the run with exactly one Failed carrying the
+			// reason — never a Canceled, which is reserved for the
+			// executor's Cancel (#360, coordinated with #342).
+			e.markEndedByExecutor(execCtx.TaskID)
+			e.runner.Cancel(e.sessionID)
+			// Give the runner a brief window to observe the cancel and
+			// settle; a truly wedged run ignores it, and the outcome is
+			// discarded either way — the task fails with the reason.
+			select {
+			case <-done:
+			case <-time.After(inactivitySettleWindow):
+			}
+			return nil, fmt.Errorf("inactivity timeout: no progress for %s", e.inactivityTimeout)
 		case snap, ok := <-todoCh:
 			if !ok {
 				todoCh = nil
@@ -250,8 +316,39 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 			if !yield(todoStatusUpdate(execCtx, snap), nil) {
 				return nil, errConsumerStopped
 			}
+			if inactReset != nil {
+				inactReset()
+			}
 		}
 	}
+}
+
+// inactivitySettleWindow bounds the backstop's wait for the run goroutine
+// after canceling the runner (#360): long enough for a responsive runner
+// to observe the cancel, short enough that a wedged one delays the
+// terminal Failed by seconds, not minutes.
+const inactivitySettleWindow = 2 * time.Second
+
+// markEndedByExecutor records that the executor itself has emitted the
+// task's terminal status — the inactivity backstop's Failed (#360) — so
+// #342's out-of-band cancel branch, which lands separately, does not
+// also emit a Canceled status for the same task.
+func (e *Executor) markEndedByExecutor(taskID a2aspec.TaskID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.endedByExecutor == nil {
+		e.endedByExecutor = make(map[string]struct{})
+	}
+	e.endedByExecutor[string(taskID)] = struct{}{}
+}
+
+// clearEndedByExecutor drops the mark: each run ends with at most one
+// terminal of the executor's own, so a finished task's ID is safe to
+// forget before the next run.
+func (e *Executor) clearEndedByExecutor(taskID a2aspec.TaskID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.endedByExecutor, string(taskID))
 }
 
 // todoStatusUpdate maps one todo snapshot onto a non-terminal Working

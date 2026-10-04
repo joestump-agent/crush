@@ -56,6 +56,12 @@ type ServerParams struct {
 	// Call is the template every served turn runs with (#71) — the
 	// dispatch's full call shaping; the prompt is overridden per message.
 	Call agent.SessionAgentCall
+	// InactivityTimeout is the A2A-level backstop (#360): a served run
+	// that yields no events for this long is ended by the executor with
+	// a Failed status carrying the reason. 0 (the default) disables it;
+	// when set, the SDK's own inactivity guard also runs, one minute
+	// later, as an outer net for a wedged executor.
+	InactivityTimeout time.Duration
 }
 
 // Server is one dispatched agent's in-process A2A server (#70): JSON-RPC
@@ -121,10 +127,21 @@ func StartServer(ctx context.Context, p ServerParams) (*Server, error) {
 	if p.Todos != nil {
 		opts = append(opts, WithTodos(p.Todos))
 	}
+	if p.InactivityTimeout > 0 {
+		opts = append(opts, WithInactivityTimeout(p.InactivityTimeout))
+	}
 	opts = append(opts, WithCallTemplate(p.Call))
 	executor := NewExecutor(p.Runner, p.SessionID, opts...)
 
-	handler := a2asrv.NewHandler(executor)
+	// The SDK's inactivity guard (#360's outer net): when the backstop
+	// is armed, it runs one minute after the executor's — the executor's
+	// reason-bearing Failed is expected to land first; this only fires
+	// for a wedged executor, and writes its own causeless Failed.
+	var handlerOpts []a2asrv.RequestHandlerOption
+	if p.InactivityTimeout > 0 {
+		handlerOpts = append(handlerOpts, a2asrv.WithAgentInactivityTimeout(p.InactivityTimeout+time.Minute))
+	}
+	handler := a2asrv.NewHandler(executor, handlerOpts...)
 	mux := http.NewServeMux()
 	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
 	mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
@@ -175,15 +192,16 @@ func NewServerFactory() *ServerFactory { return &ServerFactory{} }
 // any so the agent package never imports the a2a types.
 func (f *ServerFactory) StartDispatchServer(ctx context.Context, p agent.DispatchServerParams) (string, any, func(), error) {
 	server, err := StartServer(ctx, ServerParams{
-		Runner:      p.Runner,
-		SessionID:   p.SessionID,
-		Diff:        p.Diff,
-		Todos:       p.Todos,
-		Name:        p.Name,
-		Description: p.Description,
-		Skills:      p.Skills,
-		Version:     version.Version,
-		Call:        p.Call,
+		Runner:            p.Runner,
+		SessionID:         p.SessionID,
+		Diff:              p.Diff,
+		Todos:             p.Todos,
+		Name:              p.Name,
+		Description:       p.Description,
+		Skills:            p.Skills,
+		Version:           version.Version,
+		Call:              p.Call,
+		InactivityTimeout: p.InactivityTimeout,
 	})
 	if err != nil {
 		return "", nil, nil, err
