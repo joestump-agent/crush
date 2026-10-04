@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"charm.land/fantasy"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 )
 
@@ -111,9 +112,13 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 
 	if target == nil {
 		// Distinguish a finished dispatch from an unknown session so the
-		// refusal tells the caller which one happened.
+		// refusal tells the caller which one happened. A non-terminal
+		// registry entry (e.g. the window between the dispatch handle
+		// being returned and the background run registering its injection
+		// target) must not claim "finished": the entry is not done, and
+		// the caller would be told to dispatch a duplicate.
 		if workspace != nil {
-			if entry, ok := workspace.BySession(msg.SessionID); ok {
+			if entry, ok := workspace.BySession(msg.SessionID); ok && entry.Status != dispatch.StatusRunning && entry.Status != dispatch.StatusProvisioned {
 				return fmt.Errorf("agent %s finished (%s); task sessions are never continuable — dispatch a new agent instead", msg.SessionID, entry.Status)
 			}
 		}

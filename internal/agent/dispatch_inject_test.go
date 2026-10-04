@@ -181,6 +181,29 @@ func TestDeliverAgentMessageOrderingAndConcurrency(t *testing.T) {
 	close(agent.gate)
 }
 
+// A registry entry that is still running but has no injection target —
+// the window between the dispatch handle being returned and the
+// background run registering itself — must refuse as "no running agent",
+// not claim the agent finished with a running status and send the caller
+// off to dispatch a duplicate.
+func TestDeliverAgentMessageRunningWithoutTargetIsNotFinished(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, _ := newInjectionEnv(t, agent)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
+	agent.waitRunning(t)
+
+	// Simulate the registration window: the entry is running, the
+	// injection target is not registered yet.
+	c.unregisterDispatchRun(handle.SessionID)
+	err := c.DeliverAgentMessage(t.Context(), AgentMessage{SessionID: handle.SessionID, Text: "hi"})
+	require.ErrorContains(t, err, "no running agent for session")
+	require.NotContains(t, err.Error(), "finished")
+
+	close(agent.gate)
+}
+
 // Unknown sessions and argument validation fail fast with actionable
 // errors.
 func TestDeliverAgentMessageValidationAndUnknownSession(t *testing.T) {
