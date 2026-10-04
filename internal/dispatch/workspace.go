@@ -88,8 +88,7 @@ type Entry struct {
 	// other revision as given at provision time.
 	Base string
 	// BaseSHA is the commit Base resolved to when the workspace was
-	// provisioned. Diff falls back to it when the base branch no longer
-	// exists.
+	// provisioned. Diff always diffs against it.
 	BaseSHA string
 	// SessionID is the ephemeral session backing the dispatched agent
 	// (#48/#50); empty until the dispatch starts running.
@@ -436,12 +435,16 @@ func (w *Workspace) Subscribe(ctx context.Context) <-chan pubsub.Event[Entry] {
 }
 
 // Diff returns the dispatched agent's work product as one unified diff:
-// base...HEAD plus the uncommitted state (staged, unstaged, and
-// untracked files), so committed work is never lost. The base is the
-// merge-base of the entry's Base and HEAD — falling back to the
-// recorded BaseSHA when the base branch no longer exists. Uncommitted
-// changes are staged into a throwaway temporary index, mirroring
-// a2a.GitDiff, so the workspace's real index is never touched.
+// the recorded base SHA...HEAD plus the uncommitted state (staged,
+// unstaged, and untracked files), so committed work is never lost. The
+// base is always entry.BaseSHA, the commit the dispatch branch was cut
+// from, resolved in the repository root at provision time. Never
+// re-resolve the base revision against the worktree: a "HEAD" or
+// "HEAD~1" base would resolve to the worktree's own tip and the
+// agent's commits would vanish from the diff (#380). An empty BaseSHA
+// is an error, not a fallback. Uncommitted changes are staged into a
+// throwaway temporary index, mirroring a2a.GitDiff, so the
+// workspace's real index is never touched.
 //
 // The contract is owned here and consumed twice: #66's DispatchResult
 // diff and the executor DiffFunc injected in #71.
@@ -453,10 +456,8 @@ func (w *Workspace) Diff(ctx context.Context, id string) (string, error) {
 	if _, err := os.Stat(entry.Path); err != nil {
 		return "", fmt.Errorf("workspace directory missing: %w", err)
 	}
-
-	base := entry.BaseSHA
-	if out, err := gitOutput(ctx, entry.Path, nil, "merge-base", entry.Base, "HEAD"); err == nil {
-		base = strings.TrimSpace(string(out))
+	if entry.BaseSHA == "" {
+		return "", fmt.Errorf("dispatch %q has no recorded base SHA", id)
 	}
 
 	tmp, err := os.CreateTemp("", "crush-dispatch-index-")
@@ -478,7 +479,7 @@ func (w *Workspace) Diff(ctx context.Context, id string) (string, error) {
 	if err := runGit(ctx, entry.Path, env, "add", "-A"); err != nil {
 		return "", fmt.Errorf("stage workspace: %w", err)
 	}
-	out, err := gitOutput(ctx, entry.Path, env, "diff", "--cached", base)
+	out, err := gitOutput(ctx, entry.Path, env, "diff", "--cached", entry.BaseSHA)
 	if err != nil {
 		return "", fmt.Errorf("diff against base: %w", err)
 	}

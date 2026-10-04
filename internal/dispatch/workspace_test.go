@@ -48,6 +48,17 @@ func gitIn(t *testing.T, dir string, args ...string) string {
 	return string(out)
 }
 
+// commitIn stages nothing and commits the index in dir, with gpg
+// signing disabled so fixtures never depend on the machine's
+// commit.gpgsign setting.
+func commitIn(t *testing.T, dir, msg string) {
+	t.Helper()
+	full := []string{"-C", dir, "-c", "commit.gpgsign=false", "commit", "-qm", msg}
+	cmd := exec.CommandContext(t.Context(), "git", full...)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "git commit %q: %s", msg, out)
+}
+
 // branchExists reports whether the repo currently has the branch.
 func branchExists(t *testing.T, repo, branch string) bool {
 	t.Helper()
@@ -212,6 +223,124 @@ func TestWorkspaceExplicitBaseAndFallback(t *testing.T) {
 	require.Contains(t, diff, "work.txt")
 
 	require.NoError(t, ws.Remove(ctx, entry.ID))
+}
+
+// A detached parent (a CI checkout, a rebase or bisect in progress, any
+// jj-colocated repo) records Base as "HEAD"; the diff must still show
+// the agent's committed work, not only the uncommitted leftovers (#380).
+func TestDiffDetachedParent(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	gitIn(t, repo, "checkout", "--detach")
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	entry, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "HEAD", entry.Base)
+	require.NotEmpty(t, entry.BaseSHA)
+
+	// The dispatched agent commits one file and leaves another
+	// uncommitted. Both must appear in the diff.
+	write(t, filepath.Join(entry.Path, "committed.txt"), "committed")
+	gitIn(t, entry.Path, "add", "-A")
+	commitIn(t, entry.Path, "committed work")
+	write(t, filepath.Join(entry.Path, "uncommitted.txt"), "uncommitted")
+
+	diff, err := ws.Diff(ctx, entry.ID)
+	require.NoError(t, err)
+	require.Contains(t, diff, "b/committed.txt")
+	require.Contains(t, diff, "b/uncommitted.txt")
+
+	require.NoError(t, ws.Remove(ctx, entry.ID))
+}
+
+// A model-supplied relative base ("HEAD~1") resolves at provision time;
+// the diff must include every agent commit, not just the last (#380).
+func TestDiffRelativeBase(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	// A second commit so HEAD~1 is not the only commit.
+	write(t, filepath.Join(repo, "second.txt"), "second")
+	gitIn(t, repo, "add", "-A")
+	commitIn(t, repo, "second")
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	entry, err := ws.Provision(ctx, ProvisionOptions{Base: "HEAD~1"})
+	require.NoError(t, err)
+	require.Equal(t, "HEAD~1", entry.Base)
+
+	// Two agent commits on top of the relative base.
+	write(t, filepath.Join(entry.Path, "a.txt"), "a")
+	gitIn(t, entry.Path, "add", "-A")
+	commitIn(t, entry.Path, "first agent commit")
+	write(t, filepath.Join(entry.Path, "b.txt"), "b")
+	gitIn(t, entry.Path, "add", "-A")
+	commitIn(t, entry.Path, "second agent commit")
+
+	diff, err := ws.Diff(ctx, entry.ID)
+	require.NoError(t, err)
+	require.Contains(t, diff, "a.txt")
+	require.Contains(t, diff, "b.txt")
+
+	require.NoError(t, ws.Remove(ctx, entry.ID))
+}
+
+// A base branch that moves forward after provision does not leak into
+// the diff: the diff is against the recorded base SHA, not the branch's
+// new tip (#380).
+func TestDiffIgnoresAdvancedBase(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	entry, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	// The dispatch works; meanwhile the base branch advances.
+	write(t, filepath.Join(entry.Path, "work.txt"), "dispatched")
+	gitIn(t, entry.Path, "add", "-A")
+	commitIn(t, entry.Path, "dispatched work")
+	write(t, filepath.Join(repo, "advanced.txt"), "base branch work")
+	gitIn(t, repo, "add", "-A")
+	commitIn(t, repo, "base advanced")
+
+	diff, err := ws.Diff(ctx, entry.ID)
+	require.NoError(t, err)
+	require.Contains(t, diff, "work.txt")
+	require.NotContains(t, diff, "advanced.txt")
+
+	require.NoError(t, ws.Remove(ctx, entry.ID))
+}
+
+// An entry with no recorded base SHA is an error, never a fallback to
+// some other revision (#380).
+func TestDiffMissingBaseSHA(t *testing.T) {
+	repo := newTestRepo(t)
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	// A directory standing in for a workspace whose registry entry lost
+	// its base SHA.
+	path := filepath.Join(ws.worktreesDir, BranchPrefix+"no-base")
+	require.NoError(t, os.MkdirAll(path, 0o755))
+	t.Cleanup(func() {
+		ws.mu.Lock()
+		delete(ws.entries, "no-base")
+		ws.mu.Unlock()
+		os.RemoveAll(path)
+	})
+	ws.entries["no-base"] = Entry{ID: "no-base", Path: path, Base: "HEAD"}
+
+	_, err = ws.Diff(t.Context(), "no-base")
+	require.Error(t, err)
 }
 
 func TestWorkspaceDiffUnknownID(t *testing.T) {
