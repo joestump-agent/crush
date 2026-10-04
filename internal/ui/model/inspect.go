@@ -42,18 +42,22 @@ type agentBlockRef struct {
 }
 
 // inspectSessionLoadedMsg carries the fetched child session and its
-// transcript for the inspect view.
+// transcript for the inspect view. seq is the inspect transition the
+// fetch started under; a later transition makes it stale.
 type inspectSessionLoadedMsg struct {
+	seq      int
 	sess     *session.Session
 	messages []message.Message
 }
 
 // inspectRestoreMsg carries the parent transcript to restore on exit,
-// plus the scroll position captured on entry.
+// plus the scroll state captured on entry.
 type inspectRestoreMsg struct {
+	sessionID  string
 	messages   []message.Message
 	scrollIdx  int
 	scrollLine int
+	follow     bool
 }
 
 // isInspecting reports whether the UI is currently viewing a sub-agent
@@ -74,12 +78,13 @@ func (m *UI) inspectingSessionID() string {
 // clearInspectState drops the inspect state without touching the chat.
 // Called whenever the active session changes underneath inspect mode
 // (session switch, new session) so the view never claims to inspect a
-// session it is not showing.
+// session it is not showing. Bumping inspectSeq drops any child load
+// still in flight.
 func (m *UI) clearInspectState() {
 	m.inspecting = nil
 	m.inspectRing = nil
 	m.inspectRingPos = 0
-	m.inspectLoadBusy = false
+	m.inspectSeq++
 }
 
 // agentBlocks enumerates the drill-in targets in the chat transcript in
@@ -110,18 +115,6 @@ func (m *UI) agentBlocks() []agentBlockRef {
 		}
 	}
 	return refs
-}
-
-// isLiveChildSession reports whether the given session is one of the
-// transcript's live drill-in targets. Runs on the Update goroutine from
-// in-memory block state only.
-func (m *UI) isLiveChildSession(sessionID string) bool {
-	for _, ref := range m.agentBlocks() {
-		if ref.sessionID == sessionID {
-			return ref.live
-		}
-	}
-	return false
 }
 
 // liveAgentSessionIDs returns the live drill-in targets' session IDs in
@@ -210,8 +203,7 @@ func (m *UI) handleInspectDrill() tea.Cmd {
 		return util.ReportInfo("No live sub-agents to inspect")
 	}
 	m.chat.SetSelected(liveRefs[0].index)
-	m.chat.ScrollToSelected()
-	return m.enterInspect(liveRefs[0])
+	return tea.Batch(m.chat.ScrollToSelected(), m.enterInspect(liveRefs[0]))
 }
 
 // enterInspect captures the parent's scroll position and live-agent ring
@@ -221,6 +213,7 @@ func (m *UI) enterInspect(ref agentBlockRef) tea.Cmd {
 	if !m.isInspecting() {
 		idx, line := m.chat.ScrollPosition()
 		m.inspectScroll = [2]int{idx, line}
+		m.inspectFollow = m.chat.Follow()
 		m.inspectRing = m.liveAgentSessionIDs()
 		m.inspectRingPos = 0
 	}
@@ -243,21 +236,23 @@ func (m *UI) cycleInspectAgent() tea.Cmd {
 
 // loadInspectSession fetches a child session and its transcript
 // off-thread and returns a command delivering inspectSessionLoadedMsg.
+// Each call supersedes the loads before it: only the latest one lands,
+// so rapid cycling settles on the last press and the ring position
+// always names the session on screen.
 func (m *UI) loadInspectSession(sessionID string) tea.Cmd {
-	if m.inspectLoadBusy {
-		return nil
-	}
-	m.inspectLoadBusy = true
+	m.inspectSeq++
+	seq := m.inspectSeq
+	ws := m.com.Workspace
 	return func() tea.Msg {
-		sess, err := m.com.Workspace.GetSession(context.Background(), sessionID)
+		sess, err := ws.GetSession(context.Background(), sessionID)
 		if err != nil {
 			return util.NewErrorMsg(err)
 		}
-		msgs, err := m.com.Workspace.ListMessages(context.Background(), sessionID)
+		msgs, err := ws.ListMessages(context.Background(), sessionID)
 		if err != nil {
 			return util.NewErrorMsg(err)
 		}
-		return inspectSessionLoadedMsg{sess: &sess, messages: msgs}
+		return inspectSessionLoadedMsg{seq: seq, sess: &sess, messages: msgs}
 	}
 }
 
@@ -266,12 +261,15 @@ func (m *UI) loadInspectSession(sessionID string) tea.Cmd {
 // active-session concern keep pointing at the parent: this handler only
 // touches the chat view.
 func (m *UI) handleInspectLoaded(msg inspectSessionLoadedMsg) tea.Cmd {
-	m.inspectLoadBusy = false
+	if msg.seq != m.inspectSeq {
+		// Superseded by a later cycle, ctrl+[, or session switch.
+		return nil
+	}
 	m.inspecting = msg.sess
 
-	// Liveness is read from the parent's blocks before the transcript
-	// swap takes them out of the chat.
-	live := m.isLiveChildSession(msg.sess.ID)
+	// Liveness comes from the ring captured off the parent's blocks at
+	// entry: when cycling, the chat holds the previous child, not them.
+	live := slices.Contains(m.inspectRing, msg.sess.ID)
 
 	cmd := m.setSessionMessages(msg.messages)
 	if live {
@@ -289,35 +287,49 @@ func (m *UI) handleInspectLoaded(msg inspectSessionLoadedMsg) tea.Cmd {
 
 // exitInspect leaves inspect mode: it reloads the parent transcript
 // off-thread (the parent may have streamed messages while its blocks
-// were not on screen) and restores the scroll position captured on
-// entry.
+// were not on screen) and restores the scroll state captured on entry.
+// Clearing the inspect state drops any child load still in flight.
 func (m *UI) exitInspect() tea.Cmd {
-	m.inspecting = nil
-	m.inspectRing = nil
-	m.inspectRingPos = 0
-	m.inspectLoadBusy = false
-	scroll := m.inspectScroll
+	m.clearInspectState()
+	scroll, follow := m.inspectScroll, m.inspectFollow
 	parentID := m.currentSessionID()
+	ws := m.com.Workspace
 	return func() tea.Msg {
-		msgs, err := m.com.Workspace.ListMessages(context.Background(), parentID)
+		msgs, err := ws.ListMessages(context.Background(), parentID)
 		if err != nil {
 			return util.NewErrorMsg(err)
 		}
-		return inspectRestoreMsg{messages: msgs, scrollIdx: scroll[0], scrollLine: scroll[1]}
+		return inspectRestoreMsg{
+			sessionID:  parentID,
+			messages:   msgs,
+			scrollIdx:  scroll[0],
+			scrollLine: scroll[1],
+			follow:     follow,
+		}
 	}
 }
 
 // handleInspectRestore swaps the parent transcript back in and restores
-// the captured scroll position, clamped to whatever the reloaded
-// transcript can honor.
+// the captured scroll state: a parent that was following the stream
+// comes back at the bottom, still following; otherwise the captured
+// position, clamped to whatever the reloaded transcript can honor. A
+// restore that lands after a re-entry, or after the active session
+// changed, would paint the wrong transcript and is dropped.
 func (m *UI) handleInspectRestore(msg inspectRestoreMsg) tea.Cmd {
-	cmd := m.setSessionMessages(msg.messages)
-	m.chat.ScrollToIndex(msg.scrollIdx)
-	if msg.scrollLine > 0 {
-		m.chat.ScrollBy(msg.scrollLine)
+	if m.isInspecting() || msg.sessionID != m.currentSessionID() {
+		return nil
+	}
+	cmds := []tea.Cmd{m.setSessionMessages(msg.messages)}
+	if msg.follow {
+		cmds = append(cmds, m.chat.ScrollToBottom())
+	} else {
+		cmds = append(cmds, m.chat.ScrollToIndex(msg.scrollIdx))
+		if msg.scrollLine > 0 {
+			cmds = append(cmds, m.chat.ScrollBy(msg.scrollLine))
+		}
 	}
 	m.invalidateFrames()
-	return cmd
+	return tea.Batch(cmds...)
 }
 
 // handleInspectChildMessage applies a live message from the inspected

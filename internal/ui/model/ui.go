@@ -380,15 +380,18 @@ type UI struct {
 
 	// Inspect mode (#314): viewing a sub-agent's session read-only in
 	// the chat while the parent stays the active session. inspecting is
-	// nil when not inspecting. The scroll pair is the parent chat
-	// position captured on entry and restored on exit. inspectRing
-	// enumerates the live agent blocks (in transcript order) at the
-	// moment inspect mode was entered; ctrl+] cycles it.
-	inspecting      *session.Session
-	inspectScroll   [2]int
-	inspectRing     []string
-	inspectRingPos  int
-	inspectLoadBusy bool
+	// nil when not inspecting. The scroll pair and follow flag are the
+	// parent chat state captured on entry and restored on exit.
+	// inspectRing enumerates the live agent blocks (in transcript order)
+	// at the moment inspect mode was entered; ctrl+] cycles it.
+	// inspectSeq numbers inspect transitions so a child load that lands
+	// after a later one is dropped.
+	inspecting     *session.Session
+	inspectScroll  [2]int
+	inspectFollow  bool
+	inspectRing    []string
+	inspectRingPos int
+	inspectSeq     int
 
 	// onboarding state
 	onboarding struct {

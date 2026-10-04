@@ -280,9 +280,15 @@ func TestInspectBackRestoresParentAndScroll(t *testing.T) {
 	ws := newInspectWorkspace()
 	m := newInspectUI(t, ws)
 	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
-	addParentTranscript(t, m, ws, 6)
+	// A short viewport over a long transcript, scrolled to the middle, so
+	// the position being restored is neither the top nor the bottom.
+	m.chat.SetSize(80, 6)
+	addParentTranscript(t, m, ws, 30)
 	m.chat.ScrollToTop()
+	m.chat.ScrollBy(7)
 	wantIdx, wantLine := m.chat.ScrollPosition()
+	require.NotZero(t, wantIdx+wantLine, "the test position must be off the top")
+	require.False(t, m.chat.AtBottom(), "the test position must be off the bottom")
 
 	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
 	require.True(t, m.isInspecting())
@@ -431,4 +437,108 @@ func TestInspectEscIsBackOnLegacyTerminals(t *testing.T) {
 	handled, _ := m.handleInspectKeys(tea.KeyPressMsg{Code: tea.KeyEscape})
 	require.False(t, handled, "with key disambiguation esc is not ctrl+[")
 	require.True(t, m.isInspecting())
+}
+
+// TestInspectStaleLoadsAreDropped pins the async ordering of inspect
+// transitions: only the latest requested view may paint the chat, in
+// whichever order the fetches land.
+func TestInspectStaleLoadsAreDropped(t *testing.T) {
+	setup := func(t *testing.T) (*UI, *inspectWorkspace) {
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+		addChild(ws, inspectChild2ID, inspectParentID, "Agent B", inspectChildMessages()...)
+		addParentTranscript(t, m, ws, 3)
+		addAgentBlock(t, m, inspectMessageID, inspectCallID)
+		addAgentBlock(t, m, inspectMessageID, inspectCall2ID)
+		runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+		require.Equal(t, inspectChildID, m.inspectingSessionID())
+		return m, ws
+	}
+	back := tea.KeyPressMsg{Code: '[', Mod: tea.ModCtrl}
+
+	t.Run("cycle superseded by back, cycle lands last", func(t *testing.T) {
+		m, _ := setup(t)
+		cycle := m.handleInspectDrill()
+		_, exit := m.handleInspectKeys(back)
+		runInspectCmds(m, exit)
+		runInspectCmds(m, cycle)
+		require.False(t, m.isInspecting(), "a load superseded by ctrl+[ must not re-enter inspect mode")
+		require.NotNil(t, m.chat.MessageItem(parentMessageID(0)))
+	})
+
+	t.Run("cycle superseded by back, cycle lands first", func(t *testing.T) {
+		m, _ := setup(t)
+		cycle := m.handleInspectDrill()
+		_, exit := m.handleInspectKeys(back)
+		runInspectCmds(m, cycle)
+		runInspectCmds(m, exit)
+		require.False(t, m.isInspecting(),
+			"the inspect state must match the parent transcript on screen")
+		require.NotNil(t, m.chat.MessageItem(parentMessageID(0)))
+	})
+
+	t.Run("rapid cycling settles on the last press", func(t *testing.T) {
+		m, _ := setup(t)
+		first := m.handleInspectDrill()
+		second := m.handleInspectDrill()
+		runInspectCmds(m, first)
+		runInspectCmds(m, second)
+		require.Equal(t, m.inspectRing[m.inspectRingPos], m.inspectingSessionID(),
+			"the viewed session must be the ring position the indicator shows")
+		require.Equal(t, inspectChildID, m.inspectingSessionID())
+	})
+
+	t.Run("restore after a session switch is dropped", func(t *testing.T) {
+		m, ws := setup(t)
+		_, exit := m.handleInspectKeys(back)
+		next := session.Session{ID: "parent-2"}
+		ws.sessions[next.ID] = next
+		ws.messages[next.ID] = []message.Message{{ID: "n0", SessionID: next.ID, Role: message.User}}
+		runInspectCmds(m, m.loadSession(next.ID))
+		runInspectCmds(m, exit)
+		require.NotNil(t, m.chat.MessageItem("n0"))
+		require.Nil(t, m.chat.MessageItem(parentMessageID(0)),
+			"a restore of the old parent must not paint over the new session")
+	})
+}
+
+// TestInspectFailedLoadDoesNotWedge pins that a child fetch that fails
+// leaves drill-in usable: the next ctrl+] still loads.
+func TestInspectFailedLoadDoesNotWedge(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: "missing$$call"}))
+	require.False(t, m.isInspecting())
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	require.True(t, m.isInspecting(), "a failed load must not block the next drill-in")
+}
+
+// TestInspectBackResumesFollow pins that a parent which was following the
+// stream at entry comes back following, at the bottom, including messages
+// that landed while it was off screen.
+func TestInspectBackResumesFollow(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+	m.chat.SetSize(80, 6)
+	addParentTranscript(t, m, ws, 20)
+	m.chat.ScrollToBottom()
+	require.True(t, m.chat.Follow())
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	// The parent keeps streaming while the child is on screen.
+	for i := 20; i < 30; i++ {
+		ws.messages[inspectParentID] = append(ws.messages[inspectParentID], message.Message{
+			ID: parentMessageID(i), SessionID: inspectParentID, Role: message.User,
+		})
+	}
+	_, exit := m.handleInspectKeys(tea.KeyPressMsg{Code: '[', Mod: tea.ModCtrl})
+	runInspectCmds(m, exit)
+
+	require.True(t, m.chat.AtBottom(), "a following parent must come back at the bottom")
+	require.True(t, m.chat.Follow(), "and keep following the stream")
 }
