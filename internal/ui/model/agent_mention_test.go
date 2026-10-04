@@ -191,6 +191,27 @@ func TestRouteLeadingAgentHandle(t *testing.T) {
 	require.NotNil(t, cmd)
 }
 
+// A leading handle typed with different casing routes to the same
+// stored slug — "@Tester stop" steers the "tester" agent, exactly like
+// the message_agent tool path tolerates the addressed form.
+func TestRouteLeadingAgentHandleCaseInsensitive(t *testing.T) {
+	t.Parallel()
+
+	ws := &agentMentionWorkspace{byHandle: map[string]dispatch.TodoSnapshot{
+		"tester": runningSnapshot("tester", "writes tests"),
+	}}
+	m := newAgentMentionUI(ws)
+
+	_, handled := m.routeLeadingAgentHandle("@Tester stop writing Rust")
+	require.True(t, handled)
+	require.Equal(t, []deliveredMessage{{handle: "tester", text: "stop writing Rust"}}, ws.delivered)
+
+	// An unknown name still falls back to the normal prompt path, upper-
+	// or lower-case alike.
+	_, handled = m.routeLeadingAgentHandle("@Nope hello")
+	require.False(t, handled)
+}
+
 // Mid-sentence mentions compose agent-card attachments for every handle
 // that resolves, live or finished, and skip files and unknowns.
 func TestAgentMentionAttachments(t *testing.T) {
@@ -209,6 +230,12 @@ func TestAgentMentionAttachments(t *testing.T) {
 	require.Contains(t, string(cards[1].Content), "not continuable")
 
 	require.Empty(t, m.agentMentionAttachments("no mentions"))
+
+	// Casing never matters and one card lands per agent: "@Tester" is
+	// the stored "tester" slug, however the user typed it.
+	cards = m.agentMentionAttachments("ask @Tester and @tester what happened")
+	require.Len(t, cards, 1)
+	require.Contains(t, string(cards[0].Content), "@tester")
 }
 
 // The completions' live-agents source carries handle, role, a status

@@ -142,20 +142,30 @@ func AgentCardAttachment(snap dispatch.TodoSnapshot) message.Attachment {
 // mid-sentence @handle mention in the prompt that resolves to a known
 // dispatch (#313). The router never multiplexes a mid-sentence question
 // to the mentioned agents: the parent turn keeps the text verbatim, and
-// the cards are what the mentioned agents contribute.
+// the cards are what the mentioned agents contribute. Handles resolve
+// through their slug, so the user's casing never matters — "@Tester"
+// and "@tester" are the same agent, and one card per agent.
 func (m *UI) agentMentionAttachments(prompt string) []message.Attachment {
 	handles := mentionHandles(prompt)
 	if len(handles) == 0 {
 		return nil
 	}
-	var cards []message.Attachment
+	var (
+		cards []message.Attachment
+		seen  = map[string]bool{}
+	)
 	for _, handle := range handles {
-		snap, ok := m.com.Workspace.DispatchByHandle(handle)
+		slug := dispatch.HandleSlug(handle)
+		if seen[slug] {
+			continue
+		}
+		snap, ok := m.com.Workspace.DispatchByHandle(slug)
 		if !ok {
 			// Not a dispatch: a file mention, a typo, or prose. The
 			// normal prompt path handles @file tokens.
 			continue
 		}
+		seen[slug] = true
 		cards = append(cards, AgentCardAttachment(snap))
 	}
 	return cards
@@ -172,6 +182,9 @@ func (m *UI) routeLeadingAgentHandle(prompt string) (cmd tea.Cmd, handled bool) 
 	if !ok {
 		return nil, false
 	}
+	// Handles are stored slugged; resolve through the slug so the user's
+	// casing never matters, exactly like the message_agent tool path.
+	handle = dispatch.HandleSlug(handle)
 	if rest == "" {
 		return util.ReportWarn("Nothing to send @handle — write the message after the handle, e.g. \"@" + handle + " stop writing Rust\"."), true
 	}
