@@ -551,8 +551,10 @@ type TodoEnforcementConfig struct {
 	Enabled *bool `json:"enabled,omitempty" jsonschema:"description=Inject a context nudge when an agent works without a todo list,default=true"`
 	// NudgeThreshold is how many tool calls without todos activity trip
 	// the first nudge. A mutating tool call (write/edit/multiedit/bash)
-	// trips it immediately regardless of count.
-	NudgeThreshold *int `json:"nudge_threshold,omitempty" jsonschema:"description=Tool calls without todos activity before a nudge is injected; a mutating tool call trips it immediately,default=4,example=8,example=1"`
+	// trips it immediately regardless of count. 0 or "off" disables
+	// nudging, the same as enabled: false; a negative value is a load
+	// error.
+	NudgeThreshold *IntOrOff `json:"nudge_threshold,omitempty" jsonschema:"description=Tool calls without todos activity before a nudge is injected; a mutating tool call trips it immediately. 0 or 'off' disables nudging\\, the same as enabled: false; a negative value is a load error"`
 	// HardGate rejects mutating tools (write/edit/multiedit/bash) until
 	// the session has a todo list. Deterministic but brittle; off by
 	// default.
@@ -560,17 +562,66 @@ type TodoEnforcementConfig struct {
 	// KillAfterNudges is the wander-kill rung (#316): how many nudges a
 	// run may ignore before the coordinator kills it deterministically.
 	// The default of 2 kills after both the nudge and the escalating
-	// nudge are ignored; 0 disables the kill. It only wires up for
-	// dispatched agents (the parent must be able to re-dispatch); the
-	// main agent's ladder stays capped at nudging.
-	KillAfterNudges *int `json:"kill_after_nudges,omitempty" jsonschema:"description=Wander kill: nudges a dispatched agent may ignore before it is killed; 0 disables,default=2,example=3"`
+	// nudge are ignored; 0 or "off" disables the kill, and any positive
+	// value is honored, unclamped. It only wires up for dispatched
+	// agents (the parent must be able to re-dispatch); the main
+	// agent's ladder stays capped at nudging. A negative value is a
+	// load error.
+	KillAfterNudges *IntOrOff `json:"kill_after_nudges,omitempty" jsonschema:"description=Wander kill: nudges a dispatched agent may ignore before it is killed. 0 or 'off' disables; a negative value is a load error"`
 	// StallWindow kills a dispatched run whose todo list has not been
-	// updated for this many seconds while it keeps running ("stalled
-	// todos"). 0 (the default) disables the stall check.
-	StallWindow *int `json:"stall_window,omitempty" jsonschema:"description=Wander kill: seconds without a todo update that mark a dispatched run as stalled; 0 disables,default=0,example=300"`
-	// HardTimeout kills a dispatched run after this many seconds,
-	// whatever its progress. 0 (the default) disables the timeout.
-	HardTimeout *int `json:"hard_timeout,omitempty" jsonschema:"description=Wander kill: seconds after which a dispatched run is killed outright; 0 disables,default=0,example=1800"`
+	// updated for this long while it keeps running ("stalled todos").
+	// 0 or "off" (the default) disables the stall check. Accepts a
+	// number of seconds (legacy form) or a duration string such as
+	// "30m"; a negative value is a load error.
+	StallWindow *Duration `json:"stall_window,omitempty" jsonschema:"description=Wander kill: time without a todo update that marks a dispatched run as stalled. 0 or 'off' disables; a negative value is a load error"`
+	// HardTimeout kills a dispatched run after this long, whatever its
+	// progress. 0 or "off" (the default) disables the timeout. Accepts
+	// a number of seconds (legacy form) or a duration string such as
+	// "30m"; a negative value is a load error.
+	HardTimeout *Duration `json:"hard_timeout,omitempty" jsonschema:"description=Wander kill: time after which a dispatched run is killed outright. 0 or 'off' disables; a negative value is a load error"`
+}
+
+// JSONSchemaExtend adds the defaults and examples for the knob fields.
+// They cannot come from the field tags: the tags reach only the $ref
+// wrapper, while the type-specific keyword parsing the tags rely on runs
+// on typed properties, and these are references to the knob definitions.
+func (TodoEnforcementConfig) JSONSchemaExtend(schema *jsonschema.Schema) {
+	if schema.Properties == nil {
+		return
+	}
+	set := func(name string, def any, examples ...any) {
+		if prop, ok := schema.Properties.Get(name); ok {
+			prop.Default = def
+			prop.Examples = examples
+		}
+	}
+	set("nudge_threshold", 4, 8, 1, "off")
+	set("kill_after_nudges", 2, 3, 10, "off")
+	set("stall_window", 0, 300, "30m", "off")
+	set("hard_timeout", 0, 1800, "30m", "off")
+}
+
+// Validate checks the ladder's numeric knobs: 0 or "off" disables a knob
+// and a positive value configures it, but a negative value is a load
+// error, not a setting. The path names the block in the config file, so
+// each error points at the offending key.
+func (c *TodoEnforcementConfig) Validate(path string) error {
+	if c == nil {
+		return nil
+	}
+	if c.NudgeThreshold != nil && *c.NudgeThreshold < 0 {
+		return fmt.Errorf("%s.nudge_threshold: must not be negative (got %d)", path, *c.NudgeThreshold)
+	}
+	if c.KillAfterNudges != nil && *c.KillAfterNudges < 0 {
+		return fmt.Errorf("%s.kill_after_nudges: must not be negative (got %d)", path, *c.KillAfterNudges)
+	}
+	if c.StallWindow != nil && *c.StallWindow < 0 {
+		return fmt.Errorf("%s.stall_window: must not be negative (got %s)", path, durationForError(*c.StallWindow))
+	}
+	if c.HardTimeout != nil && *c.HardTimeout < 0 {
+		return fmt.Errorf("%s.hard_timeout: must not be negative (got %s)", path, durationForError(*c.HardTimeout))
+	}
+	return nil
 }
 
 // TodoEnforcementSettings is the resolved enforcement ladder: the per-agent
@@ -630,20 +681,25 @@ func ResolveTodoEnforcement(global, over *TodoEnforcementConfig) TodoEnforcement
 	if merged.Enabled != nil {
 		settings.Enabled = *merged.Enabled
 	}
-	if merged.NudgeThreshold != nil && *merged.NudgeThreshold > 0 {
-		settings.NudgeThreshold = *merged.NudgeThreshold
+	if merged.NudgeThreshold != nil {
+		settings.NudgeThreshold = int(*merged.NudgeThreshold)
 	}
 	if merged.HardGate != nil {
 		settings.HardGate = *merged.HardGate
 	}
 	if merged.KillAfterNudges != nil {
-		settings.KillAfterNudges = max(*merged.KillAfterNudges, 0)
+		settings.KillAfterNudges = int(*merged.KillAfterNudges)
 	}
-	if merged.StallWindow != nil && *merged.StallWindow > 0 {
-		settings.StallWindow = time.Duration(*merged.StallWindow) * time.Second
+	if merged.StallWindow != nil {
+		settings.StallWindow = time.Duration(*merged.StallWindow)
 	}
-	if merged.HardTimeout != nil && *merged.HardTimeout > 0 {
-		settings.HardTimeout = time.Duration(*merged.HardTimeout) * time.Second
+	if merged.HardTimeout != nil {
+		settings.HardTimeout = time.Duration(*merged.HardTimeout)
+	}
+	// An explicit 0 (or "off") threshold disables nudging outright, the
+	// same as enabled: false; it must win over an explicit enabled: true.
+	if merged.NudgeThreshold != nil && *merged.NudgeThreshold == 0 {
+		settings.Enabled = false
 	}
 	return settings
 }

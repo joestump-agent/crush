@@ -84,6 +84,13 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 		return nil, fmt.Errorf("invalid hook configuration: %w", err)
 	}
 
+	// Validate the todo enforcement knobs with the same rule: 0 or
+	// "off" disables a knob, a positive value configures it, and a
+	// negative value is a load error that names its path.
+	if err := cfg.Options.TodoEnforcement.Validate("options.todo_enforcement"); err != nil {
+		return nil, fmt.Errorf("invalid todo enforcement configuration: %w", err)
+	}
+
 	if !isInsideWorktree() {
 		const depth = 2
 		const items = 100
