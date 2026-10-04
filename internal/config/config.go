@@ -579,6 +579,13 @@ type TodoEnforcementConfig struct {
 	// a number of seconds (legacy form) or a duration string such as
 	// "30m"; a negative value is a load error.
 	HardTimeout *Duration `json:"hard_timeout,omitempty" jsonschema:"description=Wander kill: time after which a dispatched run is killed outright. 0 or 'off' disables; a negative value is a load error"`
+	// InactivityTimeout is the A2A-level backstop (#360): a dispatched
+	// run served over A2A that yields no events at all for this many
+	// seconds is ended by the executor with a Failed status carrying
+	// the reason. It guards the runs the in-process watchdogs (#316)
+	// miss: stall_window and hard_timeout default to 0, and the ladder
+	// needs model steps to fire. 0 (the default) disables the backstop.
+	InactivityTimeout *int `json:"inactivity_timeout,omitempty" jsonschema:"description=A2A backstop: seconds without any event that end a silent dispatched run with a Failed status; 0 disables,default=0,example=900"`
 }
 
 // JSONSchemaExtend adds the defaults and examples for the knob fields.
@@ -621,6 +628,9 @@ func (c *TodoEnforcementConfig) Validate(path string) error {
 	if c.HardTimeout != nil && *c.HardTimeout < 0 {
 		return fmt.Errorf("%s.hard_timeout: must not be negative (got %s)", path, durationForError(*c.HardTimeout))
 	}
+	if c.InactivityTimeout != nil && *c.InactivityTimeout < 0 {
+		return fmt.Errorf("%s.inactivity_timeout: must not be negative (got %d)", path, *c.InactivityTimeout)
+	}
 	return nil
 }
 
@@ -632,10 +642,12 @@ type TodoEnforcementSettings struct {
 	HardGate       bool
 	// Wander kill (#316). KillAfterNudges is the number of ignored
 	// nudges that trip the kill; StallWindow and HardTimeout are 0 when
-	// disabled.
-	KillAfterNudges int
-	StallWindow     time.Duration
-	HardTimeout     time.Duration
+	// disabled. InactivityTimeout is the A2A-level backstop (#360), also
+	// 0 when disabled.
+	KillAfterNudges   int
+	StallWindow       time.Duration
+	HardTimeout       time.Duration
+	InactivityTimeout time.Duration
 }
 
 const (
@@ -672,6 +684,9 @@ func ResolveTodoEnforcement(global, over *TodoEnforcementConfig) TodoEnforcement
 		if over.HardTimeout != nil {
 			merged.HardTimeout = over.HardTimeout
 		}
+		if over.InactivityTimeout != nil {
+			merged.InactivityTimeout = over.InactivityTimeout
+		}
 	}
 	settings := TodoEnforcementSettings{
 		Enabled:         true,
@@ -700,6 +715,9 @@ func ResolveTodoEnforcement(global, over *TodoEnforcementConfig) TodoEnforcement
 	// same as enabled: false; it must win over an explicit enabled: true.
 	if merged.NudgeThreshold != nil && *merged.NudgeThreshold == 0 {
 		settings.Enabled = false
+	}
+	if merged.InactivityTimeout != nil && *merged.InactivityTimeout > 0 {
+		settings.InactivityTimeout = time.Duration(*merged.InactivityTimeout) * time.Second
 	}
 	return settings
 }

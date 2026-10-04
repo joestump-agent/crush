@@ -3,11 +3,15 @@ package a2a
 import (
 	"context"
 	"errors"
+	"fmt"
 	"iter"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"charm.land/fantasy"
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
@@ -15,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/session"
 )
 
 // fakeRunner is a test double for the SessionAgent slice the Executor drives.
@@ -248,22 +253,106 @@ func TestExecuteNilResultFails(t *testing.T) {
 	require.Contains(t, statusMessageText(t, evs[2]), "did not start a turn")
 }
 
-func TestExecuteCanceledRunEmitsNoTerminalStatus(t *testing.T) {
+// blockingCancelRunner blocks in Run until its kill channel fires, then
+// returns context.Canceled — a kill delivered behind the executor's back
+// unless the test calls Cancel itself.
+type blockingCancelRunner struct {
+	started chan struct{}
+	kill    chan struct{}
+}
+
+func (f *blockingCancelRunner) Run(_ context.Context, call agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	if f.started != nil {
+		close(f.started)
+	}
+	<-f.kill
+	return nil, context.Canceled
+}
+
+func (f *blockingCancelRunner) Cancel(sessionID string) {
+	close(f.kill)
+}
+
+func TestExecuteOutOfBandCancelEmitsCanceled(t *testing.T) {
 	t.Parallel()
 
-	// A canceled run is reported by Cancel's own Canceled status; Execute
-	// must not race it with a Failed status.
-	runner := &fakeRunner{err: context.Canceled}
+	// A runner killed behind the SDK's back — the wander ladder or the
+	// watchdog canceling the agent directly — returns context.Canceled
+	// on a live context with no executor Cancel in play. The executor
+	// must surface exactly one terminal Canceled carrying the kill
+	// reason, or the consumer waits forever (#342).
+	tests := []struct {
+		name   string
+		opts   []Option
+		reason string
+	}{
+		{
+			name:   "default reason",
+			reason: "canceled",
+		},
+		{
+			name:   "kill reason",
+			opts:   []Option{WithCancelReason(func() string { return "wander kill: no todo progress" })},
+			reason: "wander kill: no todo progress",
+		},
+		{
+			name:   "empty reason falls back",
+			opts:   []Option{WithCancelReason(func() string { return "" })},
+			reason: "canceled",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			runner := &fakeRunner{err: context.Canceled}
+			exec := NewExecutor(runner, "sess-1", tt.opts...)
+
+			msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+			evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+
+			want := []a2aspec.TaskState{
+				a2aspec.TaskStateSubmitted,
+				a2aspec.TaskStateWorking,
+				a2aspec.TaskStateCanceled,
+			}
+			require.Equal(t, want, states(t, evs), "an out-of-band cancel must end the task canceled")
+			require.Equal(t, tt.reason, statusMessageText(t, evs[2]))
+		})
+	}
+}
+
+func TestExecuteOwnCancelEmitsOneTerminal(t *testing.T) {
+	t.Parallel()
+
+	// The executor's own Cancel emits the terminal Canceled status; the
+	// run ending on that same cancel must not emit a second one.
+	runner := &blockingCancelRunner{started: make(chan struct{}), kill: make(chan struct{})}
 	exec := NewExecutor(runner, "sess-1")
 
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
-	evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+	evsCh := make(chan []a2aspec.Event, 1)
+	go func() {
+		evsCh <- collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+	}()
 
-	want := []a2aspec.TaskState{
-		a2aspec.TaskStateSubmitted,
-		a2aspec.TaskStateWorking,
+	<-runner.started
+	cancelEvs := collect(t, exec.Cancel(context.Background(), newExecCtx(nil)))
+
+	var executeEvs []a2aspec.Event
+	select {
+	case executeEvs = <-evsCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the canceled run to end")
 	}
-	require.Equal(t, want, states(t, evs), "no terminal status for a canceled run")
+
+	canceled := 0
+	for _, st := range append(states(t, cancelEvs), states(t, executeEvs)...) {
+		if st == a2aspec.TaskStateCanceled {
+			canceled++
+		}
+	}
+	require.Equal(t, 1, canceled, "exactly one Canceled across the Execute and Cancel sequences")
 }
 
 func TestExecuteEmptyPromptRejects(t *testing.T) {
@@ -452,4 +541,167 @@ func TestGitDiffNotARepo(t *testing.T) {
 	diff, err := GitDiff(t.TempDir())(t.Context())
 	require.Error(t, err)
 	require.Empty(t, diff)
+}
+
+// inactivityRunner is a runner whose Run blocks until released, so a
+// test can hold a run silent (or feed it progress) and count how many
+// times the executor canceled it.
+type inactivityRunner struct {
+	result  *fantasy.AgentResult
+	release chan struct{}
+
+	mu          sync.Mutex
+	cancelCount int
+}
+
+func newInactivityRunner(result string) *inactivityRunner {
+	return &inactivityRunner{
+		result:  textResult(result),
+		release: make(chan struct{}),
+	}
+}
+
+func (r *inactivityRunner) Run(ctx context.Context, call agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	<-r.release
+	return r.result, nil
+}
+
+func (r *inactivityRunner) Cancel(string) {
+	r.mu.Lock()
+	r.cancelCount++
+	r.mu.Unlock()
+}
+
+func (r *inactivityRunner) cancels() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cancelCount
+}
+
+// The backstop's core case (#360): a silent runner that outlives the
+// timeout gets runner.Cancel called exactly once and the run ends with
+// exactly one Failed carrying the reason — no Canceled, which is
+// reserved for the executor's Cancel.
+func TestExecuteInactivitySilentRunFails(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		runner := newInactivityRunner("never")
+		exec := NewExecutor(runner, "sess-1", WithInactivityTimeout(5*time.Minute))
+
+		msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+		evsCh := make(chan []a2aspec.Event, 1)
+		go func() {
+			evsCh <- collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+		}()
+
+		// The run never yields an event: with every goroutine durably
+		// blocked, virtual time runs the backstop (5m) and the settle
+		// window (2s) past, well inside this sleep.
+		time.Sleep(6 * time.Minute)
+
+		var evs []a2aspec.Event
+		select {
+		case evs = <-evsCh:
+		default:
+			t.Fatal("the backstop did not end the run")
+		}
+
+		want := []a2aspec.TaskState{
+			a2aspec.TaskStateSubmitted,
+			a2aspec.TaskStateWorking,
+			a2aspec.TaskStateFailed,
+		}
+		require.Equal(t, want, states(t, evs))
+		require.Equal(t, "inactivity timeout: no progress for 5m0s", statusMessageText(t, evs[2]))
+		require.Equal(t, 1, runner.cancels(), "runner.Cancel must be called exactly once")
+
+		close(runner.release)
+	})
+}
+
+// A runner that emits a changed todo snapshot every half the timeout
+// keeps resetting the backstop and runs to completion: a run that is
+// visibly making progress must not trip it.
+func TestExecuteInactivityProgressResetsTimer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		runner := newInactivityRunner("done")
+		source := newPipeTodoSource()
+		exec := NewExecutor(runner, "sess-1", WithTodos(source), WithInactivityTimeout(10*time.Second))
+
+		msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+		evsCh := make(chan []a2aspec.Event, 1)
+		go func() {
+			evsCh <- collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+		}()
+
+		// A changed snapshot every 4 virtual seconds — half the
+		// timeout — resets the backstop each time, so it never fires
+		// while the run makes progress.
+		for i := 0; i < 3; i++ {
+			source.ch <- todoSnapshot(runTodos(
+				session.Todo{Content: fmt.Sprintf("step %d", i), Status: session.TodoStatusInProgress, ActiveForm: fmt.Sprintf("stepping %d", i)},
+			))
+			<-time.After(4 * time.Second)
+		}
+		close(runner.release)
+		synctest.Wait()
+
+		var evs []a2aspec.Event
+		select {
+		case evs = <-evsCh:
+		default:
+			t.Fatal("the run did not end")
+		}
+		want := []a2aspec.TaskState{
+			a2aspec.TaskStateSubmitted,
+			a2aspec.TaskStateWorking,
+			todoState,
+			todoState,
+			todoState,
+			a2aspec.TaskStateCompleted,
+		}
+		require.Equal(t, want, statesWithTodos(t, evs))
+		require.Equal(t, 0, runner.cancels(), "a run that keeps making progress must not be canceled")
+	})
+}
+
+// With inactivity_timeout=0 no timer runs and behavior is unchanged: a
+// silent run is left alone no matter how long it stays quiet, and
+// completes normally when the runner finishes.
+func TestExecuteInactivityDisabledNoTimer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		runner := newInactivityRunner("done")
+		exec := NewExecutor(runner, "sess-1", WithInactivityTimeout(0))
+
+		msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+		evsCh := make(chan []a2aspec.Event, 1)
+		go func() {
+			evsCh <- collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+		}()
+
+		// An hour of virtual silence: with the backstop disabled nothing
+		// may fire, so the run must still be in flight.
+		time.Sleep(time.Hour)
+		select {
+		case <-evsCh:
+			t.Fatal("the run must not end while the runner is silent and the backstop is disabled")
+		default:
+		}
+
+		close(runner.release)
+		synctest.Wait()
+		var evs []a2aspec.Event
+		select {
+		case evs = <-evsCh:
+		default:
+			t.Fatal("the run did not end")
+		}
+
+		want := []a2aspec.TaskState{
+			a2aspec.TaskStateSubmitted,
+			a2aspec.TaskStateWorking,
+			a2aspec.TaskStateCompleted,
+		}
+		require.Equal(t, want, states(t, evs))
+		require.Equal(t, 0, runner.cancels())
+	})
 }

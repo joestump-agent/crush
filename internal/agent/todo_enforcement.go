@@ -66,6 +66,17 @@ func isMutatingTool(name string) bool {
 	return slices.Contains(mutatingToolNames, name)
 }
 
+// hasTodosTool reports whether ts carries the todos tool. Every rung of
+// the ladder asks the model to call it, so an agent without it (the tool
+// in options.disabled_tools, or an agent whose allowed tools leave it
+// out) gets no ladder at all: the nudges would demand a call the model
+// cannot make, and the gate would refuse every mutating tool for good.
+func hasTodosTool(ts []fantasy.AgentTool) bool {
+	return slices.ContainsFunc(ts, func(t fantasy.AgentTool) bool {
+		return t.Info().Name == tools.TodosToolName
+	})
+}
+
 // todoEnforcement carries the resolved ladder settings for one session
 // agent. It is constructed by the coordinator's builders (buildAgent per
 // agent type, buildDispatchedAgent from the global options) and shared by
@@ -229,9 +240,10 @@ func (e *todoEnforcement) gate(ctx context.Context, sessionID string) error {
 
 // wrapTodoGate wraps the mutating tools in ts with the hard-gate wrapper
 // when the gate is on. Other tools pass through untouched, and a nil
-// enforcement or a disabled gate returns the slice unchanged.
+// enforcement, a disabled gate or a tool set without the todos tool
+// returns the slice unchanged.
 func wrapTodoGate(ts []fantasy.AgentTool, e *todoEnforcement) []fantasy.AgentTool {
-	if e == nil || !e.settings.HardGate {
+	if e == nil || !e.settings.HardGate || !hasTodosTool(ts) {
 		return ts
 	}
 	out := make([]fantasy.AgentTool, len(ts))

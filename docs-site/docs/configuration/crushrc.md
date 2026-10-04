@@ -158,8 +158,20 @@ appears, with your privileges.
 - Don't `source` files from the internet into your config.
 - Prefer reading secrets from a password manager over pasting them in.
 
+:::warning[Known issue]
+A [dispatched agent](/agents/overview) loads project config from its own
+worktree: the `crushrc` or `crush.json` committed at the revision the worktree
+was cut from — a revision the model chooses. That config runs with your
+privileges like any other, and an uncommitted project config never reaches the
+agent. Only let Crush dispatch in a repository whose branches you trust.
+Tracked as [#374](https://github.com/joestump-agent/crush/issues/374).
+:::
+
 ## What about JSON?
 
 `crush.json` is still fully supported but should be considered deprecated. New
-configuration options are only added to the Bash format. See
-[Legacy JSON config](/configuration/json).
+configuration options are only added to the Bash format. A few keys still
+have no builtin, though — among them `options.todo_enforcement`, the
+[multi-agent todo ladder](/agents/todo-enforcement), which only `crush.json`
+can set today (tracked as [#403](https://github.com/joestump-agent/crush/issues/403)). See
+[Legacy JSON config](/configuration/json) for the list.

@@ -199,6 +199,32 @@ func TestTodoKill_DisabledWhenZero(t *testing.T) {
 	require.Zero(t, calls, "kill_after_nudges=0 must disable the kill")
 }
 
+// TestTodoKill_NoTodosToolNeverKilled pins that a dispatched agent
+// without the todos tool is never killed for ignoring nudges it could not
+// act on: the script that TestTodoKill_FiresAfterIgnoredNudges kills runs
+// to completion.
+func TestTodoKill_NoTodosToolNeverKilled(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	var killed killRecorder
+	sa := newTodoTestAgentOpts(t, env, model, config.TodoEnforcementSettings{
+		Enabled:         true,
+		NudgeThreshold:  1,
+		KillAfterNudges: 1,
+	}, []todoAgentOpt{withTodoKill(killed.observe), withoutTodosTool()}, probeTool())
+
+	runWithScript(t, env, sa, model)
+
+	calls, _, _ := killed.recorded()
+	require.Zero(t, calls, "an agent without the todos tool must never be killed by the ladder")
+}
+
 // TestTodoKill_NonDispatchedAgentNeverCanceled pins the kill's scope
 // (#393): an agent built without a TodoKill observer (the main coder,
 // plan mode, agent-tool sub-agents, crush run) tops out at the escalating
