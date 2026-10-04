@@ -712,6 +712,10 @@
             300,
             0
           ]
+        },
+        "todo_enforcement": {
+          "$ref": "#/$defs/TodoEnforcementConfig",
+          "description": "Proactive todo enforcement: inject a nudge when an agent works without a todo list"
         }
       },
       "additionalProperties": false,
@@ -1020,6 +1024,31 @@
         "expires_in",
         "expires_at"
       ]
+    },
+    "TodoEnforcementConfig": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Inject a context nudge when an agent works without a todo list",
+          "default": true
+        },
+        "nudge_threshold": {
+          "type": "integer",
+          "description": "Tool calls without todos activity before a nudge is injected; a mutating tool call trips it immediately",
+          "default": 4,
+          "examples": [
+            8,
+            1
+          ]
+        },
+        "hard_gate": {
+          "type": "boolean",
+          "description": "Reject mutating tools (write, edit, multiedit, bash) until a todo list exists",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
     },
     "ToolGlob": {
       "properties": {

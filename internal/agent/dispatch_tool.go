@@ -236,7 +236,10 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 
 	// Prompt and tools are known at construction, so the agent's
 	// readiness latch is satisfied immediately (newSessionAgent) — no
-	// build-time goroutines to wait for.
+	// build-time goroutines to wait for. Dispatched agents are not agent
+	// definitions, so the todo enforcement ladder (#315) uses the global
+	// options: every surface that consumes their todos (the block's
+	// current-todo line, the A2A event bridge) starves without it.
 	agent := newSessionAgent(SessionAgentOptions{
 		LargeModel:           model,
 		SmallModel:           small,
@@ -251,6 +254,7 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 		Tools:                opts.Toolchain.Tools(),
 		Notify:               c.notify,
 		RunComplete:          c.runComplete,
+		TodoEnforcement:      config.ResolveTodoEnforcement(c.cfg.Config().Options.TodoEnforcement, nil),
 	})
 
 	return &dispatchedAgent{agent: agent, model: model, providerCfg: providerCfg}, nil
