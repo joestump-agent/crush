@@ -59,6 +59,10 @@ func (w *AppWorkspace) ListSessions(ctx context.Context) ([]session.Session, err
 	return w.app.Sessions.List(ctx)
 }
 
+func (w *AppWorkspace) ListChildSessions(ctx context.Context, parentSessionID string) ([]session.Session, error) {
+	return w.app.Sessions.ListChildren(ctx, parentSessionID)
+}
+
 func (w *AppWorkspace) SaveSession(ctx context.Context, sess session.Session) (session.Session, error) {
 	return w.app.Sessions.Save(ctx, sess)
 }

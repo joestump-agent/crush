@@ -138,6 +138,17 @@ func (c *controllerV1) endpoints() []apigen.Endpoint {
 			Fails(404, 500).
 			Handle(c.handleGetWorkspaceSession),
 
+		apigen.Get("/v1/workspaces/{id}/sessions/{sid}/children").
+			Summary("List child sessions").
+			Description("Lists the sessions whose parent is the given session, "+
+				"oldest update first (sub-agent task sessions, #314).").
+			Tags("sessions").
+			PathParam("id", "Workspace ID").
+			PathParam("sid", "Session ID").
+			Responds([]proto.Session{}).
+			Fails(404, 500).
+			Handle(c.handleGetWorkspaceSessionChildren),
+
 		apigen.Put("/v1/workspaces/{id}/sessions/{sid}").
 			Summary("Update session").
 			Tags("sessions").
