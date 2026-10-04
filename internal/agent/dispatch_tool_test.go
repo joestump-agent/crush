@@ -755,3 +755,45 @@ func TestDispatchProgressFlowsToSinksAndDispatchStatus(t *testing.T) {
 	_, ok = c.DispatchStatus("no-such-session")
 	require.False(t, ok)
 }
+
+// With every write tool denied there is nothing a dispatch can do
+// (#376): the tool refuses before provisioning, so no crush-dispatch-*
+// branch or worktree directory is ever created.
+func TestDispatchAgentToolRefusedWhenAllWriteToolsDenied(t *testing.T) {
+	agent := &dispatchTestAgent{model: dispatchTestModel()}
+	c, env := newDispatchToolEnv(t, agent)
+	c.cfg.Config().Options.DisabledTools = []string{
+		tools.BashToolName,
+		tools.EditToolName,
+		tools.MultiEditToolName,
+		tools.WriteToolName,
+	}
+	c.cfg.Config().SetupAgents()
+	tool := c.dispatchTool()
+
+	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work"})
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "dispatch unavailable: bash/edit/write are disabled by your configuration")
+
+	// Nothing was provisioned: no crush-dispatch-* branches, no
+	// worktree directories, no registry entries — and the fake agent
+	// never ran.
+	branches, err := exec.CommandContext(t.Context(), "git", "-C", env.workingDir,
+		"for-each-ref", "--format=%(refname:short)", "refs/heads/crush-dispatch-*",
+	).Output()
+	require.NoError(t, err)
+	require.Empty(t, strings.TrimSpace(string(branches)))
+
+	worktrees := filepath.Join(env.workingDir, ".crush", "worktrees")
+	entries, err := os.ReadDir(worktrees)
+	if err == nil {
+		for _, entry := range entries {
+			require.NotContains(t, entry.Name(), dispatch.BranchPrefix, "a dispatch worktree was provisioned")
+		}
+	}
+
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	require.Empty(t, ws.List())
+	require.Empty(t, agent.calls)
+}

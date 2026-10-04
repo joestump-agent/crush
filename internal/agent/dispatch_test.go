@@ -161,3 +161,62 @@ func TestDispatchToolchainCloseIdempotent(t *testing.T) {
 	var nilTC *DispatchToolchain
 	nilTC.Close(t.Context())
 }
+
+// A denied tool stays denied inside a dispatch (#376): the dispatched
+// toolset must not add the write tools back over the parent's
+// options.disabled_tools / permissions deny. Only a full write-tool deny
+// or a todos deny narrows the set; the default set is unchanged.
+func TestDispatchToolchainHonorsDisabledTools(t *testing.T) {
+	cases := []struct {
+		name     string
+		disabled []string
+		denied   []string
+	}{
+		{name: "default"},
+		{
+			name:     "bash denied",
+			disabled: []string{tools.BashToolName},
+			denied:   []string{tools.BashToolName},
+		},
+		{
+			name:     "todos denied",
+			disabled: []string{tools.TodosToolName},
+			denied:   []string{tools.TodosToolName},
+		},
+		{
+			name:     "all write tools denied",
+			disabled: []string{tools.BashToolName, tools.EditToolName, tools.MultiEditToolName, tools.WriteToolName},
+			denied:   []string{tools.BashToolName, tools.EditToolName, tools.MultiEditToolName, tools.WriteToolName},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testEnv(t)
+			c := newDispatchTestCoordinator(t, env)
+			c.cfg.Config().Options.DisabledTools = tc.disabled
+			c.cfg.Config().SetupAgents()
+
+			workspace := t.TempDir()
+			toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
+			require.NoError(t, err)
+			defer toolchain.Close(t.Context())
+
+			got := make(map[string]bool, len(toolchain.Tools()))
+			for _, tool := range toolchain.Tools() {
+				got[tool.Info().Name] = true
+			}
+			for _, name := range tc.denied {
+				require.NotContains(t, got, name, "denied tool %q leaked into the dispatch", name)
+			}
+			if tc.name == "default" {
+				for _, name := range dispatchWriteTools {
+					require.Contains(t, got, name, "default set lost %q", name)
+				}
+			}
+			// A deny list narrows write tools; read tools stay.
+			require.Contains(t, got, tools.GlobToolName)
+			require.Contains(t, got, tools.ViewToolName)
+		})
+	}
+}

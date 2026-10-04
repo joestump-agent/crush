@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -234,6 +235,21 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			agentMessageID := tools.GetMessageFromContext(ctx)
 			if agentMessageID == "" {
 				return fantasy.ToolResponse{}, errors.New("agent message id missing from context")
+			}
+
+			// The parent's deny list decides what a dispatch may run
+			// with (#376): the worktree's own config must not widen it
+			// (#374). Without any write tool left there is nothing a
+			// dispatch can do, so refuse before provisioning a workspace.
+			agentCfg, ok := c.cfg.Config().Agents[config.AgentTask]
+			if !ok {
+				return fantasy.NewTextErrorResponse("dispatch unavailable: task agent not configured"), nil
+			}
+			surviving := dispatchAllowedTools(agentCfg, c.cfg.Config().Options.DisabledTools)
+			if !slices.ContainsFunc(dispatchCapabilityTools, func(name string) bool {
+				return slices.Contains(surviving, name)
+			}) {
+				return fantasy.NewTextErrorResponse("dispatch unavailable: bash/edit/write are disabled by your configuration (disabled_tools / permissions deny)"), nil
 			}
 
 			workspace, err := c.dispatchWorkspace()
