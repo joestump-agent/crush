@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
@@ -12,6 +13,18 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// schemaNamer gives config.Duration a definition name that cannot collide
+// with time.Duration, which the config tree also reflects (the grep and
+// glob tool timeouts). With the default t.Name() the time.Duration fields
+// would resolve to config.Duration's oneOf schema, advertising forms its
+// unmarshaler never accepts.
+func schemaNamer(t reflect.Type) string {
+	if t == reflect.TypeOf(config.Duration(0)) {
+		return "ConfigDuration"
+	}
+	return ""
+}
+
 var schemaCmd = &cobra.Command{
 	Use:    "schema",
 	Short:  "Generate JSON schema for configuration",
@@ -19,6 +32,7 @@ var schemaCmd = &cobra.Command{
 	Hidden: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		reflector := new(jsonschema.Reflector)
+		reflector.Namer = schemaNamer
 		schema := reflector.Reflect(&config.Config{})
 		setProviderTypeEnum(schema)
 		bts, err := json.MarshalIndent(schema, "", "  ")
