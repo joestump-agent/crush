@@ -305,3 +305,25 @@ func TestDispatchCardSteerAnswerWithoutSteer(t *testing.T) {
 	require.False(t, item.UpdateSteerAnswer("assistant-1", "orphan"))
 	require.Empty(t, item.Steers())
 }
+
+// The status line shows the @handle (#313): from the live snapshot when
+// one has arrived, else from the persisted running handle.
+func TestDispatchCardShowsHandle(t *testing.T) {
+	t.Parallel()
+
+	result := runningHandle(t, dispatch.StatusRunning)
+	handle := dispatch.DispatchResult{DispatchID: "dispatch-1", Handle: "tester", SessionID: "msg$$call-dispatch-1", Status: dispatch.StatusRunning}
+	b, err := json.Marshal(handle)
+	require.NoError(t, err)
+	result.Content = string(b)
+
+	item := newDispatchItem(t, result)
+	out := dispatchTestRender(t, item, dispatchToolOpts(result, false))
+	require.Contains(t, out, "tester")
+
+	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
+		Entry: dispatch.Entry{ID: "dispatch-1", SessionID: "msg$$call-dispatch-1", Handle: "tester-2", Status: dispatch.StatusRunning},
+	})
+	out = dispatchTestRender(t, item, dispatchToolOpts(result, false))
+	require.Contains(t, out, "tester-2", "the live snapshot's handle wins over the persisted one")
+}

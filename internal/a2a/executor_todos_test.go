@@ -177,9 +177,9 @@ func TestExecuteTodoHappyPath(t *testing.T) {
 
 		first := statusUpdate(t, evs[2])
 		require.Equal(t, "reading the code", statusMessageText(t, evs[2]))
-		require.Equal(t, []session.Todo{
-			{Content: "read the code", Status: session.TodoStatusInProgress, ActiveForm: "reading the code"},
-			{Content: "write the fix", Status: session.TodoStatusPending},
+		require.Equal(t, []any{
+			map[string]any{"content": "read the code", "status": string(session.TodoStatusInProgress), "active_form": "reading the code"},
+			map[string]any{"content": "write the fix", "status": string(session.TodoStatusPending), "active_form": ""},
 		}, first.Meta()[todoMetadataKey])
 
 		second := statusUpdate(t, evs[3])

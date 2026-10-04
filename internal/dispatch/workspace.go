@@ -37,6 +37,18 @@ import (
 	"github.com/google/uuid"
 )
 
+// IsTerminal reports whether status ends the dispatch: a terminal
+// dispatch's agent is gone, its handle answers with a refusal when
+// addressed, and it is excluded from the live-agents surfaces.
+func (s Status) IsTerminal() bool {
+	switch s {
+	case StatusCompleted, StatusFailed, StatusKilled:
+		return true
+	default:
+		return false
+	}
+}
+
 // BranchPrefix namespaces every branch and directory a dispatched
 // workspace creates, so cleanup can recognize its own artifacts no
 // matter how they were left behind.
@@ -83,8 +95,13 @@ type Entry struct {
 	// (#48/#50); empty until the dispatch starts running.
 	SessionID string
 	// Handle is the workspace's @handle for agent addressing (#313);
-	// empty until one is assigned.
+	// empty until one is assigned by [Workspace.AssignHandle].
 	Handle string
+	// Role is the one-line role label the dispatch was given (#313) —
+	// the "what it is" shown next to the handle in the @ completions,
+	// and the fallback a handle is derived from when the model did not
+	// supply one.
+	Role string
 	// Status is the workspace's lifecycle state.
 	Status Status
 	// Endpoint is the A2A server endpoint serving the dispatched agent
@@ -320,6 +337,84 @@ func (w *Workspace) SetSession(id, sessionID string) bool {
 // SetHandle records the @handle the dispatched agent is addressable by.
 func (w *Workspace) SetHandle(id, handle string) bool {
 	return w.Update(id, func(e *Entry) { e.Handle = handle })
+}
+
+// AssignHandle assigns the entry its @handle and role (#313) and returns
+// the assigned handle. requested is the handle the model asked for (the
+// leading "@" and any surrounding space are tolerated); role is the
+// one-line role label recorded alongside it. When requested is empty the
+// handle is derived from the role, and when that is empty too it falls
+// back to "agent". A handle that collides with one already claimed by
+// any registered dispatch — live or finished, since the registry is the
+// handle namespace until the entry is removed — is suffixed numerically:
+// tester, tester-2, tester-3. The assignment is atomic under the registry
+// lock, so two concurrent dispatches asking for the same handle get
+// distinct suffixed ones, and it publishes the usual entry event so the
+// dispatch block and @ completions observe the handle immediately.
+func (w *Workspace) AssignHandle(id, requested, role string) (string, bool) {
+	handle := HandleSlug(requested)
+	if handle == "" {
+		handle = HandleSlug(role)
+	}
+	if handle == "" {
+		handle = "agent"
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	e, ok := w.entries[id]
+	if !ok {
+		return "", false
+	}
+	handle = uniqueHandle(w.entries, handle)
+	e.Handle = handle
+	e.Role = strings.TrimSpace(role)
+	w.entries[id] = e
+	w.events.Publish(pubsub.UpdatedEvent, e)
+	return handle, true
+}
+
+// uniqueHandle returns handle, or its first free numeric suffix, against
+// every handle claimed in entries. Callers must hold w.mu.
+func uniqueHandle(entries map[string]Entry, handle string) string {
+	taken := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if e.Handle != "" {
+			taken[e.Handle] = true
+		}
+	}
+	if !taken[handle] {
+		return handle
+	}
+	for n := 2; ; n++ {
+		candidate := fmt.Sprintf("%s-%d", handle, n)
+		if !taken[candidate] {
+			return candidate
+		}
+	}
+}
+
+// HandleSlug normalizes a candidate handle or role into handle form:
+// lowercase, runs of non-alphanumerics collapsed to single dashes, and
+// no leading or trailing dash. "@Team Lead" becomes "team-lead"; a
+// candidate that slugs to nothing ("@__"), or an empty one, stays empty
+// so the caller can fall through to its next fallback.
+func HandleSlug(candidate string) string {
+	candidate = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(candidate), "@"))
+	candidate = strings.ToLower(candidate)
+	var b strings.Builder
+	dash := false
+	for _, r := range candidate {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			dash = false
+		case !dash && b.Len() > 0:
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 // SetEndpoint records the A2A endpoint and AgentCard serving the

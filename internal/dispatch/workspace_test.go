@@ -247,3 +247,103 @@ func TestWorkspaceUpdateUnknownEntry(t *testing.T) {
 	_, ok = ws.BySession("")
 	require.False(t, ok)
 }
+
+// HandleSlug normalizes candidates into handle form and leaves
+// unhandle-able ones empty so the caller can fall through.
+func TestHandleSlug(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct{ in, want string }{
+		{"tester", "tester"},
+		{"@Tester", "tester"},
+		{"  @Team Lead  ", "team-lead"},
+		{"Docs_Writer", "docs-writer"},
+		{"---weird__name---", "weird-name"},
+		{"🤖 robot", "robot"},
+		{"@__", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		require.Equal(t, tc.want, HandleSlug(tc.in), "HandleSlug(%q)", tc.in)
+	}
+}
+
+// AssignHandle assigns the requested handle, derives one from the role,
+// falls back to "agent", and suffixes collisions numerically — including
+// against finished dispatches, which keep their handles until their
+// registry entries are removed.
+func TestAssignHandle(t *testing.T) {
+	repo := newTestRepo(t)
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	ctx := t.Context()
+
+	a, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	b, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	c, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	// Explicit handle, with the leading @ tolerated.
+	handle, ok := ws.AssignHandle(a.ID, "@Tester", "writes tests")
+	require.True(t, ok)
+	require.Equal(t, "tester", handle)
+
+	// Derived from the role when no handle was requested.
+	handle, ok = ws.AssignHandle(b.ID, "", "Docs Writer")
+	require.True(t, ok)
+	require.Equal(t, "docs-writer", handle)
+
+	// Default when neither handle nor role was given.
+	handle, ok = ws.AssignHandle(c.ID, "", "")
+	require.True(t, ok)
+	require.Equal(t, "agent", handle)
+
+	// The entry carries handle and role, and ByHandle resolves it.
+	entry, ok := ws.Get(a.ID)
+	require.True(t, ok)
+	require.Equal(t, "tester", entry.Handle)
+	require.Equal(t, "writes tests", entry.Role)
+	got, ok := ws.ByHandle("tester")
+	require.True(t, ok)
+	require.Equal(t, a.ID, got.ID)
+
+	// A fourth dispatch asking for an in-use handle gets a suffix.
+	d, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	handle, ok = ws.AssignHandle(d.ID, "tester", "")
+	require.True(t, ok)
+	require.Equal(t, "tester-2", handle)
+
+	// Finished dispatches keep their handles: the registry is the
+	// namespace until Remove.
+	ws.SetStatus(a.ID, StatusCompleted)
+	e, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	handle, ok = ws.AssignHandle(e.ID, "tester", "")
+	require.True(t, ok)
+	require.Equal(t, "tester-3", handle)
+
+	// A removed entry releases its handle for reuse.
+	require.NoError(t, ws.Remove(ctx, b.ID))
+	handle, ok = ws.AssignHandle(e.ID, "", "docs writer")
+	require.True(t, ok)
+	require.Equal(t, "docs-writer", handle)
+
+	// Unknown entry: not assigned.
+	_, ok = ws.AssignHandle("no-such-id", "x", "")
+	require.False(t, ok)
+}
+
+// IsTerminal marks exactly the terminal statuses.
+func TestStatusIsTerminal(t *testing.T) {
+	t.Parallel()
+
+	for _, s := range []Status{StatusCompleted, StatusFailed, StatusKilled} {
+		require.True(t, s.IsTerminal(), "%s must be terminal", s)
+	}
+	for _, s := range []Status{StatusProvisioned, StatusRunning} {
+		require.False(t, s.IsTerminal(), "%s must not be terminal", s)
+	}
+}

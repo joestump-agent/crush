@@ -337,6 +337,18 @@ func (w *AppWorkspace) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, 
 	return w.app.DispatchStatus(sessionID)
 }
 
+func (w *AppWorkspace) DispatchLive() []dispatch.TodoSnapshot {
+	return w.app.DispatchLive()
+}
+
+func (w *AppWorkspace) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+	return w.app.DispatchByHandle(handle)
+}
+
+func (w *AppWorkspace) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+	return w.app.DeliverAgentMessageByHandle(ctx, handle, text)
+}
+
 // -- LSP --
 
 func (w *AppWorkspace) LSPStart(ctx context.Context, path string) {

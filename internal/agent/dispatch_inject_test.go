@@ -9,6 +9,7 @@ import (
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,9 +27,14 @@ type gatedDispatchAgent struct {
 	enterOnce sync.Once
 	mu        sync.Mutex
 	queued    []SessionAgentCall
+	lastCall  *SessionAgentCall
 }
 
 func (f *gatedDispatchAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+	f.mu.Lock()
+	callCopy := call
+	f.lastCall = &callCopy
+	f.mu.Unlock()
 	f.enterOnce.Do(func() { close(f.entered) })
 	select {
 	case <-f.gate:
@@ -36,6 +42,23 @@ func (f *gatedDispatchAgent) Run(ctx context.Context, call SessionAgentCall) (*f
 		return nil, ctx.Err()
 	}
 	return f.result, nil
+}
+
+// lastRunCall returns a copy of the call the dispatched agent ran with,
+// for asserting the call shaping (#71).
+func (f *gatedDispatchAgent) lastRunCall() (SessionAgentCall, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lastCall == nil {
+		return SessionAgentCall{}, false
+	}
+	return *f.lastCall, true
+}
+
+// ranOnce reports whether the agent's Run was entered.
+func (f *gatedDispatchAgent) ranOnce() bool {
+	_, ok := f.lastRunCall()
+	return ok
 }
 
 // waitRunning blocks until the dispatched run has entered the agent's Run
@@ -139,6 +162,83 @@ func TestDeliverAgentMessageMidRunThenRefusalAfterFinish(t *testing.T) {
 	err = c.DeliverAgentMessage(t.Context(), AgentMessage{SessionID: handle.SessionID, Text: "one more thing"})
 	require.ErrorContains(t, err, "finished")
 	require.ErrorContains(t, err, "dispatch a new agent")
+}
+
+// parkedSessions parks the first Get of one session ID until released.
+// runDispatch's first read of the dispatched session is its cost
+// propagation, which runs after the registry entry turns terminal, so
+// parking it holds the dispatch inside the window between "the registry
+// says finished" and runDispatch returning — where its deferred cleanup
+// has not run yet.
+type parkedSessions struct {
+	session.Service
+
+	mu      sync.Mutex
+	id      string
+	once    sync.Once
+	parked  chan struct{}
+	release chan struct{}
+}
+
+func newParkedSessions(inner session.Service) *parkedSessions {
+	return &parkedSessions{Service: inner, parked: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (s *parkedSessions) park(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.id = id
+}
+
+func (s *parkedSessions) Get(ctx context.Context, id string) (session.Session, error) {
+	s.mu.Lock()
+	park := s.id != "" && id == s.id
+	s.mu.Unlock()
+	if park {
+		s.once.Do(func() {
+			close(s.parked)
+			<-s.release
+		})
+	}
+	return s.Service.Get(ctx, id)
+}
+
+// A delivery that observes the registry entry as terminal must be
+// refused, whatever runDispatch still has left to do (#312). The
+// dispatch is parked in the cost propagation that follows the terminal
+// status, so the delivery lands deterministically in the window a
+// deferred-only unregister leaves open: there, a target that is still
+// registered takes the message (the fake agent always accepts), which is
+// the Windows flake TestDeliverAgentMessageMidRunThenRefusalAfterFinish
+// hit when the unregister ran only on return.
+func TestDeliverAgentMessageRefusesOnceRegistryIsTerminal(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, _ := newInjectionEnv(t, agent)
+	sessions := newParkedSessions(c.sessions)
+	c.sessions = sessions
+	defer close(sessions.release)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
+	agent.waitRunning(t)
+
+	sessions.park(handle.SessionID)
+	close(agent.gate)
+	select {
+	case <-sessions.parked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dispatch never reached cost propagation")
+	}
+
+	ws, _ := c.dispatchWorkspace()
+	entry, ok := ws.Get(handle.DispatchID)
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusCompleted, entry.Status, "the dispatch is parked after its terminal status")
+
+	err := c.DeliverAgentMessage(t.Context(), AgentMessage{SessionID: handle.SessionID, Text: "one more thing"})
+	require.ErrorContains(t, err, "finished")
+	require.ErrorContains(t, err, "dispatch a new agent")
+	require.Empty(t, agent.injected(), "a finished dispatch must not take the message")
 }
 
 // The queue is concurrency-safe with FIFO delivery for sequential sends,
@@ -254,8 +354,9 @@ func TestMessageAgentToolDeliversAndRefuses(t *testing.T) {
 	})
 	require.True(t, resp.IsError)
 	require.Contains(t, resp.Content, "dispatch a new agent")
+	require.Len(t, agent.injected(), 1, "a completed dispatch must never enqueue a message")
 
 	resp = runTool(t, messageTool, MessageAgentToolName, MessageAgentParams{Message: "no session"})
 	require.True(t, resp.IsError)
-	require.Contains(t, resp.Content, "session id is required")
+	require.Contains(t, resp.Content, "session id or handle is required")
 }

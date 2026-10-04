@@ -39,6 +39,15 @@ type DispatchAgentParams struct {
 	// Branch is the base revision the workspace is cut from; the default
 	// is the repository's current branch.
 	Branch string `json:"branch,omitempty" description:"Base revision the isolated workspace is cut from (default: current branch)"`
+	// Handle is the @handle the dispatched agent is addressable by
+	// (#313); the user steers it mid-run as "@handle stop writing Rust".
+	// Collisions are suffixed numerically (tester-2). Default: derived
+	// from Role, else "agent".
+	Handle string `json:"handle,omitempty" description:"@handle to address the dispatched agent by while it runs (default: derived from role, else \"agent\")"`
+	// Role is the one-line label of what the agent is for — shown next
+	// to the handle in the editor's @ completions and used to derive the
+	// handle when none was supplied.
+	Role string `json:"role,omitempty" description:"One-line role label for the dispatched agent (e.g. \"tester\", \"docs writer\"), shown in the @ completions and used to derive its handle"`
 }
 
 // dispatchSweepTimeout bounds the session-end sweep: it runs git commands
@@ -122,6 +131,11 @@ type dispatchRun struct {
 	// call time so the dispatched agent's turns render at the right size
 	// (the PrepareStep stamp would otherwise clobber it with zero).
 	contentWidth int
+	// stopServer tears the dispatch's A2A server down (#70); nil when no
+	// server was started. The run owns it: the server serves exactly as
+	// long as the dispatch runs.
+	stopServer func()
+
 	// kill accumulates the wander-kill reason (#316) from the
 	// enforcement ladder's hook and the watchdog; empty when the run is
 	// never killed.
@@ -129,6 +143,32 @@ type dispatchRun struct {
 	// killSettings are the resolved wander-kill thresholds for this
 	// dispatch: nudges-before-kill, todos stall window, hard timeout.
 	killSettings config.TodoEnforcementSettings
+}
+
+// call builds the full SessionAgentCall a dispatch's turns run with:
+// the chosen model's shaping, the parent turn's content width, and the
+// non-interactive flag. Built per consumer — the server stamps its
+// executor's template with it at start (#71), and the direct run and the
+// injection queue clone it at run time.
+func (r dispatchRun) call(c *coordinator) SessionAgentCall {
+	maxTokens := r.model.CatwalkCfg.DefaultMaxTokens
+	if r.model.ModelCfg.MaxTokens != 0 {
+		maxTokens = r.model.ModelCfg.MaxTokens
+	}
+	return SessionAgentCall{
+		SessionID:        r.sessionID,
+		ContentWidth:     r.contentWidth,
+		Prompt:           r.prompt,
+		MaxOutputTokens:  maxTokens,
+		ProviderOptions:  getProviderOptions(r.model, r.providerCfg),
+		Temperature:      r.model.ModelCfg.Temperature,
+		TopP:             r.model.ModelCfg.TopP,
+		TopK:             callTopK(r.providerCfg, r.model.ModelCfg.TopK),
+		FrequencyPenalty: r.model.ModelCfg.FrequencyPenalty,
+		PresencePenalty:  r.model.ModelCfg.PresencePenalty,
+		NonInteractive:   true,
+		OnAuthRefresh:    c.makeAuthRefreshCallback(r.providerCfg),
+	}
 }
 
 // dispatchTool builds the DispatchAgent tool (#64): provision a clean
@@ -219,14 +259,18 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			}
 
 			// Keep the registry current from here on: #65's status card
-			// and #313's handles read these entries.
+			// and #313's handles read these entries. The handle is assigned
+			// after the session so the assignment event carries the complete
+			// entry — handle, role, session, running state.
 			workspace.SetSession(entry.ID, taskSession.ID)
 			workspace.SetStatus(entry.ID, dispatch.StatusRunning)
+			assignedHandle, ok := workspace.AssignHandle(entry.ID, params.Handle, params.Role)
+			if !ok {
+				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				return fantasy.NewTextErrorResponse("assign dispatch handle: registry entry vanished"), nil
+			}
 
-			// The dispatch must outlive the parent turn that started it:
-			// the main agent keeps working, and its tool-call context is
-			// canceled as soon as the turn ends.
-			go c.runDispatch(context.WithoutCancel(ctx), dispatchRun{
+			run := dispatchRun{
 				workspace:       workspace,
 				entry:           entry,
 				toolchain:       toolchain,
@@ -239,10 +283,23 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				contentWidth:    tools.GetContentWidthFromContext(ctx),
 				kill:            kill,
 				killSettings:    killSettings,
-			})
+			}
+
+			// Stand up the dispatch's in-process A2A server (#70) and stamp
+			// its endpoint and card on the registry entry — the in-memory
+			// discovery surface. The executor's served turns run with the
+			// dispatch's own call shaping (#71); the server dies with the
+			// run, and runDispatch owns the stop.
+			run.stopServer = c.startDispatchServer(ctx, workspace, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c))
+
+			// The dispatch must outlive the parent turn that started it:
+			// the main agent keeps working, and its tool-call context is
+			// canceled as soon as the turn ends.
+			go c.runDispatch(context.WithoutCancel(ctx), run)
 
 			handle := dispatch.DispatchResult{
 				DispatchID:    entry.ID,
+				Handle:        assignedHandle,
 				Branch:        entry.Branch,
 				WorkspacePath: entry.Path,
 				SessionID:     taskSession.ID,
@@ -327,6 +384,13 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 // deterministically when a kill threshold trips.
 func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	defer func() {
+		// The A2A server dies with the run (#70): teardown clears the
+		// registry's endpoint and card too, so discovery never hands out
+		// a dead endpoint. It stops before the toolchain closes, which
+		// ends the shared process-wide resources underneath it.
+		if run.stopServer != nil {
+			c.stopDispatchServer(run.workspace, run.entry.ID, run.stopServer)
+		}
 		// The toolchain outlives the turn: Close stops the permission
 		// bridge and the scoped LSP clients once nothing runs in the
 		// workspace anymore.
@@ -336,25 +400,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	watchStop := c.startDispatchKillWatch(ctx, run)
 	defer watchStop()
 
-	maxTokens := run.model.CatwalkCfg.DefaultMaxTokens
-	if run.model.ModelCfg.MaxTokens != 0 {
-		maxTokens = run.model.ModelCfg.MaxTokens
-	}
-
-	call := SessionAgentCall{
-		SessionID:        run.sessionID,
-		ContentWidth:     run.contentWidth,
-		Prompt:           run.prompt,
-		MaxOutputTokens:  maxTokens,
-		ProviderOptions:  getProviderOptions(run.model, run.providerCfg),
-		Temperature:      run.model.ModelCfg.Temperature,
-		TopP:             run.model.ModelCfg.TopP,
-		TopK:             callTopK(run.providerCfg, run.model.ModelCfg.TopK),
-		FrequencyPenalty: run.model.ModelCfg.FrequencyPenalty,
-		PresencePenalty:  run.model.ModelCfg.PresencePenalty,
-		NonInteractive:   true,
-		OnAuthRefresh:    c.makeAuthRefreshCallback(run.providerCfg),
-	}
+	call := run.call(c)
 
 	// Make the running agent addressable for mid-run injection (#312)
 	// for exactly the run's lifetime: injected messages clone this call's
@@ -365,22 +411,50 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		defer c.unregisterDispatchRun(run.sessionID)
 	}
 
-	result, err := run.agent.Run(ctx, call)
+	// The transport swap (#71): a served dispatch — an endpoint and card
+	// stamped on its registry entry, and a transport wired with the
+	// server factory — runs over the A2A client, its SSE stream consumed
+	// to the terminal state. Everything else (an unserved dispatch, no
+	// factory wired) keeps the direct in-process run. Either way the
+	// injection target above is the same: the agent behind the session
+	// is one and the same object on both paths.
+	var terminal dispatch.DispatchResult
+	if transported, ok := c.runDispatchOverTransport(ctx, run); ok {
+		terminal = transported
+	} else {
+		result, err := run.agent.Run(ctx, call)
+		watchStop()
+
+		// A nil result with a nil error means no turn ran — the session was
+		// busy or a cancel landed during dispatch (#173 review note on #64).
+		// With one ephemeral session per dispatch it should not fire, but it
+		// is a failure, never a success. One dispatch = one turn, so the
+		// queued-behind-a-busy-session path cannot produce a late result
+		// either.
+		if err != nil {
+			slog.Error("Dispatched agent run failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)
+		} else if result == nil {
+			slog.Error("Dispatched agent ran no turn", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
+		}
+
+		terminal = c.assembleTerminalDispatchResult(ctx, run, result, err)
+	}
+	// The kill watch ends with the run on both paths, before terminal
+	// assembly fires the escalation hook against a finished dispatch.
 	watchStop()
 
-	// A nil result with a nil error means no turn ran — the session was
-	// busy or a cancel landed during dispatch (#173 review note on #64).
-	// With one ephemeral session per dispatch it should not fire, but it
-	// is a failure, never a success. One dispatch = one turn, so the
-	// queued-behind-a-busy-session path cannot produce a late result
-	// either.
-	if err != nil {
-		slog.Error("Dispatched agent run failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)
-	} else if result == nil {
-		slog.Error("Dispatched agent ran no turn", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
-	}
-
-	terminal := c.assembleTerminalDispatchResult(ctx, run, result, err)
+	// Drop the injection target before the terminal status is published
+	// below: relying on the deferred unregister alone left a window in
+	// which a terminal entry still resolved to a live target and accepted
+	// a message into a session whose run had ended. Not earlier: while
+	// the result is assembled (diff capture can be slow) the entry still
+	// reads running, and the registered target's refusal stays the
+	// informative "no longer running" rather than the unknown-session
+	// one. unregisterDispatchRun is idempotent; the deferred call above
+	// stays for the early-return paths. The transported path returns only
+	// once the served turn reached its terminal state, so the run has
+	// ended here on both paths.
+	c.unregisterDispatchRun(run.sessionID)
 	// Record the terminal payload before the terminal status so the
 	// terminal entry event carries it: the completed agent block (#65)
 	// renders its durable record from the registry.
@@ -594,6 +668,12 @@ func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRu
 		Branch:        run.entry.Branch,
 		WorkspacePath: run.entry.Path,
 		SessionID:     run.sessionID,
+	}
+	// The handle was assigned after the dispatchRun's entry snapshot was
+	// taken, so read it back from the registry: the terminal payload is
+	// the model's addressable record of the run (#313).
+	if entry, ok := run.workspace.Get(run.entry.ID); ok {
+		terminal.Handle = entry.Handle
 	}
 	switch {
 	case runErr != nil:

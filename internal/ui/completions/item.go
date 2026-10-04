@@ -24,6 +24,16 @@ type ResourceCompletionValue struct {
 	MIMEType string
 }
 
+// AgentCompletionValue represents a live dispatched agent offered by the
+// "@" popup alongside files (#313). Handle is the bare handle (no "@");
+// Detail is the composed "role · status · current todo" tail shown after
+// it. Only live agents ever become values — finished handles never
+// linger in the popup, which keeps the not-continuable rule honest.
+type AgentCompletionValue struct {
+	Handle string
+	Detail string
+}
+
 // SkillCompletionValue represents an agent skill completion value. The
 // fields mirror the SKILL.md frontmatter: Description is shown after the
 // name in the popup and folded into the item's filter text, so a skill is

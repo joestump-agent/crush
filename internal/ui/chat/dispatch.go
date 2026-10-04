@@ -488,10 +488,14 @@ func (d *DispatchToolMessageItem) statusParams() []string {
 }
 
 // handleLabel returns the dispatch's @handle for the status line;
-// handles are assigned by #313 and empty until then.
+// handles are assigned at dispatch (#313). The live snapshot is
+// authoritative; a reloaded session falls back to the persisted handle.
 func (d *DispatchToolMessageItem) handleLabel() string {
 	if d.snapshot != nil {
 		return d.snapshot.Entry.Handle
+	}
+	if d.fallback != nil {
+		return d.fallback.Handle
 	}
 	return ""
 }

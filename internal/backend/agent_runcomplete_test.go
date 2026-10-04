@@ -173,3 +173,15 @@ func (c *errorCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapsh
 func (c *errorCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
 	return errors.New("not implemented")
 }
+
+func (c *errorCoordinator) DispatchLive() []dispatch.TodoSnapshot {
+	return nil
+}
+
+func (c *errorCoordinator) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+	return dispatch.TodoSnapshot{}, false
+}
+
+func (c *errorCoordinator) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+	return errors.New("not implemented")
+}

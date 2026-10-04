@@ -14,7 +14,7 @@ func TestFilterPrefersExactBasenameStem(t *testing.T) {
 	c.SetItems([]FileCompletionValue{
 		{Path: "internal/ui/chat/search.go"},
 		{Path: "internal/ui/chat/user.go"},
-	}, nil)
+	}, nil, nil)
 
 	c.Filter("user")
 
@@ -33,7 +33,7 @@ func TestFilterPrefersBasenamePrefix(t *testing.T) {
 	c.SetItems([]FileCompletionValue{
 		{Path: "internal/ui/chat/mcp.go"},
 		{Path: "internal/ui/model/chat.go"},
-	}, nil)
+	}, nil, nil)
 
 	c.Filter("chat.g")
 
@@ -96,7 +96,7 @@ func TestFilterPrefersPathSegmentExact(t *testing.T) {
 	c.SetItems([]FileCompletionValue{
 		{Path: "internal/ui/model/xychat.go"},
 		{Path: "internal/ui/chat/mcp.go"},
-	}, nil)
+	}, nil, nil)
 
 	c.Filter("chat")
 
@@ -105,4 +105,29 @@ func TestFilterPrefersPathSegmentExact(t *testing.T) {
 	first, ok := filtered[0].(*CompletionItem)
 	require.True(t, ok)
 	require.Equal(t, "internal/ui/chat/mcp.go", first.Text())
+}
+
+// Live dispatched agents ride the @ popup alongside files (#313): agent
+// rows lead, the handle is the primary text, and the detail tail carries
+// role, status, and current todo.
+func TestSetItemsIncludesLiveAgents(t *testing.T) {
+	t.Parallel()
+
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c.SetItems([]FileCompletionValue{{Path: "internal/ui/chat/search.go"}}, nil, []AgentCompletionValue{
+		{Handle: "tester", Detail: "writes tests · ● working · wiring form validation"},
+	})
+	c.Filter("tester")
+
+	filtered := c.filtered
+	require.NotEmpty(t, filtered)
+	first, ok := filtered[0].(*CompletionItem)
+	require.True(t, ok)
+	require.Equal(t, "@tester", first.SortKey())
+	require.Contains(t, first.Text(), "@tester")
+	require.Contains(t, first.Text(), "writes tests")
+
+	sel, ok := first.Value().(AgentCompletionValue)
+	require.True(t, ok)
+	require.Equal(t, "tester", sel.Handle)
 }

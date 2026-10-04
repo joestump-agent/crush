@@ -532,6 +532,24 @@ func (w *ClientWorkspace) DispatchStatus(sessionID string) (dispatch.TodoSnapsho
 	return dispatch.TodoSnapshot{}, false
 }
 
+// DispatchLive, DispatchByHandle, and DeliverAgentMessageByHandle share
+// DispatchStatus's client/server limitation (#313): the dispatch registry
+// and the injection queue live in the server process, and no wire
+// surface carries them yet. The @ completions show no live agents, an
+// @handle resolves to nothing, and steering a dispatched agent reports
+// that it needs a local process rather than failing silently.
+func (w *ClientWorkspace) DispatchLive() []dispatch.TodoSnapshot {
+	return nil
+}
+
+func (w *ClientWorkspace) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+	return dispatch.TodoSnapshot{}, false
+}
+
+func (w *ClientWorkspace) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+	return errors.New("dispatch steering is not available in client/server mode")
+}
+
 // -- LSP --
 
 func (w *ClientWorkspace) LSPStart(ctx context.Context, path string) {

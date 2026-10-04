@@ -344,3 +344,15 @@ func (s *stubCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapsho
 func (s *stubCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
 	return errors.New("not implemented")
 }
+
+func (s *stubCoordinator) DispatchLive() []dispatch.TodoSnapshot {
+	return nil
+}
+
+func (s *stubCoordinator) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+	return dispatch.TodoSnapshot{}, false
+}
+
+func (s *stubCoordinator) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+	return errors.New("not implemented")
+}

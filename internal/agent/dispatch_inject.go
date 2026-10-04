@@ -19,11 +19,15 @@ var messageAgentToolDescription string
 // MessageAgentToolName is the registered name of the MessageAgent tool.
 const MessageAgentToolName = "message_agent"
 
-// MessageAgentParams are the MessageAgent tool's arguments.
+// MessageAgentParams are the MessageAgent tool's arguments. Address the
+// agent by task session or by its @handle (#313); exactly one is needed.
 type MessageAgentParams struct {
 	// SessionID is the dispatched agent's task session — the "session_id"
 	// field of the running handle the dispatch_agent tool returned.
 	SessionID string `json:"session_id" description:"Session ID of the running dispatched agent (the \"session_id\" from its dispatch handle)"`
+	// Handle is the dispatched agent's @handle (#313) — the "handle"
+	// field of the dispatch handle, or the handle the user addressed.
+	Handle string `json:"handle,omitempty" description:"@handle of the running dispatched agent (the \"handle\" from its dispatch handle)"`
 	// Message is the text to deliver. It lands as the agent's next input
 	// while the agent keeps running — a steer, not a new task.
 	Message string `json:"message" description:"The message to deliver to the running agent; it lands as the agent's next input"`
@@ -159,15 +163,28 @@ func (c *coordinator) messageAgentTool() fantasy.AgentTool {
 		MessageAgentToolName,
 		messageAgentToolDescription,
 		func(ctx context.Context, params MessageAgentParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			if err := c.DeliverAgentMessage(ctx, AgentMessage{
-				SessionID: params.SessionID,
-				Text:      params.Message,
-			}); err != nil {
+			var err error
+			switch {
+			case params.SessionID != "":
+				err = c.DeliverAgentMessage(ctx, AgentMessage{
+					SessionID: params.SessionID,
+					Text:      params.Message,
+				})
+			case params.Handle != "":
+				err = c.DeliverAgentMessageByHandle(ctx, dispatch.HandleSlug(params.Handle), params.Message)
+			default:
+				err = errors.New("session id or handle is required")
+			}
+			if err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
+			addressed := params.SessionID
+			if addressed == "" {
+				addressed = "@" + dispatch.HandleSlug(params.Handle)
+			}
 			return fantasy.NewTextResponse(fmt.Sprintf(
-				"Message delivered to the running agent (session %s). It lands as the agent's next input; the agent's response appears on its dispatch block in the chat.",
-				params.SessionID,
+				"Message delivered to the running agent (%s). It lands as the agent's next input; the agent's response appears on its dispatch block in the chat.",
+				addressed,
 			)), nil
 		},
 	)
