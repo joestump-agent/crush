@@ -154,6 +154,18 @@ type Coordinator interface {
 	// the editor's @handle routing (#313), and #71's A2A follow-up
 	// messages. Addressing a finished session returns a refusal.
 	DeliverAgentMessage(ctx context.Context, msg AgentMessage) error
+	// DispatchLive returns the snapshots of every non-terminal dispatch
+	// (#313) — the editor's live-agents @ completion source. Finished
+	// handles never appear.
+	DispatchLive() []dispatch.TodoSnapshot
+	// DispatchByHandle resolves an @handle to its dispatch snapshot
+	// (#313), finished dispatches included; the caller decides what a
+	// finished handle means.
+	DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool)
+	// DeliverAgentMessageByHandle delivers a message to the running
+	// dispatched agent carrying handle (#313) — the editor's leading
+	// @handle routing. A finished or unknown handle refuses cleanly.
+	DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error
 }
 
 type coordinator struct {

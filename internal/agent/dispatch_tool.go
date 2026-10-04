@@ -37,6 +37,15 @@ type DispatchAgentParams struct {
 	// Branch is the base revision the workspace is cut from; the default
 	// is the repository's current branch.
 	Branch string `json:"branch,omitempty" description:"Base revision the isolated workspace is cut from (default: current branch)"`
+	// Handle is the @handle the dispatched agent is addressable by
+	// (#313); the user steers it mid-run as "@handle stop writing Rust".
+	// Collisions are suffixed numerically (tester-2). Default: derived
+	// from Role, else "agent".
+	Handle string `json:"handle,omitempty" description:"@handle to address the dispatched agent by while it runs (default: derived from role, else \"agent\")"`
+	// Role is the one-line label of what the agent is for — shown next
+	// to the handle in the editor's @ completions and used to derive the
+	// handle when none was supplied.
+	Role string `json:"role,omitempty" description:"One-line role label for the dispatched agent (e.g. \"tester\", \"docs writer\"), shown in the @ completions and used to derive its handle"`
 }
 
 // dispatchSweepTimeout bounds the session-end sweep: it runs git commands
@@ -166,9 +175,16 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			}
 
 			// Keep the registry current from here on: #65's status card
-			// and #313's handles read these entries.
+			// and #313's handles read these entries. The handle is assigned
+			// after the session so the assignment event carries the complete
+			// entry — handle, role, session, running state.
 			workspace.SetSession(entry.ID, taskSession.ID)
 			workspace.SetStatus(entry.ID, dispatch.StatusRunning)
+			assignedHandle, ok := workspace.AssignHandle(entry.ID, params.Handle, params.Role)
+			if !ok {
+				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				return fantasy.NewTextErrorResponse("assign dispatch handle: registry entry vanished"), nil
+			}
 
 			// The dispatch must outlive the parent turn that started it:
 			// the main agent keeps working, and its tool-call context is
@@ -188,6 +204,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 
 			handle := dispatch.DispatchResult{
 				DispatchID:    entry.ID,
+				Handle:        assignedHandle,
 				Branch:        entry.Branch,
 				WorkspacePath: entry.Path,
 				SessionID:     taskSession.ID,
@@ -299,6 +316,14 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 
 	result, err := run.agent.Run(ctx, call)
 
+	// Drop the injection target as soon as the run returns, before the
+	// terminal status is published below: relying on the deferred
+	// unregister alone left a window in which a terminal entry still
+	// resolved to a live target and accepted a message into a session
+	// whose run had ended. unregisterDispatchRun is idempotent; the
+	// deferred call above stays for the early-return paths.
+	c.unregisterDispatchRun(run.sessionID)
+
 	// A nil result with a nil error means no turn ran — the session was
 	// busy or a cancel landed during dispatch (#173 review note on #64).
 	// With one ephemeral session per dispatch it should not fire, but it
@@ -339,6 +364,12 @@ func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRu
 		Branch:        run.entry.Branch,
 		WorkspacePath: run.entry.Path,
 		SessionID:     run.sessionID,
+	}
+	// The handle was assigned after the dispatchRun's entry snapshot was
+	// taken, so read it back from the registry: the terminal payload is
+	// the model's addressable record of the run (#313).
+	if entry, ok := run.workspace.Get(run.entry.ID); ok {
+		terminal.Handle = entry.Handle
 	}
 	switch {
 	case runErr != nil:

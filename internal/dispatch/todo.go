@@ -168,6 +168,59 @@ func (c *TodoCollector) Snapshot(sessionID string) (TodoSnapshot, bool) {
 	return c.mergeEntry(entry), true
 }
 
+// SnapshotByHandle returns the current snapshot for the dispatch carrying
+// handle, if the registry knows one (#313). The registry is the handle
+// namespace until an entry is removed, so this resolves finished
+// dispatches too — the caller decides what a finished handle means (a
+// read-only card, a routing refusal).
+func (c *TodoCollector) SnapshotByHandle(handle string) (TodoSnapshot, bool) {
+	entry, ok := c.ws.ByHandle(handle)
+	if !ok {
+		return TodoSnapshot{}, false
+	}
+	return c.mergeEntry(entry), true
+}
+
+// Snapshots returns the latest snapshot for every registered dispatch,
+// ordered by entry ID (#313). Entries that have not reduced a session
+// event yet still appear, seeded from their registry entry, so a freshly
+// provisioned dispatch is never invisible to the live-agents surfaces.
+func (c *TodoCollector) Snapshots() []TodoSnapshot {
+	return c.mergeAll(c.ws.List())
+}
+
+// LiveSnapshots returns the snapshots of every non-terminal dispatch —
+// the live-agents source for the @ completions (#313). Finished handles
+// never appear, which keeps the not-continuable rule honest: nothing in
+// the popup can be addressed into a continuation.
+func (c *TodoCollector) LiveSnapshots() []TodoSnapshot {
+	all := c.mergeAll(c.ws.List())
+	live := make([]TodoSnapshot, 0, len(all))
+	for _, snap := range all {
+		if !snap.Entry.Status.IsTerminal() {
+			live = append(live, snap)
+		}
+	}
+	return live
+}
+
+// mergeAll composes every entry with its latest reduced session state.
+func (c *TodoCollector) mergeAll(entries []Entry) []TodoSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]TodoSnapshot, 0, len(entries))
+	for _, entry := range entries {
+		snap, ok := c.latest[entry.ID]
+		if !ok {
+			snap = TodoSnapshot{Entry: entry}
+		} else {
+			snap.Entry = entry
+		}
+		out = append(out, snap)
+	}
+	return out
+}
+
 // processSessionEvent reduces one session event when it belongs to a
 // dispatched session.
 func (c *TodoCollector) processSessionEvent(ev pubsub.Event[session.Session]) {

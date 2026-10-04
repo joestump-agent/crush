@@ -1604,7 +1604,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Guard against a stale async file load landing after the popup
 		// switched to (or was reopened in) skill mode.
 		if m.completionsOpen && m.completionsTrigger == completions.TriggerFile {
-			m.completions.SetItems(msg.Files, msg.Resources)
+			m.completions.SetItems(msg.Files, msg.Resources, m.agentCompletionValues())
 		}
 	case uv.KittyGraphicsEvent:
 		if !bytes.HasPrefix(msg.Payload, []byte("OK")) {
@@ -3362,6 +3362,11 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 						if !msg.KeepOpen {
 							m.closeCompletions()
 						}
+					case completions.SelectionMsg[completions.AgentCompletionValue]:
+						cmds = append(cmds, m.insertAgentCompletion(msg.Value.Handle))
+						if !msg.KeepOpen {
+							m.closeCompletions()
+						}
 					case completions.SelectionMsg[completions.ResourceCompletionValue]:
 						cmds = append(cmds, m.insertMCPResourceCompletion(msg.Value))
 						if !msg.KeepOpen {
@@ -3452,6 +3457,18 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 
 				m.randomizePlaceholders()
 				m.historyReset()
+
+				// A prompt that opens with a live agent's @handle routes to
+				// that agent's injection queue instead of starting a parent
+				// turn (#313). The editor was already reset above, exactly
+				// like a sent prompt.
+				if cmd, handled := m.routeLeadingAgentHandle(value); handled {
+					return tea.Batch(cmd, m.loadPromptHistory())
+				}
+
+				// Mid-sentence @handle mentions stay a normal parent turn —
+				// verbatim text, plus an agent card per mentioned dispatch.
+				attachments = append(attachments, m.agentMentionAttachments(value)...)
 
 				return tea.Batch(m.sendMessage(value, attachments...), m.loadPromptHistory())
 			case key.Matches(msg, m.keyMap.Chat.NewSession):
@@ -5349,6 +5366,18 @@ func (m *UI) clearCompletionRange() {
 	m.lastCompletionEnd = 0
 	m.lastCompletionText = ""
 	m.lastCompletionFilePath = ""
+}
+
+// insertAgentCompletion inserts the selected live agent's @handle into
+// the textarea, replacing the @query (#313). No attachment: the handle
+// means routing (leading) or a card (mid-sentence), both decided at
+// submit time by what the prompt looks like then.
+func (m *UI) insertAgentCompletion(handle string) tea.Cmd {
+	prevHeight := m.textarea.Height()
+	if !m.insertCompletionText("@" + handle) {
+		return nil
+	}
+	return m.handleTextareaHeightChange(prevHeight)
 }
 
 // insertFileCompletion inserts the selected file path into the textarea,
