@@ -566,8 +566,11 @@ type TodoEnforcementConfig struct {
 	KillAfterNudges *int `json:"kill_after_nudges,omitempty" jsonschema:"description=Wander kill: nudges a dispatched agent may ignore before it is killed; 0 disables,default=2,example=3"`
 	// StallWindow kills a dispatched run whose todo list has not been
 	// updated for this many seconds while it keeps running ("stalled
-	// todos"). 0 (the default) disables the stall check.
-	StallWindow *int `json:"stall_window,omitempty" jsonschema:"description=Wander kill: seconds without a todo update that mark a dispatched run as stalled; 0 disables,default=0,example=300"`
+	// todos"). The clock arms on the first todo list, so late plans are
+	// still watched. 0 (the default) disables the stall check; the
+	// check is part of the todo enforcement ladder, so enabled=false
+	// disables it too.
+	StallWindow *int `json:"stall_window,omitempty" jsonschema:"description=Wander kill: seconds without a todo update that mark a dispatched run as stalled; arms on the first todo list; 0 disables and enabled=false disables it too,default=0,example=300"`
 	// HardTimeout kills a dispatched run after this many seconds,
 	// whatever its progress. 0 (the default) disables the timeout.
 	HardTimeout *int `json:"hard_timeout,omitempty" jsonschema:"description=Wander kill: seconds after which a dispatched run is killed outright; 0 disables,default=0,example=1800"`

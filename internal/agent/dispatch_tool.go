@@ -463,7 +463,7 @@ func (c *coordinator) startDispatchKillWatch(ctx context.Context, run dispatchRu
 		}()
 	}
 
-	if settings.StallWindow > 0 {
+	if settings.Enabled && settings.StallWindow > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -478,9 +478,12 @@ func (c *coordinator) startDispatchKillWatch(ctx context.Context, run dispatchRu
 }
 
 // watchTodosStall polls the dispatched session's todo list and kills the
-// run once an existing list goes untouched for the stall window ("stalled
-// todos"). The poll cadence is a quarter of the window, clamped so tiny
-// windows still poll and huge ones do not hammer the DB.
+// run once the list goes untouched for the stall window ("stalled
+// todos"). The clock arms on the first non-empty todo list, so a dispatch
+// that creates its plan late in the run is still watched; a run that
+// never creates todos is the nudge ladder's problem, not a stall. The
+// poll cadence is a quarter of the window, clamped so tiny windows still
+// poll and huge ones do not hammer the DB.
 func (c *coordinator) watchTodosStall(ctx context.Context, run dispatchRun, window time.Duration, kill func(string)) {
 	tick := window / 4
 	if tick < 50*time.Millisecond {
@@ -492,11 +495,9 @@ func (c *coordinator) watchTodosStall(ctx context.Context, run dispatchRun, wind
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 
-	fingerprint, ok := c.dispatchTodosFingerprint(ctx, run.sessionID)
-	if !ok {
-		return
-	}
-	stalledSince := time.Now()
+	var fingerprint string
+	armed := false
+	var stalledSince time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -505,10 +506,12 @@ func (c *coordinator) watchTodosStall(ctx context.Context, run dispatchRun, wind
 		}
 		current, ok := c.dispatchTodosFingerprint(ctx, run.sessionID)
 		if !ok {
+			// No todo list yet: the clock arms when one appears.
 			continue
 		}
-		if current != fingerprint {
+		if !armed || current != fingerprint {
 			fingerprint = current
+			armed = true
 			stalledSince = time.Now()
 			continue
 		}

@@ -385,7 +385,8 @@ func TestWanderKill_HardTimeout(t *testing.T) {
 
 // TestWanderKill_StalledTodos pins the stall window: a run whose todo
 // list goes untouched for the configured window is killed with the
-// stalled-todos reason even though it keeps tool-calling.
+// stalled-todos reason even though it keeps tool-calling. The stall
+// check is a todo-enforcement lever, so it requires the ladder enabled.
 func TestWanderKill_StalledTodos(t *testing.T) {
 	t.Parallel()
 	model := &scriptedModel{steps: []scriptedStep{
@@ -394,7 +395,7 @@ func TestWanderKill_StalledTodos(t *testing.T) {
 	}}
 	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
 	settings := config.TodoEnforcementSettings{
-		Enabled:     false,
+		Enabled:     true,
 		StallWindow: 400 * time.Millisecond,
 	}
 	f := newWanderKillFixture(t, model, settings)
@@ -423,6 +424,55 @@ func TestWanderKill_StalledTodos(t *testing.T) {
 	}
 
 	f.requireKilled(t, dispatch.ReasonStalledTodos)
+}
+
+// TestWanderKill_StallDisabledWhenEnforcementOff pins the review follow
+// up: the stall window is a todo-enforcement lever, so with the ladder
+// disabled a stalled todo list does not kill — the run finishes
+// naturally. (The hard timeout stays independent by design.)
+func TestWanderKill_StallDisabledWhenEnforcementOff(t *testing.T) {
+	t.Parallel()
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+	settings := config.TodoEnforcementSettings{
+		Enabled:     false,
+		StallWindow: 200 * time.Millisecond,
+	}
+	f := newWanderKillFixture(t, model, settings)
+	f.runModel = blocked
+	f.buildDispatched(t, blocked, settings, nil)
+
+	sess, err := f.env.sessions.Get(t.Context(), f.taskSess.ID)
+	require.NoError(t, err)
+	sess.Todos = []session.Todo{{Content: "stale plan", Status: session.TodoStatusInProgress, ActiveForm: "Stalling"}}
+	_, err = f.env.sessions.Save(t.Context(), sess)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.runDispatchSync(t)
+	}()
+
+	// Outlive the stall window so a mis-armed watchdog would have fired.
+	time.Sleep(600 * time.Millisecond)
+	close(blocked.hold)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dispatch did not finish after release")
+	}
+
+	entry, ok := f.ws.Get(f.entry.ID)
+	require.True(t, ok)
+	assert.Equal(t, dispatch.StatusCompleted, entry.Status,
+		"enforcement off must leave the stall kill unarmed")
+	require.NotNil(t, entry.Result)
+	assert.Empty(t, entry.Result.KilledReason)
 }
 
 // TestWanderKill_ToolLoop pins the tool-loop kill reason: a run that

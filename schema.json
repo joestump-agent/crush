@@ -1056,7 +1056,7 @@
         },
         "stall_window": {
           "type": "integer",
-          "description": "Wander kill: seconds without a todo update that mark a dispatched run as stalled; 0 disables",
+          "description": "Wander kill: seconds without a todo update that mark a dispatched run as stalled; arms on the first todo list; 0 disables and enabled=false disables it too",
           "default": 0,
           "examples": [
             300
