@@ -1,9 +1,9 @@
 package dialog
 
 // Tests for the sessions picker tree (#314): inspectable sub-agent task
-// sessions nest under their parent through the sub-menu pattern, and
-// selecting one hands the task session to the caller (which opens it in
-// inspect mode).
+// sessions nest under their parent through the sub-menu pattern (ctrl+]),
+// and selecting one hands the task session to the caller (which opens it
+// in inspect mode).
 //
 // Assertions are on dialog state (item counts, IDs, returned actions),
 // never on rendered strings, so they hold on Windows terminals too.
@@ -46,9 +46,6 @@ func (w *sessionsTreeWorkspace) ParseAgentToolSessionID(sessionID string) (strin
 	}
 	return "", "", false
 }
-
-// workspaceShim is unused; the tree tests only touch the three session
-// methods they override.
 
 func newSessionsTreeDialog(t *testing.T, ws *sessionsTreeWorkspace) *Session {
 	t.Helper()
@@ -102,18 +99,26 @@ func TestSessionsTreeNestsInspectableChildren(t *testing.T) {
 	require.False(t, p2.child)
 }
 
-// TestSessionsTreeSubMenu pins the navigation: enter on a parent with
-// children pushes a sub-menu of its task sessions; enter on a child
-// returns the child for inspect mode; esc pops back to the parent list.
+// TestSessionsTreeSubMenu pins the navigation: enter opens a session
+// whether or not it has children; ctrl+] on a parent with children
+// pushes a sub-menu of its task sessions; enter on a child returns the
+// child for inspect mode; esc pops back to the parent list.
 func TestSessionsTreeSubMenu(t *testing.T) {
 	ws := treeTestWorkspace()
 	dialog := newSessionsTreeDialog(t, ws)
 
-	// Enter on the parent with children pushes the sub-menu, it does
-	// not select the parent.
+	// Enter on a parent with children still opens the parent: a session
+	// that ran sub-agents must stay one keypress away.
 	dialog.list.SetSelected(0)
 	action := dialog.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
-	require.Nil(t, action, "a parent with children must open its sub-menu, not select")
+	sel, ok := action.(ActionSelectSession)
+	require.True(t, ok, "enter on a parent with children must open the parent")
+	require.Equal(t, "p1", sel.Session.ID)
+	require.False(t, dialog.inSubMenu())
+
+	// ctrl+] pushes its sub-menu.
+	action = dialog.HandleMsg(ctrlKey(t, ']'))
+	require.Nil(t, action)
 	require.True(t, dialog.inSubMenu())
 	require.Equal(t, []string{"Parent One"}, dialog.breadcrumb)
 
@@ -128,7 +133,7 @@ func TestSessionsTreeSubMenu(t *testing.T) {
 	// task session can only ever reach inspect.
 	action = dialog.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
 	require.NotNil(t, action)
-	sel, ok := action.(ActionSelectSession)
+	sel, ok = action.(ActionSelectSession)
 	require.True(t, ok)
 	require.Equal(t, "m1$$t1", sel.Session.ID)
 	require.Equal(t, "p1", sel.Session.ParentSessionID)
@@ -138,13 +143,13 @@ func TestSessionsTreeSubMenu(t *testing.T) {
 	require.False(t, dialog.inSubMenu())
 	require.Len(t, dialog.list.FilteredItems(), 2)
 
-	// Enter on a childless parent selects it directly.
+	// ctrl+] on a childless parent reports instead of pushing an empty
+	// sub-menu.
 	dialog.list.SetSelected(1)
-	action = dialog.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
-	require.NotNil(t, action)
-	sel, ok = action.(ActionSelectSession)
+	action = dialog.HandleMsg(ctrlKey(t, ']'))
+	_, ok = action.(ActionCmd)
 	require.True(t, ok)
-	require.Equal(t, "p2", sel.Session.ID)
+	require.False(t, dialog.inSubMenu())
 }
 
 // TestSessionsTreeRenameDeleteGuardedAtTopLevel pins that rename and
@@ -155,7 +160,7 @@ func TestSessionsTreeRenameDeleteGuardedAtTopLevel(t *testing.T) {
 	dialog := newSessionsTreeDialog(t, ws)
 
 	dialog.list.SetSelected(0)
-	dialog.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
+	dialog.HandleMsg(ctrlKey(t, ']'))
 	require.True(t, dialog.inSubMenu())
 
 	dialog.HandleMsg(ctrlKey(t, 'r'))

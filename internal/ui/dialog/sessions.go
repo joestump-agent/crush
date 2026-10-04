@@ -58,6 +58,7 @@ type Session struct {
 
 	keyMap struct {
 		Select        key.Binding
+		Agents        key.Binding
 		Next          key.Binding
 		Previous      key.Binding
 		UpDown        key.Binding
@@ -131,6 +132,11 @@ func NewSessions(com *common.Common, selectedSessionID string) (*Session, error)
 	s.keyMap.Select = key.NewBinding(
 		key.WithKeys("enter", "tab", "ctrl+y"),
 		key.WithHelp("enter", "choose"),
+	)
+	// The same chord that drills into an agent block in the chat (#314).
+	s.keyMap.Agents = key.NewBinding(
+		key.WithKeys("ctrl+]"),
+		key.WithHelp("ctrl+]", "agents"),
 	)
 	s.keyMap.Next = key.NewBinding(
 		key.WithKeys("down", "ctrl+n"),
@@ -247,11 +253,18 @@ func (s *Session) HandleMsg(msg tea.Msg) Action {
 			case key.Matches(msg, s.keyMap.Select):
 				if item := s.list.SelectedItem(); item != nil {
 					sessionItem := item.(*SessionItem)
-					if len(s.children[sessionItem.Session.ID]) > 0 {
-						s.pushMenu(sessionItem)
-						return nil
-					}
 					return ActionSelectSession{sessionItem.Session}
+				}
+			case key.Matches(msg, s.keyMap.Agents) && !s.inSubMenu():
+				// Enter keeps opening the session itself; its sub-agent
+				// task sessions are one chord away (#314).
+				if item := s.list.SelectedItem(); item != nil {
+					sessionItem := item.(*SessionItem)
+					if len(s.children[sessionItem.Session.ID]) == 0 {
+						return ActionCmd{util.ReportInfo("No sub-agent sessions to inspect")}
+					}
+					s.pushMenu(sessionItem)
+					return nil
 				}
 			default:
 				prevValue := s.input.Value()
@@ -298,10 +311,6 @@ func (s *Session) handleMouseClick(msg tea.MouseClickMsg) Action {
 	now := time.Now()
 	if s.lastClickID == sessionItem.ID() && now.Sub(s.lastClickTime) <= sessionDoubleClickThreshold {
 		s.resetMouseClick()
-		if len(s.children[sessionItem.Session.ID]) > 0 {
-			s.pushMenu(sessionItem)
-			return nil
-		}
 		return ActionSelectSession{sessionItem.Session}
 	}
 	s.lastClickTime = now
@@ -606,6 +615,7 @@ func (s *Session) ShortHelp() []key.Binding {
 			s.keyMap.Rename,
 			s.keyMap.Delete,
 			s.keyMap.Select,
+			s.keyMap.Agents,
 			s.keyMap.Close,
 		}
 	}
@@ -619,6 +629,7 @@ func (s *Session) FullHelp() [][]key.Binding {
 		s.keyMap.Rename,
 		s.keyMap.Delete,
 		s.keyMap.Select,
+		s.keyMap.Agents,
 		s.keyMap.Close,
 	}
 
