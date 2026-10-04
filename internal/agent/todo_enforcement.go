@@ -36,7 +36,8 @@ import (
 // loop_detection.go: watch the run, act when it misbehaves.
 
 // maxNudgesPerRun caps the ladder at a nudge and an escalating nudge per
-// run; the follow-up (wander kill, #316) escalates past this.
+// run when no kill threshold applies: the main agent's and sub-agents'
+// contract, and a dispatched run's when the kill is disabled.
 const maxNudgesPerRun = 2
 
 // todoNudgeMessage is the first-rung nudge, injected as the run's next
@@ -63,6 +64,17 @@ var mutatingToolNames = []string{
 // tools.
 func isMutatingTool(name string) bool {
 	return slices.Contains(mutatingToolNames, name)
+}
+
+// hasTodosTool reports whether ts carries the todos tool. Every rung of
+// the ladder asks the model to call it, so an agent without it (the tool
+// in options.disabled_tools, or an agent whose allowed tools leave it
+// out) gets no ladder at all: the nudges would demand a call the model
+// cannot make, and the gate would refuse every mutating tool for good.
+func hasTodosTool(ts []fantasy.AgentTool) bool {
+	return slices.ContainsFunc(ts, func(t fantasy.AgentTool) bool {
+		return t.Info().Name == tools.TodosToolName
+	})
 }
 
 // todoEnforcement carries the resolved ladder settings for one session
@@ -151,15 +163,20 @@ func (r *todoEnforcementRun) recordToolCall(toolName string) {
 // pendingNudge decides whether the run's next model call should carry a
 // nudge, and returns its text when so. Trips when todos activity is
 // absent and either the tool-call threshold is past or a mutating tool
-// was called; escalating on the second nudge, capped at maxNudgesPerRun.
-// Counters reset on injection so escalation needs another full window of
-// ignoring, not the next tool call.
+// was called; escalating past the first nudge, capped at the run's nudge
+// cap. Counters reset on injection so escalation needs another full
+// window of ignoring, not the next tool call.
+//
+// The cap is the configured kill threshold when a kill hook is wired and
+// the kill is enabled, so a dispatched agent can be given as many
+// escalating nudges as kill_after_nudges allows before the kill; without
+// a wired, enabled kill the ladder stays capped at a nudge and an
+// escalating nudge, the main agent's and sub-agents' contract.
 //
 // This is also the kill rung (#316): when the configured number of
 // nudges has been given and the window after the last one completes with
 // still no todos activity, the wander-kill hook fires (ignored nudges)
-// and the run is canceled. With no hook wired the ladder stays capped at
-// nudging, which is the main agent's and sub-agents' contract.
+// and the run is canceled.
 func (r *todoEnforcementRun) pendingNudge() string {
 	if r == nil || !r.enforcement.settings.Enabled {
 		return ""
@@ -176,15 +193,20 @@ func (r *todoEnforcementRun) pendingNudge() string {
 	r.mutatingCall = false
 	// The kill rung (#316) comes first: if the ladder has already
 	// delivered killAfterNudges nudges, this window is the ignored-nudges
-	// kill, not another nudge. Clamp the threshold to the ladder's cap,
-	// since no further nudges are coming past it.
-	if r.onKill != nil && r.enforcement.settings.KillAfterNudges > 0 &&
-		r.nudges >= min(r.enforcement.settings.KillAfterNudges, maxNudgesPerRun) {
+	// kill, not another nudge.
+	killThreshold := r.enforcement.settings.KillAfterNudges
+	if r.onKill != nil && killThreshold > 0 && r.nudges >= killThreshold {
 		r.killed = true
 		r.onKill(dispatch.ReasonIgnoredNudges)
 		return ""
 	}
-	if r.nudges < maxNudgesPerRun {
+	// The nudge cap: the kill threshold when the kill is wired and
+	// enabled, else the nudge-and-escalating cap.
+	nudgeCap := maxNudgesPerRun
+	if r.onKill != nil && killThreshold > 0 {
+		nudgeCap = killThreshold
+	}
+	if r.nudges < nudgeCap {
 		r.nudges++
 		if r.nudges == 1 {
 			return todoNudgeMessage
@@ -218,9 +240,10 @@ func (e *todoEnforcement) gate(ctx context.Context, sessionID string) error {
 
 // wrapTodoGate wraps the mutating tools in ts with the hard-gate wrapper
 // when the gate is on. Other tools pass through untouched, and a nil
-// enforcement or a disabled gate returns the slice unchanged.
+// enforcement, a disabled gate or a tool set without the todos tool
+// returns the slice unchanged.
 func wrapTodoGate(ts []fantasy.AgentTool, e *todoEnforcement) []fantasy.AgentTool {
-	if e == nil || !e.settings.HardGate {
+	if e == nil || !e.settings.HardGate || !hasTodosTool(ts) {
 		return ts
 	}
 	out := make([]fantasy.AgentTool, len(ts))
