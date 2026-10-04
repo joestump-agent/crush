@@ -385,13 +385,15 @@ type UI struct {
 	// inspectRing enumerates the live agent blocks (in transcript order)
 	// at the moment inspect mode was entered; ctrl+] cycles it.
 	// inspectSeq numbers inspect transitions so a child load that lands
-	// after a later one is dropped.
+	// after a later one is dropped. inspectPending is a task session
+	// picked from the sessions dialog, waiting for its parent to load.
 	inspecting     *session.Session
 	inspectScroll  [2]int
 	inspectFollow  bool
 	inspectRing    []string
 	inspectRingPos int
 	inspectSeq     int
+	inspectPending *session.Session
 
 	// onboarding state
 	onboarding struct {
@@ -938,7 +940,10 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// The active session is changing: any inspect view belonged to
 		// the previous transcript and must not survive the switch (#314).
+		// A task session picked under this parent opens once it is on
+		// screen.
 		m.clearInspectState()
+		inspectPending := m.takeInspectPending(msg.session.ID)
 		// Plan mode is scoped to the session it was enabled in: switching
 		// to another session falls back to code mode and drops any pending
 		// plan handoff. (Loading the session that was just created for the
@@ -998,6 +1003,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.loadPromptHistory())
 		m.refreshCronTasks()
 		m.updateLayoutAndSize()
+		if inspectPending != nil {
+			cmds = append(cmds, m.enterInspect(agentBlockRef{sessionID: inspectPending.ID}))
+		}
 
 	case sessionFilesUpdatesMsg:
 		m.sessionFiles = msg.sessionFiles
@@ -7117,6 +7125,7 @@ func (m *UI) newSession() tea.Cmd {
 	planCmd := m.resetPlanModeState()
 	m.session = nil
 	m.clearInspectState()
+	m.inspectPending = nil
 	m.sidebarScroll = 0
 	m.sessionFiles = nil
 	m.sessionFileReads = nil

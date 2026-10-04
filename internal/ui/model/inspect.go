@@ -146,11 +146,32 @@ func (m *UI) agentBlockAt(index int) (agentBlockRef, bool) {
 // handleSelectSession routes a sessions-picker selection (#314): a task
 // session opens in the read-only inspect view and can never become the
 // active, continuable session; a parent session loads as active.
+//
+// A task session whose parent is not the active session (another one, or
+// none yet, on the landing screen) loads that parent first and opens in
+// inspect mode once it is on screen: prompts then land in the session
+// the transcript came from, and the ring holds that parent's agents.
 func (m *UI) handleSelectSession(sess session.Session) tea.Cmd {
-	if sess.ParentSessionID != "" {
-		return m.enterInspect(agentBlockRef{sessionID: sess.ID})
+	if sess.ParentSessionID == "" {
+		return m.loadSession(sess.ID)
 	}
-	return m.loadSession(sess.ID)
+	if sess.ParentSessionID != m.currentSessionID() {
+		m.inspectPending = &sess
+		return m.loadSession(sess.ParentSessionID)
+	}
+	return m.enterInspect(agentBlockRef{sessionID: sess.ID})
+}
+
+// takeInspectPending returns the task session waiting for the given
+// parent to load, if any, and clears it either way so a failed load
+// cannot fire it against a later, unrelated session.
+func (m *UI) takeInspectPending(loadedID string) *session.Session {
+	pending := m.inspectPending
+	m.inspectPending = nil
+	if pending == nil || pending.ParentSessionID != loadedID {
+		return nil
+	}
+	return pending
 }
 
 // handleInspectKeys routes ctrl+] and ctrl+[ (#314). It runs after the

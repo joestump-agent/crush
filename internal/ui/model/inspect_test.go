@@ -542,3 +542,34 @@ func TestInspectBackResumesFollow(t *testing.T) {
 	require.True(t, m.chat.AtBottom(), "a following parent must come back at the bottom")
 	require.True(t, m.chat.Follow(), "and keep following the stream")
 }
+
+// TestPickerTaskSessionOpensUnderItsParent pins the picker route for a
+// task session whose parent is not the active session (another session,
+// or none loaded yet): the parent loads as the active session first, so
+// prompts land where the transcript came from, then the child opens in
+// inspect mode. The task session itself never becomes active.
+func TestPickerTaskSessionOpensUnderItsParent(t *testing.T) {
+	const otherParentID, otherChildID = "parent-2", "msg-9$$call-9"
+	for name, landing := range map[string]bool{"from another session": false, "from landing": true} {
+		t.Run(name, func(t *testing.T) {
+			ws := newInspectWorkspace()
+			m := newInspectUI(t, ws)
+			if landing {
+				m.session = nil
+				m.state = uiLanding
+			}
+			ws.sessions[otherParentID] = session.Session{ID: otherParentID}
+			ws.messages[otherParentID] = []message.Message{{ID: "o0", SessionID: otherParentID, Role: message.User}}
+			addChild(ws, otherChildID, otherParentID, "Other Agent", inspectChildMessages()...)
+
+			runInspectCmds(m, m.handleSelectSession(ws.sessions[otherChildID]))
+
+			require.NotNil(t, m.session)
+			require.Equal(t, otherParentID, m.session.ID,
+				"the task session's parent must become the active session")
+			require.Equal(t, uiChat, m.state)
+			require.True(t, m.isInspecting())
+			require.Equal(t, otherChildID, m.inspectingSessionID())
+		})
+	}
+}
