@@ -217,6 +217,10 @@ type coordinator struct {
 	// context.Background.
 	dispatchCtx   context.Context
 	dispatchSinks []dispatch.TodoSink
+	// dispatchServer starts in-process A2A servers for dispatches (#70);
+	// nil until the app wires a2a.ServerFactory, and nil means dispatches
+	// simply are not served.
+	dispatchServer DispatchServerStarter
 
 	// semanticStore and semanticClient back the semantic_search and
 	// semantic_index tools. Both are nil unless an embedding provider is
@@ -262,6 +266,12 @@ type CoordinatorOptions struct {
 	// will attach as a second sink over the same reduction. Empty in
 	// callers that do not observe progress.
 	DispatchSinks []dispatch.TodoSink
+
+	// DispatchServer starts in-process A2A servers for dispatched agents
+	// (#70); the app passes a2a.ServerFactory. Nil (tests, or any caller
+	// without the factory wired) means dispatches run unserved — Phase 1
+	// has no A2A client in the dispatch loop yet (#71).
+	DispatchServer DispatchServerStarter
 }
 
 func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, error) {
@@ -305,6 +315,7 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		semanticSymbols: symbols.NewExtractor(),
 		dispatchCtx:     ctx,
 		dispatchSinks:   opts.DispatchSinks,
+		dispatchServer:  opts.DispatchServer,
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]
