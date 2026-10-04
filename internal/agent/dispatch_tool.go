@@ -273,7 +273,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		maxTokens = run.model.ModelCfg.MaxTokens
 	}
 
-	result, err := run.agent.Run(ctx, SessionAgentCall{
+	call := SessionAgentCall{
 		SessionID:        run.sessionID,
 		ContentWidth:     run.contentWidth,
 		Prompt:           run.prompt,
@@ -286,7 +286,18 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		PresencePenalty:  run.model.ModelCfg.PresencePenalty,
 		NonInteractive:   true,
 		OnAuthRefresh:    c.makeAuthRefreshCallback(run.providerCfg),
-	})
+	}
+
+	// Make the running agent addressable for mid-run injection (#312)
+	// for exactly the run's lifetime: injected messages clone this call's
+	// shaping, and the target is dropped the moment the run returns so a
+	// finished dispatch refuses instead of running another turn.
+	if injectable, ok := run.agent.(injectableAgent); ok {
+		c.registerDispatchRun(run.sessionID, injectable, call)
+		defer c.unregisterDispatchRun(run.sessionID)
+	}
+
+	result, err := run.agent.Run(ctx, call)
 
 	// A nil result with a nil error means no turn ran — the session was
 	// busy or a cancel landed during dispatch (#173 review note on #64).

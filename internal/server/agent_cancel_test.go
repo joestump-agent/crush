@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -239,4 +240,8 @@ func TestPostAgent_DetachesRequestContext(t *testing.T) {
 
 func (s *runCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
+}
+
+func (s *runCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
+	return errors.New("not implemented")
 }

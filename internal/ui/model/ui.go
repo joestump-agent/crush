@@ -2059,17 +2059,27 @@ func (m *UI) updateSessionMessage(msg message.Message) tea.Cmd {
 func (m *UI) handleChildSessionMessage(event pubsub.Event[message.Message]) tea.Cmd {
 	var cmds []tea.Cmd
 
-	// Only process messages with tool calls or results.
-	if len(event.Payload.ToolCalls()) == 0 && len(event.Payload.ToolResults()) == 0 {
-		return nil
-	}
-
 	// Check if this is an agent tool session and parse it.
 	childSessionID := event.Payload.SessionID
 	_, toolCallID, ok := m.com.Workspace.ParseAgentToolSessionID(childSessionID)
 	if !ok {
 		return nil
 	}
+
+	// Child sessions created by dispatch_agent also carry conversation —
+	// injected steers and the running agent's replies (#312) — which the
+	// dispatch block records alongside its nested tool activity.
+	if item := m.chat.MessageItem(toolCallID); item != nil {
+		if block, ok := item.(*chat.DispatchToolMessageItem); ok {
+			m.feedDispatchConversation(block, event)
+		}
+	}
+
+	// Only the tool-call machinery below needs tool calls or results.
+	if len(event.Payload.ToolCalls()) == 0 && len(event.Payload.ToolResults()) == 0 {
+		return nil
+	}
+
 	// Nested tool activity means the agent is running; the animation clock
 	// may have been frozen by a non-busy session reload.
 	m.chat.SetAnimationsAllowed(true)
@@ -2142,6 +2152,42 @@ func (m *UI) handleChildSessionMessage(event pubsub.Event[message.Message]) tea.
 	}
 
 	return tea.Sequence(cmds...)
+}
+
+// feedDispatchConversation feeds child-session conversation events into
+// the dispatch block (#312): a user message that is not the initial
+// dispatch prompt is a steer — a message injected into the running agent
+// — and each assistant message's text is the running agent's latest
+// answer, streaming as the message grows. The steer and its answer are
+// what "the response streams back to the parent chat" renders: the block
+// is the only sub-agent surface.
+func (m *UI) feedDispatchConversation(block *chat.DispatchToolMessageItem, event pubsub.Event[message.Message]) {
+	msg := event.Payload
+	switch msg.Role {
+	case message.User:
+		text := msg.Content().Text
+		if text == "" || block.IsInitialDispatchPrompt(text) {
+			return
+		}
+		block.AddSteer(text)
+	case message.Assistant:
+		text := msg.Content().Text
+		if text == "" {
+			return
+		}
+		if !block.UpdateSteerAnswer(msg.ID, text) {
+			return
+		}
+	default:
+		return
+	}
+	// Live dispatch activity means the animation clock must run even when
+	// the loaded session is idle.
+	m.chat.SetAnimationsAllowed(true)
+	if m.chat.Follow() {
+		m.chat.ScrollToBottom()
+		m.chat.SelectLast()
+	}
 }
 
 // handleDispatchTodos feeds one reduced dispatch snapshot (#65) into the

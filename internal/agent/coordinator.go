@@ -148,6 +148,12 @@ type Coordinator interface {
 	// dispatch_agent tool call created. ok=false when no dispatch is
 	// known for the session.
 	DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool)
+	// DeliverAgentMessage delivers a message to the dispatched agent
+	// running on the message's session as its next input (#312) — the
+	// transport-agnostic injection seam shared by the message_agent tool,
+	// the editor's @handle routing (#313), and #71's A2A follow-up
+	// messages. Addressing a finished session returns a refusal.
+	DeliverAgentMessage(ctx context.Context, msg AgentMessage) error
 }
 
 type coordinator struct {
@@ -187,6 +193,12 @@ type coordinator struct {
 	// per-dispatch snapshots for the configured sinks (#65); created
 	// with the registry and run on the coordinator's lifetime context.
 	dispatchCollector *dispatch.TodoCollector
+	// dispatchRuns maps each running dispatch's task session to its
+	// injection target (#312): the injectable agent plus the call
+	// shaping captured at dispatch time. An entry lives exactly as long
+	// as the background run, so handle lifetime is run lifetime and a
+	// finished dispatch refuses messages instead of running another turn.
+	dispatchRuns map[string]*runningDispatch
 	// dispatchCtx is the NewCoordinator context the collector's
 	// subscriptions run on; nil-safe (tests construct the coordinator
 	// struct directly) — dispatchWorkspace falls back to
@@ -956,6 +968,15 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// the isolation boundary the dispatch toolchain enforces.
 	if !isSubAgent && slices.Contains(agent.AllowedTools, DispatchAgentToolName) {
 		allTools = append(allTools, c.dispatchTool())
+	}
+
+	// Mid-run message injection (#312) is the model-facing front door of
+	// the injection queue. Main agents only: a dispatched agent steering
+	// a sibling would cross the same isolation boundary the dispatch
+	// toolchain enforces, and worker-to-worker routing is deliberately
+	// deferred (A2A epic #67).
+	if !isSubAgent && slices.Contains(agent.AllowedTools, MessageAgentToolName) {
+		allTools = append(allTools, c.messageAgentTool())
 	}
 
 	// Get the model name for the agent
