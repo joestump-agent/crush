@@ -88,6 +88,19 @@ type Executor struct {
 	// so a run the executor ended is not also reported Canceled.
 	mu              sync.Mutex
 	endedByExecutor map[string]struct{}
+	// cancelMu guards canceledTasks: the task IDs this executor's own
+	// Cancel has touched (#342). A run that returns context.Canceled
+	// while its task is in the set was ended by that Cancel — which
+	// emits the terminal Canceled status itself — while the same error
+	// from an out-of-band kill (the wander ladder, the watchdog) must
+	// surface as this executor's own Canceled, or the task never
+	// reaches a terminal state.
+	cancelMu      sync.Mutex
+	canceledTasks map[string]struct{}
+	// cancelReason reports why the current run was killed (#316), for
+	// the Canceled status an out-of-band cancel emits. Optional; a nil
+	// func or an empty string falls back to "canceled".
+	cancelReason func() string
 }
 
 // Option configures an [Executor].
@@ -126,6 +139,14 @@ func WithInactivityTimeout(d time.Duration) Option {
 	return func(e *Executor) { e.inactivityTimeout = d }
 }
 
+// WithCancelReason sets the reporter for why the dispatched run was killed
+// (#316): the reason text carried by the Canceled status an out-of-band
+// cancel emits (#342). A nil func or an empty string falls back to
+// "canceled".
+func WithCancelReason(fn func() string) Option {
+	return func(e *Executor) { e.cancelReason = fn }
+}
+
 // NewExecutor builds an Executor that drives runner against sessionID — the
 // (ephemeral) session backing the dispatched agent.
 func NewExecutor(runner Runner, sessionID string, opts ...Option) *Executor {
@@ -150,6 +171,10 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		// "ended by the executor" mark when this sequence ends, so a
 		// later run of the same executor starts clean.
 		defer e.clearEndedByExecutor(execCtx.TaskID)
+		// The task ID leaves the own-cancel set when this sequence ends,
+		// so the silent return of an already-emitted Canceled cannot
+		// outlive the task it belongs to.
+		defer e.forgetCanceledTask(string(execCtx.TaskID))
 
 		// A message that referenced no existing task starts a new one:
 		// announce it submitted before transitioning to working.
@@ -181,9 +206,23 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			// be delivered, and the run's own outcome is dropped with it.
 			return
 		case errors.Is(err, context.Canceled):
-			// The run was canceled — by this executor's Cancel, which
-			// emits the terminal Canceled status itself. A Failed status
-			// here would race it.
+			// A canceled run is either this executor's own Cancel — which
+			// emits the terminal Canceled status itself, and a second one
+			// here would race it — or the SDK canceling the producer's
+			// context, in which case the consumer is gone with the stream.
+			// The same silence holds for a task the inactivity backstop
+			// already failed (#360): its reason-bearing Failed is the
+			// task's last word. Any other cancel is out of band (#342):
+			// the wander ladder or the watchdog killed the agent behind
+			// the SDK's back, nothing else will emit a terminal state, and
+			// this stream is the consumer's only way out — so yield
+			// exactly one Canceled carrying the kill reason.
+			if e.ownCancel(string(execCtx.TaskID)) ||
+				e.endedByExecutorHas(string(execCtx.TaskID)) || ctx.Err() != nil {
+				return
+			}
+			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled,
+				agentMessage(execCtx, e.canceledStatusText())), nil)
 			return
 		case err != nil:
 			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
@@ -386,13 +425,67 @@ func todoMetadata(todos []session.Todo) []any {
 	return out
 }
 
-// Cancel stops the in-flight dispatched run for this executor's session and
-// reports the task canceled.
+// Cancel stops the in-flight dispatched run for this executor's session
+// and reports the task canceled. The task is marked as this executor's own
+// cancel before the runner aborts (#342), so the run's returning
+// context.Canceled takes the silent path and this Canceled status stays
+// the only terminal one.
 func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
+		e.markOwnCancel(string(execCtx.TaskID))
 		e.runner.Cancel(e.sessionID)
 		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled, nil), nil)
 	}
+}
+
+// markOwnCancel records taskID as canceled by this executor's own Cancel.
+func (e *Executor) markOwnCancel(taskID string) {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	if e.canceledTasks == nil {
+		e.canceledTasks = make(map[string]struct{})
+	}
+	e.canceledTasks[taskID] = struct{}{}
+}
+
+// ownCancel reports whether taskID was canceled by this executor's own
+// Cancel.
+func (e *Executor) ownCancel(taskID string) bool {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	_, ok := e.canceledTasks[taskID]
+	return ok
+}
+
+// forgetCanceledTask drops taskID from the own-cancel set: the task's
+// execution sequence has ended, one way or the other.
+func (e *Executor) forgetCanceledTask(taskID string) {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	delete(e.canceledTasks, taskID)
+}
+
+// endedByExecutorHas reports whether the executor itself already emitted
+// the task's terminal status (the inactivity backstop's Failed, #360):
+// that Failed is the task's last word, and a cancel that observes it
+// stays silent.
+func (e *Executor) endedByExecutorHas(taskID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.endedByExecutor[taskID]
+	return ok
+}
+
+// canceledStatusText is the message text for an out-of-band Canceled
+// status: the kill reason when one is wired and non-empty, else the
+// generic "canceled".
+func (e *Executor) canceledStatusText() string {
+	if e.cancelReason != nil {
+		if reason := e.cancelReason(); reason != "" {
+			return reason
+		}
+	}
+	return "canceled"
 }
 
 // GitDiff returns a [DiffFunc] that captures the full uncommitted state of
