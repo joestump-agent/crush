@@ -186,6 +186,18 @@ func (w *ClientWorkspace) ListChildSessions(ctx context.Context, parentSessionID
 	return sessions, nil
 }
 
+func (w *ClientWorkspace) ListAllChildSessions(ctx context.Context) ([]session.Session, error) {
+	protoSessions, err := w.client.ListAllChildSessions(ctx, w.workspaceID())
+	if err != nil {
+		return nil, err
+	}
+	sessions := make([]session.Session, len(protoSessions))
+	for i, s := range protoSessions {
+		sessions[i] = protoToSession(s)
+	}
+	return sessions, nil
+}
+
 func (w *ClientWorkspace) SaveSession(ctx context.Context, sess session.Session) (session.Session, error) {
 	saved, err := w.client.SaveSession(ctx, w.workspaceID(), sessionToProto(sess))
 	if err != nil {

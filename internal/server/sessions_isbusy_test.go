@@ -79,6 +79,10 @@ func (s *stubSessions) Get(_ context.Context, id string) (session.Session, error
 	return session.Session{}, errors.New("not found")
 }
 
+func (s *stubSessions) ListAllChildren(context.Context) ([]session.Session, error) {
+	return s.all, nil
+}
+
 // buildBusyWorkspace returns a controller wired to a backend that owns
 // a single workspace whose AgentCoordinator reports the named session
 // as busy.

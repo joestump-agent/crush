@@ -49,6 +49,18 @@ func (b *Backend) ListChildSessions(ctx context.Context, workspaceID, parentSess
 	return ws.Sessions.ListChildren(ctx, parentSessionID)
 }
 
+// ListAllChildSessions returns every child session of every parent in
+// the given workspace in one grouped query (#408), grouped by parent
+// and oldest-created first.
+func (b *Backend) ListAllChildSessions(ctx context.Context, workspaceID string) ([]session.Session, error) {
+	ws, err := b.GetWorkspace(workspaceID)
+	if err != nil {
+		return nil, err
+	}
+
+	return ws.Sessions.ListAllChildren(ctx)
+}
+
 // GetAgentSession returns session metadata with the agent's busy
 // status.
 func (b *Backend) GetAgentSession(ctx context.Context, workspaceID, sessionID string) (proto.AgentSession, error) {
