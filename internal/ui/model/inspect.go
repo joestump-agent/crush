@@ -26,8 +26,9 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/util"
 )
 
-// inspectPlaceholderWidth bounds the inspect placeholder so a long child
-// session title cannot wrap the editor row.
+// inspectPlaceholderWidth bounds the inspect placeholder before the
+// editor has been sized, so a long child session title cannot wrap the
+// editor row.
 const inspectPlaceholderWidth = 64
 
 // agentBlockRef is one drill-in target found in the chat transcript: a
@@ -370,7 +371,8 @@ func (m *UI) handleInspectChildMessage(event pubsub.Event[message.Message]) tea.
 
 // inspectPlaceholder renders the editor placeholder shown while
 // inspecting: a persistent reminder of what is on screen, where prompts
-// land, and how to leave.
+// land, and how to leave. The title is what gets truncated, so the way
+// back stays visible however long the child session's title is.
 func (m *UI) inspectPlaceholder() string {
 	title := "sub-agent"
 	if m.inspecting != nil && m.inspecting.Title != "" {
@@ -380,6 +382,13 @@ func (m *UI) inspectPlaceholder() string {
 	if len(m.inspectRing) > 1 {
 		pos = fmt.Sprintf(" (%d/%d)", m.inspectRingPos+1, len(m.inspectRing))
 	}
-	text := fmt.Sprintf("Inspecting %s%s · ctrl+[ returns · prompts go to the session", title, pos)
-	return ansi.Truncate(text, inspectPlaceholderWidth, "…")
+	const prefix = "Inspecting "
+	suffix := pos + " · ctrl+[ returns · prompts go to the parent"
+	width := m.textarea.Width() - 1
+	if width <= 0 {
+		width = inspectPlaceholderWidth
+	}
+	room := max(1, width-ansi.StringWidth(prefix)-ansi.StringWidth(suffix))
+	text := prefix + ansi.Truncate(title, room, "…") + suffix
+	return ansi.Truncate(text, width, "…")
 }

@@ -12,10 +12,12 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/agent"
@@ -572,4 +574,19 @@ func TestPickerTaskSessionOpensUnderItsParent(t *testing.T) {
 			require.Equal(t, otherChildID, m.inspectingSessionID())
 		})
 	}
+}
+
+// TestInspectPlaceholderKeepsTheWayBack pins the editor hint: a long
+// child title is what gets truncated, never the ctrl+[ hint.
+func TestInspectPlaceholderKeepsTheWayBack(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	m.textarea.SetWidth(100)
+	long := strings.Repeat("Fix message queueing when todos exist ", 4)
+	addChild(ws, inspectChildID, inspectParentID, long, inspectChildMessages()...)
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	placeholder := m.inspectPlaceholder()
+	require.Contains(t, placeholder, "ctrl+[ returns")
+	require.LessOrEqual(t, ansi.StringWidth(placeholder), m.textarea.Width())
 }
