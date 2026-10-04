@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -346,4 +347,169 @@ func TestStatusIsTerminal(t *testing.T) {
 	for _, s := range []Status{StatusProvisioned, StatusRunning} {
 		require.False(t, s.IsTerminal(), "%s must not be terminal", s)
 	}
+}
+
+// newTestRepoWithRemote extends a test repo with a bare "origin" and
+// an origin/main ref, the shape a dispatch fan-out provisions against.
+func newTestRepoWithRemote(t *testing.T) string {
+	t.Helper()
+
+	repo := newTestRepo(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	require.NoError(t, os.MkdirAll(remote, 0o755))
+	run := func(dir string, args ...string) {
+		t.Helper()
+		out, err := exec.CommandContext(t.Context(), "git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+		require.NoError(t, err, "git %s: %s", strings.Join(args, " "), out)
+	}
+	run(remote, "init", "-q", "--bare")
+	run(repo, "remote", "add", "origin", remote)
+	run(repo, "push", "-q", "origin", "HEAD:main")
+	run(repo, "fetch", "-q", "origin")
+	return repo
+}
+
+// worktreeCount counts the worktrees git reports for the repo, by its
+// porcelain form's leading "worktree" line per entry.
+func worktreeCount(t *testing.T, repo string) int {
+	t.Helper()
+
+	out := strings.TrimSpace(gitIn(t, repo, "worktree", "list", "--porcelain"))
+	if out == "" {
+		return 0
+	}
+	count := 0
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "worktree ") {
+			count++
+		}
+	}
+	return count
+}
+
+// dispatchBranches lists the crush-dispatch-* branches in the repo.
+func dispatchBranches(t *testing.T, repo string) []string {
+	t.Helper()
+
+	out := strings.TrimSpace(gitIn(t, repo, "branch", "--list", BranchPrefix+"*"))
+	if out == "" {
+		return nil
+	}
+	var branches []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			branches = append(branches, line)
+		}
+	}
+	return branches
+}
+
+// A fan-out of concurrent provisions against a remote-tracking base —
+// what fantasy's parallel tool calls do — must all succeed: unserialized
+// worktree add calls race on .git/config and fail, leaving orphaned
+// branches behind.
+func TestProvisionConcurrent(t *testing.T) {
+	repo := newTestRepoWithRemote(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	const n = 12
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = ws.Provision(ctx, ProvisionOptions{Base: "origin/main"})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		require.NoError(t, err, "concurrent provision %d", i)
+	}
+
+	// Every provision is registered, its directory is on disk, and the
+	// branch count matches the registry.
+	entries := ws.List()
+	require.Len(t, entries, n)
+	for _, entry := range entries {
+		require.DirExists(t, entry.Path, "worktree directory missing for %s", entry.ID)
+	}
+	require.Len(t, dispatchBranches(t, repo), n)
+
+	// --no-track keeps .git/config free of upstream entries for the
+	// dispatch branches.
+	require.Empty(t, strings.TrimSpace(gitIn(t, repo, "config", "--get-regexp", `^branch\.crush-dispatch-`)))
+}
+
+// A failed provision leaves no branch, no directory, and no worktree
+// admin entry: cleanup runs in the locked region right after the add.
+func TestProvisionFailureCleansUp(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	var failedBranch string
+	// A non-empty target directory makes worktree add fail after the
+	// branch is created — the exact residue the fix must remove.
+	ws.provisionHook = func(branch, path string) {
+		failedBranch = branch
+		require.NoError(t, os.MkdirAll(path, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(path, "stuck.txt"), []byte("x"), 0o644))
+	}
+
+	_, err = ws.Provision(ctx, ProvisionOptions{})
+	require.Error(t, err)
+
+	require.False(t, branchExists(t, repo, failedBranch), "failed provision left its branch")
+	_, statErr := os.Stat(filepath.Join(ws.worktreesDir, failedBranch))
+	require.True(t, os.IsNotExist(statErr), "failed provision left its directory")
+	require.Empty(t, dispatchBranches(t, repo))
+
+	// No stale worktree admin entries either: only the main worktree
+	// remains.
+	require.NoError(t, runGit(ctx, repo, nil, "worktree", "prune"))
+	require.Equal(t, 1, worktreeCount(t, repo))
+}
+
+// cleanupFailedProvision removes each residue class a failed worktree
+// add can leave behind: a created branch, a partial directory, and a
+// stale admin entry — including when the add never created a branch.
+func TestCleanupFailedProvision(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	// Residue from a crashed provision: the branch exists, its
+	// directory is gone, and a stale admin entry remains.
+	branch := BranchPrefix + "crashed"
+	path := filepath.Join(ws.worktreesDir, branch)
+	out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "-b", branch, path).CombinedOutput()
+	require.NoError(t, err, string(out))
+	require.NoError(t, os.RemoveAll(path))
+
+	ws.cleanupFailedProvision(ctx, branch, path)
+
+	require.False(t, branchExists(t, repo, branch))
+	require.Empty(t, dispatchBranches(t, repo))
+	require.NoError(t, runGit(ctx, repo, nil, "worktree", "prune"))
+	require.Equal(t, 1, worktreeCount(t, repo))
+
+	// A partial directory is removed even without a branch.
+	partial := BranchPrefix + "partial"
+	partialPath := filepath.Join(ws.worktreesDir, partial)
+	require.NoError(t, os.MkdirAll(partialPath, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(partialPath, "leftover"), []byte("x"), 0o644))
+
+	ws.cleanupFailedProvision(ctx, partial, partialPath)
+
+	_, statErr := os.Stat(partialPath)
+	require.True(t, os.IsNotExist(statErr))
 }
