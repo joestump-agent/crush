@@ -1204,6 +1204,7 @@ func allToolNames() []string {
 		"job_kill",
 		"download",
 		"dispatch_agent",
+		"message_agent",
 		"edit",
 		"multiedit",
 		"lsp_diagnostics",

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -747,4 +748,8 @@ func TestE2E_CancelOfActiveRunAlsoCancelsAcceptedFollowUp(t *testing.T) {
 
 func (c *scriptedCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
+}
+
+func (c *scriptedCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
+	return errors.New("not implemented")
 }

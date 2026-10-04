@@ -45,6 +45,23 @@ type DispatchToolMessageItem struct {
 	// a reloaded session, client/server mode, or a dispatch from an
 	// earlier process. Its state is static by definition.
 	fallback *dispatch.DispatchResult
+	// steers records the mid-run messages injected into the running
+	// agent (#312) and the agent's latest reply to each, as observed on
+	// the child session's message events. The initial dispatch prompt is
+	// not a steer and is never recorded. In-memory only: a reloaded
+	// session loses the live steer log; the durable record remains the
+	// terminal result's findings.
+	steers []dispatchSteer
+}
+
+// dispatchSteer is one injected message and the agent's answer so far.
+// ResponseMessageID ties the answer to the assistant message currently
+// streaming on the child session; Response is its text snapshot, updated
+// as the message grows.
+type dispatchSteer struct {
+	Text              string
+	ResponseMessageID string
+	Response          string
 }
 
 var (
@@ -185,6 +202,55 @@ func (d *DispatchToolMessageItem) terminalResult() *dispatch.DispatchResult {
 		return d.fallback
 	}
 	return nil
+}
+
+// AddSteer records one message injected into the running agent (#312),
+// as observed on the child session's message events, and bumps the card
+// so the steer renders immediately.
+func (d *DispatchToolMessageItem) AddSteer(text string) {
+	d.steers = append(d.steers, dispatchSteer{Text: text})
+	d.clearCache()
+	d.Bump()
+}
+
+// UpdateSteerAnswer records the assistant message currently answering the
+// latest steer: the message ID is retargeted whenever a later assistant
+// message streams text, so the answer shown is always the agent's most
+// recent reply on the child session. Reports whether anything changed.
+func (d *DispatchToolMessageItem) UpdateSteerAnswer(messageID, text string) bool {
+	if len(d.steers) == 0 {
+		return false
+	}
+	steer := &d.steers[len(d.steers)-1]
+	if steer.ResponseMessageID == messageID && steer.Response == text {
+		return false
+	}
+	steer.ResponseMessageID = messageID
+	steer.Response = text
+	d.clearCache()
+	d.Bump()
+	return true
+}
+
+// IsInitialDispatchPrompt reports whether a child-session user message is
+// the dispatch's own initial prompt rather than an injected steer: before
+// any steer exists, the only user message that can equal the prompt text
+// is the prompt itself. A steer whose text happens to be identical is
+// indistinguishable and treated as the prompt — cosmetic, never a
+// delivery concern.
+func (d *DispatchToolMessageItem) IsInitialDispatchPrompt(text string) bool {
+	if len(d.steers) > 0 || text == "" {
+		return false
+	}
+	var params agent.DispatchAgentParams
+	_ = json.Unmarshal([]byte(d.ToolCall().Input), &params)
+	return params.Prompt == text
+}
+
+// Steers returns the recorded steers — the injected messages and the
+// agent's answers so far.
+func (d *DispatchToolMessageItem) Steers() []dispatchSteer {
+	return d.steers
 }
 
 // elapsed returns the dispatch's run time: FinishedAt - StartedAt once
@@ -347,6 +413,9 @@ func (r *DispatchToolRenderContext) RenderTool(sty *styles.Styles, width int, op
 	if activity := d.activityLine(sty, remainingWidth); activity != "" {
 		header = lipgloss.JoinVertical(lipgloss.Left, header, activity)
 	}
+	if convo := d.renderSteers(sty, remainingWidth); convo != "" {
+		header = lipgloss.JoinVertical(lipgloss.Left, header, convo)
+	}
 
 	// Build tree with nested tool calls.
 	childTools := tree.Root(header)
@@ -429,6 +498,27 @@ func (d *DispatchToolMessageItem) activityLine(sty *styles.Styles, width int) st
 	text := ansi.Truncate(d.snapshot.CurrentTodo, width-2, "…")
 	return sty.Tool.TodoInProgressIcon.Render(styles.ArrowRightIcon+" ") +
 		sty.Tool.TodoJustStarted.Render(text)
+}
+
+// renderSteers renders the mid-run injection conversation (#312): each
+// injected message with the agent's answer so far beneath it. Plain text,
+// not markdown — the answer streams token by token and a glamour
+// re-render per delta would cost more than the line is worth; the full
+// reply is in the terminal record's findings once the run completes.
+func (d *DispatchToolMessageItem) renderSteers(sty *styles.Styles, width int) string {
+	if len(d.steers) == 0 {
+		return ""
+	}
+	var sections []string
+	for _, steer := range d.steers {
+		q := sty.Tool.TodoInProgressIcon.Render(styles.ArrowRightIcon+" ") +
+			sty.Tool.TodoJustStarted.Render(steer.Text)
+		sections = append(sections, q)
+		if steer.Response != "" {
+			sections = append(sections, toolOutputPlainContent(sty, steer.Response, width, true))
+		}
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
 // renderDispatchTerminal renders the completed block's durable record:
