@@ -522,11 +522,15 @@ func (d *DispatchToolMessageItem) renderSteers(sty *styles.Styles, width int) st
 }
 
 // renderDispatchTerminal renders the completed block's durable record:
-// the failure reason on failed runs, the key findings, and the diff
-// stat. Collapsed output is line-capped like any tool body; expanded
-// shows everything.
+// the failure reason on failed runs, the kill reason on killed runs
+// (#316), the key findings, and the diff stat. Collapsed output is
+// line-capped like any tool body; expanded shows everything.
 func renderDispatchTerminal(sty *styles.Styles, res *dispatch.DispatchResult, width int, expanded bool) string {
 	var sections []string
+	if res.KilledReason != "" {
+		note := sty.Tool.TodoStatusNote.Render("Killed")
+		sections = append(sections, lipgloss.JoinHorizontal(lipgloss.Left, note, " "+sty.Tool.ErrorMessage.Render(res.KilledReason)))
+	}
 	if res.Error != "" {
 		note := sty.Tool.TodoStatusNote.Render("Error")
 		sections = append(sections, lipgloss.JoinHorizontal(lipgloss.Left, note, " "+sty.Tool.ErrorMessage.Render(res.Error)))

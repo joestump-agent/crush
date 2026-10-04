@@ -491,6 +491,10 @@ type Options struct {
 	// This is a dangerous option and should be used with caution.
 	AllowAllCommands bool `json:"allow_all_commands,omitempty" jsonschema:"description=Remove all command restrictions from the bash tool, including package-manager argument blocks (dangerous). Commands still require permission approval unless yolo mode is enabled.,default=false"`
 	RequestTimeout   *int `json:"request_timeout,omitempty" jsonschema:"description=Timeout in seconds for each LLM API request. Streaming responses are aborted only after this much inactivity\\, so slow but active streams are never killed. 0 disables it\\, negative values are invalid.,default=60,example=120,example=300,example=0"`
+
+	// TodoEnforcement carries the global todo enforcement defaults
+	// (#315); per agent type overrides live on the agent definitions.
+	TodoEnforcement *TodoEnforcementConfig `json:"todo_enforcement,omitempty" jsonschema:"description=Proactive todo enforcement: inject a nudge when an agent works without a todo list, and optionally reject mutating tools until one exists"`
 }
 
 // DefaultRequestTimeout bounds each LLM API request when the user has not
@@ -531,6 +535,123 @@ type EmbeddingsConfig struct {
 type MCP struct {
 	Name string    `json:"name"`
 	MCP  MCPConfig `json:"mcp"`
+}
+
+// TodoEnforcementConfig configures the proactive todo enforcement ladder
+// (#315): nudges and, opt-in, a hard gate that keeps mutating tools out of
+// agents with no todo list. It appears once under options (global defaults
+// for every agent) and once per agent definition (per agent type
+// overrides); a per-agent field replaces the global one field by field.
+//
+// Nil everywhere means "defaults on": nudge injection enabled, hard gate
+// off.
+type TodoEnforcementConfig struct {
+	// Enabled toggles nudge injection. When false the coordinator never
+	// injects todo nudges; the hard gate is governed by its own field.
+	Enabled *bool `json:"enabled,omitempty" jsonschema:"description=Inject a context nudge when an agent works without a todo list,default=true"`
+	// NudgeThreshold is how many tool calls without todos activity trip
+	// the first nudge. A mutating tool call (write/edit/multiedit/bash)
+	// trips it immediately regardless of count.
+	NudgeThreshold *int `json:"nudge_threshold,omitempty" jsonschema:"description=Tool calls without todos activity before a nudge is injected; a mutating tool call trips it immediately,default=4,example=8,example=1"`
+	// HardGate rejects mutating tools (write/edit/multiedit/bash) until
+	// the session has a todo list. Deterministic but brittle; off by
+	// default.
+	HardGate *bool `json:"hard_gate,omitempty" jsonschema:"description=Reject mutating tools (write\\, edit\\, multiedit\\, bash) until a todo list exists,default=false"`
+	// KillAfterNudges is the wander-kill rung (#316): how many nudges a
+	// run may ignore before the coordinator kills it deterministically.
+	// The default of 2 kills after both the nudge and the escalating
+	// nudge are ignored; 0 disables the kill. It only wires up for
+	// dispatched agents (the parent must be able to re-dispatch); the
+	// main agent's ladder stays capped at nudging.
+	KillAfterNudges *int `json:"kill_after_nudges,omitempty" jsonschema:"description=Wander kill: nudges a dispatched agent may ignore before it is killed; 0 disables,default=2,example=3"`
+	// StallWindow kills a dispatched run whose todo list has not been
+	// updated for this many seconds while it keeps running ("stalled
+	// todos"). 0 (the default) disables the stall check.
+	StallWindow *int `json:"stall_window,omitempty" jsonschema:"description=Wander kill: seconds without a todo update that mark a dispatched run as stalled; 0 disables,default=0,example=300"`
+	// HardTimeout kills a dispatched run after this many seconds,
+	// whatever its progress. 0 (the default) disables the timeout.
+	HardTimeout *int `json:"hard_timeout,omitempty" jsonschema:"description=Wander kill: seconds after which a dispatched run is killed outright; 0 disables,default=0,example=1800"`
+}
+
+// TodoEnforcementSettings is the resolved enforcement ladder: the per-agent
+// override layered over the global options with defaults applied.
+type TodoEnforcementSettings struct {
+	Enabled        bool
+	NudgeThreshold int
+	HardGate       bool
+	// Wander kill (#316). KillAfterNudges is the number of ignored
+	// nudges that trip the kill; StallWindow and HardTimeout are 0 when
+	// disabled.
+	KillAfterNudges int
+	StallWindow     time.Duration
+	HardTimeout     time.Duration
+}
+
+const (
+	defaultTodoNudgeThreshold = 4
+	// defaultTodoKillAfterNudges kills a dispatched agent after both the
+	// nudge and the escalating nudge have been ignored.
+	defaultTodoKillAfterNudges = 2
+)
+
+// ResolveTodoEnforcement layers the per-agent config over over the global
+// one, field by field, and applies defaults. Nil layers resolve to the
+// defaults: nudging on, threshold 4, hard gate off.
+func ResolveTodoEnforcement(global, over *TodoEnforcementConfig) TodoEnforcementSettings {
+	merged := TodoEnforcementConfig{}
+	if global != nil {
+		merged = *global
+	}
+	if over != nil {
+		if over.Enabled != nil {
+			merged.Enabled = over.Enabled
+		}
+		if over.NudgeThreshold != nil {
+			merged.NudgeThreshold = over.NudgeThreshold
+		}
+		if over.HardGate != nil {
+			merged.HardGate = over.HardGate
+		}
+		if over.KillAfterNudges != nil {
+			merged.KillAfterNudges = over.KillAfterNudges
+		}
+		if over.StallWindow != nil {
+			merged.StallWindow = over.StallWindow
+		}
+		if over.HardTimeout != nil {
+			merged.HardTimeout = over.HardTimeout
+		}
+	}
+	settings := TodoEnforcementSettings{
+		Enabled:         true,
+		NudgeThreshold:  defaultTodoNudgeThreshold,
+		KillAfterNudges: defaultTodoKillAfterNudges,
+	}
+	if merged.Enabled != nil {
+		settings.Enabled = *merged.Enabled
+	}
+	if merged.NudgeThreshold != nil && *merged.NudgeThreshold > 0 {
+		settings.NudgeThreshold = *merged.NudgeThreshold
+	}
+	if merged.HardGate != nil {
+		settings.HardGate = *merged.HardGate
+	}
+	if merged.KillAfterNudges != nil {
+		settings.KillAfterNudges = max(*merged.KillAfterNudges, 0)
+	}
+	if merged.StallWindow != nil && *merged.StallWindow > 0 {
+		settings.StallWindow = time.Duration(*merged.StallWindow) * time.Second
+	}
+	if merged.HardTimeout != nil && *merged.HardTimeout > 0 {
+		settings.HardTimeout = time.Duration(*merged.HardTimeout) * time.Second
+	}
+	return settings
+}
+
+// ResolvedTodoEnforcement returns the effective enforcement settings for
+// this agent type, layering its override over the global options.
+func (a Agent) ResolvedTodoEnforcement(global *TodoEnforcementConfig) TodoEnforcementSettings {
+	return ResolveTodoEnforcement(global, a.TodoEnforcement)
 }
 
 func (m MCPs) Sorted() []MCP {
@@ -784,6 +905,10 @@ type Agent struct {
 
 	// Overrides the context paths for this agent
 	ContextPaths []string `json:"context_paths,omitempty"`
+
+	// TodoEnforcement overrides the global todo enforcement settings
+	// (#315) for this agent type, field by field.
+	TodoEnforcement *TodoEnforcementConfig `json:"todo_enforcement,omitempty" jsonschema:"description=Todo enforcement overrides for this agent: nudge injection and the opt-in mutating-tool gate"`
 }
 
 type Tools struct {

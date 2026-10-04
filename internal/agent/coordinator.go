@@ -899,6 +899,11 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		Tools:                nil,
 		Notify:               c.notify,
 		RunComplete:          c.runComplete,
+		// The todo enforcement ladder (#315) applies to every agent the
+		// coordinator builds (main, plan, and agent-tool sub-agents
+		// alike) with this agent type's overrides layered over the
+		// global options.
+		TodoEnforcement: agent.ResolvedTodoEnforcement(c.cfg.Config().Options.TodoEnforcement),
 	})
 
 	// The readiness goroutines below perform one-time setup — building the
