@@ -121,6 +121,11 @@ type Workspace interface {
 	CreateSession(ctx context.Context, title string) (session.Session, error)
 	GetSession(ctx context.Context, sessionID string) (session.Session, error)
 	ListSessions(ctx context.Context) ([]session.Session, error)
+	// ListChildSessions returns the child sessions of the given
+	// session, oldest update first (#314): the task sessions the
+	// sessions picker nests under their parent. Includes every child
+	// kind; callers filter.
+	ListChildSessions(ctx context.Context, parentSessionID string) ([]session.Session, error)
 	SaveSession(ctx context.Context, sess session.Session) (session.Session, error)
 	SetSessionChannel(ctx context.Context, sessionID, channel string) (session.Session, error)
 	DeleteSession(ctx context.Context, sessionID string) error

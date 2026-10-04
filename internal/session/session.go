@@ -71,6 +71,11 @@ type Service interface {
 	Get(ctx context.Context, id string) (Session, error)
 	GetLast(ctx context.Context) (Session, error)
 	List(ctx context.Context) ([]Session, error)
+	// ListChildren returns the sessions whose ParentSessionID is the
+	// given session, oldest update first — the inverse of List's
+	// parent-only filter (#314). Includes every child kind (task
+	// sessions and title sessions); callers filter by kind.
+	ListChildren(ctx context.Context, parentID string) ([]Session, error)
 	Save(ctx context.Context, session Session) (Session, error)
 	SetChannel(ctx context.Context, sessionID, channel string) (Session, error)
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
@@ -274,6 +279,22 @@ func (s *service) Rename(ctx context.Context, id string, title string) error {
 
 func (s *service) List(ctx context.Context) ([]Session, error) {
 	dbSessions, err := s.q.ListSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sessions := make([]Session, len(dbSessions))
+	for i, dbSession := range dbSessions {
+		sessions[i] = s.fromDBItem(dbSession)
+		s.applyEstimatedUsageState(&sessions[i])
+	}
+	return sessions, nil
+}
+
+func (s *service) ListChildren(ctx context.Context, parentID string) ([]Session, error) {
+	dbSessions, err := s.q.ListChildSessions(ctx, sql.NullString{
+		String: parentID,
+		Valid:  parentID != "",
+	})
 	if err != nil {
 		return nil, err
 	}

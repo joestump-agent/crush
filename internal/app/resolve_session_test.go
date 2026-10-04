@@ -93,6 +93,10 @@ func (m *mockSessionService) IsAgentToolSession(sessionID string) bool {
 	return ok
 }
 
+func (m *mockSessionService) ListChildren(context.Context, string) ([]session.Session, error) {
+	return nil, nil
+}
+
 func newTestApp(sessions session.Service) *App {
 	return &App{Sessions: sessions}
 }

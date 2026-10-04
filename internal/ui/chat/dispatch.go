@@ -191,6 +191,22 @@ func (d *DispatchToolMessageItem) dispatchStatus() (dispatch.Status, bool) {
 	return dispatch.StatusProvisioned, true
 }
 
+// IsLive reports whether the dispatched agent is believed to be running
+// right now, judged from in-memory state only so the UI can enumerate
+// live agents without probing the workspace (#314): a registry snapshot
+// that has not reached a terminal state, or a tool call that has not
+// returned its running handle yet. A card seeded only from its persisted
+// handle is static by definition and never reports live: the run may
+// have ended, and in client/server mode the registry lives in another
+// process.
+func (d *DispatchToolMessageItem) IsLive() bool {
+	status, live := d.dispatchStatus()
+	if !live {
+		return false
+	}
+	return !isTerminalDispatchStatus(status)
+}
+
 // terminalResult returns the terminal DispatchResult to render as the
 // durable record, from the registry snapshot or, failing that, the
 // persisted handle.

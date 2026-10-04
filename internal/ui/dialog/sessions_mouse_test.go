@@ -25,6 +25,14 @@ func (w *sessionMouseWorkspace) ListSessions(context.Context) ([]session.Session
 	return w.sessions, nil
 }
 
+func (w *sessionMouseWorkspace) ListChildSessions(context.Context, string) ([]session.Session, error) {
+	return nil, nil
+}
+
+func (w *sessionMouseWorkspace) ParseAgentToolSessionID(string) (string, string, bool) {
+	return "", "", false
+}
+
 func (w *sessionMouseWorkspace) AgentIsReady() bool {
 	return false
 }

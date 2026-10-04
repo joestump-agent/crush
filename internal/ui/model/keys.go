@@ -83,6 +83,12 @@ type KeyMap struct {
 	Tab        key.Binding
 	ToggleYolo key.Binding
 	ShiftTab   key.Binding
+
+	// Inspect mode (#314): drill into an agent block's session and
+	// navigate back. Unbound anywhere else across the dialog and
+	// textarea keymaps.
+	InspectDrill key.Binding
+	InspectBack  key.Binding
 }
 
 func DefaultKeyMap() KeyMap {
@@ -122,6 +128,14 @@ func DefaultKeyMap() KeyMap {
 		ShiftTab: key.NewBinding(
 			key.WithKeys("shift+tab"),
 			key.WithHelp("shift+tab", "mode"),
+		),
+		InspectDrill: key.NewBinding(
+			key.WithKeys("ctrl+]"),
+			key.WithHelp("ctrl+]", "inspect agent"),
+		),
+		InspectBack: key.NewBinding(
+			key.WithKeys("ctrl+["),
+			key.WithHelp("ctrl+[", "back to chat"),
 		),
 	}
 

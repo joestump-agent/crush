@@ -38,6 +38,17 @@ func (b *Backend) ListSessions(ctx context.Context, workspaceID string) ([]sessi
 	return ws.Sessions.List(ctx)
 }
 
+// ListChildSessions returns the child sessions of the given session in
+// the given workspace (#314).
+func (b *Backend) ListChildSessions(ctx context.Context, workspaceID, parentSessionID string) ([]session.Session, error) {
+	ws, err := b.GetWorkspace(workspaceID)
+	if err != nil {
+		return nil, err
+	}
+
+	return ws.Sessions.ListChildren(ctx, parentSessionID)
+}
+
 // GetAgentSession returns session metadata with the agent's busy
 // status.
 func (b *Backend) GetAgentSession(ctx context.Context, workspaceID, sessionID string) (proto.AgentSession, error) {

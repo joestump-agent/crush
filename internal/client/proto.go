@@ -689,6 +689,24 @@ func (c *Client) ListSessions(ctx context.Context, id string) ([]proto.Session, 
 	return sessions, nil
 }
 
+// ListChildSessions lists the child sessions of a session as proto
+// types (#314).
+func (c *Client) ListChildSessions(ctx context.Context, id, sessionID string) ([]proto.Session, error) {
+	rsp, err := c.get(ctx, fmt.Sprintf("/workspaces/%s/sessions/%s/children", id, sessionID), nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get child sessions: %w", err)
+	}
+	defer rsp.Body.Close()
+	if rsp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get child sessions: status code %d", rsp.StatusCode)
+	}
+	var sessions []proto.Session
+	if err := json.NewDecoder(rsp.Body).Decode(&sessions); err != nil {
+		return nil, fmt.Errorf("failed to decode child sessions: %w", err)
+	}
+	return sessions, nil
+}
+
 // GrantPermission grants a permission on a workspace. The returned
 // bool reports whether this call resolved the pending request (true)
 // or found it already resolved by a previous caller (false). A false
