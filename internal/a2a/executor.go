@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log/slog"
 	"os"
 	"os/exec"
+	"runtime/debug"
 	"slices"
 	"strings"
 
@@ -214,6 +216,18 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 	}
 	done := make(chan runOutcome, 1)
 	go func() {
+		// A panic in a tool or provider adapter must fail this task, not
+		// the whole process (#345): recover it, log it, and hand a run
+		// error back so Execute yields its single Failed status. The
+		// error uses %v and never wraps, so it cannot be
+		// context.Canceled and the canceled branch of Execute cannot
+		// swallow it (#342).
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("Dispatched run panicked", "session_id", e.sessionID, "panic", r, "stack", string(debug.Stack()))
+				done <- runOutcome{err: fmt.Errorf("dispatched run panicked: %v", r)}
+			}
+		}()
 		call := e.call
 		call.SessionID = e.sessionID
 		call.Prompt = prompt

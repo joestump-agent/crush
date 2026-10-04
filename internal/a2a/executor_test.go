@@ -22,6 +22,10 @@ type fakeRunner struct {
 	result *fantasy.AgentResult
 	err    error
 
+	// panicValue, when non-nil, makes Run panic with it instead of
+	// returning (#345).
+	panicValue any
+
 	gotCall     agent.SessionAgentCall
 	ran         bool
 	canceledFor string
@@ -30,6 +34,9 @@ type fakeRunner struct {
 func (f *fakeRunner) Run(_ context.Context, call agent.SessionAgentCall) (*fantasy.AgentResult, error) {
 	f.ran = true
 	f.gotCall = call
+	if f.panicValue != nil {
+		panic(f.panicValue)
+	}
 	return f.result, f.err
 }
 
@@ -223,6 +230,37 @@ func TestExecuteRunFailure(t *testing.T) {
 
 	// The error is surfaced in the failed status message.
 	require.Equal(t, "model exploded", statusMessageText(t, evs[2]))
+}
+
+// A panic inside the runner (a tool or provider adapter bug) must fail
+// the task and keep the process alive (#345): Execute yields Submitted,
+// Working, then exactly one Failed with "panicked" in the message.
+func TestExecuteRunnerPanicFails(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{panicValue: errors.New("tool blew up")}
+	exec := NewExecutor(runner, "sess-1", WithDiff(func(context.Context) (string, error) {
+		return "should not be called", nil
+	}))
+
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+	evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+
+	want := []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateFailed,
+	}
+	require.Equal(t, want, states(t, evs))
+	require.Contains(t, statusMessageText(t, evs[2]), "panicked")
+
+	// The recovered error must not wrap context.Canceled, so the
+	// canceled branch of Execute cannot swallow it (#342).
+	_, err := exec.runWithTodos(context.Background(), newExecCtx(msg), "go",
+		func(a2aspec.Event, error) bool { return true })
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "panicked")
+	require.False(t, errors.Is(err, context.Canceled))
 }
 
 func TestExecuteNilResultFails(t *testing.T) {

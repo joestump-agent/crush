@@ -85,6 +85,26 @@ func TestStreamDispatchFailedRun(t *testing.T) {
 	require.Contains(t, outcome.Text, "provider exploded")
 }
 
+// A panic in the dispatched runner must surface as a failed outcome
+// across the wire, not crash the server process (#345).
+func TestStreamDispatchRunnerPanicFails(t *testing.T) {
+	server, err := StartServer(t.Context(), ServerParams{
+		Runner:    &fakeRunner{panicValue: errors.New("adapter blew up")},
+		SessionID: "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+
+	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "fix the bug",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusFailed, outcome.Status)
+	require.Contains(t, outcome.Text, "panicked")
+}
+
 // An unreachable or bogus endpoint is a transport error before any
 // terminal state, never a silent success.
 func TestStreamDispatchTransportErrors(t *testing.T) {
