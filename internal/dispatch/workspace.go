@@ -658,7 +658,9 @@ func (w *Workspace) Sweep(ctx context.Context) error {
 // entry. Missing artifacts are not errors. When lease is not nil the
 // lock file is unlinked while the lease is still held — dispatch IDs
 // are never reused, so no other holder can appear in between — and the
-// lease is released last.
+// lease is released last. Windows cannot unlink a file its own process
+// holds open, so there the lease is dropped first and the unlink
+// retried.
 func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) error {
 	if entry.Path != "" {
 		if err := runGit(ctx, w.repoRoot, nil, "worktree", "remove", entry.Path); err != nil {
@@ -685,7 +687,11 @@ func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) 
 		os.Remove(w.ownerPath(entry.Branch))
 	}
 	if lease != nil {
-		os.Remove(w.leasePath(entry.Branch))
+		if os.Remove(w.leasePath(entry.Branch)) != nil {
+			lease()
+			os.Remove(w.leasePath(entry.Branch))
+			return nil
+		}
 		lease()
 	}
 	return nil
