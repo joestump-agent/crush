@@ -610,15 +610,36 @@ func (s *Session) ShortHelp() []key.Binding {
 			s.keyMap.CancelRename,
 		}
 	default:
+		if s.selectedHasChildren() {
+			// The help line truncates, so the ctrl+] hint leads the
+			// optional bindings while it applies.
+			return []key.Binding{
+				s.keyMap.UpDown,
+				s.keyMap.Select,
+				s.keyMap.Agents,
+				s.keyMap.Rename,
+				s.keyMap.Delete,
+				s.keyMap.Close,
+			}
+		}
 		return []key.Binding{
 			s.keyMap.UpDown,
 			s.keyMap.Rename,
 			s.keyMap.Delete,
 			s.keyMap.Select,
-			s.keyMap.Agents,
 			s.keyMap.Close,
 		}
 	}
+}
+
+// selectedHasChildren reports whether the selected top-level row has
+// sub-agent task sessions to open with ctrl+].
+func (s *Session) selectedHasChildren() bool {
+	if s.inSubMenu() {
+		return false
+	}
+	item, ok := s.list.SelectedItem().(*SessionItem)
+	return ok && item != nil && s.childCount(item.Session.ID) > 0
 }
 
 // FullHelp implements [help.KeyMap].

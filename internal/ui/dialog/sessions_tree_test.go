@@ -10,9 +10,13 @@ package dialog
 
 import (
 	"context"
+	"fmt"
+	"image"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/session"
@@ -180,4 +184,46 @@ func TestSessionsTreeRenameDeleteGuardedAtTopLevel(t *testing.T) {
 func ctrlKey(t *testing.T, r rune) tea.KeyPressMsg {
 	t.Helper()
 	return tea.KeyPressMsg{Code: r, Mod: tea.ModCtrl}
+}
+
+// TestSessionsTreeKeepsInfoColumn pins that advertising a sub-agent count
+// does not cost the picker its timestamps: the info column hides for every
+// row once its widest entry crowds the title, so the count must stay
+// compact enough to fit beside an old timestamp at the default width.
+func TestSessionsTreeKeepsInfoColumn(t *testing.T) {
+	ws := treeTestWorkspace()
+	old := time.Now().AddDate(0, -11, 0).Unix()
+	ws.parents[0].UpdatedAt = old
+	ws.parents[1].UpdatedAt = old
+	kids := make([]session.Session, 0, 120)
+	for i := range 120 {
+		kids = append(kids, session.Session{ID: fmt.Sprintf("m%d$$t", i), ParentSessionID: "p1"})
+	}
+	ws.children["p1"] = kids
+	dialog := newSessionsTreeDialog(t, ws)
+
+	scr := uv.NewScreenBuffer(120, 40)
+	dialog.Draw(scr, image.Rect(0, 0, 120, 40))
+
+	for _, item := range dialog.list.FilteredItems() {
+		row, ok := item.(*SessionItem)
+		require.True(t, ok)
+		require.False(t, row.hideInfo, "row %s lost its info column", row.ID())
+	}
+}
+
+// TestSessionsTreeHelpShowsAgentsWhenRelevant pins the ctrl+] hint: the
+// short help line truncates, so the hint leads the optional bindings
+// only while the selected row has sub-agents, and is absent otherwise.
+func TestSessionsTreeHelpShowsAgentsWhenRelevant(t *testing.T) {
+	ws := treeTestWorkspace()
+	dialog := newSessionsTreeDialog(t, ws)
+
+	dialog.list.SetSelected(0)
+	help := dialog.ShortHelp()
+	require.Contains(t, help[:3], dialog.keyMap.Agents,
+		"a parent with sub-agents shows ctrl+] ahead of the truncation point")
+
+	dialog.list.SetSelected(1)
+	require.NotContains(t, dialog.ShortHelp(), dialog.keyMap.Agents)
 }

@@ -110,11 +110,15 @@ func (s *SessionItem) Cursor() *tea.Cursor {
 	return s.updateTitleInput.Cursor()
 }
 
-// InfoText returns the secondary text shown on the right of the item.
+// InfoText returns the secondary text shown on the right of the item. A
+// parent's sub-agent count is the compact "▸N" (the dialog's sub-menu
+// glyph): the info column hides for every row once its widest entry
+// crowds the title, so a spelled-out count would cost the picker its
+// timestamps.
 func (s *SessionItem) InfoText() string {
 	info := humanize.Time(time.Unix(s.UpdatedAt, 0))
 	if s.agentCount > 0 {
-		info = fmt.Sprintf("%d agents · %s", s.agentCount, info)
+		info = fmt.Sprintf("▸%d · %s", s.agentCount, info)
 	}
 	return info
 }
