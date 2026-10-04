@@ -571,6 +571,13 @@ type TodoEnforcementConfig struct {
 	// HardTimeout kills a dispatched run after this many seconds,
 	// whatever its progress. 0 (the default) disables the timeout.
 	HardTimeout *int `json:"hard_timeout,omitempty" jsonschema:"description=Wander kill: seconds after which a dispatched run is killed outright; 0 disables,default=0,example=1800"`
+	// InactivityTimeout is the A2A-level backstop (#360): a dispatched
+	// run served over A2A that yields no events at all for this many
+	// seconds is ended by the executor with a Failed status carrying
+	// the reason. It guards the runs the in-process watchdogs (#316)
+	// miss: stall_window and hard_timeout default to 0, and the ladder
+	// needs model steps to fire. 0 (the default) disables the backstop.
+	InactivityTimeout *int `json:"inactivity_timeout,omitempty" jsonschema:"description=A2A backstop: seconds without any event that end a silent dispatched run with a Failed status; 0 disables,default=0,example=900"`
 }
 
 // TodoEnforcementSettings is the resolved enforcement ladder: the per-agent
@@ -581,10 +588,12 @@ type TodoEnforcementSettings struct {
 	HardGate       bool
 	// Wander kill (#316). KillAfterNudges is the number of ignored
 	// nudges that trip the kill; StallWindow and HardTimeout are 0 when
-	// disabled.
-	KillAfterNudges int
-	StallWindow     time.Duration
-	HardTimeout     time.Duration
+	// disabled. InactivityTimeout is the A2A-level backstop (#360), also
+	// 0 when disabled.
+	KillAfterNudges   int
+	StallWindow       time.Duration
+	HardTimeout       time.Duration
+	InactivityTimeout time.Duration
 }
 
 const (
@@ -621,6 +630,9 @@ func ResolveTodoEnforcement(global, over *TodoEnforcementConfig) TodoEnforcement
 		if over.HardTimeout != nil {
 			merged.HardTimeout = over.HardTimeout
 		}
+		if over.InactivityTimeout != nil {
+			merged.InactivityTimeout = over.InactivityTimeout
+		}
 	}
 	settings := TodoEnforcementSettings{
 		Enabled:         true,
@@ -644,6 +656,9 @@ func ResolveTodoEnforcement(global, over *TodoEnforcementConfig) TodoEnforcement
 	}
 	if merged.HardTimeout != nil && *merged.HardTimeout > 0 {
 		settings.HardTimeout = time.Duration(*merged.HardTimeout) * time.Second
+	}
+	if merged.InactivityTimeout != nil && *merged.InactivityTimeout > 0 {
+		settings.InactivityTimeout = time.Duration(*merged.InactivityTimeout) * time.Second
 	}
 	return settings
 }
