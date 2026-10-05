@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -253,32 +254,43 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 // Failures are logged and left for a later reconciliation or cleanup;
 // startup never fails because leftovers could not be removed.
 func (w *Workspace) reconcileStartup(ctx context.Context) {
-	markers, err := filepath.Glob(filepath.Join(w.worktreesDir, "*"+ownerMarkerSuffix))
+	// Marker access goes through os.Root: every open is confined to the
+	// worktrees directory itself, so neither the directory-derived path
+	// reaching this code nor a hostile or symlinked marker name can
+	// address a file outside — the root rejects traversal and escapes
+	// instead of trusting string validation.
+	root, err := os.OpenRoot(w.worktreesDir)
+	if err != nil {
+		slog.Debug("Skipping dispatch startup reconciliation", "worktrees_dir", w.worktreesDir, "error", err)
+		return
+	}
+	defer root.Close()
+	markers, err := fs.Glob(root.FS(), "*"+ownerMarkerSuffix)
 	if err != nil {
 		return
 	}
-	for _, path := range markers {
-		branch := strings.TrimSuffix(filepath.Base(path), ownerMarkerSuffix)
+	for _, name := range markers {
+		branch := strings.TrimSuffix(name, ownerMarkerSuffix)
 		// A marker's file name is the only thing naming the workspace it
 		// describes, and that name feeds every path below, so refuse
 		// anything that is not a plain dispatch branch name: a stray or
 		// malicious file in the worktrees directory cannot point cleanup
 		// outside it.
 		if !strings.HasPrefix(branch, BranchPrefix) || strings.ContainsAny(branch, `/\`) || strings.Contains(branch, "..") {
-			slog.Debug("Skipping dispatch owner marker with unusable name", "path", path)
+			slog.Debug("Skipping dispatch owner marker with unusable name", "name", name)
 			continue
 		}
-		// The name is validated to BranchPrefix with no separators or
-		// traversal above, so path stays inside worktreesDir.
-		// codeql[go/path-injection]
-		data, err := os.ReadFile(path)
+		// Confined to the worktrees directory by the os.Root above: a
+		// marker whose name escapes it — directly or through a symlink —
+		// fails here instead of being read.
+		data, err := root.ReadFile(name)
 		if err != nil {
-			slog.Debug("Skipping unreadable dispatch owner marker", "path", path, "error", err)
+			slog.Debug("Skipping unreadable dispatch owner marker", "name", name, "error", err)
 			continue
 		}
 		var m ownerMarker
 		if err := json.Unmarshal(data, &m); err != nil {
-			slog.Debug("Skipping malformed dispatch owner marker", "path", path, "error", err)
+			slog.Debug("Skipping malformed dispatch owner marker", "name", name, "error", err)
 			continue
 		}
 
@@ -287,7 +299,6 @@ func (w *Workspace) reconcileStartup(ctx context.Context) {
 		// died and the decision is ours to apply.
 		// The name is validated to BranchPrefix with no separators or
 		// traversal above, so leasePath stays inside worktreesDir.
-		// codeql[go/path-injection]
 		release, err := lock.TryFile(w.leasePath(branch))
 		if err != nil {
 			continue

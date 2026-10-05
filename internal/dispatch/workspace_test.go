@@ -1236,3 +1236,41 @@ func TestStartupReconciliation(t *testing.T) {
 	require.True(t, os.IsNotExist(err), "decided workspace must be reconciled away")
 	require.False(t, branchExists(t, repo, decided.Branch))
 }
+
+// A marker replaced by a symlink pointing outside the worktrees
+// directory must be ignored, not followed (#367): startup
+// reconciliation reads markers through an os.Root, which refuses the
+// escape instead of reading whatever the link names, so the workspace
+// the marker claims to describe stays untouched.
+func TestStartupReconciliationIgnoresEscapingMarkerSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks requires privileges on windows")
+	}
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	victim, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	dropLeases(ws)
+
+	// A plausible-looking marker outside the worktrees directory: the
+	// real marker copied verbatim, so it would reconcile the workless
+	// workspace away if the link were followed.
+	marker, err := os.ReadFile(filepath.Join(ws.worktreesDir, victim.Branch+ownerMarkerSuffix))
+	require.NoError(t, err)
+	outside := filepath.Join(t.TempDir(), "outside.owner.json")
+	write(t, outside, string(marker))
+	markerPath := filepath.Join(ws.worktreesDir, victim.Branch+ownerMarkerSuffix)
+	require.NoError(t, os.Remove(markerPath))
+	require.NoError(t, os.Symlink(outside, markerPath))
+
+	fresh, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fresh.Sweep(context.Background()) })
+
+	require.DirExists(t, victim.Path, "an escaping marker symlink must not reconcile the workspace away")
+	require.True(t, branchExists(t, repo, victim.Branch))
+}
