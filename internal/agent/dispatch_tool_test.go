@@ -86,6 +86,15 @@ func dispatchTestModel() Model {
 
 func intPtr(v int) *int { return &v }
 
+// heldDispatchSlots reports the dispatch concurrency slots currently
+// held, so tests can wait for a finished dispatch to actually give its
+// slot back instead of only seeing its registry status flip.
+func (c *coordinator) heldDispatchSlots() int {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	return c.dispatchSlots
+}
+
 // initGitRepo makes dir a git repository with one commit, so dispatch can
 // provision worktrees from it.
 func initGitRepo(t *testing.T, dir string) {
@@ -1374,12 +1383,18 @@ func TestDispatchAgentToolRefusesAtCapacity(t *testing.T) {
 	// Both held dispatches finish, and the freed slot lets the next
 	// call through.
 	close(gate)
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
+	reg := c.dispatchRegistry()
 	require.Eventually(t, func() bool {
-		entryA, ok := ws.Get(handleA.DispatchID)
-		entryB, okB := ws.Get(handleB.DispatchID)
-		return ok && okB && entryA.Status != dispatch.StatusRunning && entryB.Status != dispatch.StatusRunning
+		entryA, ok := reg.Get(handleA.DispatchID)
+		entryB, okB := reg.Get(handleB.DispatchID)
+		if !ok || !okB || entryA.Status == dispatch.StatusRunning || entryB.Status == dispatch.StatusRunning {
+			return false
+		}
+		// The slot is released at the end of the run's teardown, after
+		// the registry status flips: wait for the release itself, or the
+		// next dispatch below races the still-running teardown and is
+		// refused at the cap.
+		return c.heldDispatchSlots() == 0
 	}, 10*time.Second, 50*time.Millisecond)
 
 	handleD := decodeDispatchHandle(t, runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "work D", Branch: "main"}, "dispatch-tool-call-D"))
@@ -1439,17 +1454,18 @@ func TestDispatchAgentToolParallelCallsNeverOvershootCap(t *testing.T) {
 	// silently dropped.
 	require.Len(t, handles, 3)
 
-	// Every admitted run finishes and gives its slot back.
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
+	// Every admitted run finishes and gives its slot back. The slot is
+	// released at the end of the run's teardown, after the registry
+	// status flips, so wait for the release itself.
+	reg := c.dispatchRegistry()
 	require.Eventually(t, func() bool {
 		for _, handle := range handles {
-			entry, ok := ws.Get(handle.DispatchID)
+			entry, ok := reg.Get(handle.DispatchID)
 			if !ok || entry.Status == dispatch.StatusRunning {
 				return false
 			}
 		}
-		return true
+		return c.heldDispatchSlots() == 0
 	}, 10*time.Second, 50*time.Millisecond)
 }
 
