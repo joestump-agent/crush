@@ -807,9 +807,13 @@ func (c *coordinator) startDispatchKillWatch(ctx context.Context, run dispatchRu
 }
 
 // watchTodosStall polls the dispatched session's todo list and kills the
-// run once an existing list goes untouched for the stall window ("stalled
-// todos"). The poll cadence is a quarter of the window, clamped so tiny
-// windows still poll and huge ones do not hammer the DB.
+// run once the list has gone untouched for the stall window ("stalled
+// todos"). The dispatch session starts empty, so a missing list is not a
+// stall: the watcher keeps polling until the first todo write, arms from
+// there, and a run that never writes todos is never stall-killed (an
+// absent list is the nudge ladder's problem, not a stall). The poll
+// cadence is a quarter of the window, clamped so tiny windows still poll
+// and huge ones do not hammer the DB.
 func (c *coordinator) watchTodosStall(ctx context.Context, run dispatchRun, window time.Duration, kill func(string)) {
 	tick := window / 4
 	if tick < 50*time.Millisecond {
@@ -821,11 +825,10 @@ func (c *coordinator) watchTodosStall(ctx context.Context, run dispatchRun, wind
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 
-	fingerprint, ok := c.dispatchTodosFingerprint(ctx, run.sessionID)
-	if !ok {
-		return
-	}
-	stalledSince := time.Now()
+	// An empty fingerprint cannot equal a real list: the first todo
+	// write is a "change" that arms the window.
+	fingerprint := ""
+	stalledSince := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
