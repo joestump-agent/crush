@@ -253,7 +253,10 @@ func (m *UI) handleInspectDrill() tea.Cmd {
 
 // enterInspect captures the parent's scroll position and live-agent ring
 // (only on the transition into inspect mode) and starts the child
-// transcript load.
+// transcript load. The ring position names the viewed session; when the
+// session is not in the ring (a finished block, or a task session picked
+// in the sessions picker) it is -1, so the first ctrl+] cycles to the
+// first live agent instead of skipping it.
 func (m *UI) enterInspect(ref agentBlockRef) tea.Cmd {
 	if !m.isInspecting() {
 		idx, line := m.chat.ScrollPosition()
@@ -261,11 +264,8 @@ func (m *UI) enterInspect(ref agentBlockRef) tea.Cmd {
 		m.inspectFollow = m.chat.Follow()
 		m.inspectRing = m.liveAgentSessionIDs()
 		m.inspectDispatchTargets = m.liveDispatchSessionIDs()
-		m.inspectRingPos = 0
 	}
-	if pos := slices.Index(m.inspectRing, ref.sessionID); pos >= 0 {
-		m.inspectRingPos = pos
-	}
+	m.inspectRingPos = slices.Index(m.inspectRing, ref.sessionID)
 	return m.loadInspectSession(ref.sessionID)
 }
 
@@ -403,7 +403,7 @@ func (m *UI) inspectPlaceholder() string {
 		title = m.inspecting.Title
 	}
 	pos := ""
-	if len(m.inspectRing) > 1 {
+	if len(m.inspectRing) > 1 && m.inspectRingPos >= 0 {
 		pos = fmt.Sprintf(" (%d/%d)", m.inspectRingPos+1, len(m.inspectRing))
 	}
 	const prefix = "Inspecting "
