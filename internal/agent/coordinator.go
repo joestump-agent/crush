@@ -222,6 +222,13 @@ type coordinator struct {
 	dispatchProvider     *dispatch.GitWorktreeProvider
 	dispatchProviderErr  error
 	dispatchAgentBuilder func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error)
+	// pendingResults holds each parent session's dispatch results whose
+	// delivery turn has not succeeded yet (#388): a result arrives while
+	// the parent is busy, so it waits here — outside the prompt queue
+	// the user's Esc clears — and flushPendingResults delivers it on the
+	// next idle. Guarded by dispatchMu; lazily created because tests
+	// construct the coordinator struct directly.
+	pendingResults map[string][]dispatch.DispatchResult
 	// dispatchCollector reduces dispatched-session state into
 	// per-dispatch snapshots for the configured sinks (#65); created
 	// with the provider and run on the coordinator's lifetime context.
@@ -569,6 +576,7 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	// the coalesce closure publishes the final outcome under that
 	// same correlator.
 	runID := RunIDFromContext(ctx)
+	systemDelivery := SystemDeliveryFromContext(ctx)
 	run := func() (*fantasy.AgentResult, error) {
 		return agent.Run(ctx, SessionAgentCall{
 			SessionID:         sessionID,
@@ -585,6 +593,7 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 			TopK:              callTopK(providerCfg, topK),
 			FrequencyPenalty:  freqPenalty,
 			PresencePenalty:   presPenalty,
+			systemDelivery:    systemDelivery,
 			OnComplete:        onComplete,
 			Accepted:          accept,
 			OnAuthRefresh:     c.makeAuthRefreshCallback(providerCfg),
@@ -613,6 +622,10 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 		// error it is about to receive.
 		MarkRunCompletePublished(ctx)
 	}
+	// A run on this session just ended (#388): dispatch results that
+	// pended while it was busy can deliver now. Detached: the flush
+	// runs its own turn.
+	go c.flushPendingResults(sessionID)
 	return result, originalErr
 }
 

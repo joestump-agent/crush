@@ -606,6 +606,161 @@ func TestWanderKill_StalledTodos(t *testing.T) {
 	})
 }
 
+// TestWanderKill_StalledTodosWrittenAfterStart pins the watcher arming on
+// the first todo write (#396): the dispatch session starts empty, the run
+// writes todos shortly after it starts and never updates them, and the
+// run is stall-killed about one window after that first write. A real
+// clock with a 400ms window keeps it fast outside synctest (#430).
+func TestWanderKill_StalledTodosWrittenAfterStart(t *testing.T) {
+	t.Parallel()
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+	settings := config.TodoEnforcementSettings{
+		Enabled:     false,
+		StallWindow: 400 * time.Millisecond,
+	}
+	f := newWanderKillFixture(t, model, settings)
+	f.runModel = blocked
+	f.buildDispatched(t, blocked, settings, nil)
+	f.armRunRoot()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.runDispatchSync(t)
+	}()
+
+	// The task session starts empty (a fresh dispatch's real shape): the
+	// watcher must survive the empty list and arm when the first todo
+	// lands.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		sess, err := f.env.sessions.Get(t.Context(), f.taskSess.ID)
+		if err != nil {
+			t.Errorf("Get task session: %v", err)
+			return
+		}
+		sess.Todos = []session.Todo{{Content: "late plan", Status: session.TodoStatusInProgress, ActiveForm: "Stalling"}}
+		if _, err := f.env.sessions.Save(t.Context(), sess); err != nil {
+			t.Errorf("Save late todos: %v", err)
+		}
+	}()
+
+	require.Eventually(t, func() bool {
+		entry, ok := f.ws.Get(f.entry.ID)
+		return ok && entry.Status == dispatch.StatusKilled
+	}, 5*time.Second, 25*time.Millisecond,
+		"a todo list that never updates after its first write must be stall-killed")
+	<-done
+	f.requireKilled(t, dispatch.ReasonStalledTodos)
+}
+
+// TestWanderKill_NoTodosNeverStallKilled pins the flip side of the arming
+// fix (#396): a run that never writes todos is not stall-killed, even
+// though it stays open far past the window — an absent list is the nudge
+// ladder's problem, not a stall.
+func TestWanderKill_NoTodosNeverStallKilled(t *testing.T) {
+	t.Parallel()
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+	settings := config.TodoEnforcementSettings{
+		Enabled:     false,
+		StallWindow: 400 * time.Millisecond,
+	}
+	f := newWanderKillFixture(t, model, settings)
+	f.runModel = blocked
+	f.buildDispatched(t, blocked, settings, nil)
+	f.armRunRoot()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.runDispatchSync(t)
+	}()
+
+	// Hold the run open for 3x the window with no todos written, then
+	// let the scripted model finish it.
+	time.Sleep(3 * settings.StallWindow)
+	close(blocked.hold)
+	<-done
+
+	entry, ok := f.ws.Get(f.entry.ID)
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusCompleted, entry.Status, "a run that never writes todos must not be stall-killed")
+	require.NotNil(t, entry.Result)
+	assert.Empty(t, entry.Result.KilledReason)
+}
+
+// TestWanderKill_TodosUpdatedWithinWindowNotKilled pins the reset half of
+// the stall window (#396): a run that keeps refreshing its todo list
+// within each window is never stall-killed, even though it stays open
+// far past a single window.
+func TestWanderKill_TodosUpdatedWithinWindowNotKilled(t *testing.T) {
+	t.Parallel()
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+	settings := config.TodoEnforcementSettings{
+		Enabled:     false,
+		StallWindow: 400 * time.Millisecond,
+	}
+	f := newWanderKillFixture(t, model, settings)
+	f.runModel = blocked
+	f.buildDispatched(t, blocked, settings, nil)
+	f.armRunRoot()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.runDispatchSync(t)
+	}()
+
+	// Keep the todo list fresh until the run ends: the first write arms
+	// the window, and every update within it resets the timer.
+	updated := make(chan struct{})
+	go func() {
+		defer close(updated)
+		step := 0
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
+			step++
+			sess, err := f.env.sessions.Get(t.Context(), f.taskSess.ID)
+			if err != nil {
+				t.Errorf("Get task session: %v", err)
+				return
+			}
+			sess.Todos = []session.Todo{{Content: fmt.Sprintf("progress %d", step), Status: session.TodoStatusInProgress, ActiveForm: "Working"}}
+			if _, err := f.env.sessions.Save(t.Context(), sess); err != nil {
+				t.Errorf("Save refreshed todos: %v", err)
+				return
+			}
+		}
+	}()
+
+	time.Sleep(3 * settings.StallWindow)
+	close(blocked.hold)
+	<-done
+	<-updated
+
+	entry, ok := f.ws.Get(f.entry.ID)
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusCompleted, entry.Status, "a run that refreshes its todos within each window must not be stall-killed")
+	require.NotNil(t, entry.Result)
+	assert.Empty(t, entry.Result.KilledReason)
+}
+
 // lateStartAgent delays every Run past a fixed duration: the real agent
 // registers its session only after the wrapper's delay elapses. Under
 // synctest's fake clock the watchdog's hard timeout can be made to fire
