@@ -268,9 +268,9 @@ func (w *Workspace) reconcileStartup(ctx context.Context) {
 			slog.Debug("Skipping dispatch owner marker with unusable name", "path", path)
 			continue
 		}
-		// codeql[go/path-injection] the name is validated to BranchPrefix
-		// with no separators or traversal above, so path stays inside
-		// worktreesDir.
+		// The name is validated to BranchPrefix with no separators or
+		// traversal above, so path stays inside worktreesDir.
+		// codeql[go/path-injection]
 		data, err := os.ReadFile(path)
 		if err != nil {
 			slog.Debug("Skipping unreadable dispatch owner marker", "path", path, "error", err)
@@ -285,9 +285,9 @@ func (w *Workspace) reconcileStartup(ctx context.Context) {
 		// Take the lease: a contended lease belongs to a live process,
 		// whose entries are never touched; a free lease means the owner
 		// died and the decision is ours to apply.
-		// codeql[go/path-injection] the name is validated to BranchPrefix
-		// with no separators or traversal above, so leasePath stays
-		// inside worktreesDir.
+		// The name is validated to BranchPrefix with no separators or
+		// traversal above, so leasePath stays inside worktreesDir.
+		// codeql[go/path-injection]
 		release, err := lock.TryFile(w.leasePath(branch))
 		if err != nil {
 			continue
