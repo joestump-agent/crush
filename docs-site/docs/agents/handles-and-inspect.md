@@ -198,8 +198,6 @@ terminal, and <kbd>esc</kbd> will never cancel the main agent from inspect mode
 - Entering from a finished block makes the first <kbd>ctrl+]</kbd> skip the
   first live agent, and the ring misses agents with no block in the transcript
   ([#416](https://github.com/joestump-agent/crush/issues/416)).
-- A message arriving just as you enter or leave can land in the wrong
-  transcript, or drop out of view until a reload ([#406](https://github.com/joestump-agent/crush/issues/406)).
 - A2UI forms in an inspected transcript stay live; submitting one starts a turn
   on the main agent ([#407](https://github.com/joestump-agent/crush/issues/407)).
 - The inspect keys are missing from <kbd>ctrl+g</kbd> help ([#412](https://github.com/joestump-agent/crush/issues/412)).
