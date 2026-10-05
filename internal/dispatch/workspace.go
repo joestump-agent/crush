@@ -593,7 +593,12 @@ func (w *Workspace) Remove(ctx context.Context, id string) error {
 // crashed run whose registry was lost). Orphans a live process still
 // holds — another Workspace on the same repository — and orphans with
 // no lease file at all, whose ownership cannot be proven, are left
-// alone (#369 is the explicit cleanup tool for those).
+// alone (#369 is the explicit cleanup tool for those). It is the
+// session-end backstop: nothing dispatch created survives it, and no
+// dangling branches or .crush/worktrees/ entries are left behind. One
+// stubborn workspace does not stop the sweep: every entry and every
+// orphan is attempted, the errors are joined and returned, and a failed
+// entry stays registered so a later sweep or Remove can retry it.
 func (w *Workspace) Sweep(ctx context.Context) error {
 	w.mu.Lock()
 	type sweepEntry struct {
@@ -608,56 +613,82 @@ func (w *Workspace) Sweep(ctx context.Context) error {
 	w.entries = make(map[string]Entry)
 	w.mu.Unlock()
 
+	var errs []error
 	for _, item := range items {
 		if err := w.removeEntry(ctx, item.entry, item.release); err != nil {
-			return err
+			errs = append(errs, err)
+			// The removal failed, so the entry and its lease stay
+			// registered for a later sweep or Remove to retry.
+			w.mu.Lock()
+			w.entries[item.entry.ID] = item.entry
+			if item.release != nil {
+				w.leases[item.entry.ID] = item.release
+			}
+			w.mu.Unlock()
 		}
 	}
 
-	// Orphaned directories: registered names are gone by now, so
-	// anything left under the worktrees dir with our prefix belongs to a
-	// run whose registry entry was lost. The directory name is the
+	// Orphaned directories: registered names — including entries this
+	// sweep just failed, whose removal a later sweep or Remove will
+	// retry — are not ours to take, so anything left under the
+	// worktrees dir with our prefix and an unregistered branch belongs
+	// to a run whose registry entry was lost. The directory name is the
 	// branch name, so the branch is recoverable from it.
+	w.mu.Lock()
+	registered := make(map[string]struct{}, len(w.entries))
+	for _, e := range w.entries {
+		registered[e.Branch] = struct{}{}
+	}
+	w.mu.Unlock()
+
 	dirs, err := os.ReadDir(w.worktreesDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+		if !os.IsNotExist(err) {
+			errs = append(errs, err)
 		}
-		return err
-	}
-	for _, d := range dirs {
-		if !d.IsDir() || !strings.HasPrefix(d.Name(), BranchPrefix) {
-			continue
-		}
-		lockPath := w.leasePath(d.Name())
-		if _, err := os.Stat(lockPath); err != nil {
-			if os.IsNotExist(err) {
-				// Without a lease file ownership cannot be proven,
-				// so the directory is not ours to take.
-				slog.Debug("Skipping dispatch worktree without a lease file", "path", filepath.Join(w.worktreesDir, d.Name()))
+	} else {
+		for _, d := range dirs {
+			if !d.IsDir() || !strings.HasPrefix(d.Name(), BranchPrefix) {
 				continue
 			}
-			return err
-		}
-		release, err := lock.TryFile(lockPath)
-		if err != nil {
-			if errors.Is(err, lock.ErrContended) {
-				// A live process — another Workspace on this
-				// repository — still owns this workspace.
-				slog.Debug("Skipping dispatch worktree with a held lease", "path", filepath.Join(w.worktreesDir, d.Name()))
+			if _, ok := registered[d.Name()]; ok {
 				continue
 			}
-			return err
-		}
-		entry := Entry{
-			Path:   filepath.Join(w.worktreesDir, d.Name()),
-			Branch: d.Name(),
-		}
-		if err := w.removeEntry(ctx, entry, release); err != nil {
-			return err
+			lockPath := w.leasePath(d.Name())
+			if _, err := os.Stat(lockPath); err != nil {
+				if os.IsNotExist(err) {
+					// Without a lease file ownership cannot be proven,
+					// so the directory is not ours to take.
+					slog.Debug("Skipping dispatch worktree without a lease file", "path", filepath.Join(w.worktreesDir, d.Name()))
+					continue
+				}
+				errs = append(errs, err)
+				continue
+			}
+			release, err := lock.TryFile(lockPath)
+			if err != nil {
+				if errors.Is(err, lock.ErrContended) {
+					// A live process — another Workspace on this
+					// repository — still owns this workspace.
+					slog.Debug("Skipping dispatch worktree with a held lease", "path", filepath.Join(w.worktreesDir, d.Name()))
+					continue
+				}
+				errs = append(errs, err)
+				continue
+			}
+			entry := Entry{
+				Path:   filepath.Join(w.worktreesDir, d.Name()),
+				Branch: d.Name(),
+			}
+			if err := w.removeEntry(ctx, entry, release); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
-	return runGit(ctx, w.repoRoot, nil, "worktree", "prune")
+	if err := runGit(ctx, w.repoRoot, nil, "worktree", "prune"); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // removeEntry tears down one workspace on disk: the worktree (forced if
@@ -669,24 +700,36 @@ func (w *Workspace) Sweep(ctx context.Context) error {
 // ownership artifacts — and the lease is released last, after
 // everything else is gone.
 func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) error {
+	// Errors are prefixed with the entry so a joined sweep error says
+	// what failed. Orphan entries carry no ID; their branch is the name.
+	label := entry.ID
+	if label == "" {
+		label = entry.Branch
+	}
 	if entry.Path != "" {
 		if err := runGit(ctx, w.repoRoot, nil, "worktree", "remove", entry.Path); err != nil {
 			// A dirty workspace still removes with --force; a missing
 			// one is already gone and prune cleans the admin entry.
 			if err := runGit(ctx, w.repoRoot, nil, "worktree", "remove", "--force", entry.Path); err != nil {
 				if err := runGit(ctx, w.repoRoot, nil, "worktree", "prune"); err != nil {
-					return fmt.Errorf("remove worktree %s: %w", entry.Path, err)
+					return fmt.Errorf("dispatch %s: remove worktree %s: %w", label, entry.Path, err)
 				}
 			}
 		}
 	}
 	if entry.Branch != "" {
 		// -D because a dispatched branch may be unmerged — that is the
-		// point of an explicit review step — and a missing branch is
-		// already gone.
-		if err := runGit(ctx, w.repoRoot, nil, "branch", "-D", entry.Branch); err != nil {
-			if !isBranchMissing(err) {
-				return fmt.Errorf("delete branch %s: %w", entry.Branch, err)
+		// point of an explicit review step. Existence is checked by exit
+		// code, not by git's message text, so a deleted branch is
+		// tolerated under any locale.
+		if hasBranch(ctx, w.repoRoot, entry.Branch) {
+			if err := runGit(ctx, w.repoRoot, nil, "branch", "-D", entry.Branch); err != nil {
+				// A concurrent Remove may have deleted the branch
+				// between the existence check and -D; gone is gone, so
+				// only an error on a branch still there is real.
+				if hasBranch(ctx, w.repoRoot, entry.Branch) {
+					return fmt.Errorf("dispatch %s: delete branch %s: %w", label, entry.Branch, err)
+				}
 			}
 		}
 	}
@@ -697,10 +740,12 @@ func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) 
 	return nil
 }
 
-// isBranchMissing reports whether a git branch error is just "no such
-// branch", which cleanup treats as success.
-func isBranchMissing(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "not found")
+// hasBranch reports whether the repository has the local branch, decided
+// by git's exit code so the check never reads localized message text.
+func hasBranch(ctx context.Context, dir, branch string) bool {
+	cmd := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	cmd.Dir = dir
+	return cmd.Run() == nil
 }
 
 // currentRevision returns the repository's current branch name, or HEAD

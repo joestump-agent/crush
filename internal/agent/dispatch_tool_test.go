@@ -374,7 +374,11 @@ func TestSweepDispatchOnCoordinatorEnd(t *testing.T) {
 		_, err := os.Stat(handle.WorkspacePath)
 		return os.IsNotExist(err)
 	}, 10*time.Second, 50*time.Millisecond)
-	require.Empty(t, ws.List())
+	// Sweep unregisters an entry only after its removal succeeds, so the
+	// registry can drain a few git invocations behind the directory.
+	require.Eventually(t, func() bool {
+		return len(ws.List()) == 0
+	}, 10*time.Second, 50*time.Millisecond)
 }
 
 // buildDispatchedAgent constructs a real dispatched agent offline: the

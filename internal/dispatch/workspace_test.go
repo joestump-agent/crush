@@ -156,6 +156,94 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	rel()
 }
 
+// A locked worktree fails its own removal but must not stop the sweep:
+// the other workspaces are still removed, the failed entry stays
+// registered for retry, and the orphan pass and final prune still run.
+func TestSweepContinuesPastLockedWorktree(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	one, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	locked, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	three, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	// Lock the worktree, as a stale run or a Windows hold would.
+	out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "lock", locked.Path).CombinedOutput()
+	require.NoError(t, err, string(out))
+	t.Cleanup(func() {
+		gitIn(t, repo, "worktree", "unlock", locked.Path)
+		gitIn(t, repo, "worktree", "prune")
+	})
+
+	err = ws.Sweep(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), locked.ID, "sweep error must name the locked entry")
+
+	// The other two workspaces are fully gone: directory, branch, and
+	// registry entry.
+	for _, gone := range []Entry{one, three} {
+		_, statErr := os.Stat(gone.Path)
+		require.True(t, os.IsNotExist(statErr), "sweep left %s behind", gone.Path)
+		require.False(t, branchExists(t, repo, gone.Branch), "sweep left branch %s behind", gone.Branch)
+		_, ok := ws.Get(gone.ID)
+		require.False(t, ok, "removed entry %s still registered", gone.ID)
+	}
+
+	// The locked entry is still registered so a later sweep can retry.
+	_, ok := ws.Get(locked.ID)
+	require.True(t, ok)
+	require.Len(t, ws.List(), 1)
+
+	// Unlock and sweep again: the retry succeeds and nothing is left.
+	gitIn(t, repo, "worktree", "unlock", locked.Path)
+	require.NoError(t, ws.Sweep(ctx))
+	require.Empty(t, ws.List())
+	_, statErr := os.Stat(locked.Path)
+	require.True(t, os.IsNotExist(statErr), "retry sweep left %s behind", locked.Path)
+	require.False(t, branchExists(t, repo, locked.Branch))
+}
+
+// Removing an entry whose worktree and branch were deleted behind the
+// registry's back succeeds: absence is detected by exit code, without
+// reading git's (localized) message text.
+func TestRemoveToleratesMissingBranch(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	entry, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	// Delete the worktree and the branch out from under the registry.
+	out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "remove", "--force", entry.Path).CombinedOutput()
+	require.NoError(t, err, string(out))
+	out, err = exec.CommandContext(ctx, "git", "-C", repo, "branch", "-D", entry.Branch).CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	require.NoError(t, ws.Sweep(ctx))
+	require.Empty(t, ws.List())
+	require.NoError(t, ws.Remove(ctx, entry.ID))
+}
+
+// hasBranch decides by git's exit code, never by its message text.
+func TestHasBranch(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	out, err := exec.CommandContext(ctx, "git", "-C", repo, "branch", "has-branch-probe").CombinedOutput()
+	require.NoError(t, err, string(out))
+	require.True(t, hasBranch(ctx, repo, "has-branch-probe"))
+	require.False(t, hasBranch(ctx, repo, BranchPrefix+"missing"))
+}
+
 // Sweep is the session-end backstop: it removes every tracked
 // workspace, even abandoned ones, plus orphaned crush-dispatch-*
 // directories whose registry entry was lost, and leaves no dangling
