@@ -807,6 +807,11 @@ func TestByHandlePrefersLiveEntry(t *testing.T) {
 	require.NoError(t, err)
 	ctx := t.Context()
 
+	// Release the entries' ownership leases on the way out: the open
+	// lock files keep t.TempDir's RemoveAll from cleaning up on
+	// Windows.
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+
 	a, err := ws.Provision(ctx, ProvisionOptions{})
 	require.NoError(t, err)
 	_, ok := ws.AssignHandle(a.ID, "tester", "")
