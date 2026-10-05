@@ -65,8 +65,11 @@ func (t *DispatchToolchain) WorkingDir() string {
 }
 
 // Config returns the scoped config store the toolchain was built from —
-// rooted at the workspace directory, with the workspace's own project
-// config, LSP config, and skills paths.
+// the parent's configuration viewed from the workspace directory: the
+// parent's published config (permissions, command allow-lists, LSP
+// servers, skills paths, MCP) with workingDir pointed at the workspace,
+// so directory-scoped behavior resolves there while no policy value can
+// come from the workspace's own config files (#374).
 func (t *DispatchToolchain) Config() *config.ConfigStore {
 	return t.store
 }
@@ -116,9 +119,13 @@ type DispatchToolchainOptions struct {
 // BuildDispatchToolchain builds a dispatched agent's entire toolchain
 // rooted at opts.WorkingDir: the file/bash tools are constructed with
 // workingDir = the workspace path, and the LSP manager and permission
-// service are rooted there too. A scoped config store is loaded from the
-// workspace directory (picking up its project config), while the parent's
-// data directory is reused so no second database or lock is taken.
+// service are rooted there too. The scoped config store is the parent's
+// configuration viewed from the workspace directory (#374): the model
+// chooses the base revision, so nothing that revision's config files
+// declare — shell config, permissions, command allow-lists, LSP
+// commands, skills — is read or executed; policy is always the parent's.
+// The parent's data directory is reused so no second database or lock
+// is taken.
 //
 // #64's DispatchAgent tool consumes this: provision a clean workspace,
 // bootstrap the toolchain against its path, run. The caller's context is
@@ -141,25 +148,28 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 		return nil, errors.New("task agent not configured")
 	}
 
-	// Scoped config: config loading, LSP config, and skills paths resolve
-	// against the dispatched workspace. The parent's data directory is
-	// passed through so logs, spill files, and the database stay shared.
-	scoped, err := config.Load(dir, c.cfg.Config().Options.DataDirectory, c.cfg.Config().Options.Debug)
-	if err != nil {
-		return nil, err
-	}
+	// Scoped config: the parent's configuration viewed from the
+	// dispatched workspace (#374). Nothing in the workspace is read or
+	// executed, so a base revision the model chose cannot run its own
+	// shell config or widen policy; directory-scoped behavior (path
+	// tools, LSP roots) still resolves against the workspace, and the
+	// parent's data directory keeps logs, spill files, and the database
+	// shared.
+	scoped := c.cfg.WithWorkingDir(dir)
 
 	lspManager := lsp.NewManager(scoped)
 
 	// Scoped permissions, mirroring app.New's construction: rooted at the
 	// workspace directory and inheriting the parent's allowed-tools so a
-	// dispatched agent starts from the same policy. With a parent
+	// dispatched agent starts from the same policy. The list is read from
+	// the parent's config (#374): a base revision's permissions allow
+	// must never auto-approve a dispatched agent's tools. With a parent
 	// service, skip approval follows the parent's live state so a
 	// runtime yolo toggle reaches dispatched agents; the startup flag is
 	// only a fallback for callers with no parent service.
 	var allowedTools []string
-	if scoped.Config().Permissions != nil && scoped.Config().Permissions.AllowedTools != nil {
-		allowedTools = scoped.Config().Permissions.AllowedTools
+	if parentCfg := c.cfg.Config(); parentCfg.Permissions != nil && parentCfg.Permissions.AllowedTools != nil {
+		allowedTools = parentCfg.Permissions.AllowedTools
 	}
 	var permissions permission.Service
 	if c.permissions != nil {

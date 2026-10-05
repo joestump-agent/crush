@@ -158,14 +158,10 @@ appears, with your privileges.
 - Don't `source` files from the internet into your config.
 - Prefer reading secrets from a password manager over pasting them in.
 
-:::warning[Known issue]
-A [dispatched agent](/agents/overview) loads project config from its own
-worktree: the `crushrc` or `crush.json` committed at the revision the worktree
-was cut from — a revision the model chooses. That config runs with your
-privileges like any other, and an uncommitted project config never reaches the
-agent. Only let Crush dispatch in a repository whose branches you trust.
-Tracked as [#374](https://github.com/joestump-agent/crush/issues/374).
-:::
+Dispatched agents follow the same rule in both directions: a dispatch reuses
+the config your session already loaded and never reads or executes the
+worktree's own `crushrc` or `crush.json`, so a branch the model picks cannot
+run code when the dispatch starts ([#374](https://github.com/joestump-agent/crush/issues/374)).
 
 ## What about JSON?
 
