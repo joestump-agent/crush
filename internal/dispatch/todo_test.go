@@ -126,6 +126,7 @@ func TestReduceNoInProgressTodo(t *testing.T) {
 func TestTodoCollectorDualSink(t *testing.T) {
 	ws, err := NewWorkspace(newTestRepo(t))
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
 	sessions := pubsub.NewBroker[session.Session]()
 	defer sessions.Shutdown()
@@ -187,6 +188,7 @@ func TestTodoCollectorDualSink(t *testing.T) {
 func TestTodoCollectorIgnoresUnknownSessions(t *testing.T) {
 	ws, err := NewWorkspace(newTestRepo(t))
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
 	sessions := pubsub.NewBroker[session.Session]()
 	defer sessions.Shutdown()
@@ -210,6 +212,7 @@ func TestTodoCollectorIgnoresUnknownSessions(t *testing.T) {
 func TestTodoCollectorSnapshotPull(t *testing.T) {
 	ws, err := NewWorkspace(newTestRepo(t))
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
 	sessions := pubsub.NewBroker[session.Session]()
 	collector := NewTodoCollector(ws, sessions)
@@ -243,6 +246,7 @@ func TestTodoCollectorSnapshotPull(t *testing.T) {
 func TestTodoCollectorSubscribeSessionTodos(t *testing.T) {
 	ws, err := NewWorkspace(newTestRepo(t))
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
 	sessions := pubsub.NewBroker[session.Session]()
 	collector := NewTodoCollector(ws, sessions)

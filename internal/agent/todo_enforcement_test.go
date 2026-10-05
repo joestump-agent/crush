@@ -191,6 +191,11 @@ func withTodoKill(fn func(sessionID, reason string)) todoAgentOpt {
 	return func(o *SessionAgentOptions) { o.TodoKill = fn }
 }
 
+// withLoopStop wires the loop-stop observer (#343) onto the agent.
+func withLoopStop(fn func(sessionID string)) todoAgentOpt {
+	return func(o *SessionAgentOptions) { o.LoopStop = fn }
+}
+
 // withoutTodosTool drops the todos tool the helper otherwise adds, as
 // options.disabled_tools does for a real agent.
 func withoutTodosTool() todoAgentOpt {

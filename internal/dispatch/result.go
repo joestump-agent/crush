@@ -115,35 +115,77 @@ func SummarizeDiff(diff string) string {
 	}
 
 	type fileStat struct {
-		added   int
-		removed int
+		added      int
+		removed    int
+		oldPath    string
+		newPath    string
+		display    string
+		isRename   bool
+		renameOnly bool
+		binary     bool
 	}
 	var order []string
 	stats := make(map[string]*fileStat)
 	current := ""
-	oldSide := ""
+	// state: 0 = before any section, 1 = header (before the first @@),
+	// 2 = hunk body.
+	state := 0
 	for _, line := range strings.Split(strings.TrimSuffix(diff, "\n"), "\n") {
-		if after, ok := strings.CutPrefix(line, "--- "); ok {
-			// The "--- a/file" half of the header, not a removal. Kept
-			// for the deletion case below.
-			oldSide = strings.TrimPrefix(after, "a/")
+		// A section starts at its git header line, wherever the previous
+		// section left off (a binary or rename-only section has no @@ to
+		// end it).
+		if rest, ok := strings.CutPrefix(line, "diff --git a/"); ok {
+			oldPath, newPath, _ := strings.Cut(rest, " b/")
+			display := newPath
+			if display == "" || display == "/dev/null" {
+				// A deletion names /dev/null as its new side; the deleted
+				// file's own path is what the parent agent reads.
+				display = oldPath
+			}
+			s := &fileStat{
+				oldPath:  oldPath,
+				newPath:  newPath,
+				display:  display,
+				isRename: oldPath != newPath,
+			}
+			if _, ok := stats[display]; !ok {
+				stats[display] = s
+				order = append(order, display)
+			}
+			current = display
+			state = 1
 			continue
 		}
-		if after, ok := strings.CutPrefix(line, "+++ "); ok {
-			// "+++ b/path" (and "+++ /dev/null" for deletions); the b/
-			// prefix is cosmetic, drop it. A deletion names /dev/null as
-			// its new side, so the stat falls back to the old side's
-			// path: the deleted file is what the parent agent reads.
-			current = strings.TrimPrefix(after, "b/")
-			if current == "/dev/null" {
-				current = oldSide
+		if state == 0 {
+			// Not inside a section yet (e.g. a bare binary line with no
+			// git header); the raw-diff fallback below still carries it.
+			continue
+		}
+		if state == 1 {
+			// Header block: recognize the extended-header markers, and
+			// nothing else; a hunk header ends it.
+			if strings.HasPrefix(line, "@@") {
+				state = 2
+				continue
 			}
-			if _, ok := stats[current]; !ok {
-				stats[current] = &fileStat{}
-				order = append(order, current)
+			s := stats[current]
+			switch {
+			case strings.HasPrefix(line, "similarity index 100%"):
+				s.renameOnly = true
+			case strings.HasPrefix(line, "rename from "):
+				s.oldPath = strings.TrimPrefix(line, "rename from ")
+			case strings.HasPrefix(line, "rename to "):
+				s.newPath = strings.TrimPrefix(line, "rename to ")
+				s.display = s.newPath
+			case strings.HasPrefix(line, "Binary files "),
+				strings.HasPrefix(line, "GIT binary patch"):
+				s.binary = true
 			}
 			continue
 		}
+		// state == 2: hunk body. Every + / - line is content, never a
+		// header, so a line whose text starts "-- " or "++ " can no
+		// longer open a phantom file.
 		s, ok := stats[current]
 		if !ok {
 			continue
@@ -158,13 +200,20 @@ func SummarizeDiff(diff string) string {
 
 	var b strings.Builder
 	if len(order) == 0 {
-		// A diff with no per-file headers (e.g. a binary diff): fall
-		// back to the raw text, still truncated.
+		// A diff with no per-file sections (e.g. a bare binary line):
+		// fall back to the raw text, still truncated.
 		b.WriteString("(no per-file stats; raw diff)\n")
 	} else {
 		for _, file := range order {
 			s := stats[file]
-			fmt.Fprintf(&b, "%s | +%d -%d\n", file, s.added, s.removed)
+			switch {
+			case s.binary:
+				fmt.Fprintf(&b, "%s | binary\n", s.display)
+			case s.isRename && s.renameOnly:
+				fmt.Fprintf(&b, "%s \u2192 %s | renamed\n", s.oldPath, s.newPath)
+			default:
+				fmt.Fprintf(&b, "%s | +%d -%d\n", s.display, s.added, s.removed)
+			}
 		}
 	}
 	b.WriteString("\n")

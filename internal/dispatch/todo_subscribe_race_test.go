@@ -17,6 +17,7 @@ import (
 func TestTodoCollectorSubscribeUnsubscribeRace(t *testing.T) {
 	ws, err := NewWorkspace(newTestRepo(t))
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
 	sessions := pubsub.NewBroker[session.Session]()
 	collector := NewTodoCollector(ws, sessions)
