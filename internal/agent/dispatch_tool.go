@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/shell"
 )
 
 //go:embed templates/dispatch_tool.md
@@ -471,6 +472,10 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 // deterministically when a kill threshold trips.
 func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	defer func() {
+		// Backstop for the kill after the run returns (#385): a run that
+		// ends before its terminal result is assembled still must not
+		// leave its background jobs running in the workspace.
+		c.killDispatchSessionJobs(ctx, run)
 		// The A2A server dies with the run (#70): teardown clears the
 		// registry's endpoint and card too, so discovery never hands out
 		// a dead endpoint. It stops before the toolchain closes, which
@@ -528,6 +533,11 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		} else if result == nil {
 			slog.Error("Dispatched agent ran no turn", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
 		}
+
+		// Kill the run's background jobs before terminal assembly, so the
+		// salvage diff cannot race a job still writing the workspace
+		// (#385).
+		c.killDispatchSessionJobs(ctx, run)
 
 		terminal = c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcome{
 			completed:     err == nil && result != nil,
@@ -621,6 +631,18 @@ func (c *coordinator) assembleTerminalDispatchResult(ctx context.Context, run di
 		return c.assembleKilledDispatchResult(ctx, run, dispatch.ReasonToolLoop)
 	}
 	return c.assembleDispatchResult(ctx, run, natural)
+}
+
+// killDispatchSessionJobs kills the run's background jobs — the ones its
+// bash calls tagged with the dispatch session's ID — and logs how many
+// it killed at Debug when non-zero. The main agent's jobs carry the main
+// session's ID, as do other dispatches', so only this run's jobs are
+// touched (#385).
+func (c *coordinator) killDispatchSessionJobs(ctx context.Context, run dispatchRun) {
+	killed := shell.GetBackgroundShellManager().KillSession(ctx, run.sessionID)
+	if killed > 0 {
+		slog.Debug("Killed dispatch background jobs", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "killed", killed)
+	}
 }
 
 // dispatchRunStoppedInLoop reports whether a finished run ended on the

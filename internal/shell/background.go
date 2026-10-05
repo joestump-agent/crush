@@ -45,7 +45,12 @@ func (sb *syncBuffer) String() string {
 
 // BackgroundShell represents a shell running in the background.
 type BackgroundShell struct {
-	ID          string
+	ID string
+	// SessionID is the session that owns the job; it tags the shell so
+	// the job can be killed with its session (a dispatch teardown kills
+	// its session's jobs, #385). Empty for jobs started without a
+	// session.
+	SessionID   string
 	Command     string
 	Description string
 	Shell       *Shell
@@ -85,8 +90,10 @@ func GetBackgroundShellManager() *BackgroundShellManager {
 	return backgroundManager
 }
 
-// Start creates and starts a new background shell with the given command.
-func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, blockFuncs []BlockFunc, command string, description string) (*BackgroundShell, error) {
+// Start creates and starts a new background shell with the given
+// command, tagged with the session that owns it so the job is killed
+// when that session ends (#385).
+func (m *BackgroundShellManager) Start(ctx context.Context, sessionID, workingDir string, blockFuncs []BlockFunc, command string, description string) (*BackgroundShell, error) {
 	// Check job limit
 	if m.shells.Len() >= MaxBackgroundJobs {
 		return nil, fmt.Errorf("maximum number of background jobs (%d) reached. Please terminate or wait for some jobs to complete", MaxBackgroundJobs)
@@ -103,6 +110,7 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 
 	bgShell := &BackgroundShell{
 		ID:          id,
+		SessionID:   sessionID,
 		Command:     command,
 		Description: description,
 		WorkingDir:  workingDir,
@@ -189,6 +197,48 @@ func (m *BackgroundShellManager) Cleanup() int {
 	}
 
 	return len(toRemove)
+}
+
+// KillSession terminates every background shell tagged with the given
+// session ID and removes it from the manager, returning how many shells
+// were still running when killed. Shells that already completed are
+// removed without counting. An empty session ID kills nothing, so a
+// missing tag cannot wipe out the untagged jobs it would match.
+// The provided context bounds how long the function waits for each shell
+// to exit.
+func (m *BackgroundShellManager) KillSession(ctx context.Context, sessionID string) int {
+	if sessionID == "" {
+		return 0
+	}
+
+	var shells []*BackgroundShell
+	for shell := range m.shells.Seq() {
+		if shell.SessionID == sessionID {
+			shells = append(shells, shell)
+		}
+	}
+	for _, shell := range shells {
+		m.Remove(shell.ID)
+	}
+
+	killed := 0
+	var wg sync.WaitGroup
+	for _, shell := range shells {
+		if shell.IsDone() {
+			continue
+		}
+		killed++
+		wg.Go(func() {
+			shell.cancel()
+			select {
+			case <-shell.done:
+			case <-ctx.Done():
+			}
+		})
+	}
+	wg.Wait()
+
+	return killed
 }
 
 // KillAll terminates all background shells. The provided context bounds how
