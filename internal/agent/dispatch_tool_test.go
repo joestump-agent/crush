@@ -172,6 +172,14 @@ func TestDispatchWorktreesLiveUnderDataDirectory(t *testing.T) {
 			resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work", Branch: "main"})
 			handle := decodeDispatchHandle(t, resp)
 
+			// Release the workspace lease before TempDir cleanup runs:
+			// the dispatch holds the lock file, and Windows refuses to
+			// remove a file another process has open. Cleanups run LIFO,
+			// so this lands ahead of testEnv's RemoveAll.
+			ws, werr := c.dispatchWorkspace()
+			require.NoError(t, werr)
+			t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+
 			// The workspace is <dataDir>/worktrees/<repo-key>/<branch>,
 			// under the resolved data directory — never beside the cwd.
 			wtDir := mustWorktreesDir(t, c)
