@@ -649,6 +649,19 @@ func TestBuildDispatchedAgent(t *testing.T) {
 	cfg.OverridePreferredModel(config.SelectedModelTypeSmall, config.SelectedModel{Provider: smallProviderID, Model: modelID})
 	cfg.SetupAgents()
 
+	// The dispatched agent sees the context files committed at its
+	// base revision (#386): commit a marker AGENTS.md before
+	// provisioning so the worktree carries it.
+	const projectMarker = "dispatch-project-context-marker-386"
+	require.NoError(t, os.WriteFile(filepath.Join(env.workingDir, "AGENTS.md"), []byte(projectMarker), 0o644))
+	git := func(args ...string) {
+		t.Helper()
+		out, err := exec.CommandContext(t.Context(), "git", append([]string{"-C", env.workingDir}, args...)...).CombinedOutput()
+		require.NoError(t, err, "git %s: %s", strings.Join(args, " "), out)
+	}
+	git("add", "AGENTS.md")
+	git("-c", "commit.gpgsign=false", "commit", "-qm", "add AGENTS.md")
+
 	c := &coordinator{
 		cfg:         cfg,
 		sessions:    env.sessions,
@@ -662,6 +675,13 @@ func TestBuildDispatchedAgent(t *testing.T) {
 	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 	require.NoError(t, err)
 	defer toolchain.Close(t.Context())
+
+	// The scoped store's user context is what the dispatched agent
+	// renders: point it at a temp file with a second marker (#386).
+	const globalMarker = "dispatch-global-context-marker-386"
+	globalCtxPath := filepath.Join(t.TempDir(), "CRUSH.md")
+	require.NoError(t, os.WriteFile(globalCtxPath, []byte(globalMarker), 0o644))
+	toolchain.Config().Config().Options.GlobalContextPaths = []string{globalCtxPath}
 
 	cases := []struct {
 		name      string
@@ -699,6 +719,28 @@ func TestBuildDispatchedAgent(t *testing.T) {
 	require.Contains(t, rendered, "dispatched agent")
 	require.Contains(t, rendered, filepath.ToSlash(entry.Path))
 	require.Contains(t, rendered, "Do NOT merge, rebase, push")
+
+	// The worktree's AGENTS.md is rendered under the project context
+	// section, and the user's global context file under the user
+	// context section (#386).
+	require.Contains(t, rendered, "# Project-Specific Context")
+	require.Contains(t, rendered, projectMarker)
+	require.Contains(t, rendered, "# User context")
+	require.Contains(t, rendered, globalMarker)
+
+	// With no context files, the prompt renders as it did before
+	// (#386): no context sections at all.
+	savedContextPaths := toolchain.Config().Config().Options.ContextPaths
+	savedGlobalContextPaths := toolchain.Config().Config().Options.GlobalContextPaths
+	toolchain.Config().Config().Options.ContextPaths = nil
+	toolchain.Config().Config().Options.GlobalContextPaths = nil
+	bare, err := c.buildDispatchedAgent(t.Context(), dispatchAgentOptions{Toolchain: toolchain})
+	require.NoError(t, err)
+	bareRendered := bare.agent.(*sessionAgent).systemPrompt.Get()
+	require.NotContains(t, bareRendered, "# Project-Specific Context")
+	require.NotContains(t, bareRendered, "# User context")
+	toolchain.Config().Config().Options.ContextPaths = savedContextPaths
+	toolchain.Config().Config().Options.GlobalContextPaths = savedGlobalContextPaths
 
 	// The tools are the task agent's read-only set widened with the
 	// dispatch write tools.
