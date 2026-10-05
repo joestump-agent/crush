@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/charmbracelet/crush/internal/lock"
 )
 
 // newTestRepo creates a git repository with one commit on a file, with
@@ -31,7 +34,7 @@ func newTestRepo(t *testing.T) string {
 	run("config", "user.name", "dispatch test")
 	require.NoError(t, os.WriteFile(filepath.Join(repo, "f.txt"), []byte("one"), 0o644))
 	run("add", "-A")
-	run("commit", "-qm", "initial")
+	run("-c", "commit.gpgsign=false", "commit", "-qm", "initial")
 	return repo
 }
 
@@ -92,6 +95,12 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	require.True(t, dirInfo.IsDir())
 	require.True(t, branchExists(t, repo, entry.Branch))
 
+	// Every provisioned workspace holds a lease and carries an owner
+	// marker, both next to the worktree so they never appear in a
+	// diff.
+	require.FileExists(t, ws.leasePath(entry.Branch))
+	require.FileExists(t, ws.ownerPath(entry.Branch))
+
 	// The registry tracks the entry and answers the later-phase
 	// queries: by handle, by session, and the flat list.
 	got, ok := ws.Get(entry.ID)
@@ -131,6 +140,8 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	require.Contains(t, diff, "untracked.txt")
 	require.Contains(t, diff, "-one")
 	require.Contains(t, diff, "+one edited")
+	require.NotContains(t, diff, ".lock")
+	require.NotContains(t, diff, ".owner.json")
 
 	// The temp-index approach must not stage anything into the
 	// workspace's real index (the unstaged f.txt edit is expected; a
@@ -146,6 +157,102 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	_, ok = ws.Get(entry.ID)
 	require.False(t, ok)
 	require.NoError(t, ws.Remove(ctx, entry.ID))
+
+	// The owner marker goes with the workspace. The lock file stays on
+	// disk — flock is keyed by inode, so it is never unlinked — but
+	// nobody holds it.
+	require.NoFileExists(t, ws.ownerPath(entry.Branch))
+	rel, err := lock.TryFile(ws.leasePath(entry.Branch))
+	require.NoError(t, err)
+	rel()
+}
+
+// A locked worktree fails its own removal but must not stop the sweep:
+// the other workspaces are still removed, the failed entry stays
+// registered for retry, and the orphan pass and final prune still run.
+func TestSweepContinuesPastLockedWorktree(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	one, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	locked, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	three, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	// Lock the worktree, as a stale run or a Windows hold would.
+	out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "lock", locked.Path).CombinedOutput()
+	require.NoError(t, err, string(out))
+	t.Cleanup(func() {
+		gitIn(t, repo, "worktree", "unlock", locked.Path)
+		gitIn(t, repo, "worktree", "prune")
+	})
+
+	err = ws.Sweep(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), locked.ID, "sweep error must name the locked entry")
+
+	// The other two workspaces are fully gone: directory, branch, and
+	// registry entry.
+	for _, gone := range []Entry{one, three} {
+		_, statErr := os.Stat(gone.Path)
+		require.True(t, os.IsNotExist(statErr), "sweep left %s behind", gone.Path)
+		require.False(t, branchExists(t, repo, gone.Branch), "sweep left branch %s behind", gone.Branch)
+		_, ok := ws.Get(gone.ID)
+		require.False(t, ok, "removed entry %s still registered", gone.ID)
+	}
+
+	// The locked entry is still registered so a later sweep can retry.
+	_, ok := ws.Get(locked.ID)
+	require.True(t, ok)
+	require.Len(t, ws.List(), 1)
+
+	// Unlock and sweep again: the retry succeeds and nothing is left.
+	gitIn(t, repo, "worktree", "unlock", locked.Path)
+	require.NoError(t, ws.Sweep(ctx))
+	require.Empty(t, ws.List())
+	_, statErr := os.Stat(locked.Path)
+	require.True(t, os.IsNotExist(statErr), "retry sweep left %s behind", locked.Path)
+	require.False(t, branchExists(t, repo, locked.Branch))
+}
+
+// Removing an entry whose worktree and branch were deleted behind the
+// registry's back succeeds: absence is detected by exit code, without
+// reading git's (localized) message text.
+func TestRemoveToleratesMissingBranch(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	entry, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	// Delete the worktree and the branch out from under the registry.
+	out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "remove", "--force", entry.Path).CombinedOutput()
+	require.NoError(t, err, string(out))
+	out, err = exec.CommandContext(ctx, "git", "-C", repo, "branch", "-D", entry.Branch).CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	require.NoError(t, ws.Sweep(ctx))
+	require.Empty(t, ws.List())
+	require.NoError(t, ws.Remove(ctx, entry.ID))
+}
+
+// hasBranch decides by git's exit code, never by its message text.
+func TestHasBranch(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	out, err := exec.CommandContext(ctx, "git", "-C", repo, "branch", "has-branch-probe").CombinedOutput()
+	require.NoError(t, err, string(out))
+	require.True(t, hasBranch(ctx, repo, "has-branch-probe"))
+	require.False(t, hasBranch(ctx, repo, BranchPrefix+"missing"))
 }
 
 // Sweep is the session-end backstop: it removes every tracked
@@ -166,10 +273,22 @@ func TestWorkspaceSweepRemovesTrackedAndOrphans(t *testing.T) {
 	require.True(t, ws.SetStatus(abandoned.ID, StatusRunning))
 
 	// An orphan: a worktree this process did not register, as a crashed
-	// run would leave behind.
+	// run would leave behind. Its lease file survives the crash — the
+	// kernel releases the lock, not the file — so the orphan here gets
+	// a lock file nobody holds, and is still reclaimed.
 	orphanBranch := BranchPrefix + "orphaned"
 	orphanPath := filepath.Join(ws.worktreesDir, orphanBranch)
 	out, err := exec.CommandContext(t.Context(), "git", "-C", repo, "worktree", "add", "-b", orphanBranch, orphanPath).CombinedOutput()
+	require.NoError(t, err, string(out))
+	orphanRelease, err := lock.TryFile(ws.leasePath(orphanBranch))
+	require.NoError(t, err)
+	orphanRelease()
+
+	// A worktree with no lease file at all: ownership cannot be
+	// proven, so Sweep must leave it alone.
+	unmarkedBranch := BranchPrefix + "unmarked"
+	unmarkedPath := filepath.Join(ws.worktreesDir, unmarkedBranch)
+	out, err = exec.CommandContext(t.Context(), "git", "-C", repo, "worktree", "add", "-b", unmarkedBranch, unmarkedPath).CombinedOutput()
 	require.NoError(t, err, string(out))
 
 	require.NoError(t, ws.Sweep(ctx))
@@ -181,7 +300,89 @@ func TestWorkspaceSweepRemovesTrackedAndOrphans(t *testing.T) {
 	for _, branch := range []string{tracked.Branch, abandoned.Branch, orphanBranch} {
 		require.False(t, branchExists(t, repo, branch), "sweep left branch %s behind", branch)
 	}
+	_, err = os.Stat(unmarkedPath)
+	require.NoError(t, err, "sweep removed a worktree with no lease file")
+	require.True(t, branchExists(t, repo, unmarkedBranch))
 	require.Empty(t, ws.List())
+}
+
+// dropLeases simulates process exit: it releases every lease the
+// workspace holds without removing any workspace, leaving the lock
+// files on disk unheld — exactly what a crashed run leaves behind.
+func dropLeases(ws *Workspace) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	for _, release := range ws.leases {
+		release()
+	}
+	ws.leases = make(map[string]func())
+}
+
+// A second Workspace on the same repository is a live peer: its
+// provisioned workspaces — committed and uncommitted work included —
+// survive another instance's Sweep, and keep diffing.
+func TestSweepLeavesOtherInstancesLiveWorkspaces(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	a, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	b, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Sweep(context.Background()) })
+
+	entry, err := b.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	write(t, filepath.Join(entry.Path, "committed.txt"), "committed")
+	gitIn(t, entry.Path, "add", "-A")
+	gitIn(t, entry.Path, "-c", "commit.gpgsign=false", "commit", "-qm", "dispatched work")
+	write(t, filepath.Join(entry.Path, "f.txt"), "one edited")
+
+	require.NoError(t, a.Sweep(ctx))
+
+	_, err = os.Stat(entry.Path)
+	require.NoError(t, err, "sweep removed another instance's live workspace")
+	require.True(t, branchExists(t, repo, entry.Branch))
+	require.FileExists(t, filepath.Join(entry.Path, "committed.txt"))
+	require.FileExists(t, filepath.Join(entry.Path, "f.txt"))
+
+	diff, err := b.Diff(ctx, entry.ID)
+	require.NoError(t, err)
+	require.Contains(t, diff, "committed.txt")
+	require.Contains(t, diff, "+one edited")
+	require.NotContains(t, diff, ".lock")
+	require.NotContains(t, diff, ".owner.json")
+
+	_, ok := b.Get(entry.ID)
+	require.True(t, ok)
+}
+
+// A workspace whose owner died — the lock file remains but nobody
+// holds the lease — is an orphan like any other, and Sweep reclaims
+// it: directory, branch, and ownership artifacts.
+func TestSweepReclaimsDeadOwnersWorkspace(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	b, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	entry, err := b.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	a, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	dropLeases(b)
+
+	require.NoError(t, a.Sweep(ctx))
+
+	_, err = os.Stat(entry.Path)
+	require.True(t, os.IsNotExist(err), "sweep left a dead owner's workspace behind")
+	require.False(t, branchExists(t, repo, entry.Branch))
+	require.FileExists(t, b.leasePath(entry.Branch))
+	rel, err := lock.TryFile(b.leasePath(entry.Branch))
+	require.NoError(t, err)
+	rel()
+	require.NoFileExists(t, b.ownerPath(entry.Branch))
 }
 
 // Provisioning from an explicit base cuts the workspace at that
@@ -343,6 +544,79 @@ func TestDiffMissingBaseSHA(t *testing.T) {
 	require.Error(t, err)
 }
 
+// Bases a model could supply that git would otherwise read as options,
+// plus a ref that does not exist: Provision must fail without leaving a
+// worktree, branch, or registry entry behind.
+func TestWorkspaceProvisionRejectsBadBases(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	worktreesBefore := gitIn(t, repo, "worktree", "list", "--porcelain")
+	branchesBefore := gitIn(t, repo, "branch", "--list", BranchPrefix+"*")
+
+	tests := []struct {
+		base string
+		err  string
+	}{
+		{"--lock", `invalid base "--lock"`},
+		{"--no-checkout", `invalid base "--no-checkout"`},
+		{"-b", `invalid base "-b"`},
+		{"no-such-ref", "unknown revision"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.base, func(t *testing.T) {
+			_, err := ws.Provision(ctx, ProvisionOptions{Base: tt.base})
+			require.ErrorContains(t, err, tt.err)
+		})
+	}
+
+	require.Equal(t, worktreesBefore, gitIn(t, repo, "worktree", "list", "--porcelain"))
+	require.Equal(t, branchesBefore, gitIn(t, repo, "branch", "--list", BranchPrefix+"*"))
+	require.Empty(t, ws.List())
+}
+
+// Branch, tag, full SHA, and HEAD~1 bases still work: BaseSHA is the
+// commit git says the ref points at, and the worktree is cut from it.
+func TestWorkspaceProvisionValidBases(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	gitIn(t, repo, "tag", "v1")
+	write(t, filepath.Join(repo, "f.txt"), "two")
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "-c", "commit.gpgsign=false", "commit", "-qm", "second")
+	headSHA := strings.TrimSpace(gitIn(t, repo, "rev-parse", "HEAD"))
+	gitIn(t, repo, "branch", "stable", "v1")
+	baseSHA := strings.TrimSpace(gitIn(t, repo, "rev-parse", "v1^{commit}"))
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		base string
+		want string
+	}{
+		{"branch", "stable", baseSHA},
+		{"tag", "v1", baseSHA},
+		{"full sha", headSHA, headSHA},
+		{"head tilde one", "HEAD~1", baseSHA},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry, err := ws.Provision(ctx, ProvisionOptions{Base: tt.base})
+			require.NoError(t, err)
+			require.Equal(t, tt.base, entry.Base)
+			require.Equal(t, tt.want, entry.BaseSHA)
+			require.Equal(t, tt.want, strings.TrimSpace(gitIn(t, entry.Path, "rev-parse", "HEAD")))
+			require.NoError(t, ws.Remove(ctx, entry.ID))
+		})
+	}
+}
+
 func TestWorkspaceDiffUnknownID(t *testing.T) {
 	repo := newTestRepo(t)
 	ws, err := NewWorkspace(repo)
@@ -405,6 +679,7 @@ func TestAssignHandle(t *testing.T) {
 	repo := newTestRepo(t)
 	ws, err := NewWorkspace(repo)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 	ctx := t.Context()
 
 	a, err := ws.Provision(ctx, ProvisionOptions{})
