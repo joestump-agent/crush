@@ -43,11 +43,6 @@ forever and the agent stalls ([#371](https://github.com/joestump-agent/crush/iss
   [Allowing tools](/configuration/permissions#allowing-tools).
 :::
 
-:::warning[Known issue]
-Dispatches that run longer than 3 minutes are reported as failed ([#344](https://github.com/joestump-agent/crush/issues/344)). Size
-the task so it can finish in that time: one package, one kind of change.
-:::
-
 ## Ask for parallel work
 
 Ask for the split in plain language. Name a role, and pass along any

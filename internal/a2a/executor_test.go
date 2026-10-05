@@ -33,6 +33,10 @@ type fakeRunner struct {
 	// returning (#345).
 	panicValue any
 
+	// delay, when non-zero, makes Run take that long before returning,
+	// for tests that need a served run slower than a transport deadline.
+	delay time.Duration
+
 	gotCall     agent.SessionAgentCall
 	ran         bool
 	canceledFor string
@@ -43,6 +47,9 @@ func (f *fakeRunner) Run(_ context.Context, call agent.SessionAgentCall) (*fanta
 	f.gotCall = call
 	if f.panicValue != nil {
 		panic(f.panicValue)
+	}
+	if f.delay > 0 {
+		time.Sleep(f.delay)
 	}
 	return f.result, f.err
 }

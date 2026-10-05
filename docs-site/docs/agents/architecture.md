@@ -213,10 +213,7 @@ Then, in this order, the coordinator:
 On the transport path — the production path — kills are lost. A kill
 cancels the agent behind the executor's back, the executor emits no
 terminal event, and the stream hangs ([#342](https://github.com/joestump-agent/crush/issues/342)). The transport result also
-ignores kill reasons, loop detection and diff errors ([#343](https://github.com/joestump-agent/crush/issues/343)). The SDK
-client's default 3-minute total timeout ends the hang, but it also fails
-every dispatch that runs longer than 3 minutes, while the agent keeps
-working ([#344](https://github.com/joestump-agent/crush/issues/344)).
+ignores kill reasons, loop detection and diff errors ([#343](https://github.com/joestump-agent/crush/issues/343)).
 :::
 
 ### 6. Deliver
