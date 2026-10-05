@@ -751,7 +751,7 @@ func validatePrompt(path string, prompt *string, appendOnly bool) error {
 	switch {
 	case strings.HasPrefix(value, "builtin:"):
 		if appendOnly {
-			return fmt.Errorf("%s: prompt_append must be a file:<path> reference, not builtin:", path)
+			return fmt.Errorf("%s: prompt_append must be a file:<path> reference, not a builtin prompt", path)
 		}
 		id := strings.TrimPrefix(value, "builtin:")
 		if !slices.Contains(builtinPromptIDs, id) {

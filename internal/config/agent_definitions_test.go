@@ -415,7 +415,7 @@ func TestAgentDefinitions_ValidationErrors(t *testing.T) {
 		{
 			name:    "prompt_append must be a file",
 			agents:  `{"coder": {"prompt_append": "builtin:coder"}}`,
-			wantErr: `agents.coder: prompt_append must be a file:<path> reference, not builtin:`,
+			wantErr: `agents.coder: prompt_append must be a file:<path> reference, not a builtin prompt`,
 		},
 		{
 			name:    "defaults carry todos and kill only",
