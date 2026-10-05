@@ -187,6 +187,87 @@ func (c *coordinator) teardownLiveDispatch(id string) {
 	close(live.done)
 }
 
+// cancelDispatchesForShutdown is CancelAll's dispatch phase (#372): the
+// agent cancel before it reaches only the main agent, and every
+// dispatched agent runs on its own detached context, so quitting Crush
+// must cancel them here. Each live dispatch records the shutdown kill
+// reason and takes the same graceful agent.Cancel path the watchdog
+// uses, then the phase waits one shared bound for every run's teardown
+// to close its done channel. A dispatch still running when the bound
+// expires gets its root cancel, which also unblocks a transport-path
+// client stream, and one more shared bound; anything that outlives that
+// is logged with its dispatch ID and left to its run goroutine.
+func (c *coordinator) cancelDispatchesForShutdown() {
+	// Raise the flag before touching any dispatch: from here on a
+	// finishing dispatch records its terminal state but starts no
+	// parent delivery turn.
+	c.shuttingDown.Store(true)
+
+	type shutdownTarget struct {
+		id   string
+		live *liveDispatch
+	}
+	c.dispatchMu.Lock()
+	targets := make([]shutdownTarget, 0, len(c.liveDispatches))
+	for id, live := range c.liveDispatches {
+		targets = append(targets, shutdownTarget{id: id, live: live})
+	}
+	c.dispatchMu.Unlock()
+	if len(targets) == 0 {
+		return
+	}
+
+	cancelWait, rootWait := c.dispatchShutdownWait, c.dispatchShutdownRootWait
+	if cancelWait <= 0 {
+		cancelWait = 5 * time.Second
+	}
+	if rootWait <= 0 {
+		rootWait = time.Second
+	}
+
+	for _, target := range targets {
+		if target.live.kill != nil {
+			target.live.kill.kill(dispatch.ReasonShutdown)
+		}
+		target.live.agent.Cancel(target.live.sessionID)
+	}
+
+	deadline := time.NewTimer(cancelWait)
+	defer deadline.Stop()
+	var remaining []shutdownTarget
+waitLoop:
+	for i, target := range targets {
+		select {
+		case <-target.live.done:
+		case <-deadline.C:
+			remaining = targets[i:]
+			break waitLoop
+		}
+	}
+	if len(remaining) == 0 {
+		return
+	}
+
+	rootDeadline := time.NewTimer(rootWait)
+	defer rootDeadline.Stop()
+	for _, target := range remaining {
+		if target.live.cancel != nil {
+			target.live.cancel()
+		}
+	}
+	var stuck []shutdownTarget
+	for _, target := range remaining {
+		select {
+		case <-target.live.done:
+		case <-rootDeadline.C:
+			stuck = append(stuck, target)
+		}
+	}
+	for _, target := range stuck {
+		slog.Warn("Dispatch still running after shutdown cancel", "dispatch_id", target.id, "session_id", target.live.sessionID)
+	}
+}
+
 // call builds the full SessionAgentCall a dispatch's turns run with:
 // the chosen model's shaping, the parent turn's content width, and the
 // non-interactive flag. Built per consumer — the server stamps its
@@ -886,6 +967,13 @@ func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRu
 // parent session that no longer exists (deleted, or a `crush run`
 // process that already exited), or no runnable main agent.
 func (c *coordinator) deliverDispatchResult(ctx context.Context, parentSessionID string, terminal dispatch.DispatchResult) {
+	// Shutdown starts no parent delivery turn (#372): the run above
+	// already recorded its terminal result and status, and a turn here
+	// would run against a coordinator that is canceling everything.
+	if c.shuttingDown.Load() {
+		slog.Debug("Dispatch result delivery skipped: shutting down", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
+		return
+	}
 	if _, err := c.sessions.Get(ctx, parentSessionID); err != nil {
 		slog.Debug("Dispatch result dropped: parent session is gone", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
 		return

@@ -244,12 +244,16 @@ registry entry. It then removes every `crush-dispatch-*` directory left
 under `.crush/worktrees`, and deletes each branch with `git branch -D`.
 Completed and killed work goes too.
 
+Shutdown itself runs before that sweep: every live dispatch is canceled
+with the "crush exited" kill reason, and the exit waits (bounded) for
+each dispatched run to record its terminal state, so agents stop before
+messages flush and the database closes.
+
 :::warning[Known issue]
 The exit sweep discards unreviewed and killed work, contradicting the
 "workspace is preserved" message the main agent receives ([#367](https://github.com/joestump-agent/crush/issues/367)). It also
 removes worktrees that belong to another Crush instance in the same
-repository ([#365](https://github.com/joestump-agent/crush/issues/365)). Shutdown does not cancel running dispatches first
-([#372](https://github.com/joestump-agent/crush/issues/372)).
+repository ([#365](https://github.com/joestump-agent/crush/issues/365)).
 :::
 
 ## Where this is going
