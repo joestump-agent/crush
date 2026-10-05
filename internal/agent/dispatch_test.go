@@ -6,10 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/scheduler"
 	"github.com/stretchr/testify/require"
 )
@@ -105,11 +107,12 @@ func TestBuildDispatchToolchainRootsToolsAtWorkspaceDir(t *testing.T) {
 	})
 	require.Contains(t, viewResp.Content, "dispatched notes")
 
-	// Bash inherits the parent's skip-permissions setting through the
-	// bridge (env.permissions is skip=true), so the command runs with
-	// the workspace as its working directory: a relative redirect lands
-	// inside the workspace. (A `pwd` content match would not survive
-	// Windows path rendering.)
+	// Bash runs without a prompt because the scoped permission service
+	// follows the parent's live skip state (env.permissions is skip=true
+	// here and is never toggled), so the command runs with the workspace
+	// as its working directory: a relative redirect lands inside the
+	// workspace. (A `pwd` content match would not survive Windows path
+	// rendering.)
 	bashResp := runTool(t, byName[tools.BashToolName], tools.BashToolName, map[string]any{
 		"command":     "echo marker > marker.txt",
 		"description": "write a marker into the dispatch working directory",
@@ -218,5 +221,90 @@ func TestDispatchToolchainHonorsDisabledTools(t *testing.T) {
 			require.Contains(t, got, tools.GlobToolName)
 			require.Contains(t, got, tools.ViewToolName)
 		})
+	}
+}
+
+// A dispatched agent must follow the parent service's live yolo state,
+// not the startup snapshot it was built under (#378): built while the
+// parent skips requests, a runtime toggle to prompting mode must make
+// the next dispatched request surface on the parent and wait for it.
+func TestDispatchPermissionFollowsParentSkipOffToggle(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	workspace := t.TempDir()
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	parentEvents := env.permissions.Subscribe(t.Context())
+	env.permissions.SetSkipRequests(false)
+
+	type outcome struct {
+		granted bool
+		err     error
+	}
+	resCh := make(chan outcome, 1)
+	go func() {
+		granted, err := tc.permissions.Request(t.Context(), permission.CreatePermissionRequest{
+			SessionID:  "dispatch-test-session",
+			ToolCallID: "call-378",
+			ToolName:   "bash",
+			Action:     "execute",
+			Path:       filepath.Join(workspace, "outside.txt"),
+		})
+		resCh <- outcome{granted, err}
+	}()
+
+	select {
+	case ev := <-parentEvents:
+		require.Equal(t, "call-378", ev.Payload.ToolCallID)
+		require.True(t, env.permissions.Grant(ev.Payload), "parent grant should resolve the request")
+	case res := <-resCh:
+		t.Fatalf("dispatched request resolved without the parent: granted=%v err=%v", res.granted, res.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the dispatched request to surface on the parent")
+	}
+
+	select {
+	case res := <-resCh:
+		require.NoError(t, res.err)
+		require.True(t, res.granted, "parent grant should reach the dispatched waiter")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the dispatched request to resolve")
+	}
+}
+
+// The other direction (#378): built in prompting mode, a runtime toggle
+// to skip must auto-approve the next dispatched request, and the parent
+// sees no request event.
+func TestDispatchPermissionFollowsParentSkipOnToggle(t *testing.T) {
+	env := testEnv(t)
+	env.permissions = permission.NewPermissionService(env.workingDir, false, nil)
+	c := newDispatchTestCoordinator(t, env)
+
+	workspace := t.TempDir()
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	parentEvents := env.permissions.Subscribe(t.Context())
+	env.permissions.SetSkipRequests(true)
+
+	granted, err := tc.permissions.Request(t.Context(), permission.CreatePermissionRequest{
+		SessionID:  "dispatch-test-session",
+		ToolCallID: "call-379",
+		ToolName:   "bash",
+		Action:     "execute",
+		Path:       filepath.Join(workspace, "outside.txt"),
+	})
+	require.NoError(t, err)
+	require.True(t, granted, "toggled-on parent should auto-approve dispatched requests")
+
+	time.Sleep(250 * time.Millisecond)
+	select {
+	case ev := <-parentEvents:
+		t.Fatalf("parent saw an unexpected request event: %v", ev.Payload)
+	default:
 	}
 }

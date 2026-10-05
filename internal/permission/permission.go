@@ -102,7 +102,12 @@ type permissionService struct {
 	autoApproveSessions   map[string]bool
 	autoApproveSessionsMu sync.RWMutex
 	skip                  atomic.Bool
-	allowedTools          []string
+	// skipFn is consulted on every Request so a runtime toggle reaches
+	// requests already in flight. A standalone service points it at its
+	// own skip flag; a scoped service points it at its parent.
+	skipFn       func() bool
+	parent       Service
+	allowedTools []string
 
 	// used to make sure we only process one request at a time
 	requestMu       sync.Mutex
@@ -179,7 +184,7 @@ func (s *permissionService) Deny(permission PermissionRequest) bool {
 }
 
 func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRequest) (bool, error) {
-	if s.skip.Load() {
+	if s.skipFn() {
 		return true, nil
 	}
 
@@ -306,5 +311,42 @@ func NewPermissionService(workingDir string, skip bool, allowedTools []string) S
 		pendingRequests:     csync.NewMap[string, chan bool](),
 	}
 	svc.skip.Store(skip)
+	svc.skipFn = svc.skip.Load
 	return svc
+}
+
+// scopedPermissionService is a permission service rooted at a dispatch
+// workspace that follows another service's live skip state. Everything
+// else (grants, session permissions, subscriptions) stays scoped to the
+// dispatch; only skip approval is delegated, so the parent's yolo
+// toggle applies to dispatched agents at request time.
+type scopedPermissionService struct {
+	*permissionService
+}
+
+func (s *scopedPermissionService) SkipRequests() bool {
+	return s.parent.SkipRequests()
+}
+
+func (s *scopedPermissionService) SetSkipRequests(skip bool) {
+	s.parent.SetSkipRequests(skip)
+}
+
+// NewScopedPermissionService returns a service whose Request checks
+// parent.SkipRequests at request time instead of a startup snapshot, so
+// toggling the parent's yolo at runtime reaches dispatched agents in
+// both directions. parent must be non-nil.
+func NewScopedPermissionService(parent Service, workingDir string, allowedTools []string) Service {
+	svc := &permissionService{
+		Broker:              pubsub.NewBroker[PermissionRequest](),
+		notificationBroker:  pubsub.NewBroker[PermissionNotification](),
+		workingDir:          workingDir,
+		sessionPermissions:  csync.NewMap[PermissionKey, bool](),
+		autoApproveSessions: make(map[string]bool),
+		parent:              parent,
+		allowedTools:        allowedTools,
+		pendingRequests:     csync.NewMap[string, chan bool](),
+	}
+	svc.skipFn = parent.SkipRequests
+	return &scopedPermissionService{permissionService: svc}
 }
