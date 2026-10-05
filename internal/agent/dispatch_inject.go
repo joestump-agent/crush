@@ -149,11 +149,14 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 	// non-interactive) with the message as its prompt. RunID and accept
 	// state stay empty: a RunID-bearing queued call runs as its own turn
 	// with its own lifecycle, while an untracked one folds into the
-	// running agent's next input — the injection contract.
+	// running agent's next input — the injection contract. Steer marks
+	// the persisted message as an injection (#410), so the dispatch card
+	// never mistakes it for the initial prompt or a todo nudge.
 	call := target.baseCall
 	call.Prompt = msg.Text
 	call.Attachments = msg.Attachments
 	call.RunID = ""
+	call.Steer = true
 	call.Accepted = nil
 	call.OnComplete = nil
 
