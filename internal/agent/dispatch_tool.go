@@ -885,7 +885,16 @@ func (c *coordinator) dispatchWorkspace() (*dispatch.Workspace, error) {
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
 	if c.dispatchWS == nil && c.dispatchWSErr == nil {
-		c.dispatchWS, c.dispatchWSErr = dispatch.NewWorkspace(c.cfg.WorkingDir())
+		// Worktrees live under the data directory, never beside the
+		// working directory: a launch from a repo subdirectory must not
+		// create a new <cwd>/.crush that git picks up and that later
+		// launches treat as their data directory (#383).
+		worktreesDir, err := dispatch.WorktreesDir(c.cfg.Config().Options.DataDirectory, c.cfg.WorkingDir())
+		if err != nil {
+			c.dispatchWSErr = err
+		} else {
+			c.dispatchWS, c.dispatchWSErr = dispatch.NewWorkspace(c.cfg.WorkingDir(), worktreesDir)
+		}
 		if c.dispatchWS != nil {
 			c.dispatchCollector = dispatch.NewTodoCollector(c.dispatchWS, c.sessions, c.dispatchSinks...)
 			ctx := c.dispatchCtx

@@ -346,7 +346,7 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 	}
 	f.buildDispatched(t, model, dispatchedSettings, nil)
 
-	ws, err := dispatch.NewWorkspace(env.workingDir)
+	ws, err := dispatch.NewWorkspace(env.workingDir, filepath.Join(env.workingDir, "worktrees"))
 	require.NoError(t, err)
 	f.ws = ws
 

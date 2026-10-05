@@ -24,8 +24,17 @@ import (
 // permissions), mirroring how the app wires the real one.
 func newDispatchTestCoordinator(t *testing.T, env fakeEnv) *coordinator {
 	t.Helper()
+	return newDispatchTestCoordinatorAt(t, env, env.workingDir, "")
+}
 
-	cfg, err := config.Init(env.workingDir, "", false)
+// newDispatchTestCoordinatorAt is newDispatchTestCoordinator with the
+// coordinator's working directory and data directory overridden, for
+// tests that start dispatch away from the repo root (#383). An empty
+// dataDir keeps config's own resolution.
+func newDispatchTestCoordinatorAt(t *testing.T, env fakeEnv, workingDir, dataDir string) *coordinator {
+	t.Helper()
+
+	cfg, err := config.Init(workingDir, dataDir, false)
 	require.NoError(t, err)
 	cfg.SetupAgents()
 

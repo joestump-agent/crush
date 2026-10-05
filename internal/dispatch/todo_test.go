@@ -124,7 +124,7 @@ func TestReduceNoInProgressTodo(t *testing.T) {
 // registry transitions each produce snapshots, and every sink receives
 // the same ones.
 func TestTodoCollectorDualSink(t *testing.T) {
-	ws, err := NewWorkspace(newTestRepo(t))
+	ws, err := newWorkspace(t, newTestRepo(t))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
@@ -186,7 +186,7 @@ func TestTodoCollectorDualSink(t *testing.T) {
 // Session events for sessions the registry does not know are not
 // dispatched work and must not reach the sinks.
 func TestTodoCollectorIgnoresUnknownSessions(t *testing.T) {
-	ws, err := NewWorkspace(newTestRepo(t))
+	ws, err := newWorkspace(t, newTestRepo(t))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
@@ -210,7 +210,7 @@ func TestTodoCollectorIgnoresUnknownSessions(t *testing.T) {
 // event was a registry transition, composing the entry with the last
 // reduced session state.
 func TestTodoCollectorSnapshotPull(t *testing.T) {
-	ws, err := NewWorkspace(newTestRepo(t))
+	ws, err := newWorkspace(t, newTestRepo(t))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
@@ -244,7 +244,7 @@ func TestTodoCollectorSnapshotPull(t *testing.T) {
 // from session saves and registry transitions alike — and only for its
 // session; the channel closes when its context ends.
 func TestTodoCollectorSubscribeSessionTodos(t *testing.T) {
-	ws, err := NewWorkspace(newTestRepo(t))
+	ws, err := newWorkspace(t, newTestRepo(t))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
