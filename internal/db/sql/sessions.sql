@@ -45,7 +45,7 @@ ORDER BY updated_at DESC;
 SELECT *
 FROM sessions
 WHERE parent_session_id = ?
-ORDER BY updated_at ASC;
+ORDER BY created_at ASC, rowid ASC;
 
 -- name: ListAllChildSessions :many
 SELECT *
