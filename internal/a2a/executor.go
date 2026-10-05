@@ -518,7 +518,11 @@ func GitDiff(dir string) DiffFunc {
 		tmp.Close()
 		defer os.Remove(tmp.Name())
 
-		env := append(os.Environ(), "GIT_INDEX_FILE="+tmp.Name())
+		// Run git hermetically: scrub the git variables that leak in
+		// from a surrounding shell or hook so the command can only act
+		// on the worktree in dir, pin LC_ALL to C for stable output,
+		// and carry the temporary index on top.
+		env := scrubGitEnv([]string{"GIT_INDEX_FILE=" + tmp.Name()})
 		git := func(args ...string) *exec.Cmd {
 			cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
 			cmd.Env = env
@@ -534,12 +538,46 @@ func GitDiff(dir string) DiffFunc {
 		if err := git("add", "-A").Run(); err != nil {
 			return "", err
 		}
-		out, err := git("diff", "--cached", "HEAD").Output()
+		// The diff's output is parsed, so pin the format on the command
+		// line: no external diff driver or textconv, no color, and the
+		// a/ b/ prefixes the consumer expects.
+		out, err := git(
+			"-c", "color.ui=never",
+			"-c", "diff.noprefix=false",
+			"-c", "diff.mnemonicPrefix=false",
+			"diff", "--no-ext-diff", "--no-textconv", "--no-color",
+			"--src-prefix=a/", "--dst-prefix=b/",
+			"--cached", "HEAD",
+		).Output()
 		if err != nil {
 			return "", err
 		}
 		return string(out), nil
 	}
+}
+
+// scrubGitEnv removes the git variables that leak in from a surrounding
+// shell or hook so a git command can only act on the repository it is
+// told to, and pins LC_ALL to C for stable, locale-independent output.
+// extraEnv is appended on top so a temporary GIT_INDEX_FILE survives.
+func scrubGitEnv(extraEnv []string) []string {
+	env := make([]string, 0, len(os.Environ())+1+len(extraEnv))
+	for _, kv := range os.Environ() {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		switch key {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+			"GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+			"GIT_PREFIX":
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "LC_ALL=C")
+	env = append(env, extraEnv...)
+	return env
 }
 
 // messageText concatenates the text parts of an incoming A2A message into a

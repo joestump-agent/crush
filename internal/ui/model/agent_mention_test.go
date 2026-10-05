@@ -6,6 +6,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/workspace"
 	"github.com/stretchr/testify/require"
 )
@@ -21,29 +22,32 @@ type agentMentionWorkspace struct {
 }
 
 type deliveredMessage struct {
-	handle, text string
+	session, handle, text string
 }
 
-func (w *agentMentionWorkspace) DispatchLive() []dispatch.TodoSnapshot {
+func (w *agentMentionWorkspace) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	var out []dispatch.TodoSnapshot
 	for _, snap := range w.byHandle {
-		if !snap.Entry.Status.IsTerminal() {
+		if !snap.Entry.Status.IsTerminal() && snap.Entry.ParentSessionID == sessionID {
 			out = append(out, snap)
 		}
 	}
 	return out
 }
 
-func (w *agentMentionWorkspace) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+func (w *agentMentionWorkspace) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
 	snap, ok := w.byHandle[handle]
+	if !ok || snap.Entry.ParentSessionID != sessionID {
+		return dispatch.TodoSnapshot{}, false
+	}
 	return snap, ok
 }
 
-func (w *agentMentionWorkspace) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+func (w *agentMentionWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
 	if w.deliverErr != nil {
 		return w.deliverErr
 	}
-	w.delivered = append(w.delivered, deliveredMessage{handle: handle, text: text})
+	w.delivered = append(w.delivered, deliveredMessage{session: sessionID, handle: handle, text: text})
 	return nil
 }
 
@@ -52,17 +56,23 @@ var _ workspace.Workspace = (*agentMentionWorkspace)(nil)
 
 func newAgentMentionUI(ws *agentMentionWorkspace) *UI {
 	ui := newCompletionBackspaceUIWith(ws)
+	ui.session = &session.Session{ID: testMentionSession}
 	return ui
 }
+
+// testMentionSession is the session the mention-test UI is attached to;
+// its dispatches carry it as their parent.
+const testMentionSession = "sess-mention-parent"
 
 func runningSnapshot(handle, role string) dispatch.TodoSnapshot {
 	return dispatch.TodoSnapshot{
 		Entry: dispatch.Entry{
-			ID:        "dispatch-" + handle,
-			SessionID: "msg$$call-" + handle,
-			Handle:    handle,
-			Role:      role,
-			Status:    dispatch.StatusRunning,
+			ID:              "dispatch-" + handle,
+			SessionID:       "msg$$call-" + handle,
+			ParentSessionID: testMentionSession,
+			Handle:          handle,
+			Role:            role,
+			Status:          dispatch.StatusRunning,
 		},
 		CurrentTodo: "wiring form validation",
 	}
@@ -71,10 +81,11 @@ func runningSnapshot(handle, role string) dispatch.TodoSnapshot {
 func finishedSnapshot(handle string) dispatch.TodoSnapshot {
 	return dispatch.TodoSnapshot{
 		Entry: dispatch.Entry{
-			ID:        "dispatch-" + handle,
-			SessionID: "msg$$call-" + handle,
-			Handle:    handle,
-			Status:    dispatch.StatusCompleted,
+			ID:              "dispatch-" + handle,
+			SessionID:       "msg$$call-" + handle,
+			ParentSessionID: testMentionSession,
+			Handle:          handle,
+			Status:          dispatch.StatusCompleted,
 			Result: &dispatch.DispatchResult{
 				Status:      dispatch.StatusCompleted,
 				KeyFindings: "Switched to Go.",
@@ -163,10 +174,11 @@ func TestRouteLeadingAgentHandle(t *testing.T) {
 	}}
 	m := newAgentMentionUI(ws)
 
-	// Routing: consumed, delivered with the rest of the prompt.
+	// Routing: consumed, delivered with the rest of the prompt, scoped
+	// to the UI's session.
 	_, handled := m.routeLeadingAgentHandle("@tester stop writing Rust")
 	require.True(t, handled)
-	require.Equal(t, []deliveredMessage{{handle: "tester", text: "stop writing Rust"}}, ws.delivered)
+	require.Equal(t, []deliveredMessage{{session: testMentionSession, handle: "tester", text: "stop writing Rust"}}, ws.delivered)
 
 	// Finished: refused, not delivered.
 	cmd, handled := m.routeLeadingAgentHandle("@done one more thing")
@@ -204,7 +216,7 @@ func TestRouteLeadingAgentHandleCaseInsensitive(t *testing.T) {
 
 	_, handled := m.routeLeadingAgentHandle("@Tester stop writing Rust")
 	require.True(t, handled)
-	require.Equal(t, []deliveredMessage{{handle: "tester", text: "stop writing Rust"}}, ws.delivered)
+	require.Equal(t, []deliveredMessage{{session: testMentionSession, handle: "tester", text: "stop writing Rust"}}, ws.delivered)
 
 	// An unknown name still falls back to the normal prompt path, upper-
 	// or lower-case alike.
@@ -255,4 +267,25 @@ func TestAgentCompletionValues(t *testing.T) {
 	require.Contains(t, values[0].Detail, "writes tests")
 	require.Contains(t, values[0].Detail, "●")
 	require.Contains(t, values[0].Detail, "wiring form validation")
+}
+
+// The UI's dispatch surfaces are scoped to the session the UI is
+// attached to (#399): an agent another session dispatched is invisible
+// to routing, mentions, and completions, and a leading @handle for one
+// falls back to the normal prompt path.
+func TestAgentMentionOtherSessionInvisible(t *testing.T) {
+	t.Parallel()
+
+	foreign := runningSnapshot("foreign", "other session's agent")
+	foreign.Entry.ParentSessionID = "sess-other-session"
+	ws := &agentMentionWorkspace{byHandle: map[string]dispatch.TodoSnapshot{
+		"foreign": foreign,
+	}}
+	m := newAgentMentionUI(ws)
+
+	_, handled := m.routeLeadingAgentHandle("@foreign stop")
+	require.False(t, handled, "a foreign-session handle falls back to the prompt path")
+	require.Empty(t, ws.delivered)
+	require.Empty(t, m.agentMentionAttachments("why is @foreign stuck?"))
+	require.Empty(t, m.agentCompletionValues())
 }

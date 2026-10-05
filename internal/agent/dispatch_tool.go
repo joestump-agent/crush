@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -152,6 +153,33 @@ type dispatchRun struct {
 	killSettings config.TodoEnforcementSettings
 }
 
+// registerLiveDispatch records a running dispatch (#371). The map is
+// lazily created: tests construct the coordinator struct directly.
+func (c *coordinator) registerLiveDispatch(id string, live *liveDispatch) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	if c.liveDispatches == nil {
+		c.liveDispatches = make(map[string]*liveDispatch)
+	}
+	c.liveDispatches[id] = live
+}
+
+// teardownLiveDispatch ends one dispatch: cancel the root (the bridge
+// bound to it exits with it), drop the live record, and close done so
+// waiters observe the teardown. Unknown IDs (a dispatch that never
+// registered, or a second teardown) are a no-op.
+func (c *coordinator) teardownLiveDispatch(id string) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	live, ok := c.liveDispatches[id]
+	if !ok {
+		return
+	}
+	delete(c.liveDispatches, id)
+	live.cancel()
+	close(live.done)
+}
+
 // call builds the full SessionAgentCall a dispatch's turns run with:
 // the chosen model's shaping, the parent turn's content width, and the
 // non-interactive flag. Built per consumer — the server stamps its
@@ -209,6 +237,21 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				return fantasy.ToolResponse{}, errors.New("agent message id missing from context")
 			}
 
+			// The parent's deny list decides what a dispatch may run
+			// with (#376): the worktree's own config must not widen it
+			// (#374). Without any write tool left there is nothing a
+			// dispatch can do, so refuse before provisioning a workspace.
+			agentCfg, ok := c.cfg.Config().Agents[config.AgentTask]
+			if !ok {
+				return fantasy.NewTextErrorResponse("dispatch unavailable: task agent not configured"), nil
+			}
+			surviving := dispatchAllowedTools(agentCfg, c.cfg.Config().Options.DisabledTools)
+			if !slices.ContainsFunc(dispatchCapabilityTools, func(name string) bool {
+				return slices.Contains(surviving, name)
+			}) {
+				return fantasy.NewTextErrorResponse("dispatch unavailable: bash/edit/write are disabled by your configuration (disabled_tools / permissions deny)"), nil
+			}
+
 			workspace, err := c.dispatchWorkspace()
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("dispatch unavailable: %s", err)), nil
@@ -223,13 +266,27 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("provision dispatch workspace: %s", err)), nil
 			}
 
-			toolchain, err := c.BuildDispatchToolchain(ctx, DispatchToolchainOptions{WorkingDir: entry.Path})
+			// The dispatch outlives the turn that started it: its root
+			// context is detached from the tool call's, so the run and
+			// the permission bridge bound to the root (#371) survive the
+			// turn's end. runDispatch's teardown cancels it, and every
+			// setup-failure path below does too. Not derived from
+			// c.dispatchCtx: in server mode that is still the request
+			// context (#419).
+			rootCtx, rootCancel := context.WithCancel(context.WithoutCancel(ctx))
+
+			// The toolchain's permission bridge binds to the dispatch's
+			// root (#371): the bridge lives as long as the dispatch, not
+			// the tool call.
+			toolchain, err := c.BuildDispatchToolchain(rootCtx, DispatchToolchainOptions{WorkingDir: entry.Path})
 			if err != nil {
+				rootCancel()
 				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("build dispatch toolchain: %s", err)), nil
 			}
 
 			if unknown := missingSkills(toolchain.Config(), params.Skills); len(unknown) > 0 {
+				rootCancel()
 				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("unknown skills: %s", strings.Join(unknown, ", "))), nil
 			}
@@ -255,6 +312,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				},
 			})
 			if err != nil {
+				rootCancel()
 				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("build dispatched agent: %s", err)), nil
 			}
@@ -264,6 +322,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			taskSessionID := c.sessions.CreateAgentToolSessionID(agentMessageID, call.ID)
 			taskSession, err := c.sessions.CreateTaskSession(ctx, taskSessionID, sessionID, "Dispatched Agent")
 			if err != nil {
+				rootCancel()
 				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("create session: %s", err)), nil
 			}
@@ -273,9 +332,11 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// after the session so the assignment event carries the complete
 			// entry — handle, role, session, running state.
 			workspace.SetSession(entry.ID, taskSession.ID)
+			workspace.SetParentSessionID(entry.ID, sessionID)
 			workspace.SetStatus(entry.ID, dispatch.StatusRunning)
 			assignedHandle, ok := workspace.AssignHandle(entry.ID, params.Handle, params.Role)
 			if !ok {
+				rootCancel()
 				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
 				return fantasy.NewTextErrorResponse("assign dispatch handle: registry entry vanished"), nil
 			}
@@ -306,10 +367,20 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// status carrying it.
 			run.stopServer = c.startDispatchServer(ctx, workspace, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current)
 
-			// The dispatch must outlive the parent turn that started it:
-			// the main agent keeps working, and its tool-call context is
-			// canceled as soon as the turn ends.
-			go c.runDispatch(context.WithoutCancel(ctx), run)
+			// The dispatch runs on its root context, detached from the
+			// tool call's (#371): the permission bridge bound to the root
+			// lives as long as the dispatch, not the turn. The live record
+			// goes in before the run starts so teardown cancels the root
+			// and closes done exactly once per dispatch.
+			live := &liveDispatch{
+				cancel:    rootCancel,
+				sessionID: taskSession.ID,
+				agent:     dispatched.agent,
+				kill:      kill,
+				done:      make(chan struct{}),
+			}
+			c.registerLiveDispatch(entry.ID, live)
+			go c.runDispatch(rootCtx, run)
 
 			handle := dispatch.DispatchResult{
 				DispatchID:    entry.ID,
@@ -411,6 +482,11 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		// bridge and the scoped LSP clients once nothing runs in the
 		// workspace anymore.
 		run.toolchain.Close(ctx)
+		// The dispatch's root dies with the dispatch (#371): canceling
+		// it ends the bridge goroutine bound to it, and dropping the
+		// live record keeps the registry holding exactly the running
+		// dispatches.
+		c.teardownLiveDispatch(run.entry.ID)
 	}()
 
 	watchStop := c.startDispatchKillWatch(ctx, run)

@@ -1,6 +1,8 @@
 package permission
 
 import (
+	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -612,4 +614,119 @@ func TestPermissionService_ResolveIdempotency(t *testing.T) {
 			// good: no notification.
 		}
 	})
+}
+
+// A scoped service must read its parent's skip state on every request,
+// so a runtime yolo toggle reaches dispatched agents in both directions
+// (#378). parentSkip is the parent's skip flag before each request;
+// grant says whether the (non-skip) request is granted or denied.
+func TestScopedPermissionService_FollowsParentSkip(t *testing.T) {
+	t.Parallel()
+
+	request := func(t *testing.T, svc Service, callID string, grant bool) bool {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		type outcome struct {
+			granted bool
+			err     error
+		}
+		events := svc.Subscribe(t.Context())
+		resCh := make(chan outcome, 1)
+		go func() {
+			granted, err := svc.Request(ctx, CreatePermissionRequest{
+				SessionID:  "s1",
+				ToolCallID: callID,
+				ToolName:   "bash",
+				Action:     "execute",
+				Path:       "/tmp",
+			})
+			resCh <- outcome{granted, err}
+		}()
+
+		select {
+		case ev := <-events:
+			require.Equal(t, callID, ev.Payload.ToolCallID)
+			if grant {
+				svc.Grant(ev.Payload)
+			} else {
+				svc.Deny(ev.Payload)
+			}
+			res := <-resCh
+			require.NoError(t, res.err)
+			return res.granted
+		case res := <-resCh:
+			require.NoError(t, res.err)
+			return res.granted
+		}
+	}
+
+	tests := []struct {
+		name       string
+		parentSkip []bool
+		grant      []bool
+		want       []bool
+	}{
+		{
+			name:       "skip at build with no toggle keeps auto-approving",
+			parentSkip: []bool{true, true},
+			grant:      []bool{false, false},
+			want:       []bool{true, true},
+		},
+		{
+			name:       "toggled off after build starts prompting",
+			parentSkip: []bool{true, false},
+			grant:      []bool{false, true},
+			want:       []bool{true, true},
+		},
+		{
+			name:       "toggled off after build can deny",
+			parentSkip: []bool{true, false},
+			grant:      []bool{false, false},
+			want:       []bool{true, false},
+		},
+		{
+			name:       "toggled on after build stops prompting",
+			parentSkip: []bool{false, true},
+			grant:      []bool{true, false},
+			want:       []bool{true, true},
+		},
+		{
+			name:       "prompting at build with no toggle keeps prompting",
+			parentSkip: []bool{false, false},
+			grant:      []bool{true, true},
+			want:       []bool{true, true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			parent := NewPermissionService("/tmp", tt.parentSkip[0], nil)
+			scoped := NewScopedPermissionService(parent, "/tmp", nil)
+			require.Equal(t, tt.parentSkip[0], scoped.SkipRequests())
+
+			for i := range tt.parentSkip {
+				if i > 0 {
+					parent.SetSkipRequests(tt.parentSkip[i])
+					require.Equal(t, tt.parentSkip[i], scoped.SkipRequests())
+				}
+				got := request(t, scoped, fmt.Sprintf("call-%d", i), tt.grant[i])
+				require.Equal(t, tt.want[i], got)
+			}
+		})
+	}
+}
+
+func TestScopedPermissionService_SkipAccessorsForwardToParent(t *testing.T) {
+	t.Parallel()
+
+	parent := NewPermissionService("/tmp", false, nil)
+	scoped := NewScopedPermissionService(parent, "/tmp", nil)
+	require.False(t, scoped.SkipRequests())
+
+	scoped.SetSkipRequests(true)
+	require.True(t, parent.SkipRequests())
+	require.True(t, scoped.SkipRequests())
 }

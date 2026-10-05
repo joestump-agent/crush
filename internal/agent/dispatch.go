@@ -83,8 +83,9 @@ func (t *DispatchToolchain) Permissions() permission.Service {
 	return t.permissions
 }
 
-// Tools returns the constructed tool set, filtered by the task agent's
-// AllowedTools.
+// Tools returns the constructed tool set, filtered to the task agent's
+// allowed tools, widened with the dispatch write and support tools and
+// narrowed by the parent's deny list.
 func (t *DispatchToolchain) Tools() []fantasy.AgentTool {
 	return t.tools
 }
@@ -120,7 +121,9 @@ type DispatchToolchainOptions struct {
 // data directory is reused so no second database or lock is taken.
 //
 // #64's DispatchAgent tool consumes this: provision a clean workspace,
-// bootstrap the toolchain against its path, run.
+// bootstrap the toolchain against its path, run. The caller's context is
+// the permission bridge's lifetime (#371): the tool passes the dispatch's
+// root, never the tool-call context.
 func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchToolchainOptions) (*DispatchToolchain, error) {
 	if opts.WorkingDir == "" {
 		return nil, ErrNoWorkingDir
@@ -149,14 +152,21 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 	lspManager := lsp.NewManager(scoped)
 
 	// Scoped permissions, mirroring app.New's construction: rooted at the
-	// workspace directory, inheriting the parent's skip setting and
-	// allowed-tools so a dispatched agent starts from the same policy.
-	skip := c.cfg.Overrides().SkipPermissionRequests
+	// workspace directory and inheriting the parent's allowed-tools so a
+	// dispatched agent starts from the same policy. With a parent
+	// service, skip approval follows the parent's live state so a
+	// runtime yolo toggle reaches dispatched agents; the startup flag is
+	// only a fallback for callers with no parent service.
 	var allowedTools []string
 	if scoped.Config().Permissions != nil && scoped.Config().Permissions.AllowedTools != nil {
 		allowedTools = scoped.Config().Permissions.AllowedTools
 	}
-	permissions := permission.NewPermissionService(dir, skip, allowedTools)
+	var permissions permission.Service
+	if c.permissions != nil {
+		permissions = permission.NewScopedPermissionService(c.permissions, dir, allowedTools)
+	} else {
+		permissions = permission.NewPermissionService(dir, c.cfg.Overrides().SkipPermissionRequests, allowedTools)
+	}
 
 	var cancel context.CancelFunc
 	if c.permissions != nil {
@@ -174,21 +184,55 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 	return t, nil
 }
 
-// dispatchWriteTools are the tools every dispatched agent gets on top of
-// the task agent's AllowedTools (#64). The task agent's default set is
-// deliberately read-only — it exists to answer research prompts — but a
-// dispatch's whole point is producing work, so bash, the edit tools, and
-// write are non-negotiable, and the todo enforcement ladder
-// (interaction model, #315) needs the todos tool. The union keeps
-// everything the task agent was already allowed: narrowing via config
-// still works for read tools, it just cannot remove write capability
-// from a dispatch.
-var dispatchWriteTools = []string{
+// dispatchCapabilityTools are the write tools a dispatch is useless
+// without (#376): if the parent's deny list removes all of them, the
+// dispatch tool refuses before provisioning a workspace: a dispatched
+// agent that can neither run commands nor edit files cannot produce
+// work.
+var dispatchCapabilityTools = []string{
 	tools.BashToolName,
 	tools.EditToolName,
 	tools.MultiEditToolName,
 	tools.WriteToolName,
-	tools.TodosToolName,
+}
+
+// dispatchWriteTools are the tools every dispatched agent gets on top of
+// the task agent's AllowedTools (#64). The task agent's default set is
+// deliberately read-only — it exists to answer research prompts — but a
+// dispatch's whole point is producing work, so bash, the edit tools,
+// write, and the todos tool the enforcement ladder needs (interaction
+// model, #315) are added to the union. The union is still bounded by the
+// parent's deny list: dispatchAllowedTools drops anything the user
+// denied, so options.disabled_tools / permissions deny hold inside a
+// dispatch (#376). Narrowing via config still works for read tools.
+var dispatchWriteTools = slices.Concat(dispatchCapabilityTools, []string{tools.TodosToolName})
+
+// dispatchAllowedTools is the allow-list a dispatched agent's tools are
+// filtered against: the task agent's allowed tools widened with
+// dispatchWriteTools (#64) and dispatchSupportTools (#384), minus
+// everything in disabled (#376).
+// disabled is the parent's options.disabled_tools (the list
+// permissions deny writes), never the dispatched workspace's own config,
+// which must not widen what the user denied at the top (#374).
+func dispatchAllowedTools(agentCfg config.Agent, disabled []string) []string {
+	allowed := slices.Concat(agentCfg.AllowedTools, dispatchWriteTools, dispatchSupportTools)
+	return slices.DeleteFunc(allowed, func(name string) bool {
+		return slices.Contains(disabled, name)
+	})
+}
+
+// dispatchSupportTools are the observation tools a dispatched agent gets
+// on top of the task agent's AllowedTools (#384). bash auto-backgrounds
+// any command past DefaultAutoBackgroundAfter and tells the agent to read
+// the result back with job_output (or stop it with job_kill), and
+// lsp_diagnostics is how the agent checks what the LSP thinks of an edit
+// (constructed only while the LSP tools are registered). None of them
+// writes, but without them a dispatch loses the output of any command it
+// starts: the buffer lives only in this process.
+var dispatchSupportTools = []string{
+	tools.JobOutputToolName,
+	tools.JobKillToolName,
+	tools.DiagnosticsToolName,
 }
 
 // buildDispatchTools constructs the dispatched agent's tools against the
@@ -253,9 +297,11 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 		)
 	}
 
-	// The task agent's set widened with the dispatch write tools: a
-	// dispatched agent must be able to edit, not just read (#64).
-	allowed := slices.Concat(agentCfg.AllowedTools, dispatchWriteTools)
+	// The task agent's set widened with the dispatch write tools and
+	// support tools, minus the parent's deny list (#376): a dispatched
+	// agent must be able to edit, not just read (#64), and observe what
+	// it ran and wrote (#384), but a tool the user denied stays denied.
+	allowed := dispatchAllowedTools(agentCfg, c.cfg.Config().Options.DisabledTools)
 
 	var filtered []fantasy.AgentTool
 	for _, tool := range allTools {
@@ -283,12 +329,20 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 // scope to the parent workspace's permission service, so dispatched-agent
 // tool calls surface in the same approval flow as the main agent's. Each
 // forwarded request resolves the scoped service's pending request with
-// the parent's verdict. The bridge runs until cancel is called; requests
-// still waiting when the bridge stops are denied by the canceled context.
+// the parent's verdict. The bridge's context is the dispatch's root, not
+// the parent turn's tool-call context: it lives as long as the dispatch
+// (#371), so requests raised after the turn ends still reach the parent's
+// subscribers. Requests still waiting when the bridge stops are denied by
+// the canceled context.
 func bridgePermissions(ctx context.Context, parent, scoped permission.Service) context.CancelFunc {
 	ctx, cancel := context.WithCancel(ctx)
+	// Subscribe before spawning the consumer: Broker delivery is lossy
+	// for events published before a subscriber registers, so subscribing
+	// inside the goroutine could strand a request that arrived first and
+	// leave its waiter blocked until the context is canceled.
+	events := scoped.Subscribe(ctx)
 	go func() {
-		for ev := range scoped.Subscribe(ctx) {
+		for ev := range events {
 			req := ev.Payload
 			allowed, err := parent.Request(ctx, permission.CreatePermissionRequest{
 				SessionID:   req.SessionID,

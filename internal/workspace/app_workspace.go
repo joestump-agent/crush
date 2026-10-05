@@ -63,6 +63,10 @@ func (w *AppWorkspace) ListChildSessions(ctx context.Context, parentSessionID st
 	return w.app.Sessions.ListChildren(ctx, parentSessionID)
 }
 
+func (w *AppWorkspace) ListAllChildSessions(ctx context.Context) ([]session.Session, error) {
+	return w.app.Sessions.ListAllChildren(ctx)
+}
+
 func (w *AppWorkspace) SaveSession(ctx context.Context, sess session.Session) (session.Session, error) {
 	return w.app.Sessions.Save(ctx, sess)
 }
@@ -337,16 +341,16 @@ func (w *AppWorkspace) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, 
 	return w.app.DispatchStatus(sessionID)
 }
 
-func (w *AppWorkspace) DispatchLive() []dispatch.TodoSnapshot {
-	return w.app.DispatchLive()
+func (w *AppWorkspace) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
+	return w.app.DispatchLive(sessionID)
 }
 
-func (w *AppWorkspace) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
-	return w.app.DispatchByHandle(handle)
+func (w *AppWorkspace) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
+	return w.app.DispatchByHandle(sessionID, handle)
 }
 
-func (w *AppWorkspace) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
-	return w.app.DeliverAgentMessageByHandle(ctx, handle, text)
+func (w *AppWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+	return w.app.DeliverAgentMessageByHandle(ctx, sessionID, handle, text)
 }
 
 // -- LSP --

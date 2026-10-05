@@ -137,6 +137,49 @@ func (q *Queries) GetSessionByID(ctx context.Context, id string) (Session, error
 	return i, err
 }
 
+const listAllChildSessions = `-- name: ListAllChildSessions :many
+SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, channel
+FROM sessions
+WHERE parent_session_id IS NOT NULL
+ORDER BY parent_session_id, created_at, rowid
+`
+
+func (q *Queries) ListAllChildSessions(ctx context.Context) ([]Session, error) {
+	rows, err := q.query(ctx, q.listAllChildSessionsStmt, listAllChildSessions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Session{}
+	for rows.Next() {
+		var i Session
+		if err := rows.Scan(
+			&i.ID,
+			&i.ParentSessionID,
+			&i.Title,
+			&i.MessageCount,
+			&i.PromptTokens,
+			&i.CompletionTokens,
+			&i.Cost,
+			&i.UpdatedAt,
+			&i.CreatedAt,
+			&i.SummaryMessageID,
+			&i.Todos,
+			&i.Channel,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listChildSessions = `-- name: ListChildSessions :many
 SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, channel
 FROM sessions

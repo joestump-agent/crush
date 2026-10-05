@@ -34,10 +34,9 @@ permissions deny bash sourcegraph
 ```
 
 Denied tools do not appear in the model's tool list at all, so the model never
-tries to call them — with one current exception, inside
-[dispatched agents](#dispatched-agents). To disable tools from a specific MCP
-server instead, use `--disabled-tools` / `--enabled-tools` on the server — see
-[MCP](/features/mcp#restricting-tools).
+tries to call them — inside dispatched agents too. To disable tools from a
+specific MCP server instead, use `--disabled-tools` / `--enabled-tools` on the
+server — see [MCP](/features/mcp#restricting-tools).
 
 ## Blocked commands
 
@@ -126,18 +125,18 @@ worktree — your global config plus the project config committed at the
 revision it was cut from; an uncommitted project config does not apply. Your
 `--allow-commands` and `--allow-all-commands` overrides carry over.
 
+Your deny list holds inside a dispatched agent: `permissions deny` and
+`options.disabled_tools` remove the tool from dispatched agents as well.
+Denying all of `bash`, `edit`, `multiedit`, and `write` disables dispatch
+entirely.
+
 Dispatch is on by default. Turn it off by denying both of its tools:
 
 ```bash
 permissions deny dispatch_agent message_agent
 ```
 
-:::warning[Known issue]
-- A deny list does not hold inside a dispatched agent. `permissions deny` and
-  `options.disabled_tools` can hide `bash`, `edit`, `multiedit`, `write`, and
-  `todos` from the main agent, but a dispatched agent always gets them back.
-  If you rely on a deny list, deny `dispatch_agent` as well. Tracked as
-  [#376](https://github.com/joestump-agent/crush/issues/376).
+:::warning[Known issues]
 - A dispatched agent follows the yolo setting Crush **started** with, not the
   <kbd>ctrl+y</kbd> toggle. Start with `--yolo`, toggle it off, and dispatched
   agents still approve everything without asking. Tracked as [#378](https://github.com/joestump-agent/crush/issues/378).

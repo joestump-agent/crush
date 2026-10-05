@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -69,8 +71,9 @@ func TestDispatchToolAssignsHandles(t *testing.T) {
 	}, 4))
 	require.Equal(t, "agent", fourth.Handle)
 
-	// The registry entries carry handle and role, and resolve by handle.
-	snap, ok := c.DispatchByHandle("tester")
+	// The registry entries carry handle and role, and resolve by handle
+	// for the dispatching session.
+	snap, ok := c.DispatchByHandle("dispatch-parent-session", "tester")
 	require.True(t, ok)
 	require.Equal(t, first.DispatchID, snap.Entry.ID)
 	require.Equal(t, "writes tests", snap.Entry.Role)
@@ -90,7 +93,7 @@ func TestDispatchLiveExcludesFinished(t *testing.T) {
 	agent.waitRunning(t)
 	decodeDispatchHandle(t, runUniqueDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "b", Branch: "main", Handle: "docs"}, 6))
 
-	live := c.DispatchLive()
+	live := c.DispatchLive("dispatch-parent-session")
 	handles := make(map[string]bool, len(live))
 	for _, snap := range live {
 		handles[snap.Entry.Handle] = true
@@ -107,17 +110,17 @@ func TestDispatchLiveExcludesFinished(t *testing.T) {
 		return ok && entry.Status.IsTerminal()
 	}, 10*time.Second, 50*time.Millisecond)
 
-	live = c.DispatchLive()
+	live = c.DispatchLive("dispatch-parent-session")
 	for _, snap := range live {
 		require.NotEqual(t, "tester", snap.Entry.Handle, "a finished dispatch must not be live")
 	}
-	snap, ok := c.DispatchByHandle("tester")
+	snap, ok := c.DispatchByHandle("dispatch-parent-session", "tester")
 	require.True(t, ok, "a finished dispatch still resolves by handle")
 	require.True(t, snap.Entry.Status.IsTerminal())
 	require.Equal(t, first.SessionID, snap.Entry.SessionID)
 
 	// DeliverAgentMessageByHandle refuses the finished handle cleanly.
-	err := c.DeliverAgentMessageByHandle(t.Context(), "tester", "one more thing")
+	err := c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "tester", "one more thing")
 	require.ErrorContains(t, err, "finished")
 	require.ErrorContains(t, err, "dispatch a new agent")
 }
@@ -137,8 +140,8 @@ func TestDeliverByHandleRoutesAndToolAcceptsHandle(t *testing.T) {
 	}, 7))
 	agent.waitRunning(t)
 
-	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "tester", "stop writing Rust"))
-	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "@Tester", "normalized too"))
+	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "tester", "stop writing Rust"))
+	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "@Tester", "normalized too"))
 	injected := agent.injected()
 	require.Len(t, injected, 2)
 	require.Equal(t, "stop writing Rust", injected[0].Prompt)
@@ -146,18 +149,130 @@ func TestDeliverByHandleRoutesAndToolAcceptsHandle(t *testing.T) {
 	require.Equal(t, handle.SessionID, injected[0].SessionID)
 
 	// Unknown handle refuses.
-	err := c.DeliverAgentMessageByHandle(t.Context(), "ghost", "hello")
+	err := c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "ghost", "hello")
 	require.ErrorContains(t, err, "no agent with handle @ghost")
 
 	// The model-facing tool addresses by handle as well, with the "@"
 	// tolerated.
-	resp := runTool(t, c.messageAgentTool(), MessageAgentToolName, MessageAgentParams{
+	resp := runToolAsSession(t, c.messageAgentTool(), MessageAgentToolName, MessageAgentParams{
 		Handle:  "@tester",
 		Message: "add tests please",
-	})
+	}, "dispatch-parent-session")
 	require.False(t, resp.IsError, "unexpected tool error: %s", resp.Content)
 	require.Contains(t, resp.Content, "@tester")
 	require.Len(t, agent.injected(), 3)
 
 	close(agent.gate)
+}
+
+// runToolAsSession is runTool over a caller-supplied session: the
+// message_agent tool scopes its delivery to the session it runs in
+// (#399), so tests must be able to pick it.
+func runToolAsSession(t *testing.T, tool fantasy.AgentTool, name string, params any, sessionID string) fantasy.ToolResponse {
+	t.Helper()
+	input, err := json.Marshal(params)
+	require.NoError(t, err)
+	ctx := context.WithValue(context.Background(), tools.SessionIDContextKey, sessionID)
+	resp, err := tool.Run(ctx, fantasy.ToolCall{
+		ID:    "dispatch-test-call-session",
+		Name:  name,
+		Input: string(input),
+	})
+	require.NoError(t, err)
+	return resp
+}
+
+// Dispatches are scoped to the session that created them (#399): another
+// session's model cannot address the agent by session ID or by handle,
+// the refusal learns nothing about the target, and a foreign session's
+// surfaces resolve nothing.
+func TestDeliverScopedToCallerSession(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, _ := newInjectionEnv(t, agent)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runUniqueDispatchToolCall(t, tool, DispatchAgentParams{
+		Prompt: "fix the bug",
+		Branch: "main",
+		Handle: "tester",
+	}, 8))
+	agent.waitRunning(t)
+
+	err := c.DeliverAgentMessage(t.Context(), AgentMessage{
+		SessionID:     handle.SessionID,
+		FromSessionID: "dispatch-other-session",
+		Text:          "hello from next door",
+	})
+	require.ErrorContains(t, err, "no running agent")
+	require.ErrorContains(t, err, "dispatch one first")
+
+	err = c.DeliverAgentMessageByHandle(t.Context(), "dispatch-other-session", "tester", "hello from next door")
+	require.ErrorContains(t, err, "no agent with handle @tester")
+
+	_, ok := c.DispatchByHandle("dispatch-other-session", "tester")
+	require.False(t, ok)
+	require.Empty(t, c.DispatchLive("dispatch-other-session"))
+
+	resp := runToolAsSession(t, c.messageAgentTool(), MessageAgentToolName, MessageAgentParams{
+		SessionID: handle.SessionID,
+		Message:   "from the wrong session",
+	}, "dispatch-other-session")
+	require.True(t, resp.IsError, "a foreign session's tool call must refuse")
+	require.Contains(t, resp.Content, "no running agent")
+
+	resp = runToolAsSession(t, c.messageAgentTool(), MessageAgentToolName, MessageAgentParams{
+		Handle:  "tester",
+		Message: "from the wrong session",
+	}, "dispatch-other-session")
+	require.True(t, resp.IsError, "a foreign session's handle tool call must refuse")
+
+	require.NoError(t, c.DeliverAgentMessage(t.Context(), AgentMessage{
+		SessionID:     handle.SessionID,
+		FromSessionID: "dispatch-parent-session",
+		Text:          "from the parent",
+	}))
+	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "tester", "from the parent too"))
+	require.Len(t, agent.injected(), 2)
+
+	close(agent.gate)
+}
+
+// The @-completion and handle-routing surfaces read the dispatch
+// registry without provisioning it (#370): a single @ keystroke must
+// not run git or create <workingDir>/.crush in a repo where the user
+// has never dispatched an agent.
+func TestHandleSurfacesDoNotProvisionWorkspace(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, env := newInjectionEnv(t, agent)
+
+	require.Nil(t, c.DispatchLive(""))
+	_, ok := c.DispatchByHandle("", "ghost")
+	require.False(t, ok)
+	err := c.DeliverAgentMessageByHandle(t.Context(), "", "ghost", "hello")
+	require.ErrorContains(t, err, "no agent with handle @ghost")
+
+	_, err = os.Stat(filepath.Join(env.workingDir, ".crush"))
+	require.True(t, os.IsNotExist(err), "a handle read must not create .crush")
+	c.dispatchMu.Lock()
+	ws, collector := c.dispatchWS, c.dispatchCollector
+	c.dispatchMu.Unlock()
+	require.Nil(t, ws)
+	require.Nil(t, collector)
+}
+
+// The same holds in a directory with no git repository at all: the
+// live/handle surfaces report empty, and delivery refuses with the
+// unknown-handle error, without provisioning anything (#370).
+func TestHandleSurfacesInNonGitDirectory(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	require.Nil(t, c.DispatchLive(""))
+	_, ok := c.DispatchByHandle("", "ghost")
+	require.False(t, ok)
+	err := c.DeliverAgentMessageByHandle(t.Context(), "", "ghost", "hello")
+	require.ErrorContains(t, err, "no agent with handle @ghost")
+
+	_, err = os.Stat(filepath.Join(env.workingDir, ".crush"))
+	require.True(t, os.IsNotExist(err), "a handle read must not create .crush")
 }

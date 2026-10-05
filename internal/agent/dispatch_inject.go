@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"charm.land/fantasy"
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 )
@@ -42,11 +43,16 @@ type MessageAgentParams struct {
 // the model's message_agent tool call, from the editor's leading @handle
 // routing (#313), and — when #71 swaps the transport — from an A2A
 // client's follow-up message to a running task. Only the front door
-// differs; the queue and this payload are shared.
+// differs; the queue and this payload are shared. FromSessionID is the
+// addressing caller's own session (#399): when it is set and does not
+// match the dispatch's parent session, delivery refuses, so one
+// session's model cannot steer another session's agent. It stays empty
+// for callers with no session behind them.
 type AgentMessage struct {
-	SessionID   string
-	Text        string
-	Attachments []message.Attachment
+	SessionID     string
+	FromSessionID string
+	Text          string
+	Attachments   []message.Attachment
 }
 
 // injectableAgent is the slice of SessionAgent the injection queue
@@ -114,6 +120,16 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 	workspace := c.dispatchWS
 	c.dispatchMu.Unlock()
 
+	// Scope to the caller's session (#399): a message carrying a
+	// FromSessionID that does not own this dispatch refuses exactly like
+	// an unknown one, so the caller learns nothing about the other
+	// session's agent.
+	if msg.FromSessionID != "" && workspace != nil {
+		if entry, ok := workspace.BySession(msg.SessionID); ok && entry.ParentSessionID != "" && entry.ParentSessionID != msg.FromSessionID {
+			return fmt.Errorf("no running agent for session %s in this session; dispatch one first", msg.SessionID)
+		}
+	}
+
 	if target == nil {
 		// Distinguish a finished dispatch from an unknown session so the
 		// refusal tells the caller which one happened. A non-terminal
@@ -167,11 +183,12 @@ func (c *coordinator) messageAgentTool() fantasy.AgentTool {
 			switch {
 			case params.SessionID != "":
 				err = c.DeliverAgentMessage(ctx, AgentMessage{
-					SessionID: params.SessionID,
-					Text:      params.Message,
+					SessionID:     params.SessionID,
+					FromSessionID: tools.GetSessionFromContext(ctx),
+					Text:          params.Message,
 				})
 			case params.Handle != "":
-				err = c.DeliverAgentMessageByHandle(ctx, dispatch.HandleSlug(params.Handle), params.Message)
+				err = c.DeliverAgentMessageByHandle(ctx, tools.GetSessionFromContext(ctx), dispatch.HandleSlug(params.Handle), params.Message)
 			default:
 				err = errors.New("session id or handle is required")
 			}

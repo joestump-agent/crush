@@ -58,6 +58,22 @@ func (s Status) IsTerminal() bool {
 // matter how they were left behind.
 const BranchPrefix = "crush-dispatch-"
 
+// MaxHandleLength caps a handle slug in bytes (#399), so a long role
+// can never balloon the @ completions or a prompt line. A suffix is
+// included in the cap: the base truncates so "-2" still fits.
+const MaxHandleLength = 32
+
+// ReservedHandles are the names a dispatch may never claim outright:
+// the built-in agent ids, plus "all". A request for one is suffixed
+// like a collision (#399): task, task-2.
+var ReservedHandles = map[string]bool{
+	"coder":  true,
+	"plan":   true,
+	"task":   true,
+	"worker": true,
+	"all":    true,
+}
+
 // Status is the lifecycle state of a dispatched workspace.
 type Status string
 
@@ -92,12 +108,16 @@ type Entry struct {
 	// other revision as given at provision time.
 	Base string
 	// BaseSHA is the commit Base resolved to when the workspace was
-	// provisioned. Diff falls back to it when the base branch no longer
-	// exists.
+	// provisioned. Diff always diffs against it.
 	BaseSHA string
 	// SessionID is the ephemeral session backing the dispatched agent
 	// (#48/#50); empty until the dispatch starts running.
 	SessionID string
+	// ParentSessionID is the session the dispatch was created from
+	// (#399): the scope handle and session-ID addressing are validated
+	// against, so only the dispatching session can address the agent.
+	// Empty until the dispatch tool records it.
+	ParentSessionID string
 	// Handle is the workspace's @handle for agent addressing (#313);
 	// empty until one is assigned by [Workspace.AssignHandle].
 	Handle string
@@ -138,11 +158,21 @@ type Workspace struct {
 	// worktreesDir is the directory provisioned workspaces are created
 	// under, <repoRoot>/.crush/worktrees.
 	worktreesDir string
+	// commonDir is the repository's git common dir, resolved in
+	// NewWorkspace. It keys the per-repo provision lock, so two
+	// Workspaces on the same repository serialize their worktree adds.
+	commonDir string
 
 	// events re-publishes every registry mutation as an entry event, so
 	// the todo collector (#65) and later sinks observe lifecycle
 	// transitions without the mutation call sites knowing about them.
 	events *pubsub.Broker[Entry]
+
+	// provisionHook, when set, runs just before the locked worktree add
+	// with the branch and path about to be created. Tests use it to
+	// force a deterministic failure, such as a pre-created non-empty
+	// target directory.
+	provisionHook func(branch, path string)
 
 	// instanceID identifies this Workspace instance in the owner
 	// markers it writes, so humans can tell concurrent processes apart.
@@ -167,6 +197,21 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 		return nil, fmt.Errorf("%s is not a git repository: %w", repoRoot, err)
 	}
 
+	// The provision lock key: the git common dir, so every checkout of
+	// the same repository — this one or a worktree — shares a lock.
+	common, err := gitOutput(context.Background(), root, nil, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return nil, fmt.Errorf("resolve git common dir: %w", err)
+	}
+	commonDir := strings.TrimSpace(string(common))
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(root, commonDir)
+	}
+	commonDir, err = filepath.Abs(commonDir)
+	if err != nil {
+		return nil, err
+	}
+
 	dir := filepath.Join(root, ".crush", "worktrees")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create worktrees directory: %w", err)
@@ -181,11 +226,36 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 	return &Workspace{
 		repoRoot:     root,
 		worktreesDir: dir,
+		commonDir:    commonDir,
 		events:       pubsub.NewBroker[Entry](),
 		entries:      make(map[string]Entry),
 		instanceID:   uuid.New().String(),
 		leases:       make(map[string]func()),
 	}, nil
+}
+
+// provisionLocks serializes the worktree add step per repository:
+// git's .git/config lock makes concurrent worktree add calls fail
+// ("could not lock config file") even when they create disjoint
+// branches, so the add and its failure cleanup run one at a time per
+// repo. Keying by git's common dir means two Workspaces on the same
+// repository in one process serialize on the same lock.
+var (
+	provisionLocksMu sync.Mutex
+	provisionLocks   = make(map[string]*sync.Mutex)
+)
+
+// provisionLock returns the lock guarding worktree add for the repo
+// whose git common dir is key, creating it on first use.
+func provisionLock(key string) *sync.Mutex {
+	provisionLocksMu.Lock()
+	defer provisionLocksMu.Unlock()
+	lock, ok := provisionLocks[key]
+	if !ok {
+		lock = &sync.Mutex{}
+		provisionLocks[key] = lock
+	}
+	return lock
 }
 
 // ProvisionOptions configures Provision.
@@ -208,6 +278,11 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 			return Entry{}, err
 		}
 	}
+	// Defence in depth: a base starting with "-" would be read as a git
+	// option further down the line, so refuse it before git sees it.
+	if strings.HasPrefix(base, "-") {
+		return Entry{}, fmt.Errorf("invalid base %q: must not start with \"-\"", base)
+	}
 	baseSHA, err := revisionSHA(ctx, w.repoRoot, base)
 	if err != nil {
 		return Entry{}, fmt.Errorf("resolve base %q: %w", base, err)
@@ -217,9 +292,22 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 	branch := BranchPrefix + id
 	path := filepath.Join(w.worktreesDir, branch)
 
-	if err := runGit(ctx, w.repoRoot, nil, "worktree", "add", "-b", branch, path, base); err != nil {
+	// The add and its failure cleanup run one at a time per
+	// repository, but nothing else in the provision is locked.
+	addLock := provisionLock(w.commonDir)
+	addLock.Lock()
+	if w.provisionHook != nil {
+		w.provisionHook(branch, path)
+	}
+	// The resolved SHA is what worktree add gets, never the raw base
+	// string, and "--" ends option parsing before the positionals.
+	err = runGit(ctx, w.repoRoot, nil, "worktree", "add", "--no-track", "-b", branch, "--", path, baseSHA)
+	if err != nil {
+		w.cleanupFailedProvision(ctx, branch, path)
+		addLock.Unlock()
 		return Entry{}, fmt.Errorf("create worktree: %w", err)
 	}
+	addLock.Unlock()
 
 	// The lease and marker live next to the worktree, never inside it,
 	// because Diff stages the whole workspace with git add -A.
@@ -248,6 +336,27 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 	w.leases[id] = release
 	w.mu.Unlock()
 	return entry, nil
+}
+
+// cleanupFailedProvision removes what a failed worktree add may have
+// left behind: the branch -b can create before the add fails, a
+// partially created directory, and stale worktree admin entries. It
+// runs under the repository's provision lock, and its own failures are
+// ignored: the caller returns the original error either way. The
+// directory is removed before the branch, and prune runs before
+// branch -D: while a worktree admin entry remains, git still regards
+// the branch as checked out and refuses to delete it.
+func (w *Workspace) cleanupFailedProvision(ctx context.Context, branch, path string) {
+	// False positive: branch is generated here from a UUID, so path
+	// always stays inside worktreesDir and RemoveAll cannot escape the
+	// worktrees directory; the repo root is the directory the client
+	// asked the server to open.
+	// codeql[go/path-injection]
+	_ = os.RemoveAll(path)
+	_ = runGit(ctx, w.repoRoot, nil, "worktree", "prune")
+	if _, err := gitOutput(ctx, w.repoRoot, nil, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
+		_ = runGit(ctx, w.repoRoot, nil, "branch", "-D", branch)
+	}
 }
 
 // leasePath is the flock file guarding branch's workspace. It lives
@@ -310,17 +419,33 @@ func (w *Workspace) Get(id string) (Entry, bool) {
 	return e.clone(), ok
 }
 
-// ByHandle returns the entry currently carrying handle, if any.
+// ByHandle returns the entry currently carrying handle, if any. A
+// non-terminal entry always wins: handles live as long as their run
+// (#399). When no live entry carries the handle, the most recently
+// finished one answers (max FinishedAt), so a mention of a finished
+// @handle still renders its read-only card until the handle is reused.
 func (w *Workspace) ByHandle(handle string) (Entry, bool) {
 	if handle == "" {
 		return Entry{}, false
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	var finished Entry
+	haveFinished := false
 	for _, e := range w.entries {
-		if e.Handle == handle {
+		if e.Handle != handle {
+			continue
+		}
+		if !e.Status.IsTerminal() {
 			return e.clone(), true
 		}
+		if !haveFinished || e.FinishedAt.After(finished.FinishedAt) {
+			finished = e
+			haveFinished = true
+		}
+	}
+	if haveFinished {
+		return finished.clone(), true
 	}
 	return Entry{}, false
 }
@@ -413,6 +538,13 @@ func (w *Workspace) SetSession(id, sessionID string) bool {
 	return w.Update(id, func(e *Entry) { e.SessionID = sessionID })
 }
 
+// SetParentSessionID records the session the dispatch was created from
+// (#399): the scope handle and session-ID addressing are validated
+// against, so another session cannot address this dispatch.
+func (w *Workspace) SetParentSessionID(id, parentSessionID string) bool {
+	return w.Update(id, func(e *Entry) { e.ParentSessionID = parentSessionID })
+}
+
 // SetHandle records the @handle the dispatched agent is addressable by.
 func (w *Workspace) SetHandle(id, handle string) bool {
 	return w.Update(id, func(e *Entry) { e.Handle = handle })
@@ -423,10 +555,12 @@ func (w *Workspace) SetHandle(id, handle string) bool {
 // leading "@" and any surrounding space are tolerated); role is the
 // one-line role label recorded alongside it. When requested is empty the
 // handle is derived from the role, and when that is empty too it falls
-// back to "agent". A handle that collides with one already claimed by
-// any registered dispatch — live or finished, since the registry is the
-// handle namespace until the entry is removed — is suffixed numerically:
-// tester, tester-2, tester-3. The assignment is atomic under the registry
+// back to "agent". A handle lives as long as its run (#399): a handle
+// that collides with one claimed by a non-terminal dispatch — or with a
+// name in [ReservedHandles] — is suffixed numerically: tester, tester-2,
+// tester-3. A finished dispatch's handle is free for reuse, and the
+// suffixing truncates the base so the result never exceeds
+// [MaxHandleLength]. The assignment is atomic under the registry
 // lock, so two concurrent dispatches asking for the same handle get
 // distinct suffixed ones, and it publishes the usual entry event so the
 // dispatch block and @ completions observe the handle immediately.
@@ -454,11 +588,17 @@ func (w *Workspace) AssignHandle(id, requested, role string) (string, bool) {
 }
 
 // uniqueHandle returns handle, or its first free numeric suffix, against
-// every handle claimed in entries. Callers must hold w.mu.
+// every handle claimed by a non-terminal entry and every reserved name
+// (#399): a finished dispatch releases its handle for reuse. Suffixing
+// truncates the base so the result fits MaxHandleLength. Callers must
+// hold w.mu.
 func uniqueHandle(entries map[string]Entry, handle string) string {
-	taken := make(map[string]bool, len(entries))
+	taken := make(map[string]bool, len(entries)+len(ReservedHandles))
+	for name := range ReservedHandles {
+		taken[name] = true
+	}
 	for _, e := range entries {
-		if e.Handle != "" {
+		if e.Handle != "" && !e.Status.IsTerminal() {
 			taken[e.Handle] = true
 		}
 	}
@@ -466,24 +606,39 @@ func uniqueHandle(entries map[string]Entry, handle string) string {
 		return handle
 	}
 	for n := 2; ; n++ {
-		candidate := fmt.Sprintf("%s-%d", handle, n)
+		candidate := suffixedHandle(handle, n)
 		if !taken[candidate] {
 			return candidate
 		}
 	}
 }
 
+// suffixedHandle appends -n to base, truncating the base (and any
+// trailing dash the truncation leaves) so the result fits
+// MaxHandleLength.
+func suffixedHandle(base string, n int) string {
+	suffix := fmt.Sprintf("-%d", n)
+	if len(base)+len(suffix) > MaxHandleLength {
+		base = strings.TrimRight(base[:MaxHandleLength-len(suffix)], "-")
+	}
+	return base + suffix
+}
+
 // HandleSlug normalizes a candidate handle or role into handle form:
-// lowercase, runs of non-alphanumerics collapsed to single dashes, and
-// no leading or trailing dash. "@Team Lead" becomes "team-lead"; a
-// candidate that slugs to nothing ("@__"), or an empty one, stays empty
-// so the caller can fall through to its next fallback.
+// lowercase, runs of non-alphanumerics collapsed to single dashes, no
+// leading or trailing dash, and capped at MaxHandleLength bytes (#399) —
+// a trailing dash the cap leaves is trimmed. "@Team Lead" becomes
+// "team-lead"; a candidate that slugs to nothing ("@__"), or an empty
+// one, stays empty so the caller can fall through to its next fallback.
 func HandleSlug(candidate string) string {
 	candidate = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(candidate), "@"))
 	candidate = strings.ToLower(candidate)
 	var b strings.Builder
 	dash := false
 	for _, r := range candidate {
+		if b.Len() >= MaxHandleLength {
+			break
+		}
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)
@@ -493,7 +648,7 @@ func HandleSlug(candidate string) string {
 			dash = true
 		}
 	}
-	return strings.Trim(b.String(), "-")
+	return strings.TrimRight(b.String(), "-")
 }
 
 // SetEndpoint records the A2A endpoint and AgentCard serving the
@@ -515,12 +670,16 @@ func (w *Workspace) Subscribe(ctx context.Context) <-chan pubsub.Event[Entry] {
 }
 
 // Diff returns the dispatched agent's work product as one unified diff:
-// base...HEAD plus the uncommitted state (staged, unstaged, and
-// untracked files), so committed work is never lost. The base is the
-// merge-base of the entry's Base and HEAD — falling back to the
-// recorded BaseSHA when the base branch no longer exists. Uncommitted
-// changes are staged into a throwaway temporary index, mirroring
-// a2a.GitDiff, so the workspace's real index is never touched.
+// the recorded base SHA...HEAD plus the uncommitted state (staged,
+// unstaged, and untracked files), so committed work is never lost. The
+// base is always entry.BaseSHA, the commit the dispatch branch was cut
+// from, resolved in the repository root at provision time. Never
+// re-resolve the base revision against the worktree: a "HEAD" or
+// "HEAD~1" base would resolve to the worktree's own tip and the
+// agent's commits would vanish from the diff (#380). An empty BaseSHA
+// is an error, not a fallback. Uncommitted changes are staged into a
+// throwaway temporary index, mirroring a2a.GitDiff, so the
+// workspace's real index is never touched.
 //
 // The contract is owned here and consumed twice: #66's DispatchResult
 // diff and the executor DiffFunc injected in #71.
@@ -532,10 +691,8 @@ func (w *Workspace) Diff(ctx context.Context, id string) (string, error) {
 	if _, err := os.Stat(entry.Path); err != nil {
 		return "", fmt.Errorf("workspace directory missing: %w", err)
 	}
-
-	base := entry.BaseSHA
-	if out, err := gitOutput(ctx, entry.Path, nil, "merge-base", entry.Base, "HEAD"); err == nil {
-		base = strings.TrimSpace(string(out))
+	if entry.BaseSHA == "" {
+		return "", fmt.Errorf("dispatch %q has no recorded base SHA", id)
 	}
 
 	tmp, err := os.CreateTemp("", "crush-dispatch-index-")
@@ -545,19 +702,31 @@ func (w *Workspace) Diff(ctx context.Context, id string) (string, error) {
 	tmp.Close()
 	defer os.Remove(tmp.Name())
 
-	env := append(os.Environ(), "GIT_INDEX_FILE="+tmp.Name())
+	// The temporary index is the only git variable this call adds;
+	// gitCmd scrubs the inherited ones so an outer GIT_DIR,
+	// GIT_INDEX_FILE or GIT_WORK_TREE cannot redirect the commands.
+	extraEnv := []string{"GIT_INDEX_FILE=" + tmp.Name()}
 
 	// Seed the temp index from HEAD, stage the whole workspace into it
 	// (respecting .gitignore so untracked files are included), and diff
 	// it against the base. Committed changes are in the index via HEAD;
 	// uncommitted changes via the add.
-	if err := runGit(ctx, entry.Path, env, "read-tree", "HEAD"); err != nil {
+	if err := runGit(ctx, entry.Path, extraEnv, "read-tree", "HEAD"); err != nil {
 		return "", fmt.Errorf("seed temp index: %w", err)
 	}
-	if err := runGit(ctx, entry.Path, env, "add", "-A"); err != nil {
+	if err := runGit(ctx, entry.Path, extraEnv, "add", "-A"); err != nil {
 		return "", fmt.Errorf("stage workspace: %w", err)
 	}
-	out, err := gitOutput(ctx, entry.Path, env, "diff", "--cached", base)
+	// The diff's output is parsed by SummarizeDiff, so pin the format on
+	// the command line: no external diff driver or textconv, no color,
+	// and the a/ b/ prefixes the parser expects.
+	out, err := gitOutput(ctx, entry.Path, extraEnv,
+		"-c", "color.ui=never",
+		"-c", "diff.noprefix=false",
+		"-c", "diff.mnemonicPrefix=false",
+		"diff", "--no-ext-diff", "--no-textconv", "--no-color",
+		"--src-prefix=a/", "--dst-prefix=b/",
+		"--cached", entry.BaseSHA)
 	if err != nil {
 		return "", fmt.Errorf("diff against base: %w", err)
 	}
@@ -586,7 +755,12 @@ func (w *Workspace) Remove(ctx context.Context, id string) error {
 // crashed run whose registry was lost). Orphans a live process still
 // holds — another Workspace on the same repository — and orphans with
 // no lease file at all, whose ownership cannot be proven, are left
-// alone (#369 is the explicit cleanup tool for those).
+// alone (#369 is the explicit cleanup tool for those). It is the
+// session-end backstop: nothing dispatch created survives it, and no
+// dangling branches or .crush/worktrees/ entries are left behind. One
+// stubborn workspace does not stop the sweep: every entry and every
+// orphan is attempted, the errors are joined and returned, and a failed
+// entry stays registered so a later sweep or Remove can retry it.
 func (w *Workspace) Sweep(ctx context.Context) error {
 	w.mu.Lock()
 	type sweepEntry struct {
@@ -601,56 +775,82 @@ func (w *Workspace) Sweep(ctx context.Context) error {
 	w.entries = make(map[string]Entry)
 	w.mu.Unlock()
 
+	var errs []error
 	for _, item := range items {
 		if err := w.removeEntry(ctx, item.entry, item.release); err != nil {
-			return err
+			errs = append(errs, err)
+			// The removal failed, so the entry and its lease stay
+			// registered for a later sweep or Remove to retry.
+			w.mu.Lock()
+			w.entries[item.entry.ID] = item.entry
+			if item.release != nil {
+				w.leases[item.entry.ID] = item.release
+			}
+			w.mu.Unlock()
 		}
 	}
 
-	// Orphaned directories: registered names are gone by now, so
-	// anything left under the worktrees dir with our prefix belongs to a
-	// run whose registry entry was lost. The directory name is the
+	// Orphaned directories: registered names — including entries this
+	// sweep just failed, whose removal a later sweep or Remove will
+	// retry — are not ours to take, so anything left under the
+	// worktrees dir with our prefix and an unregistered branch belongs
+	// to a run whose registry entry was lost. The directory name is the
 	// branch name, so the branch is recoverable from it.
+	w.mu.Lock()
+	registered := make(map[string]struct{}, len(w.entries))
+	for _, e := range w.entries {
+		registered[e.Branch] = struct{}{}
+	}
+	w.mu.Unlock()
+
 	dirs, err := os.ReadDir(w.worktreesDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+		if !os.IsNotExist(err) {
+			errs = append(errs, err)
 		}
-		return err
-	}
-	for _, d := range dirs {
-		if !d.IsDir() || !strings.HasPrefix(d.Name(), BranchPrefix) {
-			continue
-		}
-		lockPath := w.leasePath(d.Name())
-		if _, err := os.Stat(lockPath); err != nil {
-			if os.IsNotExist(err) {
-				// Without a lease file ownership cannot be proven,
-				// so the directory is not ours to take.
-				slog.Debug("Skipping dispatch worktree without a lease file", "path", filepath.Join(w.worktreesDir, d.Name()))
+	} else {
+		for _, d := range dirs {
+			if !d.IsDir() || !strings.HasPrefix(d.Name(), BranchPrefix) {
 				continue
 			}
-			return err
-		}
-		release, err := lock.TryFile(lockPath)
-		if err != nil {
-			if errors.Is(err, lock.ErrContended) {
-				// A live process — another Workspace on this
-				// repository — still owns this workspace.
-				slog.Debug("Skipping dispatch worktree with a held lease", "path", filepath.Join(w.worktreesDir, d.Name()))
+			if _, ok := registered[d.Name()]; ok {
 				continue
 			}
-			return err
-		}
-		entry := Entry{
-			Path:   filepath.Join(w.worktreesDir, d.Name()),
-			Branch: d.Name(),
-		}
-		if err := w.removeEntry(ctx, entry, release); err != nil {
-			return err
+			lockPath := w.leasePath(d.Name())
+			if _, err := os.Stat(lockPath); err != nil {
+				if os.IsNotExist(err) {
+					// Without a lease file ownership cannot be proven,
+					// so the directory is not ours to take.
+					slog.Debug("Skipping dispatch worktree without a lease file", "path", filepath.Join(w.worktreesDir, d.Name()))
+					continue
+				}
+				errs = append(errs, err)
+				continue
+			}
+			release, err := lock.TryFile(lockPath)
+			if err != nil {
+				if errors.Is(err, lock.ErrContended) {
+					// A live process — another Workspace on this
+					// repository — still owns this workspace.
+					slog.Debug("Skipping dispatch worktree with a held lease", "path", filepath.Join(w.worktreesDir, d.Name()))
+					continue
+				}
+				errs = append(errs, err)
+				continue
+			}
+			entry := Entry{
+				Path:   filepath.Join(w.worktreesDir, d.Name()),
+				Branch: d.Name(),
+			}
+			if err := w.removeEntry(ctx, entry, release); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
-	return runGit(ctx, w.repoRoot, nil, "worktree", "prune")
+	if err := runGit(ctx, w.repoRoot, nil, "worktree", "prune"); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // removeEntry tears down one workspace on disk: the worktree (forced if
@@ -662,24 +862,36 @@ func (w *Workspace) Sweep(ctx context.Context) error {
 // ownership artifacts — and the lease is released last, after
 // everything else is gone.
 func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) error {
+	// Errors are prefixed with the entry so a joined sweep error says
+	// what failed. Orphan entries carry no ID; their branch is the name.
+	label := entry.ID
+	if label == "" {
+		label = entry.Branch
+	}
 	if entry.Path != "" {
 		if err := runGit(ctx, w.repoRoot, nil, "worktree", "remove", entry.Path); err != nil {
 			// A dirty workspace still removes with --force; a missing
 			// one is already gone and prune cleans the admin entry.
 			if err := runGit(ctx, w.repoRoot, nil, "worktree", "remove", "--force", entry.Path); err != nil {
 				if err := runGit(ctx, w.repoRoot, nil, "worktree", "prune"); err != nil {
-					return fmt.Errorf("remove worktree %s: %w", entry.Path, err)
+					return fmt.Errorf("dispatch %s: remove worktree %s: %w", label, entry.Path, err)
 				}
 			}
 		}
 	}
 	if entry.Branch != "" {
 		// -D because a dispatched branch may be unmerged — that is the
-		// point of an explicit review step — and a missing branch is
-		// already gone.
-		if err := runGit(ctx, w.repoRoot, nil, "branch", "-D", entry.Branch); err != nil {
-			if !isBranchMissing(err) {
-				return fmt.Errorf("delete branch %s: %w", entry.Branch, err)
+		// point of an explicit review step. Existence is checked by exit
+		// code, not by git's message text, so a deleted branch is
+		// tolerated under any locale.
+		if hasBranch(ctx, w.repoRoot, entry.Branch) {
+			if err := runGit(ctx, w.repoRoot, nil, "branch", "-D", entry.Branch); err != nil {
+				// A concurrent Remove may have deleted the branch
+				// between the existence check and -D; gone is gone, so
+				// only an error on a branch still there is real.
+				if hasBranch(ctx, w.repoRoot, entry.Branch) {
+					return fmt.Errorf("dispatch %s: delete branch %s: %w", label, entry.Branch, err)
+				}
 			}
 		}
 	}
@@ -690,10 +902,11 @@ func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) 
 	return nil
 }
 
-// isBranchMissing reports whether a git branch error is just "no such
-// branch", which cleanup treats as success.
-func isBranchMissing(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "not found")
+// hasBranch reports whether the repository has the local branch, decided
+// by git's exit code so the check never reads localized message text.
+func hasBranch(ctx context.Context, dir, branch string) bool {
+	cmd := gitCmd(ctx, dir, nil, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	return cmd.Run() == nil
 }
 
 // currentRevision returns the repository's current branch name, or HEAD
@@ -710,31 +923,59 @@ func currentRevision(ctx context.Context, repoRoot string) (string, error) {
 	return rev, nil
 }
 
-// revisionSHA resolves a revision to its commit SHA.
+// revisionSHA resolves a revision to its commit SHA. --end-of-options
+// stops a rev that starts with "-" from being parsed as an option, and
+// every failure, including empty output, is an unknown-revision error.
 func revisionSHA(ctx context.Context, repoRoot, rev string) (string, error) {
-	out, err := gitOutput(ctx, repoRoot, nil, "rev-parse", rev+"^{commit}")
-	if err != nil {
-		return "", err
+	out, err := gitOutput(ctx, repoRoot, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", rev+"^{commit}")
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return "", fmt.Errorf("unknown revision %q", rev)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
-// gitOutput runs git in dir with env and returns stdout.
-func gitOutput(ctx context.Context, dir string, env []string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	cmd.Env = env
-	return cmd.Output()
-}
-
-// runGit runs git in dir with env, attaching stderr to the error.
-func runGit(ctx context.Context, dir string, env []string, args ...string) error {
+// gitCmd builds a git command that runs hermetically. It starts from
+// the current environment and strips the git variables that leak in
+// from a surrounding shell or hook: GIT_DIR, GIT_WORK_TREE,
+// GIT_INDEX_FILE, GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY,
+// GIT_ALTERNATE_OBJECT_DIRECTORIES and GIT_PREFIX. With them gone the
+// command can only act on the repository rooted at dir. LC_ALL is
+// pinned to C for stable, locale-independent output, and extraEnv is
+// appended on top so callers can still override, for example a
+// temporary GIT_INDEX_FILE.
+func gitCmd(ctx context.Context, dir string, extraEnv []string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	env := make([]string, 0, len(os.Environ())+1+len(extraEnv))
+	for _, kv := range os.Environ() {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		switch key {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+			"GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+			"GIT_PREFIX":
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "LC_ALL=C")
+	env = append(env, extraEnv...)
 	cmd.Env = env
-	out, err := cmd.CombinedOutput()
+	return cmd
+}
+
+// gitOutput runs git in dir with extraEnv and returns stdout.
+func gitOutput(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
+	return gitCmd(ctx, dir, extraEnv, args...).Output()
+}
+
+// runGit runs git in dir with extraEnv, attaching stderr to the error.
+func runGit(ctx context.Context, dir string, extraEnv []string, args ...string) error {
+	out, err := gitCmd(ctx, dir, extraEnv, args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}

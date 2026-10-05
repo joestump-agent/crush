@@ -159,7 +159,7 @@ func (m *UI) agentMentionAttachments(prompt string) []message.Attachment {
 		if seen[slug] {
 			continue
 		}
-		snap, ok := m.com.Workspace.DispatchByHandle(slug)
+		snap, ok := m.com.Workspace.DispatchByHandle(m.currentSessionID(), slug)
 		if !ok {
 			// Not a dispatch: a file mention, a typo, or prose. The
 			// normal prompt path handles @file tokens.
@@ -188,7 +188,7 @@ func (m *UI) routeLeadingAgentHandle(prompt string) (cmd tea.Cmd, handled bool) 
 	if rest == "" {
 		return util.ReportWarn("Nothing to send @handle — write the message after the handle, e.g. \"@" + handle + " stop writing Rust\"."), true
 	}
-	snap, found := m.com.Workspace.DispatchByHandle(handle)
+	snap, found := m.com.Workspace.DispatchByHandle(m.currentSessionID(), handle)
 	if !found {
 		// Not a dispatch handle: most likely a file mention or a typo.
 		// The normal prompt path owns it.
@@ -197,7 +197,7 @@ func (m *UI) routeLeadingAgentHandle(prompt string) (cmd tea.Cmd, handled bool) 
 	if snap.Entry.Status.IsTerminal() {
 		return util.ReportError(fmt.Errorf("agent @%s finished (%s); task sessions are never continuable — dispatch a new agent instead", handle, snap.Entry.Status)), true
 	}
-	if err := m.com.Workspace.DeliverAgentMessageByHandle(context.Background(), handle, rest); err != nil {
+	if err := m.com.Workspace.DeliverAgentMessageByHandle(context.Background(), m.currentSessionID(), handle, rest); err != nil {
 		return util.ReportError(err), true
 	}
 	// The steer and the agent's response appear on its dispatch block in
@@ -210,7 +210,7 @@ func (m *UI) routeLeadingAgentHandle(prompt string) (cmd tea.Cmd, handled bool) 
 // completions (#313): handle, and a "role · status · current todo" detail
 // with a status dot. Live agents only — finished handles never appear.
 func (m *UI) agentCompletionValues() []completions.AgentCompletionValue {
-	live := m.com.Workspace.DispatchLive()
+	live := m.com.Workspace.DispatchLive(m.currentSessionID())
 	if len(live) == 0 {
 		return nil
 	}

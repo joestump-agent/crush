@@ -186,6 +186,24 @@ func TestDispatchAgentToolUnknownSkill(t *testing.T) {
 	require.Empty(t, ws.List())
 }
 
+// A model-supplied branch that git would read as an option is a tool
+// error: no running handle, no provisioned workspace.
+func TestDispatchAgentToolRejectsOptionLikeBranch(t *testing.T) {
+	agent := &dispatchTestAgent{model: dispatchTestModel()}
+	c, _ := newDispatchToolEnv(t, agent)
+	tool := c.dispatchTool()
+
+	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work", Branch: "--lock"})
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "provision dispatch workspace")
+
+	// The rejected branch never became a dispatch.
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	require.Empty(t, ws.List())
+	require.Empty(t, agent.calls)
+}
+
 // The happy path: the tool provisions a workspace, bootstraps the
 // toolchain, registers the ephemeral session, and returns a running
 // handle immediately; the background run then flips the registry entry to
@@ -356,7 +374,11 @@ func TestSweepDispatchOnCoordinatorEnd(t *testing.T) {
 		_, err := os.Stat(handle.WorkspacePath)
 		return os.IsNotExist(err)
 	}, 10*time.Second, 50*time.Millisecond)
-	require.Empty(t, ws.List())
+	// Sweep unregisters an entry only after its removal succeeds, so the
+	// registry can drain a few git invocations behind the directory.
+	require.Eventually(t, func() bool {
+		return len(ws.List()) == 0
+	}, 10*time.Second, 50*time.Millisecond)
 }
 
 // buildDispatchedAgent constructs a real dispatched agent offline: the
@@ -732,4 +754,46 @@ func TestDispatchProgressFlowsToSinksAndDispatchStatus(t *testing.T) {
 	// Unknown sessions report not-found, not a zero snapshot.
 	_, ok = c.DispatchStatus("no-such-session")
 	require.False(t, ok)
+}
+
+// With every write tool denied there is nothing a dispatch can do
+// (#376): the tool refuses before provisioning, so no crush-dispatch-*
+// branch or worktree directory is ever created.
+func TestDispatchAgentToolRefusedWhenAllWriteToolsDenied(t *testing.T) {
+	agent := &dispatchTestAgent{model: dispatchTestModel()}
+	c, env := newDispatchToolEnv(t, agent)
+	c.cfg.Config().Options.DisabledTools = []string{
+		tools.BashToolName,
+		tools.EditToolName,
+		tools.MultiEditToolName,
+		tools.WriteToolName,
+	}
+	c.cfg.Config().SetupAgents()
+	tool := c.dispatchTool()
+
+	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work"})
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "dispatch unavailable: bash/edit/write are disabled by your configuration")
+
+	// Nothing was provisioned: no crush-dispatch-* branches, no
+	// worktree directories, no registry entries — and the fake agent
+	// never ran.
+	branches, err := exec.CommandContext(t.Context(), "git", "-C", env.workingDir,
+		"for-each-ref", "--format=%(refname:short)", "refs/heads/crush-dispatch-*",
+	).Output()
+	require.NoError(t, err)
+	require.Empty(t, strings.TrimSpace(string(branches)))
+
+	worktrees := filepath.Join(env.workingDir, ".crush", "worktrees")
+	entries, err := os.ReadDir(worktrees)
+	if err == nil {
+		for _, entry := range entries {
+			require.NotContains(t, entry.Name(), dispatch.BranchPrefix, "a dispatch worktree was provisioned")
+		}
+	}
+
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	require.Empty(t, ws.List())
+	require.Empty(t, agent.calls)
 }

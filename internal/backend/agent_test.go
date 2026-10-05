@@ -233,14 +233,14 @@ func (c *blockingCoordinator) DeliverAgentMessage(ctx context.Context, msg agent
 	return errors.New("not implemented")
 }
 
-func (c *blockingCoordinator) DispatchLive() []dispatch.TodoSnapshot {
+func (c *blockingCoordinator) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	return nil
 }
 
-func (c *blockingCoordinator) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+func (c *blockingCoordinator) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (c *blockingCoordinator) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+func (c *blockingCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
 	return errors.New("not implemented")
 }
