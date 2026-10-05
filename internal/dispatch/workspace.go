@@ -1035,15 +1035,31 @@ func (w *Workspace) Release(ctx context.Context) error {
 		entry   Entry
 		release func()
 	}
-	var doomed []releaseEntry
+	candidates := make([]releaseEntry, 0, len(w.entries))
 	for id, e := range w.entries {
-		if w.entryDisposable(ctx, e) {
-			doomed = append(doomed, releaseEntry{e, w.leases[id]})
-			delete(w.entries, id)
-			delete(w.leases, id)
-		}
+		candidates = append(candidates, releaseEntry{e, w.leases[id]})
 	}
 	w.mu.Unlock()
+
+	// The disposability probe runs git commands, so it happens outside
+	// the registry lock, like every other git work here; the removal is
+	// then claimed under the lock, re-checking that the entry survived
+	// the probe.
+	var doomed []releaseEntry
+	for _, item := range candidates {
+		if !w.entryDisposable(ctx, item.entry) {
+			continue
+		}
+		w.mu.Lock()
+		if _, ok := w.entries[item.entry.ID]; !ok {
+			w.mu.Unlock()
+			continue
+		}
+		delete(w.entries, item.entry.ID)
+		delete(w.leases, item.entry.ID)
+		w.mu.Unlock()
+		doomed = append(doomed, item)
+	}
 
 	var errs []error
 	for _, item := range doomed {
