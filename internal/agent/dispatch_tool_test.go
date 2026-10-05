@@ -127,6 +127,68 @@ func decodeDispatchHandle(t *testing.T, resp fantasy.ToolResponse) dispatch.Disp
 	return handle
 }
 
+// A non-interactive coordinator (`crush run`) must not offer
+// dispatch_agent or message_agent: the process exits when the parent's
+// turn ends, so a dispatch started there would die with its result
+// undelivered (#387). The interactive coordinator keeps both with the
+// default config, and sub-agents keep the existing exclusion.
+func TestBuildToolsGatesDispatchOnInteractive(t *testing.T) {
+	tests := []struct {
+		name        string
+		interactive bool
+		subAgent    bool
+		want        map[string]bool
+	}{
+		{
+			name:        "interactive main agent keeps both",
+			interactive: true,
+			want:        map[string]bool{DispatchAgentToolName: true, MessageAgentToolName: true},
+		},
+		{
+			name:        "non-interactive main agent drops both",
+			interactive: false,
+			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false},
+		},
+		{
+			name:        "interactive sub-agent still drops both",
+			interactive: true,
+			subAgent:    true,
+			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newDispatchTestCoordinator(t, testEnv(t))
+			c.interactive = tt.interactive
+
+			const providerID = "test-provider"
+			c.cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+				ID:      providerID,
+				Name:    "Test",
+				Type:    openaicompat.Name,
+				BaseURL: "http://127.0.0.1:0/v1",
+				APIKey:  "test",
+				Models:  []catwalk.Model{{ID: "test-model", DefaultMaxTokens: 4096}},
+			})
+			selected := config.SelectedModel{Provider: providerID, Model: "test-model"}
+			c.cfg.OverridePreferredModel(config.SelectedModelTypeLarge, selected)
+			c.cfg.OverridePreferredModel(config.SelectedModelTypeSmall, selected)
+
+			agentCfg := c.cfg.Config().Agents[config.AgentCoder]
+			built, err := c.buildTools(t.Context(), agentCfg, tt.subAgent)
+			require.NoError(t, err)
+
+			names := make(map[string]bool, len(built))
+			for _, tool := range built {
+				names[tool.Info().Name] = true
+			}
+			for toolName, present := range tt.want {
+				require.Equal(t, present, names[toolName], "tool %q", toolName)
+			}
+		})
+	}
+}
+
 // mustWorktreesDir returns the worktrees directory the coordinator
 // provisions into — the repo-keyed path under the data directory (#383).
 func mustWorktreesDir(t *testing.T, c *coordinator) string {
