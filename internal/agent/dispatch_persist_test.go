@@ -134,7 +134,7 @@ func TestRunDispatchTerminalMetadataWaitsForLateToolResult(t *testing.T) {
 	// The run finishes before the parent's tool result is persisted:
 	// close the gate, wait for the terminal registry status, and only
 	// then write the tool result the parent turn would have written.
-	close(gated.gate)
+	gated.release()
 	require.Eventually(t, func() bool {
 		entry, ok := c.dispatchRegistry().Get(decodeDispatchID(t, handleJSON))
 		return ok && entry.Status == dispatch.StatusCompleted

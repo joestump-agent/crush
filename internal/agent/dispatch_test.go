@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,6 +54,42 @@ func newDispatchTestCoordinatorAt(t *testing.T, env fakeEnv, workingDir, dataDir
 		// test instead of leaking a Background subscription.
 		dispatchCtx: t.Context(),
 	}
+}
+
+// reapDispatchRuns installs the spawn seam (#422): every runDispatch the
+// coordinator starts is tracked in a WaitGroup, and a t.Cleanup releases
+// the given gates, then waits up to 10s for every run to finish. A run
+// that is still going then fails the test instead of deleting the
+// working directory out from under a concurrent test process. It is
+// registered after testEnv's cleanups, so it runs first (LIFO) and the
+// directory is still on disk while it waits. The WaitGroup lives in this
+// closure, never on the coordinator: Go 1.27 panics on a WaitGroup Add
+// racing a Wait (readiness.go, #298).
+func reapDispatchRuns(t *testing.T, c *coordinator, gates ...func()) {
+	t.Helper()
+	var wg sync.WaitGroup
+	c.spawnDispatch = func(f func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f()
+		}()
+	}
+	t.Cleanup(func() {
+		for _, release := range gates {
+			release()
+		}
+		finished := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(finished)
+		}()
+		select {
+		case <-finished:
+		case <-time.After(10 * time.Second):
+			t.Error("timed out waiting for a dispatched run to finish")
+		}
+	})
 }
 
 // provisionDispatchEntry provisions a workspace through the

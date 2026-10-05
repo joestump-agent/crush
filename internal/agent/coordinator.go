@@ -239,6 +239,11 @@ type coordinator struct {
 	dispatchProvider     *dispatch.GitWorktreeProvider
 	dispatchProviderErr  error
 	dispatchAgentBuilder func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error)
+	// spawnDispatch starts a dispatch's background run; nil means the
+	// production `go f()`. Tests install a WaitGroup-backed spawner so
+	// a test can never end while a runDispatch it started is still
+	// running (#422).
+	spawnDispatch func(func())
 	// pendingResults holds each parent session's dispatch results whose
 	// delivery turn has not succeeded yet (#388): a result arrives while
 	// the parent is busy, so it waits here — outside the prompt queue

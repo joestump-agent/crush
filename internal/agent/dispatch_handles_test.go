@@ -79,7 +79,7 @@ func TestDispatchToolAssignsHandles(t *testing.T) {
 	require.Equal(t, first.DispatchID, snap.Entry.ID)
 	require.Equal(t, "writes tests", snap.Entry.Role)
 
-	close(agent.gate)
+	agent.release()
 }
 
 // DispatchLive lists only non-terminal dispatches (#313): finished
@@ -104,7 +104,7 @@ func TestDispatchLiveExcludesFinished(t *testing.T) {
 
 	// Finish the first dispatch; its handle leaves the live set but still
 	// resolves by handle (finished dispatches keep their handle).
-	close(agent.gate)
+	agent.release()
 	require.Eventually(t, func() bool {
 		entry, ok := c.dispatchRegistry().Get(first.DispatchID)
 		return ok && entry.Status.IsTerminal()
@@ -165,7 +165,7 @@ func TestDeliverByHandleRoutesAndToolAcceptsHandle(t *testing.T) {
 	require.Contains(t, resp.Content, "@tester")
 	require.Len(t, agent.injected(), 3)
 
-	close(agent.gate)
+	agent.release()
 }
 
 // runToolAsSession is runTool over a caller-supplied session: the
@@ -237,7 +237,7 @@ func TestDeliverScopedToCallerSession(t *testing.T) {
 	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "tester", "from the parent too", nil))
 	require.Len(t, agent.injected(), 2)
 
-	close(agent.gate)
+	agent.release()
 }
 
 // The @-completion and handle-routing surfaces read the dispatch

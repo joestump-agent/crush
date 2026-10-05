@@ -90,7 +90,10 @@ func getModels(t *testing.T, r *vcr.Recorder, pair modelPair) (fantasy.LanguageM
 func setupAgent(t *testing.T, pair modelPair) (SessionAgent, fakeEnv) {
 	r := vcr.NewRecorder(t)
 	large, small := getModels(t, r, pair)
-	env := testEnv(t)
+	// The cassettes under testdata/TestCoderAgent/** record the fixed
+	// working directory in the request body, so only this call site
+	// keeps it (#422).
+	env := testEnvFixedDir(t)
 
 	createSimpleGoProject(t, env.workingDir)
 	agent, err := coderAgent(r, env, large, small)

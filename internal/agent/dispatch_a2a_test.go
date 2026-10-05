@@ -91,7 +91,7 @@ func TestDispatchStartsAndStopsA2AServer(t *testing.T) {
 
 	// The run finishes: the server stops and the entry stops advertising
 	// an endpoint — discovery must not hand out a dead one.
-	close(agent.gate)
+	agent.release()
 	require.Eventually(t, func() bool {
 		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status.IsTerminal() && entry.Endpoint == "" && entry.AgentCard == nil
@@ -133,7 +133,7 @@ func TestDispatchServerStartFailureIsNonFatal(t *testing.T) {
 	require.Empty(t, entry.Endpoint)
 	require.Nil(t, entry.AgentCard)
 
-	close(agent.gate)
+	agent.release()
 }
 
 // Without a wired starter (the default for direct-struct tests and any
@@ -150,7 +150,7 @@ func TestDispatchWithoutStarterRunsUnserved(t *testing.T) {
 	for _, entry := range c.dispatchRegistry().List() {
 		require.Empty(t, entry.Endpoint)
 	}
-	close(agent.gate)
+	agent.release()
 }
 
 // resolvedSkills loads every discovered skill when nothing was requested

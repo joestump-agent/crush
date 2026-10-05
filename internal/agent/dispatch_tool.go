@@ -499,7 +499,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				done:      make(chan struct{}),
 			}
 			c.registerLiveDispatch(entry.ID, live)
-			go c.runDispatch(rootCtx, run)
+			c.startDispatchRun(func() { c.runDispatch(rootCtx, run) })
 
 			handle := dispatch.DispatchResult{
 				DispatchID:    entry.ID,
@@ -580,6 +580,17 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 	})
 
 	return &dispatchedAgent{agent: agent, model: model, providerCfg: providerCfg}, nil
+}
+
+// startDispatchRun starts one dispatch's background run. Tests install
+// spawnDispatch to track every run they start, so none can be racing the
+// test's cleanup (#422); production starts the goroutine directly.
+func (c *coordinator) startDispatchRun(run func()) {
+	if c.spawnDispatch != nil {
+		c.spawnDispatch(run)
+		return
+	}
+	go run()
 }
 
 // runDispatch runs one dispatched agent to completion in the background

@@ -83,9 +83,10 @@ func (f *runnerTransport) StreamDispatch(ctx context.Context, _ DispatchTranspor
 type gatedServingTransport struct {
 	fakeServerStarter
 
-	gate    chan struct{}
-	outcome DispatchTransportOutcome
-	err     error
+	gate     chan struct{}
+	gateOnce sync.Once
+	outcome  DispatchTransportOutcome
+	err      error
 
 	// taskID, when set, is reported through the stream params' OnTask
 	// before the gate opens — the first-event stamp the coordinator
@@ -98,6 +99,12 @@ type gatedServingTransport struct {
 
 func newGatedServingTransport(outcome DispatchTransportOutcome) *gatedServingTransport {
 	return &gatedServingTransport{gate: make(chan struct{}), outcome: outcome}
+}
+
+// release opens the gate exactly once, idempotently, as
+// gatedDispatchAgent.release does (#422).
+func (f *gatedServingTransport) release() {
+	f.gateOnce.Do(func() { close(f.gate) })
 }
 
 func (f *gatedServingTransport) StreamDispatch(ctx context.Context, p DispatchTransportParams) (DispatchTransportOutcome, error) {
@@ -183,7 +190,7 @@ func TestDispatchRunsOverTransportSeam(t *testing.T) {
 	require.NoError(t, c.DeliverAgentMessage(t.Context(), AgentMessage{SessionID: handle.SessionID, Text: "stop writing Rust"}))
 	require.Len(t, agent.injected(), 1)
 
-	close(transport.gate)
+	transport.release()
 	// Wait for terminal AND the teardown's endpoint clear — the terminal
 	// status is stamped just before the run's defers tear the server
 	// down, so both are the run's completion signal here.
@@ -231,7 +238,7 @@ func TestDispatchStreamStampsRegistryTaskID(t *testing.T) {
 		return ok && e.TaskID == "task-123"
 	}, 10*time.Second, 20*time.Millisecond, "the task ID must stamp the entry mid-run")
 
-	close(transport.gate)
+	transport.release()
 	// Wait for terminal AND the teardown's endpoint clear — the status
 	// is stamped just before the run's defers tear the server down, so
 	// both together are the completion signal here.
@@ -258,7 +265,7 @@ func TestDispatchTransportStreamErrorFails(t *testing.T) {
 
 	decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
 	transport.waitStreamed(t)
-	close(transport.gate)
+	transport.release()
 
 	require.Eventually(t, func() bool {
 		entries := c.dispatchRegistry().List()
@@ -285,7 +292,7 @@ func TestDispatchTransportStreamErrorCancelsRun(t *testing.T) {
 
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
 	transport.waitStreamed(t)
-	close(transport.gate)
+	transport.release()
 
 	require.Eventually(t, func() bool {
 		entries := c.dispatchRegistry().List()
@@ -313,7 +320,7 @@ func TestServedButNotTransportedRunsDirectly(t *testing.T) {
 	agent.waitRunning(t)
 	require.True(t, agent.ranOnce(), "a served dispatch without a transport runs directly")
 
-	close(agent.gate)
+	agent.release()
 }
 
 // assembleFromTransport runs the transported outcome through the same
