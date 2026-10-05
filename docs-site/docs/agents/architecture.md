@@ -220,16 +220,20 @@ ignores kill reasons, loop detection and diff errors ([#343](https://github.com/
 
 The coordinator delivers `TerminalMessage()` to the parent session as a
 **hidden follow-up turn**. That message is a review instruction plus the
-result JSON. The turn goes through the normal run path, so it queues behind
-a busy parent. The payload stays out of the chat view, and the main
-agent's reply to it is the visible outcome. Delivery is dropped, with a
-log line, when the parent session no longer exists or there is no main
-agent. Crush never merges: the main agent, or you, reviews the branch.
+result JSON. The delivery waits in a pending set outside the prompt
+queue: a busy parent keeps it there while Esc, cancel, and queue clears
+leave it alone, and it runs on the next idle. Results that stack up
+while the parent is busy arrive in one turn, and a delivery that hits
+an error is re-pended and retried. The delivery strips the dispatch
+tool call's RunID, so `crush run` correlators are unaffected. The
+payload stays out of the chat view, and the main agent's reply to it is
+the visible outcome. Delivery is dropped, with a log line, when the
+parent session no longer exists or there is no main agent. Crush never
+merges: the main agent, or you, reviews the branch.
 
 :::warning[Known issue]
-A hidden result turn that is cleared from the queue, or that hits a
-provider error, is lost ([#388](https://github.com/joestump-agent/crush/issues/388)). In `crush run` the process exits before
-results arrive ([#387](https://github.com/joestump-agent/crush/issues/387)).
+In `crush run` the process exits before results arrive
+([#387](https://github.com/joestump-agent/crush/issues/387)).
 :::
 
 ### 7. Cleanup

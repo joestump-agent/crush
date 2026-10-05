@@ -27,6 +27,11 @@ var dispatchToolDescription string
 // DispatchAgentToolName is the registered name of the DispatchAgent tool.
 const DispatchAgentToolName = "dispatch_agent"
 
+// dispatchRetryBackoff paces the dispatch-delivery retry chain (#388):
+// every failed delivery attempt re-pends and re-arms the flush, so a
+// deterministic failure would otherwise loop back-to-back.
+const dispatchRetryBackoff = 2 * time.Second
+
 // DispatchAgentParams are the DispatchAgent tool's arguments.
 type DispatchAgentParams struct {
 	Prompt string `json:"prompt" description:"Self-contained task instructions for the dispatched agent"`
@@ -954,18 +959,20 @@ func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRu
 	return terminal
 }
 
-// deliverDispatchResult hands the terminal payload to the main agent
-// (#66). The tool call that started the dispatch returned its running
-// handle long ago, so the payload is delivered as a follow-up turn on
-// the parent session — hidden, so it reads as dispatch output rather
-// than a user message — through the same path a scheduled task fires
-// (fireScheduledTask): a normal run that respects the session's busy
-// queue. This is the in-process Phase 1 stand-in for #71's A2A terminal
-// status message; the payload shape is identical either way.
+// deliverDispatchResult records the terminal payload for delivery to
+// the main agent (#66) and triggers the flush. The result joins the
+// parent session's pending set (#388) rather than the prompt queue:
+// a delivery that lands while the parent is busy waits there — outside
+// the queue the user's Esc, Cancel, and ClearQueue tear through — and
+// is delivered on the next idle, so the parent always sees the
+// findings and the diff. This is the in-process Phase 1 stand-in for
+// #71's A2A terminal status message; the payload shape is identical
+// either way.
 //
-// Delivery is dropped, logged, when there is nothing to deliver into: a
-// parent session that no longer exists (deleted, or a `crush run`
-// process that already exited), or no runnable main agent.
+// The ctx is deliberately not carried into the delivery turn: it still
+// carries the dispatch tool call's RunID, which the delivery must not
+// echo (a queued delivery under that RunID suppresses or duplicates
+// the tool call's terminal RunComplete in `crush run`).
 func (c *coordinator) deliverDispatchResult(ctx context.Context, parentSessionID string, terminal dispatch.DispatchResult) {
 	// Shutdown starts no parent delivery turn (#372): the run above
 	// already recorded its terminal result and status, and a turn here
@@ -974,26 +981,111 @@ func (c *coordinator) deliverDispatchResult(ctx context.Context, parentSessionID
 		slog.Debug("Dispatch result delivery skipped: shutting down", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
 		return
 	}
-	if _, err := c.sessions.Get(ctx, parentSessionID); err != nil {
-		slog.Debug("Dispatch result dropped: parent session is gone", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
+	c.dispatchMu.Lock()
+	if c.pendingResults == nil {
+		c.pendingResults = make(map[string][]dispatch.DispatchResult)
+	}
+	c.pendingResults[parentSessionID] = append(c.pendingResults[parentSessionID], terminal)
+	c.dispatchMu.Unlock()
+	c.flushPendingResults(parentSessionID)
+}
+
+// flushPendingResults delivers every pending dispatch result for
+// parentSessionID in one hidden turn (#388). It is called when a result
+// lands in the pending set and every time a run on the parent session
+// ends; while the parent is busy it leaves the results pending, and a
+// parent session that no longer exists drops them, logged.
+//
+// The turn is attempted on a detached goroutine: the pending results
+// are handed to it up front, and only a run that returns a non-nil
+// result with no error counts as delivered — an error puts them back
+// into the pending set and re-arms the flush, while a nil result with
+// no error means the turn was queued behind a busy session, in which
+// case the queued (system-delivery) call now owns the delivery and
+// nothing is re-pended.
+func (c *coordinator) flushPendingResults(parentSessionID string) {
+	agent := c.currentAgent()
+	if agent == nil {
 		return
 	}
-	if c.currentAgent() == nil {
-		slog.Debug("Dispatch result dropped: no main agent", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
+	if c.shuttingDown.Load() {
+		// Shutdown is canceling everything (#372): a delivery turn
+		// must not start here either. The results stay pending, and
+		// the process exit disposes of them (#355 owns persistence).
+		return
+	}
+	if agent.IsSessionBusy(parentSessionID) {
+		// Busy: the next run end on this session re-arms the flush.
+		return
+	}
+	if _, err := c.sessions.Get(context.Background(), parentSessionID); err != nil {
+		c.dispatchMu.Lock()
+		pending := c.pendingResults[parentSessionID]
+		delete(c.pendingResults, parentSessionID)
+		c.dispatchMu.Unlock()
+		for _, terminal := range pending {
+			slog.Debug("Pending dispatch result dropped: parent session is gone", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
+		}
 		return
 	}
 
-	payload := terminal.TerminalMessage()
+	c.dispatchMu.Lock()
+	pending := c.pendingResults[parentSessionID]
+	delete(c.pendingResults, parentSessionID)
+	c.dispatchMu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+
+	// One turn for every result that stacked up while the parent was
+	// busy: each payload's terminal message in order.
+	var prompt strings.Builder
+	for _, terminal := range pending {
+		prompt.WriteString(terminal.TerminalMessage())
+		prompt.WriteString("\n\n")
+	}
+
 	go func() {
-		// Detached: the dispatch goroutine's context ends when this
-		// function returns, and the delivered turn must outlive it. The
-		// hidden marker keeps the injected prompt out of the chat UI —
-		// the agent block (#65) is the visible surface for dispatch
-		// state, and the parent's own reply to the payload is the
-		// visible outcome.
-		runCtx := message.WithHiddenUserMessage(context.WithoutCancel(ctx))
-		if _, err := c.run(runCtx, nil, parentSessionID, payload); err != nil {
-			slog.Error("Dispatch result delivery failed", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID, "error", err)
+		// Detached: the flush caller (a dispatch goroutine or a run-end
+		// hook) must not block on the delivery turn. WithoutCancel: the
+		// dispatch goroutine's context ends when deliverDispatchResult
+		// returns, and the delivered turn must outlive it. The hidden
+		// marker keeps the injected prompt out of the chat UI — the
+		// agent block (#65) is the visible surface for dispatch state —
+		// and WithRunID("") strips the tool call's RunID so the
+		// delivery's terminal event is never mistaken for the tool
+		// call's. The system-delivery marker keeps the queued call (if
+		// the parent turned busy in the window before Run) alive across
+		// queue clears.
+		runCtx := message.WithHiddenUserMessage(
+			WithRunID(WithSystemDelivery(context.WithoutCancel(context.Background())), ""),
+		)
+		result, err := c.run(runCtx, nil, parentSessionID, prompt.String())
+		switch {
+		case err == nil && result != nil:
+			// Delivered.
+		case err == nil && result == nil:
+			// The turn was queued behind a busy session; the queued
+			// system-delivery call owns the delivery now.
+		default:
+			slog.Error("Dispatch result delivery failed; pended for retry", "parent_session", parentSessionID, "error", err)
+			c.dispatchMu.Lock()
+			if c.pendingResults == nil {
+				c.pendingResults = make(map[string][]dispatch.DispatchResult)
+			}
+			c.pendingResults[parentSessionID] = append(c.pendingResults[parentSessionID], pending...)
+			c.dispatchMu.Unlock()
+			// The run-end hook that fires inside c.run raced this
+			// re-pend; arm the flush again so the retry is not lost
+			// until the next unrelated run end. A busy parent no-ops.
+			// The delay keeps a deterministic failure (a provider that
+			// is not configured, a model that will not resolve) from
+			// spinning the retry chain hot: every failed attempt
+			// re-pends and re-arms, so an instantly-failing run with no
+			// pause loops at full tilt, an Error line per turn.
+			time.AfterFunc(dispatchRetryBackoff, func() {
+				c.flushPendingResults(parentSessionID)
+			})
 		}
 	}()
 }
