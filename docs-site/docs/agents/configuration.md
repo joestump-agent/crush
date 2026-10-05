@@ -187,16 +187,15 @@ dispatch from repositories whose branches you trust. Tracked in [#374](https://g
 | Diff in the result | Per-file stat plus the diff, cut at 250 lines |
 | Nudges per run | 2 |
 | Tool-loop detection | More than 5 identical tool calls and results in the last 10 steps |
-| A2A server | One per dispatch, `127.0.0.1` on a random port, JSON-RPC, no authentication |
+| A2A server | One host per process on a unix socket, `<data dir>/a2a/<pid>.sock` (socket `0600`, directory `0700`), JSON-RPC, no authentication ([#346](https://github.com/joestump-agent/crush/issues/346)) |
 | A2A client timeout | 3 minutes total, the SDK default ([#344](https://github.com/joestump-agent/crush/issues/344)) |
 | A2A server shutdown | 5 seconds |
 | Cleanup when Crush exits | A sweep that force-removes every `crush-dispatch-*` worktree and branch, with a 30-second timeout. Whether it finishes depends on how Crush exits; see [troubleshooting](/agents/troubleshooting) |
 | Inspect keys | <kbd>ctrl+]</kbd> and <kbd>ctrl+[</kbd> |
 
 :::info[Planned]
-- One A2A host per Crush process, on a unix socket with `0600` permissions
-  instead of a TCP port per dispatch ([#346](https://github.com/joestump-agent/crush/issues/346)). A TCP listener with TLS
-  becomes opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)).
+- A TCP listener with TLS becomes opt-in ([#358](https://github.com/joestump-agent/crush/issues/358));
+  authentication arrives with `securitySchemes` ([#357](https://github.com/joestump-agent/crush/issues/357)).
 - Worktrees are preserved until you apply or dismiss them explicitly
   ([#368](https://github.com/joestump-agent/crush/issues/368)), and are never discarded at exit ([#367](https://github.com/joestump-agent/crush/issues/367)).
 :::

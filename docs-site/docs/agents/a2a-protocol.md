@@ -31,7 +31,7 @@ Crush's own coordinator.
 | SDK | [`github.com/a2aproject/a2a-go/v2`](https://github.com/a2aproject/a2a-go) v2.5.0 |
 | Protocol version | `1.0`, stamped on the card's interface |
 | Binding | JSON-RPC 2.0 over HTTP; streaming responses are Server-Sent Events |
-| Listener | `127.0.0.1`, ephemeral port, one server per dispatch |
+| Listener | One host per process on a unix socket: `<data dir>/a2a/<pid>.sock`, socket mode `0600` in a `0700` directory |
 | Lifetime | From just after provisioning until the run returns; 5-second graceful shutdown |
 | Discovery | In memory: endpoint and card are stamped on the dispatch registry entry |
 | Task store | The SDK's in-memory store, one per server |
@@ -43,8 +43,9 @@ calls `SendStreamingMessage` `message/stream`, and `CancelTask`
 
 ## Agent Card
 
-`GET /.well-known/agent-card.json` returns the card. Crush builds it from
-the dispatch:
+The coordinator builds the card from the dispatch and stamps it on the
+registry entry; discovery is in-memory and the card is not served over
+the wire:
 
 ```json
 {
@@ -53,7 +54,7 @@ the dispatch:
   "version": "devel",
   "supportedInterfaces": [
     {
-      "url": "http://127.0.0.1:53817",
+      "url": "http://crush-a2a/agents/dispatch-1",
       "protocolBinding": "JSONRPC",
       "protocolVersion": "1.0"
     }
@@ -77,7 +78,7 @@ the dispatch:
 | `name` | The dispatch's assigned `@handle`, without the `@`. |
 | `description` | The dispatch's `role`, which may be empty. |
 | `version` | The Crush build version. |
-| `supportedInterfaces[0]` | The bound endpoint, JSON-RPC binding, protocol `1.0`. Always exactly one. |
+| `supportedInterfaces[0]` | The routed endpoint, `http://crush-a2a/agents/<dispatch id>`, JSON-RPC binding, protocol `1.0`. Always exactly one. |
 | `capabilities` | `streaming: true` only. No push notifications, no extended card, no `extensions`. |
 | `defaultInputModes`, `defaultOutputModes` | `text/plain` both ways. |
 | `skills` | One entry per Crush skill the dispatch was given: every discovered skill when the dispatch named none. `id` and `name` are the skill name, and every entry carries the single tag `crush-skill`. |
@@ -88,12 +89,19 @@ registry entry.
 
 ## Endpoints
 
+Every dispatch answers on the process-wide host under its own path. The
+URL's host label, `crush-a2a`, never leaves the process: the client's
+dialer maps it onto the unix socket.
+
 | Request | Path | Behaviour |
 | --- | --- | --- |
-| `GET`, `OPTIONS` | `/.well-known/agent-card.json` | Serves the card. CORS headers reflect any `Origin`, with `Access-Control-Allow-Credentials: true`. |
-| `POST` | `/` | JSON-RPC 2.0. `SendStreamingMessage` and `SubscribeToTask` answer as an SSE stream; every other method answers with one JSON response. |
+| `POST` | `/agents/<dispatch id>` | JSON-RPC 2.0. `SendStreamingMessage` and `SubscribeToTask` answer as an SSE stream; every other method answers with one JSON response. |
+| anything else | any | `404`. The well-known card path is not served; discovery is in-memory. |
 
-The JSON-RPC handler does not check `Content-Type`, `Host` or `Origin`.
+Middleware in front of the route table rejects a request before any
+dispatch work runs: `403` when an `Origin` header is present, `415`
+unless `Content-Type` parses to `application/json`, and `400` unless the
+`Host` is `crush-a2a`.
 
 ## Methods
 
@@ -247,23 +255,26 @@ panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/cru
 
 ## Security model
 
-:::danger[Unauthenticated listener]
-Each dispatch's server listens on `127.0.0.1` with no authentication.
+:::warning[Unauthenticated by design, reach-restricted today]
+The served surface carries no authentication yet
+([#357](https://github.com/joestump-agent/crush/issues/357)). The reach
+restriction is the socket, not a credential:
 
-- **Who can reach it.** Any process on the machine can connect, including
-  other local users on a shared host. The port is not shown in the UI,
-  but that is obscurity, not protection.
-- **Browsers.** The JSON-RPC handler does not check `Content-Type`, `Host`
-  or `Origin`. A web page that finds the port can therefore send a
-  CORS-simple `POST` that runs without a preflight.
-- **What a caller can do.** `SendMessage` runs a prompt on a write-capable
-  agent with the dispatch's permission policy. With yolo on, that includes
-  unprompted `bash`. `CancelTask` stops the agent, and `GetTask` reads
-  results.
+- **Who can reach it.** Only processes running as the same OS user: the
+  socket is `0600` inside a `0700` directory under the data directory
+  (a per-user temp dir when the path would overflow the socket length
+  limit). Other local users cannot connect, and the socket never
+  listens on TCP.
+- **Browsers.** The host rejects cross-origin requests (`403`), non-JSON
+  bodies including the CORS-simple `text/plain` POST (`415`), and a
+  `Host` other than the internal `crush-a2a` label (`400`), so a web
+  page cannot fold a prompt into a running dispatch.
+- **What a caller can do.** A same-user process can still `SendMessage`
+  a write-capable agent with the dispatch's permission policy; with yolo
+  on, that includes unprompted `bash`. Auth lands with
+  [#357](https://github.com/joestump-agent/crush/issues/357).
 
-Until the per-process 0600 unix socket lands ([#346](https://github.com/joestump-agent/crush/issues/346)), avoid dispatching
-on shared machines. To turn dispatch off, run
-`permissions deny dispatch_agent`.
+To turn dispatch off, run `permissions deny dispatch_agent`.
 :::
 
 ## Planned protocol surface
@@ -276,7 +287,6 @@ and stage 3 comes after. The reasoning is in
 
 | Ticket | Change | Stage |
 | --- | --- | --- |
-| [#346](https://github.com/joestump-agent/crush/issues/346) | One A2A host per process on a 0600 unix socket; no TCP listener, JSON-only requests, no CORS reflection. | 1 |
 | [#347](https://github.com/joestump-agent/crush/issues/347) | Delete the direct-run fallback; a server start failure fails the dispatch. | 2 |
 | [#350](https://github.com/joestump-agent/crush/issues/350) | `contextId` maps to the Crush session, `taskId` to one run. | 2 |
 | [#351](https://github.com/joestump-agent/crush/issues/351) | Steering is an A2A message on the running context, completed once consumed. | 2 |
