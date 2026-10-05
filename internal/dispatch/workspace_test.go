@@ -556,6 +556,7 @@ func TestWorkspaceProvisionRejectsBadBases(t *testing.T) {
 
 	ws, err := NewWorkspace(repo)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
 	worktreesBefore := gitIn(t, repo, "worktree", "list", "--porcelain")
 	branchesBefore := gitIn(t, repo, "branch", "--list", BranchPrefix+"*")
@@ -806,6 +807,7 @@ func TestByHandlePrefersLiveEntry(t *testing.T) {
 	repo := newTestRepo(t)
 	ws, err := NewWorkspace(repo)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 	ctx := t.Context()
 
 	a, err := ws.Provision(ctx, ProvisionOptions{})
@@ -908,6 +910,7 @@ func TestProvisionConcurrent(t *testing.T) {
 
 	ws, err := NewWorkspace(repo)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
 	const n = 12
 	errs := make([]error, n)
@@ -946,6 +949,7 @@ func TestProvisionFailureCleansUp(t *testing.T) {
 
 	ws, err := NewWorkspace(repo)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
 	var failedBranch string
 	// A non-empty target directory makes worktree add fail after the
