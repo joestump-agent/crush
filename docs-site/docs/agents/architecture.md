@@ -97,10 +97,12 @@ model.
    current branch, else `HEAD`. Uncommitted changes in your checkout are
    not included. The base and its resolved SHA are recorded on the
    registry entry.
-2. **Toolchain.** It loads a config scoped to the worktree and builds the
-   tools against the worktree path: the task agent's read-only set plus
-   `bash`, `edit`, `multiedit`, `write` and `todos`. It also builds a scoped
-   LSP manager and a scoped permission service bridged to the parent's.
+2. **Toolchain.** It reuses the parent's config viewed from the worktree
+   path and builds the tools against it: the task agent's read-only set plus
+   `bash`, `edit`, `multiedit`, `write` and `todos`. Nothing the base
+   revision's config files declare is read or executed. It also builds a
+   scoped LSP manager and a scoped permission service bridged to the
+   parent's.
 3. **Agent.** It renders the system prompt from `dispatch.md.tpl` and
    builds a `SessionAgent` on the chosen model, using the global
    `todo_enforcement` settings.
@@ -110,9 +112,7 @@ model.
    else `role`, else `agent`, suffixed `-2`, `-3` on collision.
 
 :::warning[Known issue]
-The scoped config is loaded from the worktree itself, so a `.crushrc` on
-the base revision runs with your environment and its permission settings
-are adopted ([#374](https://github.com/joestump-agent/crush/issues/374)). The model-supplied `branch` is not validated with
+The model-supplied `branch` is not validated with
 `--end-of-options` ([#375](https://github.com/joestump-agent/crush/issues/375)). Parallel provisions race inside git
 ([#381](https://github.com/joestump-agent/crush/issues/381)).
 :::
@@ -220,16 +220,20 @@ ignores kill reasons, loop detection and diff errors ([#343](https://github.com/
 
 The coordinator delivers `TerminalMessage()` to the parent session as a
 **hidden follow-up turn**. That message is a review instruction plus the
-result JSON. The turn goes through the normal run path, so it queues behind
-a busy parent. The payload stays out of the chat view, and the main
-agent's reply to it is the visible outcome. Delivery is dropped, with a
-log line, when the parent session no longer exists or there is no main
-agent. Crush never merges: the main agent, or you, reviews the branch.
+result JSON. The delivery waits in a pending set outside the prompt
+queue: a busy parent keeps it there while Esc, cancel, and queue clears
+leave it alone, and it runs on the next idle. Results that stack up
+while the parent is busy arrive in one turn, and a delivery that hits
+an error is re-pended and retried. The delivery strips the dispatch
+tool call's RunID, so `crush run` correlators are unaffected. The
+payload stays out of the chat view, and the main agent's reply to it is
+the visible outcome. Delivery is dropped, with a log line, when the
+parent session no longer exists or there is no main agent. Crush never
+merges: the main agent, or you, reviews the branch.
 
 :::warning[Known issue]
-A hidden result turn that is cleared from the queue, or that hits a
-provider error, is lost ([#388](https://github.com/joestump-agent/crush/issues/388)). In `crush run` the process exits before
-results arrive ([#387](https://github.com/joestump-agent/crush/issues/387)).
+In `crush run` the process exits before results arrive
+([#387](https://github.com/joestump-agent/crush/issues/387)).
 :::
 
 ### 7. Cleanup
@@ -244,12 +248,16 @@ registry entry. It then removes every `crush-dispatch-*` directory left
 under `.crush/worktrees`, and deletes each branch with `git branch -D`.
 Completed and killed work goes too.
 
+Shutdown itself runs before that sweep: every live dispatch is canceled
+with the "crush exited" kill reason, and the exit waits (bounded) for
+each dispatched run to record its terminal state, so agents stop before
+messages flush and the database closes.
+
 :::warning[Known issue]
 The exit sweep discards unreviewed and killed work, contradicting the
 "workspace is preserved" message the main agent receives ([#367](https://github.com/joestump-agent/crush/issues/367)). It also
 removes worktrees that belong to another Crush instance in the same
-repository ([#365](https://github.com/joestump-agent/crush/issues/365)). Shutdown does not cancel running dispatches first
-([#372](https://github.com/joestump-agent/crush/issues/372)).
+repository ([#365](https://github.com/joestump-agent/crush/issues/365)).
 :::
 
 ## Where this is going

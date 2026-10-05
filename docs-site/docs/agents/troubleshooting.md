@@ -154,16 +154,11 @@ worktree with git directly. The agent's actual work is unaffected.
 
 | What was ignored | Why | Fix |
 | --- | --- | --- |
-| A gitignored or uncommitted `.crushrc`, `crush.json`, skill or context file | The agent loads config from its worktree, a checkout of committed files | Commit it, or move it to your global config |
+| A `.crushrc` or `crush.json` committed on the base revision | The dispatched agent reuses the launch directory's config and never reads the worktree's own config files ([#374](https://github.com/joestump-agent/crush/issues/374)) | Put it in the launch directory, or your global config |
 | A `PreToolUse` hook | Hooks fire on the `dispatch_agent` call, not inside the dispatched agent ([#377](https://github.com/joestump-agent/crush/issues/377)) | Gate dispatch itself with a hook on `^dispatch_agent$` |
 | `permissions deny bash` (or `edit`, `write`…) | Dispatched agents always get `bash`, `edit`, `multiedit`, `write` and `todos` ([#376](https://github.com/joestump-agent/crush/issues/376)) | Deny `dispatch_agent` itself |
 | Turning yolo off with <kbd>ctrl+y</kbd> | Dispatched agents follow the `--yolo` startup flag ([#378](https://github.com/joestump-agent/crush/issues/378)) | Restart without `--yolo` |
 
-:::warning[Known issue]
-A `crushrc` committed on the base revision is **executed** when the dispatched
-agent loads its config, before any prompt ([#374](https://github.com/joestump-agent/crush/issues/374)). Only dispatch in
-repositories whose branches you trust.
-:::
 
 ## Worktrees and branches
 

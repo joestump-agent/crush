@@ -186,6 +186,43 @@ func (s *ConfigStore) WorkingDir() string {
 	return s.workingDir
 }
 
+// WithWorkingDir returns a new store that is s's configuration viewed
+// from another working directory: the published config, variable
+// resolver, runtime overrides, and config-file paths come from s, and
+// only workingDir differs. It reads no file and runs no shell config,
+// so a directory the caller does not trust cannot contribute
+// configuration: directory-scoped behavior (path-scoped tools, LSP
+// roots, project lookups) resolves against dir while every policy value
+// (permissions, command allow-lists, LSP servers, skills paths,
+// disabled skills, MCP) stays the parent's (#374).
+//
+// The returned store is a snapshot: a reload or runtime-override change
+// on either store is not visible to the other. It is for reading —
+// reloads and config-file writes have no meaning on it and must not be
+// called.
+func (s *ConfigStore) WithWorkingDir(dir string) *ConfigStore {
+	s.configMu.RLock()
+	config := s.config
+	s.configMu.RUnlock()
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
+	overrides := s.overrides
+	if overrides.Models != nil {
+		overrides.Models = maps.Clone(overrides.Models)
+	}
+	return &ConfigStore{
+		config:             config,
+		workingDir:         dir,
+		resolver:           s.resolver,
+		globalDataPath:     s.globalDataPath,
+		workspacePath:      s.workspacePath,
+		loadedPaths:        slices.Clone(s.loadedPaths),
+		knownProviders:     slices.Clone(s.knownProviders),
+		overrides:          overrides,
+		trackedConfigPaths: slices.Clone(s.trackedConfigPaths),
+	}
+}
+
 // Resolver returns the variable resolver.
 func (s *ConfigStore) Resolver() VariableResolver {
 	s.writeMu.RLock()
