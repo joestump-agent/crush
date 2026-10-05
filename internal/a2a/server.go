@@ -32,10 +32,11 @@ import (
 const shutdownTimeout = 5 * time.Second
 
 // maxUnixSocketPathLen is the maximum length of a Unix domain socket
-// path. The macOS sun_path field is 104 bytes; Linux allows 108. The
-// limit is 104 so a path that fits here is portable across both
+// path. The macOS sun_path field is 104 bytes and must also hold the
+// trailing NUL, so a 104-byte path fails bind with EINVAL there; Linux
+// allows 108. The limit is 103 so a path that fits here binds on both
 // platforms.
-const maxUnixSocketPathLen = 104
+const maxUnixSocketPathLen = 103
 
 // a2aURLHost is the Host header every A2A request must carry. The URL
 // never leaves the process: the card endpoint is a routing label, and
