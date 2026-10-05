@@ -27,6 +27,11 @@ var dispatchToolDescription string
 // DispatchAgentToolName is the registered name of the DispatchAgent tool.
 const DispatchAgentToolName = "dispatch_agent"
 
+// dispatchRetryBackoff paces the dispatch-delivery retry chain (#388):
+// every failed delivery attempt re-pends and re-arms the flush, so a
+// deterministic failure would otherwise loop back-to-back.
+const dispatchRetryBackoff = 2 * time.Second
+
 // DispatchAgentParams are the DispatchAgent tool's arguments.
 type DispatchAgentParams struct {
 	Prompt string `json:"prompt" description:"Self-contained task instructions for the dispatched agent"`
@@ -979,7 +984,14 @@ func (c *coordinator) flushPendingResults(parentSessionID string) {
 			// The run-end hook that fires inside c.run raced this
 			// re-pend; arm the flush again so the retry is not lost
 			// until the next unrelated run end. A busy parent no-ops.
-			go c.flushPendingResults(parentSessionID)
+			// The delay keeps a deterministic failure (a provider that
+			// is not configured, a model that will not resolve) from
+			// spinning the retry chain hot: every failed attempt
+			// re-pends and re-arms, so an instantly-failing run with no
+			// pause loops at full tilt, an Error line per turn.
+			time.AfterFunc(dispatchRetryBackoff, func() {
+				c.flushPendingResults(parentSessionID)
+			})
 		}
 	}()
 }
