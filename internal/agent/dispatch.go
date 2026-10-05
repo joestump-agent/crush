@@ -11,6 +11,7 @@ import (
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/permission"
 )
@@ -262,7 +263,20 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 			filtered = append(filtered, tool)
 		}
 	}
-	return filtered
+
+	// Dispatched agents fire the parent's PreToolUse hooks (#377): they
+	// carry bash, edit, multiedit, and write, so a hook that blocks a
+	// command must reach them too. Hooks come from the parent store —
+	// never the workspace's scoped config — and run with the parent's
+	// working directory as both cwd and projectDir, so hook commands
+	// resolve to the parent's trusted scripts, never a copy checked out
+	// at a model-chosen base. The payload carries the dispatched
+	// session's ID, which is what the hook sees.
+	var hookRunner *hooks.Runner
+	if preToolHooks := c.cfg.Config().Hooks[hooks.EventPreToolUse]; len(preToolHooks) > 0 {
+		hookRunner = hooks.NewRunner(preToolHooks, c.cfg.WorkingDir(), c.cfg.WorkingDir())
+	}
+	return wrapToolsWithHooks(filtered, hookRunner, false)
 }
 
 // bridgePermissions forwards permission requests raised inside a dispatch
