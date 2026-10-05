@@ -41,6 +41,14 @@ func newTestRepo(t *testing.T) string {
 	return repo
 }
 
+// newWorkspace creates a workspace whose worktrees live under the repo
+// itself (the default before #383 moved them), nested so the ignore
+// file lands beside the per-repo key directory.
+func newWorkspace(t *testing.T, repo string) (*Workspace, error) {
+	t.Helper()
+	return NewWorkspace(repo, filepath.Join(repo, "worktrees", "repo-key"))
+}
+
 func write(t *testing.T, path, content string) {
 	t.Helper()
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
@@ -80,7 +88,7 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	entry, err := ws.Provision(ctx, ProvisionOptions{})
@@ -177,7 +185,7 @@ func TestSweepContinuesPastLockedWorktree(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	one, err := ws.Provision(ctx, ProvisionOptions{})
@@ -230,7 +238,7 @@ func TestRemoveToleratesMissingBranch(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	entry, err := ws.Provision(ctx, ProvisionOptions{})
@@ -266,7 +274,7 @@ func TestWorkspaceSweepRemovesTrackedAndOrphans(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	tracked, err := ws.Provision(ctx, ProvisionOptions{})
@@ -328,9 +336,9 @@ func TestSweepLeavesOtherInstancesLiveWorkspaces(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	a, err := NewWorkspace(repo)
+	a, err := newWorkspace(t, repo)
 	require.NoError(t, err)
-	b, err := NewWorkspace(repo)
+	b, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = b.Sweep(context.Background()) })
 
@@ -367,12 +375,12 @@ func TestSweepReclaimsDeadOwnersWorkspace(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	b, err := NewWorkspace(repo)
+	b, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 	entry, err := b.Provision(ctx, ProvisionOptions{})
 	require.NoError(t, err)
 
-	a, err := NewWorkspace(repo)
+	a, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 	dropLeases(b)
 
@@ -405,7 +413,7 @@ func TestWorkspaceExplicitBaseAndFallback(t *testing.T) {
 	out, err = exec.CommandContext(t.Context(), "git", "-C", repo, "checkout", "-q", "-").CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	entry, err := ws.Provision(ctx, ProvisionOptions{Base: "feature-base"})
@@ -438,7 +446,7 @@ func TestDiffDetachedParent(t *testing.T) {
 
 	gitIn(t, repo, "checkout", "--detach")
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	entry, err := ws.Provision(ctx, ProvisionOptions{})
@@ -472,7 +480,7 @@ func TestDiffRelativeBase(t *testing.T) {
 	gitIn(t, repo, "add", "-A")
 	commitIn(t, repo, "second")
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	entry, err := ws.Provision(ctx, ProvisionOptions{Base: "HEAD~1"})
@@ -502,7 +510,7 @@ func TestDiffIgnoresAdvancedBase(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	entry, err := ws.Provision(ctx, ProvisionOptions{})
@@ -528,7 +536,7 @@ func TestDiffIgnoresAdvancedBase(t *testing.T) {
 // some other revision (#380).
 func TestDiffMissingBaseSHA(t *testing.T) {
 	repo := newTestRepo(t)
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	// A directory standing in for a workspace whose registry entry lost
@@ -554,7 +562,7 @@ func TestWorkspaceProvisionRejectsBadBases(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
@@ -596,7 +604,7 @@ func TestWorkspaceProvisionValidBases(t *testing.T) {
 	gitIn(t, repo, "branch", "stable", "v1")
 	baseSHA := strings.TrimSpace(gitIn(t, repo, "rev-parse", "v1^{commit}"))
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -623,7 +631,7 @@ func TestWorkspaceProvisionValidBases(t *testing.T) {
 
 func TestWorkspaceDiffUnknownID(t *testing.T) {
 	repo := newTestRepo(t)
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	_, err = ws.Diff(t.Context(), "no-such-dispatch")
@@ -631,7 +639,7 @@ func TestWorkspaceDiffUnknownID(t *testing.T) {
 }
 
 func TestWorkspaceRequiresGitRepo(t *testing.T) {
-	_, err := NewWorkspace(t.TempDir())
+	_, err := NewWorkspace(t.TempDir(), filepath.Join(t.TempDir(), "worktrees"))
 	require.Error(t, err)
 }
 
@@ -639,7 +647,7 @@ func TestWorkspaceRequiresGitRepo(t *testing.T) {
 // panicking or silently succeeding.
 func TestWorkspaceUpdateUnknownEntry(t *testing.T) {
 	repo := newTestRepo(t)
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	require.False(t, ws.SetStatus("nope", StatusRunning))
@@ -682,7 +690,7 @@ func TestHandleSlug(t *testing.T) {
 // cap holds even with a suffix.
 func TestAssignHandle(t *testing.T) {
 	repo := newTestRepo(t)
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 	ctx := t.Context()
@@ -805,8 +813,10 @@ func TestHandleSlugLengthCap(t *testing.T) {
 // until the handle is reused.
 func TestByHandlePrefersLiveEntry(t *testing.T) {
 	repo := newTestRepo(t)
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
+	// Sweep releases this process's leases so Windows can unlink the
+	// lock files during TempDir cleanup.
 	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 	ctx := t.Context()
 
@@ -908,7 +918,7 @@ func TestProvisionConcurrent(t *testing.T) {
 	repo := newTestRepoWithRemote(t)
 	ctx := t.Context()
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
@@ -947,7 +957,7 @@ func TestProvisionFailureCleansUp(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
@@ -981,7 +991,7 @@ func TestCleanupFailedProvision(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 
 	// Residue from a crashed provision: the branch exists, its
@@ -1011,6 +1021,67 @@ func TestCleanupFailedProvision(t *testing.T) {
 	require.True(t, os.IsNotExist(statErr))
 }
 
+func TestWorktreesDirStablePerRepo(t *testing.T) {
+	repo := newTestRepo(t)
+	other := newTestRepo(t)
+	dataDir := t.TempDir()
+
+	first, err := WorktreesDir(dataDir, repo)
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(dataDir, "worktrees"), filepath.Dir(first))
+
+	again, err := WorktreesDir(dataDir, repo)
+	require.NoError(t, err)
+	require.Equal(t, first, again)
+
+	// A linked worktree of the same repository shares the key: the
+	// common dir, not the working directory, is hashed.
+	link := filepath.Join(t.TempDir(), "link")
+	gitIn(t, repo, "worktree", "add", "-b", "crush-test-link", "--", link, "HEAD")
+	require.DirExists(t, link)
+	fromLink, err := WorktreesDir(dataDir, link)
+	require.NoError(t, err)
+	require.Equal(t, first, fromLink)
+
+	// A different repository sharing the same data directory lands in a
+	// different key under the same worktrees root.
+	fromOther, err := WorktreesDir(dataDir, other)
+	require.NoError(t, err)
+	require.Equal(t, filepath.Dir(first), filepath.Dir(fromOther))
+	require.NotEqual(t, first, fromOther)
+}
+
+// WorktreesDir refuses a directory that is not inside a git repository.
+func TestWorktreesDirRequiresGitRepo(t *testing.T) {
+	_, err := WorktreesDir(t.TempDir(), t.TempDir())
+	require.Error(t, err)
+}
+
+// NewWorkspace keeps the worktrees location out of git: a "*" .gitignore
+// is written beside the per-repo worktrees directory — one level up, so
+// a single file covers every key sharing the root — and a workspace
+// created over the same location again leaves the file alone (#383).
+func TestNewWorkspaceWritesGitignore(t *testing.T) {
+	repo := newTestRepo(t)
+	wtDir := filepath.Join(repo, "worktrees", "key")
+
+	_, err := NewWorkspace(repo, wtDir)
+	require.NoError(t, err)
+
+	ignorePath := filepath.Join(filepath.Dir(wtDir), ".gitignore")
+	b, err := os.ReadFile(ignorePath)
+	require.NoError(t, err)
+	require.Equal(t, "*\n", string(b))
+
+	before, err := os.Stat(ignorePath)
+	require.NoError(t, err)
+	_, err = NewWorkspace(repo, wtDir)
+	require.NoError(t, err)
+	after, err := os.Stat(ignorePath)
+	require.NoError(t, err)
+	require.Equal(t, before.ModTime(), after.ModTime())
+}
+
 // TestDiffIgnoresUserDiffConfig verifies Workspace.Diff returns a plain
 // unified diff even when the user's global git config forces an external
 // diff driver and always-on color: the parsed diff keeps its a/ b/
@@ -1035,7 +1106,7 @@ func TestDiffIgnoresUserDiffConfig(t *testing.T) {
 	t.Setenv("GIT_CONFIG_GLOBAL", global)
 
 	ctx := t.Context()
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 	entry, err := ws.Provision(ctx, ProvisionOptions{})
 	require.NoError(t, err)
@@ -1072,7 +1143,7 @@ func TestGitEnvScrubbed(t *testing.T) {
 	t.Setenv("GIT_INDEX_FILE", filepath.Join(decoy, ".git", "index"))
 
 	ctx := t.Context()
-	ws, err := NewWorkspace(repo)
+	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
 	entry, err := ws.Provision(ctx, ProvisionOptions{})
 	require.NoError(t, err)
