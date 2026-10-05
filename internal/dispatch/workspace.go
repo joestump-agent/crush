@@ -255,10 +255,10 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 // startup never fails because leftovers could not be removed.
 func (w *Workspace) reconcileStartup(ctx context.Context) {
 	// Marker access goes through os.Root: every open is confined to the
-	// worktrees directory itself, so neither the directory-derived path
-	// reaching this code nor a hostile or symlinked marker name can
-	// address a file outside — the root rejects traversal and escapes
-	// instead of trusting string validation.
+	// worktrees directory itself, so neither the directory the path
+	// derives from nor a hostile or symlinked marker name can address a
+	// file outside — the root rejects traversal and escapes instead of
+	// trusting string validation.
 	root, err := os.OpenRoot(w.worktreesDir)
 	if err != nil {
 		slog.Debug("Skipping dispatch startup reconciliation", "worktrees_dir", w.worktreesDir, "error", err)
