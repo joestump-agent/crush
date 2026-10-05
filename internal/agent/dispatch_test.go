@@ -133,6 +133,185 @@ func TestBuildDispatchToolchainRootsToolsAtWorkspaceDir(t *testing.T) {
 	require.FileExists(t, filepath.Join(workspace, "marker.txt"))
 }
 
+// A dispatched agent's file tools refuse any path that resolves outside
+// the workspace (#379): absolute paths, .. escapes, and symlinks inside
+// the workspace that point out. Refusal happens in the tool, before any
+// permission check, so it holds in yolo mode too (env.permissions skips
+// prompts here).
+func TestDispatchedFileToolsContained(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	workspace := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "inside.txt"), []byte("inside"), 0o644))
+
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "parent_owned.go")
+	require.NoError(t, os.WriteFile(outsideFile, []byte("package main"), 0o644))
+
+	agentCfg := c.cfg.Config().Agents[config.AgentTask]
+	agentCfg.AllowedTools = []string{
+		tools.ViewToolName,
+		tools.GlobToolName,
+		tools.GrepToolName,
+		tools.LSToolName,
+		tools.DownloadToolName,
+	}
+	c.cfg.Config().Agents[config.AgentTask] = agentCfg
+
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+
+	byName := toolsByName(tc)
+	write := byName[tools.WriteToolName]
+
+	resp := runToolAsSession(t, write, tools.WriteToolName, map[string]any{
+		"file_path": outsideFile,
+		"content":   "hacked",
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+	require.Contains(t, resp.Content, "outside the dispatch workspace")
+	content, err := os.ReadFile(outsideFile)
+	require.NoError(t, err)
+	require.Equal(t, "package main", string(content), "outside file was modified")
+
+	resp = runToolAsSession(t, write, tools.WriteToolName, map[string]any{
+		"file_path": "../../escape.go",
+		"content":   "hacked",
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	resp = runToolAsSession(t, write, tools.WriteToolName, map[string]any{
+		"file_path": "new.txt",
+		"content":   "written inside",
+	}, sess.ID)
+	require.False(t, resp.IsError, resp.Content)
+	require.FileExists(t, filepath.Join(workspace, "new.txt"))
+
+	resp = runToolAsSession(t, byName[tools.EditToolName], tools.EditToolName, map[string]any{
+		"file_path":  outsideFile,
+		"old_string": "package main",
+		"new_string": "package hacked",
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	viewResp := runToolAsSession(t, byName[tools.ViewToolName], tools.ViewToolName, map[string]any{
+		"file_path": "inside.txt",
+	}, sess.ID)
+	require.False(t, viewResp.IsError, viewResp.Content)
+
+	resp = runToolAsSession(t, byName[tools.EditToolName], tools.EditToolName, map[string]any{
+		"file_path":  "inside.txt",
+		"old_string": "inside",
+		"new_string": "edited",
+	}, sess.ID)
+	require.False(t, resp.IsError, resp.Content)
+
+	resp = runToolAsSession(t, byName[tools.MultiEditToolName], tools.MultiEditToolName, map[string]any{
+		"file_path": outsideFile,
+		"edits": []map[string]string{{
+			"old_string": "package main",
+			"new_string": "package hacked",
+		}},
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	// The download tool refuses before it touches the network.
+	resp = runToolAsSession(t, byName[tools.DownloadToolName], tools.DownloadToolName, map[string]any{
+		"url":       "https://example.com/evil.txt",
+		"file_path": "../outside_download.txt",
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	resp = runToolAsSession(t, byName[tools.GrepToolName], tools.GrepToolName, map[string]any{
+		"pattern": "package",
+		"path":    outsideDir,
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+	require.Contains(t, resp.Content, "outside the dispatch workspace")
+
+	resp = runToolAsSession(t, byName[tools.GlobToolName], tools.GlobToolName, map[string]any{
+		"pattern": "**/*.go",
+		"path":    outsideDir,
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	resp = runToolAsSession(t, byName[tools.LSToolName], tools.LSToolName, map[string]any{
+		"path": outsideDir,
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+}
+
+// A view through a symlink inside the workspace that points outside is
+// refused: containment resolves symlinks, so the escape is caught even
+// though the path text stays inside.
+func TestDispatchedViewRefusesSymlinkEscape(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	workspace := t.TempDir()
+	outsideFile := filepath.Join(t.TempDir(), "parent_owned.go")
+	require.NoError(t, os.WriteFile(outsideFile, []byte("package main"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "inside.txt"), []byte("inside"), 0o644))
+
+	if err := os.Symlink(outsideFile, filepath.Join(workspace, "escape-link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	agentCfg := c.cfg.Config().Agents[config.AgentTask]
+	agentCfg.AllowedTools = []string{tools.ViewToolName}
+	c.cfg.Config().Agents[config.AgentTask] = agentCfg
+
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+
+	byName := toolsByName(tc)
+
+	resp := runToolAsSession(t, byName[tools.ViewToolName], tools.ViewToolName, map[string]any{
+		"file_path": "escape-link",
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	resp = runToolAsSession(t, byName[tools.ViewToolName], tools.ViewToolName, map[string]any{
+		"file_path": "inside.txt",
+	}, sess.ID)
+	require.False(t, resp.IsError, resp.Content)
+	require.Contains(t, resp.Content, "inside")
+}
+
+// The main agent's tools are untouched: no containment root rides its
+// context, so buildTools' write handles an absolute path outside the
+// working directory exactly as before.
+func TestMainAgentWriteOutsideWorkingDirUnchanged(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	agentCfg := c.cfg.Config().Agents[config.AgentCoder]
+	agentCfg.AllowedTools = []string{tools.WriteToolName}
+	built, err := c.buildTools(t.Context(), agentCfg, false)
+	require.NoError(t, err)
+	require.Len(t, built, 1)
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+
+	outsideFile := filepath.Join(t.TempDir(), "absolute.go")
+	resp := runToolAsSession(t, built[0], tools.WriteToolName, map[string]any{
+		"file_path": outsideFile,
+		"content":   "package main",
+	}, sess.ID)
+	require.False(t, resp.IsError, resp.Content)
+	require.FileExists(t, outsideFile)
+}
+
 // The default (non-dispatch) toolchain is unchanged: buildTools roots
 // its tools at the workspace root, so a relative glob matches under
 // env.workingDir.
