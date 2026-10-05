@@ -20,6 +20,7 @@ import (
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/scheduler"
 	"github.com/charmbracelet/crush/internal/session"
+	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/stretchr/testify/require"
 )
@@ -32,11 +33,18 @@ type dispatchTestAgent struct {
 	model  Model
 	result *fantasy.AgentResult
 	err    error
-	calls  []SessionAgentCall
+	// onRun, when set, runs before each turn returns — the seam the
+	// background-job tests use to start a job tagged with the dispatch
+	// session from inside the run (#385).
+	onRun func(call SessionAgentCall)
+	calls []SessionAgentCall
 }
 
 func (f *dispatchTestAgent) Run(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
 	f.calls = append(f.calls, call)
+	if f.onRun != nil {
+		f.onRun(call)
+	}
 	return f.result, f.err
 }
 
@@ -427,6 +435,100 @@ func TestRunDispatchRecordsTerminalStatus(t *testing.T) {
 			require.Equal(t, tt.status, got.Status)
 		})
 	}
+}
+
+// A dispatched run's background jobs die with the run (#385): the fake
+// agent starts a job tagged with the dispatch session, and runDispatch
+// kills it before the terminal result is assembled, so the salvage diff
+// cannot race a job still writing the workspace.
+func TestRunDispatchKillsBackgroundJobsOnCompletion(t *testing.T) {
+	var env fakeEnv
+	jobID := ""
+	agent := &dispatchTestAgent{
+		model:  dispatchTestModel(),
+		result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
+		onRun: func(call SessionAgentCall) {
+			bgShell, err := shell.GetBackgroundShellManager().Start(context.Background(), call.SessionID, env.workingDir, nil, "sleep 30", "dispatch job")
+			require.NoError(t, err)
+			jobID = bgShell.ID
+		},
+	}
+	c, env := newDispatchToolEnv(t, agent)
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
+	require.NoError(t, err)
+	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
+	require.NoError(t, err)
+
+	c.runDispatch(t.Context(), dispatchRun{
+		workspace:       ws,
+		entry:           entry,
+		toolchain:       toolchain,
+		agent:           agent,
+		model:           agent.model,
+		providerCfg:     config.ProviderConfig{ID: "test-provider"},
+		prompt:          "do work",
+		sessionID:       "dispatch-child-session",
+		parentSessionID: "dispatch-parent-session",
+	})
+
+	got, ok := ws.Get(entry.ID)
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusCompleted, got.Status)
+
+	// The job started during the run is gone after it.
+	require.NotEmpty(t, jobID)
+	_, ok = shell.GetBackgroundShellManager().Get(jobID)
+	require.False(t, ok, "background job %s survived the run", jobID)
+}
+
+// The kill path kills the run's background jobs the same way: the run is
+// killed, its Run returns context.Canceled, and the job started under the
+// dispatch session is gone when runDispatch returns (#385).
+func TestRunDispatchKillsBackgroundJobsOnKill(t *testing.T) {
+	var env fakeEnv
+	jobID := ""
+	kill := &dispatchKill{}
+	agent := &dispatchTestAgent{
+		model: dispatchTestModel(),
+		err:   context.Canceled,
+		onRun: func(call SessionAgentCall) {
+			kill.kill("test kill")
+			bgShell, err := shell.GetBackgroundShellManager().Start(context.Background(), call.SessionID, env.workingDir, nil, "sleep 30", "dispatch job")
+			require.NoError(t, err)
+			jobID = bgShell.ID
+		},
+	}
+	c, env := newDispatchToolEnv(t, agent)
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
+	require.NoError(t, err)
+	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
+	require.NoError(t, err)
+
+	c.runDispatch(t.Context(), dispatchRun{
+		workspace:       ws,
+		entry:           entry,
+		toolchain:       toolchain,
+		agent:           agent,
+		model:           agent.model,
+		providerCfg:     config.ProviderConfig{ID: "test-provider"},
+		prompt:          "do work",
+		sessionID:       "dispatch-child-session",
+		parentSessionID: "dispatch-parent-session",
+		kill:            kill,
+	})
+
+	got, ok := ws.Get(entry.ID)
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusKilled, got.Status)
+
+	// The job started during the killed run is gone after it.
+	require.NotEmpty(t, jobID)
+	_, ok = shell.GetBackgroundShellManager().Get(jobID)
+	require.False(t, ok, "background job %s survived the killed run", jobID)
 }
 
 // The session-end backstop: when the coordinator's context ends, every
