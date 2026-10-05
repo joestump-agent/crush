@@ -806,6 +806,9 @@ func TestByHandlePrefersLiveEntry(t *testing.T) {
 	repo := newTestRepo(t)
 	ws, err := NewWorkspace(repo)
 	require.NoError(t, err)
+	// Release every lease before TempDir cleanup: on Windows the open
+	// lock files stop RemoveAll from deleting the worktrees directory.
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 	ctx := t.Context()
 
 	a, err := ws.Provision(ctx, ProvisionOptions{})
