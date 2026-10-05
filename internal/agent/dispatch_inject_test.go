@@ -28,6 +28,7 @@ type gatedDispatchAgent struct {
 	mu        sync.Mutex
 	queued    []SessionAgentCall
 	lastCall  *SessionAgentCall
+	canceled  []string
 }
 
 func (f *gatedDispatchAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
@@ -77,6 +78,25 @@ func (f *gatedDispatchAgent) EnqueueWhenBusy(call SessionAgentCall) bool {
 	defer f.mu.Unlock()
 	f.queued = append(f.queued, call)
 	return true
+}
+
+// Cancel records the cancel so a test can assert the coordinator tore
+// down an orphaned dispatched run after a transport stream error (#344).
+func (f *gatedDispatchAgent) Cancel(sessionID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.canceled = append(f.canceled, sessionID)
+}
+
+// IsSessionBusy reports the session not busy, so the coordinator's
+// bounded post-cancel wait ends immediately in tests.
+func (f *gatedDispatchAgent) IsSessionBusy(sessionID string) bool { return false }
+
+// cancels returns a copy of the session ids Cancel recorded.
+func (f *gatedDispatchAgent) cancels() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.canceled...)
 }
 
 func (f *gatedDispatchAgent) Model() Model { return f.model }

@@ -138,6 +138,12 @@ func (s *Server) Stop(_ context.Context) error {
 type ServerFactory struct {
 	dataDir string
 
+	// httpClient, when set, replaces the factory's unix-socket dispatch
+	// client in StreamDispatch — the test injection seam (#344), used
+	// to bound phases of the wire protocol independently of the
+	// defaults.
+	httpClient *http.Client
+
 	mu         sync.Mutex
 	started    bool
 	closed     bool
@@ -159,8 +165,12 @@ type route struct {
 
 // NewServerFactory returns the production server factory rooted at
 // dataDir, where the host socket and its directory are created.
-func NewServerFactory(dataDir string) *ServerFactory {
-	return &ServerFactory{dataDir: dataDir, routes: make(map[string]*route)}
+func NewServerFactory(dataDir string, opts ...ServerFactoryOption) *ServerFactory {
+	f := &ServerFactory{dataDir: dataDir, routes: make(map[string]*route)}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
 }
 
 // StartServer serves one dispatched agent over A2A (#70): it builds the
@@ -228,6 +238,18 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 		return nil, err
 	}
 	return &Server{Endpoint: endpoint, Card: card, factory: f, id: p.DispatchID}, nil
+}
+
+// ServerFactoryOption customizes the server factory built by
+// NewServerFactory.
+type ServerFactoryOption func(*ServerFactory)
+
+// WithHTTPClient injects the HTTP client StreamDispatch dials with
+// (#344). Production leaves it unset and dials the factory's unix
+// socket; tests use it to shorten a phase and prove the run outlives
+// the transport's own deadline.
+func WithHTTPClient(client *http.Client) ServerFactoryOption {
+	return func(f *ServerFactory) { f.httpClient = client }
 }
 
 // StartDispatchServer implements [agent.DispatchServerStarter]: it

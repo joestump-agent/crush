@@ -75,9 +75,8 @@ Some values are not read the way they look:
   the nudges and the kill on.
 
 :::warning[Known issue]
-These semantics are surprising and are tracked in [#401](https://github.com/joestump-agent/crush/issues/401). Two more caveats on
-current main: `stall_window` never fires ([#396](https://github.com/joestump-agent/crush/issues/396)), and every dispatch dies
-after 3 minutes regardless of `hard_timeout` ([#344](https://github.com/joestump-agent/crush/issues/344)).
+These semantics are surprising and are tracked in [#401](https://github.com/joestump-agent/crush/issues/401). One more caveat on
+current main: `stall_window` never fires ([#396](https://github.com/joestump-agent/crush/issues/396)).
 :::
 
 :::warning[Known issue]
@@ -188,7 +187,7 @@ dispatch from repositories whose branches you trust. Tracked in [#374](https://g
 | Nudges per run | 2 |
 | Tool-loop detection | More than 5 identical tool calls and results in the last 10 steps |
 | A2A server | One host per process on a unix socket, `<data dir>/a2a/<pid>.sock` (socket `0600`, directory `0700`), JSON-RPC, no authentication ([#346](https://github.com/joestump-agent/crush/issues/346)) |
-| A2A client timeout | 3 minutes total, the SDK default ([#344](https://github.com/joestump-agent/crush/issues/344)) |
+| A2A client timeout | No total timeout; per-phase bounds only: 10 s dial, 10 s TLS handshake, 30 s response headers ([#344](https://github.com/joestump-agent/crush/issues/344)) |
 | A2A server shutdown | 5 seconds |
 | Cleanup when Crush exits | A sweep that force-removes every `crush-dispatch-*` worktree and branch, with a 30-second timeout. Whether it finishes depends on how Crush exits; see [troubleshooting](/agents/troubleshooting) |
 | Inspect keys | <kbd>ctrl+]</kbd> and <kbd>ctrl+[</kbd> |

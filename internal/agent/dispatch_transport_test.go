@@ -63,7 +63,13 @@ func (f *runnerTransport) StreamDispatch(ctx context.Context, _ DispatchTranspor
 		Text:   subAgentOutput(result),
 	}
 	if params.Diff != nil {
-		if diff, derr := params.Diff(ctx); derr == nil {
+		// The wire carries the diff verdict itself (#361): the diff, or
+		// the capture error when it failed.
+		diff, derr := params.Diff(ctx)
+		switch {
+		case derr != nil:
+			outcome.DiffError = derr.Error()
+		case diff != "":
 			outcome.Diff = diff
 		}
 	}
@@ -216,6 +222,37 @@ func TestDispatchTransportStreamErrorFails(t *testing.T) {
 	require.False(t, agent.ranOnce())
 }
 
+// A stream error before a terminal state cancels the dispatched agent
+// before the run tears down (#344): the served task runs on a detached
+// context, so without the explicit Cancel the agent would keep running
+// unsupervised — watchdog stopped, permission bridge closed — while the
+// registry records failed with the transport error.
+func TestDispatchTransportStreamErrorCancelsRun(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, _ := newInjectionEnv(t, agent)
+	transport := newGatedServingTransport(DispatchTransportOutcome{})
+	transport.err = errors.New("SSE stream error: context deadline exceeded")
+	c.SetDispatchServerStarter(transport)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
+	transport.waitStreamed(t)
+	close(transport.gate)
+
+	ws, _ := c.dispatchWorkspace()
+	require.Eventually(t, func() bool {
+		entries := ws.List()
+		return len(entries) > 0 && entries[0].Status == dispatch.StatusFailed
+	}, 10*time.Second, 50*time.Millisecond)
+	entries := ws.List()
+	require.Contains(t, entries[0].Result.Error, "SSE stream error")
+	// The orphaned run was canceled with the dispatch's session id —
+	// before the failed outcome was recorded.
+	require.Equal(t, []string{handle.SessionID}, agent.cancels())
+	// The cancel did not double-run the prompt directly.
+	require.False(t, agent.ranOnce())
+}
+
 // A starter that is not a transport keeps the direct in-process path:
 // the server exists (endpoint stamped) but the coordinator drives the
 // agent itself, as before #71.
@@ -238,14 +275,15 @@ func TestServedButNotTransportedRunsDirectly(t *testing.T) {
 func assembleFromTransport(t *testing.T, run dispatchRun, outcome DispatchTransportOutcome) dispatch.DispatchResult {
 	t.Helper()
 	c := newDispatchTestCoordinator(t, testEnv(t))
-	return c.assembleTerminalDispatchResult(t.Context(), run, dispatchNaturalOutcomeFromTransport(run, outcome))
+	return c.assembleTerminalDispatchResult(t.Context(), run, dispatchNaturalOutcomeFromTransport(outcome))
 }
 
 // The outcome mapping mirrors the direct path's semantics: completed
 // keeps findings and diff, failed records the reason, canceled stays
-// failed (parity — StatusKilled is wander kill's, #316), and the empty
-// completed diff re-captures in-process so a capture error can surface
-// as "(diff unavailable: ...)" (#343).
+// failed (parity — StatusKilled is wander kill's, #316), and the wire
+// carries the diff verdict itself (#361): a capture error surfaces as
+// "(diff unavailable: ...)", an arrived diff is used as-is, and nothing
+// on the wire is "(no changes)" — there is no in-process re-diff.
 func TestDispatchFromTransportOutcome(t *testing.T) {
 	t.Parallel()
 
@@ -274,6 +312,18 @@ func TestDispatchFromTransportOutcome(t *testing.T) {
 		Status: transportStatusCompleted,
 		Text:   "nothing changed",
 	}).DiffSummary)
+
+	// A wire-carried capture error (#361) maps onto the same "(diff
+	// unavailable: ...)" summary the direct path produces, with the run
+	// still completing.
+	diffErr := assembleFromTransport(t, run, DispatchTransportOutcome{
+		Status:    transportStatusCompleted,
+		Text:      "done, but the diff blew up",
+		DiffError: "not a git repo",
+	})
+	require.Equal(t, dispatch.StatusCompleted, diffErr.Status)
+	require.Equal(t, "done, but the diff blew up", diffErr.KeyFindings)
+	require.Contains(t, diffErr.DiffSummary, "(diff unavailable: not a git repo)")
 
 	failed := assembleFromTransport(t, run, DispatchTransportOutcome{
 		Status: transportStatusFailed,

@@ -24,6 +24,9 @@ func New(db DBTX) *Queries {
 func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	q := Queries{db: db}
 	var err error
+	if q.addSessionCostStmt, err = db.PrepareContext(ctx, addSessionCost); err != nil {
+		return nil, fmt.Errorf("error preparing query AddSessionCost: %w", err)
+	}
 	if q.createFileStmt, err = db.PrepareContext(ctx, createFile); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateFile: %w", err)
 	}
@@ -155,6 +158,11 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 
 func (q *Queries) Close() error {
 	var err error
+	if q.addSessionCostStmt != nil {
+		if cerr := q.addSessionCostStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing addSessionCostStmt: %w", cerr)
+		}
+	}
 	if q.createFileStmt != nil {
 		if cerr := q.createFileStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing createFileStmt: %w", cerr)
@@ -404,6 +412,7 @@ func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, ar
 type Queries struct {
 	db                                   DBTX
 	tx                                   *sql.Tx
+	addSessionCostStmt                   *sql.Stmt
 	createFileStmt                       *sql.Stmt
 	createMessageStmt                    *sql.Stmt
 	createSessionStmt                    *sql.Stmt
@@ -452,6 +461,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
 		db:                                   tx,
 		tx:                                   tx,
+		addSessionCostStmt:                   q.addSessionCostStmt,
 		createFileStmt:                       q.createFileStmt,
 		createMessageStmt:                    q.createMessageStmt,
 		createSessionStmt:                    q.createSessionStmt,

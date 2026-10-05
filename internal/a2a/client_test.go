@@ -3,6 +3,9 @@ package a2a
 import (
 	"context"
 	"errors"
+	"net"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,4 +180,118 @@ func TestStreamDispatchTransportErrors(t *testing.T) {
 		Card:     dead,
 	})
 	require.ErrorContains(t, err, "prompt is empty")
+}
+
+// An 11 MB diff survives the wire end to end (#361): the executor's
+// chunks each stay under the SDK's SSE line cap, and the client
+// reassembles them byte for byte onto the outcome.
+func TestStreamDispatchLargeDiffRoundTrips(t *testing.T) {
+	line := strings.Repeat("-", 4096) + "\n"
+	var b strings.Builder
+	for len(b.String()) < 11*1024*1024 {
+		b.WriteString(line)
+	}
+	diff := b.String()
+
+	runner := &fakeRunner{result: textResult("big change")}
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+		Diff: func(ctx context.Context) (string, error) {
+			return diff, nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "change everything",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Len(t, outcome.Diff, len(diff))
+	require.Equal(t, diff, outcome.Diff, "the reassembled diff matches byte for byte")
+	require.False(t, outcome.DiffTruncated)
+	require.Empty(t, outcome.DiffError)
+}
+
+// A diff-capture error crosses the wire on the dispatch-result artifact:
+// the run still completes, and the outcome carries the error instead of
+// a diff (#361).
+func TestStreamDispatchDiffErrorStillCompletes(t *testing.T) {
+	runner := &fakeRunner{result: textResult("done, but the diff blew up")}
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+		Diff: func(ctx context.Context) (string, error) {
+			return "", errors.New("not a git repo")
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "fix the bug",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Equal(t, "not a git repo", outcome.DiffError)
+	require.Empty(t, outcome.Diff)
+}
+
+// The production dispatch client carries no total Timeout (#344): the
+// SDK's default three-minute http.Client.Timeout bounds the whole
+// exchange including the SSE body, killing every served dispatch that
+// runs longer. The per-phase bounds stay, so a dead server still fails
+// fast.
+func TestDispatchClientHasNoTotalTimeout(t *testing.T) {
+	client := NewServerFactory(t.TempDir()).dispatchHTTPClient()
+	require.Zero(t, client.Timeout, "a total Timeout would re-create the three-minute kill")
+
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.Greater(t, transport.ResponseHeaderTimeout, time.Duration(0))
+	require.Greater(t, transport.TLSHandshakeTimeout, time.Duration(0))
+}
+
+// A served run outlives a short injected client deadline (#344): the
+// response headers arrive inside the deadline, the SSE body streams
+// past it, and the terminal outcome still lands.
+func TestStreamDispatchOutlivesShortClientDeadline(t *testing.T) {
+	runner := &fakeRunner{result: textResult("eventually done"), delay: time.Second}
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+		Todos:      &fakeTodoSource{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	factory.httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", factory.socketPath())
+			},
+			ResponseHeaderTimeout: 200 * time.Millisecond,
+		},
+	}
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "fix the bug",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Equal(t, "eventually done", outcome.Text)
 }

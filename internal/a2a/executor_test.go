@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -32,6 +33,10 @@ type fakeRunner struct {
 	// returning (#345).
 	panicValue any
 
+	// delay, when non-zero, makes Run take that long before returning,
+	// for tests that need a served run slower than a transport deadline.
+	delay time.Duration
+
 	gotCall     agent.SessionAgentCall
 	ran         bool
 	canceledFor string
@@ -42,6 +47,9 @@ func (f *fakeRunner) Run(_ context.Context, call agent.SessionAgentCall) (*fanta
 	f.gotCall = call
 	if f.panicValue != nil {
 		panic(f.panicValue)
+	}
+	if f.delay > 0 {
+		time.Sleep(f.delay)
 	}
 	return f.result, f.err
 }
@@ -138,6 +146,7 @@ func TestExecuteHappyPathWithDiff(t *testing.T) {
 		a2aspec.TaskStateSubmitted,
 		a2aspec.TaskStateWorking,
 		artifactState,
+		artifactState,
 		a2aspec.TaskStateCompleted,
 	}
 	require.Equal(t, want, states(t, evs))
@@ -146,19 +155,37 @@ func TestExecuteHappyPathWithDiff(t *testing.T) {
 	require.Equal(t, "sess-1", runner.gotCall.SessionID)
 	require.Equal(t, "do the thing", runner.gotCall.Prompt)
 
-	// The artifact carries the diff and the task's identifiers.
+	// The diff artifact carries the chunk (one, for a short diff), the
+	// task's identifiers, and the diff identity.
 	art, ok := evs[2].(*a2aspec.TaskArtifactUpdateEvent)
 	require.True(t, ok, "event is %T, want *TaskArtifactUpdateEvent", evs[2])
+	require.Equal(t, DiffArtifactID, art.Artifact.ID)
+	require.Equal(t, DiffArtifactName, art.Artifact.Name)
+	require.False(t, art.Append)
+	require.True(t, art.LastChunk, "a single-chunk diff is also the last chunk")
+	require.Equal(t, DiffMediaType, art.Artifact.Parts[0].MediaType)
+	require.Equal(t, DiffFilename, art.Artifact.Parts[0].Filename)
 	require.Equal(t, "the diff", partsText(art.Artifact.Parts))
 	require.Equal(t, a2aspec.TaskID("task-1"), art.TaskID)
 	require.Equal(t, "ctx-1", art.ContextID)
 
+	// The dispatch-result artifact carries the typed outcome.
+	res, ok := evs[3].(*a2aspec.TaskArtifactUpdateEvent)
+	require.True(t, ok, "event is %T, want *TaskArtifactUpdateEvent", evs[3])
+	require.Equal(t, ResultArtifactID, res.Artifact.ID)
+	require.Equal(t, ResultArtifactName, res.Artifact.Name)
+	require.False(t, res.Append)
+	require.True(t, res.LastChunk)
+	decoded, ok := decodeDispatchOutcome(res.Artifact.Parts[0])
+	require.True(t, ok)
+	require.Equal(t, DispatchOutcome{DiffBytes: len("the diff")}, decoded)
+
 	// The terminal status carries the agent's text output, stamped with
 	// the task's identifiers.
-	terminal := statusUpdate(t, evs[3])
+	terminal := statusUpdate(t, evs[4])
 	require.Equal(t, a2aspec.TaskID("task-1"), terminal.TaskID)
 	require.Equal(t, "ctx-1", terminal.ContextID)
-	require.Equal(t, "all done", statusMessageText(t, evs[3]))
+	require.Equal(t, "all done", statusMessageText(t, evs[4]))
 	require.NotNil(t, terminal.Status.Message)
 	require.Equal(t, a2aspec.TaskID("task-1"), terminal.Status.Message.TaskID)
 }
@@ -191,9 +218,17 @@ func TestExecuteEmptyDiffEmitsNoArtifact(t *testing.T) {
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 	evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
 
+	// No diff artifact for an empty diff; the dispatch-result artifact
+	// still reports the zero work (#361).
 	for _, ev := range evs {
-		_, isArtifact := ev.(*a2aspec.TaskArtifactUpdateEvent)
-		require.False(t, isArtifact, "emitted an artifact event for an empty diff")
+		if art, isArtifact := ev.(*a2aspec.TaskArtifactUpdateEvent); isArtifact {
+			require.Equal(t, ResultArtifactID, art.Artifact.ID, "an empty diff emits only the dispatch-result artifact")
+			decoded, ok := decodeDispatchOutcome(art.Artifact.Parts[0])
+			require.True(t, ok)
+			require.Zero(t, decoded.DiffBytes)
+			require.Zero(t, decoded.FilesChanged)
+			require.Empty(t, decoded.DiffError)
+		}
 	}
 }
 
@@ -208,12 +243,22 @@ func TestExecuteDiffErrorStillCompletes(t *testing.T) {
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 	evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
 
+	// The run still completes: no diff artifact, but the typed outcome
+	// carries the capture error on the wire (#361).
 	want := []a2aspec.TaskState{
 		a2aspec.TaskStateSubmitted,
 		a2aspec.TaskStateWorking,
+		artifactState,
 		a2aspec.TaskStateCompleted,
 	}
 	require.Equal(t, want, states(t, evs), "diff error must not fail the run")
+
+	art, ok := evs[2].(*a2aspec.TaskArtifactUpdateEvent)
+	require.True(t, ok)
+	require.Equal(t, ResultArtifactID, art.Artifact.ID)
+	decoded, ok := decodeDispatchOutcome(art.Artifact.Parts[0])
+	require.True(t, ok)
+	require.Equal(t, "not a git repo", decoded.DiffError)
 }
 
 func TestExecuteRunFailure(t *testing.T) {
@@ -780,4 +825,124 @@ func TestExecuteInactivityDisabledNoTimer(t *testing.T) {
 		require.Equal(t, want, states(t, evs))
 		require.Equal(t, 0, runner.cancels())
 	})
+}
+
+// The diff is chunked, not shipped as one SSE line (#361): every chunk
+// stays within diffChunkSize, chunks break at line boundaries where the
+// lines allow, and concatenating them reproduces the diff byte for byte.
+func TestChunkDiff(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty", func(t *testing.T) {
+		t.Parallel()
+		require.Nil(t, chunkDiff(""))
+	})
+
+	t.Run("small diff is one chunk", func(t *testing.T) {
+		t.Parallel()
+		diff := "diff --git a/x b/x\n@@\n+y\n"
+		require.Equal(t, []string{diff}, chunkDiff(diff))
+	})
+
+	t.Run("multi-line diff breaks at line boundaries", func(t *testing.T) {
+		t.Parallel()
+		line := strings.Repeat("x", 1024) + "\n"
+		var b strings.Builder
+		for range 300 {
+			b.WriteString(line)
+		}
+		diff := b.String()
+		require.Greater(t, len(diff), diffChunkSize, "the fixture must exceed one chunk")
+
+		chunks := chunkDiff(diff)
+		require.Greater(t, len(chunks), 1)
+		var reassembled strings.Builder
+		for _, chunk := range chunks {
+			require.LessOrEqual(t, len(chunk), diffChunkSize)
+			require.True(t, strings.HasSuffix(chunk, "\n"), "chunks break at line boundaries")
+			reassembled.WriteString(chunk)
+		}
+		require.Equal(t, diff, reassembled.String())
+	})
+
+	t.Run("a line longer than the cap is hard-split", func(t *testing.T) {
+		t.Parallel()
+		diff := strings.Repeat("x", 1024*1024) // 1 MiB, no newline
+		chunks := chunkDiff(diff)
+		require.Len(t, chunks, 4)
+		require.Equal(t, diff, strings.Join(chunks, ""))
+	})
+
+	t.Run("an 11 MiB diff streams in chunks within the cap", func(t *testing.T) {
+		t.Parallel()
+		line := strings.Repeat("+", 4096) + "\n"
+		var b strings.Builder
+		for len(b.String()) < 11*1024*1024 {
+			b.WriteString(line)
+		}
+		diff := b.String()
+
+		chunks := chunkDiff(diff)
+		require.Greater(t, len(chunks), 40, "an 11 MiB diff needs many chunks")
+		var reassembled strings.Builder
+		for _, chunk := range chunks {
+			require.LessOrEqual(t, len(chunk), diffChunkSize)
+			reassembled.WriteString(chunk)
+		}
+		require.Equal(t, diff, reassembled.String())
+	})
+}
+
+// The executor emits the diff as a sequence of chunk updates on one named
+// artifact: the first replaces, the rest append, the last closes, and the
+// typed dispatch-result artifact follows (#361).
+func TestExecuteDiffChunkedArtifact(t *testing.T) {
+	t.Parallel()
+
+	line := strings.Repeat("+", 4096) + "\n"
+	var b strings.Builder
+	for len(b.String()) < 11*1024*1024 {
+		b.WriteString(line)
+	}
+	diff := "diff --git a/big.txt b/big.txt\n" + b.String()
+
+	runner := &fakeRunner{result: textResult("done")}
+	exec := NewExecutor(runner, "sess-1", WithDiff(func(context.Context) (string, error) {
+		return diff, nil
+	}))
+
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+	evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+
+	var chunks []*a2aspec.TaskArtifactUpdateEvent
+	var res *a2aspec.TaskArtifactUpdateEvent
+	for _, ev := range evs {
+		art, ok := ev.(*a2aspec.TaskArtifactUpdateEvent)
+		if !ok {
+			continue
+		}
+		switch art.Artifact.ID {
+		case DiffArtifactID:
+			chunks = append(chunks, art)
+		case ResultArtifactID:
+			res = art
+		}
+	}
+	require.NotEmpty(t, chunks)
+	require.NotNil(t, res)
+
+	var reassembled strings.Builder
+	for i, chunk := range chunks {
+		require.LessOrEqual(t, len(chunk.Artifact.Parts[0].Text()), diffChunkSize, "no chunk exceeds the SSE-safe cap")
+		require.Equal(t, i > 0, chunk.Append, "only chunks after the first append")
+		require.Equal(t, i == len(chunks)-1, chunk.LastChunk, "exactly the last chunk closes the artifact")
+		reassembled.WriteString(chunk.Artifact.Parts[0].Text())
+	}
+	require.Equal(t, diff, reassembled.String(), "the chunks reassemble byte for byte")
+
+	decoded, ok := decodeDispatchOutcome(res.Artifact.Parts[0])
+	require.True(t, ok)
+	require.Equal(t, len(diff), decoded.DiffBytes)
+	require.Empty(t, decoded.DiffError)
+	require.Positive(t, decoded.FilesChanged)
 }
