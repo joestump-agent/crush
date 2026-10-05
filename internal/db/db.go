@@ -96,6 +96,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getUsageByModelStmt, err = db.PrepareContext(ctx, getUsageByModel); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUsageByModel: %w", err)
 	}
+	if q.listAllChildSessionsStmt, err = db.PrepareContext(ctx, listAllChildSessions); err != nil {
+		return nil, fmt.Errorf("error preparing query ListAllChildSessions: %w", err)
+	}
 	if q.listAllUserMessagesStmt, err = db.PrepareContext(ctx, listAllUserMessages); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllUserMessages: %w", err)
 	}
@@ -272,6 +275,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getUsageByModelStmt: %w", cerr)
 		}
 	}
+	if q.listAllChildSessionsStmt != nil {
+		if cerr := q.listAllChildSessionsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listAllChildSessionsStmt: %w", cerr)
+		}
+	}
 	if q.listAllUserMessagesStmt != nil {
 		if cerr := q.listAllUserMessagesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listAllUserMessagesStmt: %w", cerr)
@@ -420,6 +428,7 @@ type Queries struct {
 	getUsageByDayOfWeekStmt              *sql.Stmt
 	getUsageByHourStmt                   *sql.Stmt
 	getUsageByModelStmt                  *sql.Stmt
+	listAllChildSessionsStmt             *sql.Stmt
 	listAllUserMessagesStmt              *sql.Stmt
 	listChildSessionsStmt                *sql.Stmt
 	listFilesByPathStmt                  *sql.Stmt
@@ -467,6 +476,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getUsageByDayOfWeekStmt:              q.getUsageByDayOfWeekStmt,
 		getUsageByHourStmt:                   q.getUsageByHourStmt,
 		getUsageByModelStmt:                  q.getUsageByModelStmt,
+		listAllChildSessionsStmt:             q.listAllChildSessionsStmt,
 		listAllUserMessagesStmt:              q.listAllUserMessagesStmt,
 		listChildSessionsStmt:                q.listChildSessionsStmt,
 		listFilesByPathStmt:                  q.listFilesByPathStmt,

@@ -126,6 +126,11 @@ type Workspace interface {
 	// sessions picker nests under their parent. Includes every child
 	// kind; callers filter.
 	ListChildSessions(ctx context.Context, parentSessionID string) ([]session.Session, error)
+	// ListAllChildSessions returns every child session of every
+	// parent in one grouped query (#408), grouped by parent and
+	// oldest-created first. Includes every child kind; callers
+	// filter.
+	ListAllChildSessions(ctx context.Context) ([]session.Session, error)
 	SaveSession(ctx context.Context, sess session.Session) (session.Session, error)
 	SetSessionChannel(ctx context.Context, sessionID, channel string) (session.Session, error)
 	DeleteSession(ctx context.Context, sessionID string) error
