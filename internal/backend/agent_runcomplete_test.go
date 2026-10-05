@@ -53,6 +53,7 @@ func (c *errorCoordinator) ListCronTasks(string) []scheduler.Task         { retu
 func (c *errorCoordinator) Summarize(context.Context, string) error       { return nil }
 func (c *errorCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (c *errorCoordinator) UpdateModels(context.Context) error            { return nil }
+func (c *errorCoordinator) SetInteractive(context.Context, bool) error    { return nil }
 func (c *errorCoordinator) SetMainAgent(string) error                     { return nil }
 func (c *errorCoordinator) GenerateTitle(context.Context, string, string) {}
 

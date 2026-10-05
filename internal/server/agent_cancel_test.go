@@ -92,6 +92,7 @@ func (s *runCoordinator) Summarize(context.Context, string) error {
 }
 func (s *runCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (s *runCoordinator) UpdateModels(context.Context) error            { return nil }
+func (s *runCoordinator) SetInteractive(context.Context, bool) error    { return nil }
 func (s *runCoordinator) GenerateTitle(context.Context, string, string) {}
 func (s *runCoordinator) SetMainAgent(agentName string) error {
 	s.lastMainAgentSet.Store(agentName)
