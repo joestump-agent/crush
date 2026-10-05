@@ -146,8 +146,13 @@ func prefixMatchesReadOnlyCommand(command string, cmds []string) bool {
 // substitution. It matches the narrower readOnlyCommands list, because
 // the ladder must not count a command read-only when it can wrap another
 // program, change shell state, kill a process or write; unparseable
-// input fails closed.
+// input fails closed. Redirection, backgrounding and grouping are
+// mutations the prefix check cannot see, so their metacharacters fail
+// closed too.
 func IsReadOnlyCommand(command string) bool {
+	if strings.ContainsAny(command, ">&<\n()") {
+		return false
+	}
 	return prefixMatchesReadOnlyCommand(command, readOnlyCommands)
 }
 
