@@ -538,15 +538,15 @@ func (w *ClientWorkspace) DispatchStatus(sessionID string) (dispatch.TodoSnapsho
 // surface carries them yet. The @ completions show no live agents, an
 // @handle resolves to nothing, and steering a dispatched agent reports
 // that it needs a local process rather than failing silently.
-func (w *ClientWorkspace) DispatchLive() []dispatch.TodoSnapshot {
+func (w *ClientWorkspace) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	return nil
 }
 
-func (w *ClientWorkspace) DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool) {
+func (w *ClientWorkspace) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (w *ClientWorkspace) DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error {
+func (w *ClientWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
 	return errors.New("dispatch steering is not available in client/server mode")
 }
 

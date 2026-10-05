@@ -221,20 +221,21 @@ type Workspace interface {
 	// the block from its persisted tool result in that case.
 	DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool)
 	// DispatchLive returns the snapshots of every non-terminal dispatch
-	// (#313): the editor's live-agents @ completion source. Empty in
-	// client/server mode, where the registry lives in the server
-	// process.
-	DispatchLive() []dispatch.TodoSnapshot
+	// created from sessionID (#313/#399): the editor's live-agents @
+	// completion source. Empty in client/server mode, where the registry
+	// lives in the server process.
+	DispatchLive(sessionID string) []dispatch.TodoSnapshot
 	// DispatchByHandle resolves an @handle to its dispatch snapshot
 	// (#313), finished dispatches included. ok=false when no dispatch
-	// carries the handle (or in client/server mode).
-	DispatchByHandle(handle string) (dispatch.TodoSnapshot, bool)
+	// carries the handle, when another session dispatched it (#399), or
+	// in client/server mode.
+	DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool)
 	// DeliverAgentMessageByHandle routes the editor's leading @handle
 	// message to the running dispatched agent's injection queue (#312 /
-	// #313). A finished or unknown handle returns a refusal error; in
-	// client/server mode it reports that dispatch steering needs a local
-	// process.
-	DeliverAgentMessageByHandle(ctx context.Context, handle, text string) error
+	// #313). A finished, unknown, or foreign-session handle returns a
+	// refusal error (#399); in client/server mode it reports that
+	// dispatch steering needs a local process.
+	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error
 
 	// LSP
 	LSPStart(ctx context.Context, path string)

@@ -332,6 +332,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// after the session so the assignment event carries the complete
 			// entry — handle, role, session, running state.
 			workspace.SetSession(entry.ID, taskSession.ID)
+			workspace.SetParentSessionID(entry.ID, sessionID)
 			workspace.SetStatus(entry.ID, dispatch.StatusRunning)
 			assignedHandle, ok := workspace.AssignHandle(entry.ID, params.Handle, params.Role)
 			if !ok {
