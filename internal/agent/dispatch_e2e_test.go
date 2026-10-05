@@ -1,0 +1,168 @@
+package agent_test
+
+// End-to-end dispatch tests over the real A2A ServerFactory (#424):
+// the dispatch_agent tool, a real dispatched agent, the a2a server
+// serving it, the A2A client streaming the turn, and terminal assembly
+// — the composition production wires in internal/app. Each scenario
+// asserts the shared invariants (exactly one terminal status transition
+// on the registry entry, exactly one parent delivery) plus its own
+// outcome.
+
+import (
+	"net/http"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"charm.land/fantasy"
+
+	"github.com/charmbracelet/crush/internal/a2a"
+	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/stretchr/testify/require"
+)
+
+// TestDispatchE2EOverServerFactory runs the dispatch scenarios through
+// the real server factory, table-driven over the terminal outcomes that
+// reached main with green CI while every side was tested against a fake
+// of the other.
+func TestDispatchE2EOverServerFactory(t *testing.T) {
+	t.Parallel()
+
+	defaultFactory := func() agent.DispatchServerStarter { return a2a.NewServerFactory() }
+
+	// shortClientDeadlineFactory injects the client #344's seam exists
+	// for: a 250ms response-header deadline, with no total timeout. A
+	// reintroduced client Timeout would cut the SSE body and fail the
+	// long-run scenario.
+	shortClientDeadlineFactory := func() agent.DispatchServerStarter {
+		return a2a.NewServerFactory(a2a.WithHTTPClient(&http.Client{
+			Transport: &http.Transport{ResponseHeaderTimeout: 250 * time.Millisecond},
+		}))
+	}
+
+	blockedModel := func(t *testing.T) (fantasy.LanguageModel, func()) {
+		return agent.NewBlockingScriptedModel(agent.ScriptedStep{Text: "done"}), nil
+	}
+
+	scenarios := []struct {
+		name     string
+		settings config.TodoEnforcementSettings
+		factory  func() agent.DispatchServerStarter
+		model    func(t *testing.T) (fantasy.LanguageModel, func())
+		check    func(t *testing.T, entry dispatch.Entry, elapsed time.Duration)
+	}{
+		{
+			name: "completed run writes a file and delivers findings",
+			model: func(t *testing.T) (fantasy.LanguageModel, func()) {
+				return agent.NewScriptedModel(
+					agent.ScriptedStep{ToolCalls: []agent.ScriptedToolCall{{
+						Name:  "write",
+						Input: `{"file_path":"hello.txt","content":"written over a2a\n"}`,
+					}}},
+					agent.ScriptedStep{Text: "wrote hello.txt; findings here"},
+				), nil
+			},
+			check: func(t *testing.T, entry dispatch.Entry, elapsed time.Duration) {
+				require.Equal(t, dispatch.StatusCompleted, entry.Status)
+				require.Equal(t, dispatch.StatusCompleted, entry.Result.Status)
+				require.Equal(t, "wrote hello.txt; findings here", entry.Result.KeyFindings)
+				require.Contains(t, entry.Result.DiffSummary, "hello.txt")
+				written, err := os.ReadFile(filepath.Join(entry.Path, "hello.txt"))
+				require.NoError(t, err)
+				require.Equal(t, "written over a2a\n", string(written))
+			},
+		},
+		{
+			name: "out-of-band hard timeout kill ends killed in seconds",
+			settings: config.TodoEnforcementSettings{
+				HardTimeout: 200 * time.Millisecond,
+			},
+			model: blockedModel,
+			check: func(t *testing.T, entry dispatch.Entry, elapsed time.Duration) {
+				require.Less(t, elapsed, 10*time.Second,
+					"the kill must end the dispatch in seconds, not the three-minute stream cut")
+				require.Equal(t, dispatch.StatusKilled, entry.Status)
+				require.Equal(t, dispatch.ReasonHardTimeout, entry.Result.KilledReason)
+				require.Equal(t, dispatch.StatusKilled, entry.Result.Status)
+				require.DirExists(t, entry.Path, "a kill preserves the workspace for salvage")
+			},
+		},
+		{
+			name:     "long run outlives a short client deadline",
+			factory:  shortClientDeadlineFactory,
+			settings: config.TodoEnforcementSettings{},
+			model: func(t *testing.T) (fantasy.LanguageModel, func()) {
+				m := agent.NewBlockingScriptedModel(agent.ScriptedStep{Text: "finally done"})
+				return m, m.Release
+			},
+			check: func(t *testing.T, entry dispatch.Entry, elapsed time.Duration) {
+				require.GreaterOrEqual(t, elapsed, 900*time.Millisecond,
+					"the run must actually outlast the client's deadline")
+				require.Equal(t, dispatch.StatusCompleted, entry.Status)
+				require.Equal(t, "finally done", entry.Result.KeyFindings)
+			},
+		},
+		{
+			name: "tool loop ends killed with the loop reason",
+			settings: config.TodoEnforcementSettings{
+				Enabled:         true,
+				NudgeThreshold:  50,
+				KillAfterNudges: 0,
+			},
+			model: func(t *testing.T) (fantasy.LanguageModel, func()) {
+				steps := make([]agent.ScriptedStep, 0, 13)
+				for range 12 {
+					steps = append(steps, agent.ScriptedStep{
+						ToolCalls: []agent.ScriptedToolCall{{Name: "probe", Input: "{}"}},
+					})
+				}
+				steps = append(steps, agent.ScriptedStep{Text: "done"})
+				return agent.NewScriptedModel(steps...), nil
+			},
+			check: func(t *testing.T, entry dispatch.Entry, elapsed time.Duration) {
+				require.Equal(t, dispatch.StatusKilled, entry.Status)
+				require.Equal(t, dispatch.ReasonToolLoop, entry.Result.KilledReason)
+			},
+		},
+	}
+
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			t.Parallel()
+
+			factory := sc.factory
+			if factory == nil {
+				factory = defaultFactory
+			}
+			model, release := sc.model(t)
+			h := agent.NewDispatchHarness(t, model, sc.settings, factory())
+
+			start := time.Now()
+			handle := h.Dispatch(t, "do the work")
+			if release != nil {
+				go func() {
+					time.Sleep(time.Second)
+					release()
+				}()
+			}
+			entry := h.WaitTerminal(t, handle.DispatchID)
+			elapsed := time.Since(start)
+
+			// Every scenario records exactly one terminal status
+			// transition on its registry entry and exactly one parent
+			// delivery, whatever the outcome.
+			require.Eventually(t, func() bool {
+				return h.TerminalTransitions(handle.DispatchID) == 1
+			}, 10*time.Second, 25*time.Millisecond, "exactly one terminal status transition expected")
+			require.Eventually(t, func() bool {
+				return h.ParentDeliveries() == 1
+			}, 10*time.Second, 25*time.Millisecond, "exactly one parent delivery expected")
+			require.NotNil(t, entry.Result)
+
+			sc.check(t, entry, elapsed)
+		})
+	}
+}
