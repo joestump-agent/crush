@@ -77,13 +77,18 @@ func NewMultiEditTool(
 
 			params.FilePath = filepathext.SmartJoin(workingDir, params.FilePath)
 
+			contained, err := ContainPath(ctx, params.FilePath)
+			if err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
+			params.FilePath = contained
+
 			// Validate all edits before applying any
 			if err := validateEdits(params.Edits); err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
 
 			var response fantasy.ToolResponse
-			var err error
 
 			editCtx := editContext{ctx, permissions, files, filetracker, workingDir}
 			// Handle file creation case (first edit has empty old_string)

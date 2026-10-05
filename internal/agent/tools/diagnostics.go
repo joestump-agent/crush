@@ -29,6 +29,14 @@ func NewDiagnosticsTool(lspManager *lsp.Manager) fantasy.AgentTool {
 		DiagnosticsToolName,
 		diagnosticsDescription,
 		func(ctx context.Context, params DiagnosticsParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			if params.FilePath != "" {
+				contained, err := ContainPath(ctx, params.FilePath)
+				if err != nil {
+					return fantasy.NewTextErrorResponse(err.Error()), nil
+				}
+				params.FilePath = contained
+			}
+
 			notifyLSPs(ctx, lspManager, params.FilePath)
 			output := getDiagnostics(params.FilePath, lspManager)
 			return fantasy.NewTextResponse(output), nil
