@@ -105,8 +105,9 @@ func finishedSnapshot(handle string) dispatch.TodoSnapshot {
 }
 
 // splitLeadingHandle recognizes exactly the leading-address form: a
-// @handle as the very first token, closed by whitespace or end of
-// prompt; glued or mid-sentence tokens are not leading addresses.
+// @handle as the very first token, closed by whitespace, end of prompt,
+// or a boundary character that looks out at whitespace; glued or
+// mid-sentence tokens are not leading addresses.
 func TestSplitLeadingHandle(t *testing.T) {
 	t.Parallel()
 
@@ -123,6 +124,17 @@ func TestSplitLeadingHandle(t *testing.T) {
 		{"across lines", "@tester\nplease stop", "tester", "please stop", true},
 		{"leading spaces", "  @tester go", "tester", "go", true},
 		{"dashes and digits", "@tester-2 again", "tester-2", "again", true},
+		{"colon boundary", "@tester: stop", "tester", "stop", true},
+		{"comma boundary", "@tester, stop", "tester", "stop", true},
+		{"question mark boundary", "@tester? status", "tester", "status", true},
+		{"period boundary", "@tester. fix it", "tester", "fix it", true},
+		{"exclamation boundary", "@tester! now", "tester", "now", true},
+		{"period at end", "@tester.", "tester", "", true},
+		{"bare file token", "@Makefile", "Makefile", "", true},
+		{"file mention", "@main.go", "", "", false},
+		{"colon glued to word", "@tester:stop", "", "", false},
+		{"ellipsis is prose", "@tester... hmm", "", "", false},
+		{"dot mid-word", "@tester.go fix", "", "", false},
 		{"glued prose", "@tester's work is done", "", "", false},
 		{"file path", "@internal/ui/model/foo.go fix this", "", "", false},
 		{"mid-sentence only", "why is @tester writing Rust?", "", "", false},
@@ -147,6 +159,10 @@ func TestMentionHandles(t *testing.T) {
 	require.Equal(t,
 		[]string{"tester", "docs"},
 		mentionHandles("why are @tester and @docs writing Rust? @tester twice, @main.go is a file"))
+	require.Equal(t, []string{"tester"}, mentionHandles("how is @tester?"))
+	require.Equal(t, []string{"tester"}, mentionHandles("ask @tester."))
+	require.Equal(t, []string{"tester"}, mentionHandles("ping @tester, then"))
+	require.Nil(t, mentionHandles("@tester.go fix the build"))
 	require.Nil(t, mentionHandles("@tester leads so it does not mention"))
 	require.Nil(t, mentionHandles("no mentions here"))
 	require.Equal(t, []string{"tester"}, mentionHandles("line one\n@tester on the next line"))
@@ -212,13 +228,36 @@ func TestRouteLeadingAgentHandle(t *testing.T) {
 	require.NotNil(t, cmd)
 	require.Len(t, ws.delivered, 1)
 
-	// Delivery failure surfaces as an error.
+	// Unknown bare token: it parses as a leading handle candidate, but
+	// with no such agent it falls through to the normal prompt path —
+	// the empty-message warning must not swallow it.
+	_, handled, _ = m.routeLeadingAgentHandle("@Makefile", atts)
+	require.False(t, handled)
+	require.Len(t, ws.delivered, 1)
+
+	// Boundary punctuation is dropped from the message: the agent gets
+	// the rest verbatim.
+	for _, prompt := range []string{"@tester: stop", "@tester, stop", "@tester? status"} {
+		_, handled, _ = m.routeLeadingAgentHandle(prompt, atts)
+		require.True(t, handled)
+	}
+	require.Equal(t,
+		[]deliveredMessage{
+			{session: testMentionSession, handle: "tester", text: "stop writing Rust", attachments: atts},
+			{session: testMentionSession, handle: "tester", text: "stop", attachments: atts},
+			{session: testMentionSession, handle: "tester", text: "stop", attachments: atts},
+			{session: testMentionSession, handle: "tester", text: "status", attachments: atts},
+		},
+		ws.delivered)
+
+	// Delivery failure surfaces as an error, and nothing new is delivered.
+	ws.delivered = nil
 	ws.deliverErr = context.DeadlineExceeded
 	cmd, handled, delivered = m.routeLeadingAgentHandle("@tester try again", atts)
 	require.True(t, handled)
 	require.False(t, delivered)
 	require.NotNil(t, cmd)
-	require.Len(t, ws.delivered, 1)
+	require.Empty(t, ws.delivered)
 }
 
 // A leading handle typed with different casing routes to the same
