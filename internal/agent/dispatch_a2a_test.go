@@ -70,13 +70,11 @@ func TestDispatchStartsAndStopsA2AServer(t *testing.T) {
 	}))
 	agent.waitRunning(t)
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		entry, ok := ws.Get(handle.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Endpoint == "http://127.0.0.1:19999"
 	}, 10*time.Second, 50*time.Millisecond)
-	entry, ok := ws.Get(handle.DispatchID)
+	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Equal(t, "fake-card", entry.AgentCard)
 
@@ -95,7 +93,7 @@ func TestDispatchStartsAndStopsA2AServer(t *testing.T) {
 	// an endpoint — discovery must not hand out a dead one.
 	close(agent.gate)
 	require.Eventually(t, func() bool {
-		entry, ok := ws.Get(handle.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status.IsTerminal() && entry.Endpoint == "" && entry.AgentCard == nil
 	}, 10*time.Second, 50*time.Millisecond)
 	started, stopped := starter.snapshot()
@@ -103,7 +101,7 @@ func TestDispatchStartsAndStopsA2AServer(t *testing.T) {
 	require.Equal(t, 1, stopped)
 
 	// Resolve-style reads on the cleared entry find nothing.
-	entry, ok = ws.Get(handle.DispatchID)
+	entry, ok = c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	_, _, ok = entryEndpoint(entry)
 	require.False(t, ok)
@@ -130,8 +128,7 @@ func TestDispatchServerStartFailureIsNonFatal(t *testing.T) {
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
 	require.Equal(t, dispatch.StatusRunning, handle.Status)
 
-	ws, _ := c.dispatchWorkspace()
-	entry, ok := ws.Get(handle.DispatchID)
+	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Empty(t, entry.Endpoint)
 	require.Nil(t, entry.AgentCard)
@@ -150,8 +147,7 @@ func TestDispatchWithoutStarterRunsUnserved(t *testing.T) {
 	decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
 	agent.waitRunning(t)
 
-	ws, _ := c.dispatchWorkspace()
-	for _, entry := range ws.List() {
+	for _, entry := range c.dispatchRegistry().List() {
 		require.Empty(t, entry.Endpoint)
 	}
 	close(agent.gate)

@@ -246,9 +246,9 @@ func TestDispatchWorktreesLiveUnderDataDirectory(t *testing.T) {
 			// the dispatch holds the lock file, and Windows refuses to
 			// remove a file another process has open. Cleanups run LIFO,
 			// so this lands ahead of testEnv's RemoveAll.
-			ws, werr := c.dispatchWorkspace()
+			provider, werr := c.dispatchWorkspaceProvider()
 			require.NoError(t, werr)
-			t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+			t.Cleanup(func() { _ = provider.Sweep(context.Background()) })
 
 			// The workspace is <dataDir>/worktrees/<repo-key>/<branch>,
 			// under the resolved data directory — never beside the cwd.
@@ -333,9 +333,7 @@ func TestDispatchAgentToolUnknownSkill(t *testing.T) {
 
 	// Nothing was provisioned: no branches, no worktrees directory
 	// entries, no registry entries.
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	require.Empty(t, ws.List())
+	require.Empty(t, c.dispatchRegistry().List())
 }
 
 // A model-supplied branch that git would read as an option is a tool
@@ -350,9 +348,7 @@ func TestDispatchAgentToolRejectsOptionLikeBranch(t *testing.T) {
 	require.Contains(t, resp.Content, "provision dispatch workspace")
 
 	// The rejected branch never became a dispatch.
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	require.Empty(t, ws.List())
+	require.Empty(t, c.dispatchRegistry().List())
 	require.Empty(t, agent.calls)
 }
 
@@ -386,9 +382,7 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 	require.NotEmpty(t, handle.SessionID)
 	require.DirExists(t, handle.WorkspacePath)
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, ok := ws.Get(handle.DispatchID)
+	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Equal(t, handle.SessionID, entry.SessionID)
 	require.True(t, strings.HasSuffix(
@@ -399,7 +393,7 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 	// The background run completes and records the terminal status in
 	// the registry.
 	require.Eventually(t, func() bool {
-		entry, ok := ws.Get(handle.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status == dispatch.StatusCompleted
 	}, 10*time.Second, 50*time.Millisecond)
 
@@ -427,9 +421,7 @@ func TestDispatchAgentToolCleansUpFailedSetup(t *testing.T) {
 	require.True(t, resp.IsError)
 	require.Contains(t, resp.Content, "build dispatched agent")
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	require.Empty(t, ws.List())
+	require.Empty(t, c.dispatchRegistry().List())
 
 	out, err := exec.CommandContext(t.Context(), "git", "-C", env.workingDir, "branch", "--list", dispatch.BranchPrefix+"*").CombinedOutput()
 	require.NoError(t, err)
@@ -472,16 +464,14 @@ func TestRunDispatchRecordsTerminalStatus(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			c, _ := newDispatchToolEnv(t, tt.agent)
-			ws, err := c.dispatchWorkspace()
-			require.NoError(t, err)
-			entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-			require.NoError(t, err)
+			entry, provider := provisionDispatchEntry(t, c, "")
 
 			toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 			require.NoError(t, err)
 
 			c.runDispatch(t.Context(), dispatchRun{
-				workspace:       ws,
+				reg:             c.dispatchRegistry(),
+				provider:        provider,
 				entry:           entry,
 				toolchain:       toolchain,
 				agent:           tt.agent,
@@ -492,7 +482,7 @@ func TestRunDispatchRecordsTerminalStatus(t *testing.T) {
 				parentSessionID: "dispatch-parent-session",
 			})
 
-			got, ok := ws.Get(entry.ID)
+			got, ok := c.dispatchRegistry().Get(entry.ID)
 			require.True(t, ok)
 			require.Equal(t, tt.status, got.Status)
 		})
@@ -516,15 +506,13 @@ func TestRunDispatchKillsBackgroundJobsOnCompletion(t *testing.T) {
 		},
 	}
 	c, env := newDispatchToolEnv(t, agent)
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
+	entry, provider := provisionDispatchEntry(t, c, "")
 	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 	require.NoError(t, err)
 
 	c.runDispatch(t.Context(), dispatchRun{
-		workspace:       ws,
+		reg:             c.dispatchRegistry(),
+		provider:        provider,
 		entry:           entry,
 		toolchain:       toolchain,
 		agent:           agent,
@@ -535,7 +523,7 @@ func TestRunDispatchKillsBackgroundJobsOnCompletion(t *testing.T) {
 		parentSessionID: "dispatch-parent-session",
 	})
 
-	got, ok := ws.Get(entry.ID)
+	got, ok := c.dispatchRegistry().Get(entry.ID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusCompleted, got.Status)
 
@@ -563,15 +551,13 @@ func TestRunDispatchKillsBackgroundJobsOnKill(t *testing.T) {
 		},
 	}
 	c, env := newDispatchToolEnv(t, agent)
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
+	entry, provider := provisionDispatchEntry(t, c, "")
 	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 	require.NoError(t, err)
 
 	c.runDispatch(t.Context(), dispatchRun{
-		workspace:       ws,
+		reg:             c.dispatchRegistry(),
+		provider:        provider,
 		entry:           entry,
 		toolchain:       toolchain,
 		agent:           agent,
@@ -583,7 +569,7 @@ func TestRunDispatchKillsBackgroundJobsOnKill(t *testing.T) {
 		kill:            kill,
 	})
 
-	got, ok := ws.Get(entry.ID)
+	got, ok := c.dispatchRegistry().Get(entry.ID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusKilled, got.Status)
 
@@ -609,10 +595,8 @@ func TestSweepDispatchOnCoordinatorEnd(t *testing.T) {
 	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work"})
 	handle := decodeDispatchHandle(t, resp)
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		entry, ok := ws.Get(handle.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status == dispatch.StatusCompleted
 	}, 10*time.Second, 50*time.Millisecond)
 
@@ -625,7 +609,7 @@ func TestSweepDispatchOnCoordinatorEnd(t *testing.T) {
 	// Sweep unregisters an entry only after its removal succeeds, so the
 	// registry can drain a few git invocations behind the directory.
 	require.Eventually(t, func() bool {
-		return len(ws.List()) == 0
+		return len(c.dispatchRegistry().List()) == 0
 	}, 10*time.Second, 50*time.Millisecond)
 }
 
@@ -668,10 +652,7 @@ func TestBuildDispatchedAgent(t *testing.T) {
 		filetracker: *env.filetracker,
 	}
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
+	entry, _ := provisionDispatchEntry(t, c, "")
 	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 	require.NoError(t, err)
 	defer toolchain.Close(t.Context())
@@ -777,17 +758,15 @@ func (f *fakeMainAgent) SetTools(_ []fantasy.AgentTool) {}
 func TestAssembleDispatchResult(t *testing.T) {
 	agent := &dispatchTestAgent{model: dispatchTestModel()}
 	c, _ := newDispatchToolEnv(t, agent)
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
+	entry, provider := provisionDispatchEntry(t, c, "")
 
 	// Uncommitted work in the workspace: the work product the diff
 	// summary must surface.
 	require.NoError(t, os.WriteFile(filepath.Join(entry.Path, "new.txt"), []byte("work\n"), 0o644))
 
 	run := dispatchRun{
-		workspace:       ws,
+		reg:             c.dispatchRegistry(),
+		provider:        provider,
 		entry:           entry,
 		sessionID:       "dispatch-child-session",
 		parentSessionID: "dispatch-parent-session",
@@ -797,7 +776,7 @@ func TestAssembleDispatchResult(t *testing.T) {
 		completed: true,
 		findings:  "fixed the bug",
 		diff: func(ctx context.Context) (string, error) {
-			return run.workspace.Diff(ctx, run.entry.ID)
+			return run.provider.Diff(ctx, run.entry)
 		},
 	})
 	require.Equal(t, dispatch.StatusCompleted, completed.Status)
@@ -1040,8 +1019,6 @@ func TestDispatchAgentToolRefusedWhenAllWriteToolsDenied(t *testing.T) {
 		}
 	}
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	require.Empty(t, ws.List())
+	require.Empty(t, c.dispatchRegistry().List())
 	require.Empty(t, agent.calls)
 }

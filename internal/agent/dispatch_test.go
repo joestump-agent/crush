@@ -13,9 +13,11 @@ import (
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/scheduler"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,6 +53,38 @@ func newDispatchTestCoordinatorAt(t *testing.T, env fakeEnv, workingDir, dataDir
 		// test instead of leaking a Background subscription.
 		dispatchCtx: t.Context(),
 	}
+}
+
+// provisionDispatchEntry provisions a workspace through the
+// coordinator's git worktree provider and registers its entry, the same
+// two steps the dispatch tool performs. It returns the registered entry
+// and the provider, for tests that drive Sweep or Release directly.
+func provisionDispatchEntry(t *testing.T, c *coordinator, base string) (dispatch.Entry, *dispatch.GitWorktreeProvider) {
+	t.Helper()
+	provider, err := c.dispatchWorkspaceProvider()
+	require.NoError(t, err)
+	entry := provisionProviderEntry(t, provider, c.dispatchRegistry(), dispatch.ProvisionOptions{Base: base})
+	return entry, provider
+}
+
+// provisionProviderEntry provisions a workspace on provider and
+// registers the entry in reg, for tests that drive a provider they
+// built themselves.
+func provisionProviderEntry(t *testing.T, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, opts dispatch.ProvisionOptions) dispatch.Entry {
+	t.Helper()
+	id := uuid.NewString()
+	placement, err := provider.Provision(t.Context(), id, opts)
+	require.NoError(t, err)
+	entry := dispatch.Entry{
+		ID:      id,
+		Path:    placement.Path,
+		Branch:  placement.Branch,
+		Base:    placement.Base,
+		BaseSHA: placement.BaseSHA,
+		Status:  dispatch.StatusProvisioned,
+	}
+	reg.Register(entry)
+	return entry
 }
 
 func runTool(t *testing.T, tool fantasy.AgentTool, name string, params any) fantasy.ToolResponse {

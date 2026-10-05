@@ -155,8 +155,7 @@ func TestDispatchRunsOverTransportSeam(t *testing.T) {
 		Handle: "tester",
 	}))
 
-	ws, _ := c.dispatchWorkspace()
-	entry, ok := ws.Get(handle.DispatchID)
+	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.NotEmpty(t, entry.Endpoint, "the dispatch must be served for the transport to drive it")
 
@@ -181,11 +180,11 @@ func TestDispatchRunsOverTransportSeam(t *testing.T) {
 	// status is stamped just before the run's defers tear the server
 	// down, so both are the run's completion signal here.
 	require.Eventually(t, func() bool {
-		e, ok := ws.Get(handle.DispatchID)
+		e, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && e.Status.IsTerminal() && e.Endpoint == "" && e.AgentCard == nil
 	}, 10*time.Second, 50*time.Millisecond)
 
-	e, ok := ws.Get(handle.DispatchID)
+	e, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusCompleted, e.Status)
 	require.NotNil(t, e.Result)
@@ -211,12 +210,11 @@ func TestDispatchTransportStreamErrorFails(t *testing.T) {
 	transport.waitStreamed(t)
 	close(transport.gate)
 
-	ws, _ := c.dispatchWorkspace()
 	require.Eventually(t, func() bool {
-		entries := ws.List()
+		entries := c.dispatchRegistry().List()
 		return len(entries) > 0 && entries[0].Status == dispatch.StatusFailed
 	}, 10*time.Second, 50*time.Millisecond)
-	entries := ws.List()
+	entries := c.dispatchRegistry().List()
 	require.Contains(t, entries[0].Result.Error, "connection reset")
 	// No fallback double-run.
 	require.False(t, agent.ranOnce())
@@ -239,12 +237,11 @@ func TestDispatchTransportStreamErrorCancelsRun(t *testing.T) {
 	transport.waitStreamed(t)
 	close(transport.gate)
 
-	ws, _ := c.dispatchWorkspace()
 	require.Eventually(t, func() bool {
-		entries := ws.List()
+		entries := c.dispatchRegistry().List()
 		return len(entries) > 0 && entries[0].Status == dispatch.StatusFailed
 	}, 10*time.Second, 50*time.Millisecond)
-	entries := ws.List()
+	entries := c.dispatchRegistry().List()
 	require.Contains(t, entries[0].Result.Error, "SSE stream error")
 	// The orphaned run was canceled with the dispatch's session id —
 	// before the failed outcome was recorded.
@@ -288,16 +285,17 @@ func TestDispatchFromTransportOutcome(t *testing.T) {
 	t.Parallel()
 
 	repo := newTestRepoForTransport(t)
-	ws, err := dispatch.NewWorkspace(repo, filepath.Join(repo, "worktrees"))
+	reg := dispatch.NewAgentRegistry()
+	ws, err := dispatch.NewGitWorktreeProvider(repo, filepath.Join(repo, "worktrees"), reg)
 	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
+	entry := provisionProviderEntry(t, ws, reg, dispatch.ProvisionOptions{})
 	run := dispatchRun{
-		workspace: ws,
+		reg:       reg,
+		provider:  ws,
 		entry:     entry,
 		sessionID: "session-x",
 	}
-	ws.SetHandle(entry.ID, "tester")
+	reg.SetHandle(entry.ID, "tester")
 
 	completed := assembleFromTransport(t, run, DispatchTransportOutcome{
 		Status: transportStatusCompleted,
@@ -537,7 +535,7 @@ func TestDispatchParityAcrossPaths(t *testing.T) {
 				sc.build(t, f)
 
 				w := sc.check(t, f)
-				entry, ok := f.ws.Get(f.entry.ID)
+				entry, ok := f.reg.Get(f.entry.ID)
 				require.True(t, ok)
 				require.NotNil(t, entry.Result)
 				require.Equal(t, w.status, entry.Result.Status, "both paths must report the same status")

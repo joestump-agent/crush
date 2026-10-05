@@ -306,7 +306,8 @@ func (m *blockingScriptedModel) Stream(ctx context.Context, call fantasy.Call) (
 type wanderKillFixture struct {
 	env        fakeEnv
 	c          *coordinator
-	ws         *dispatch.Workspace
+	reg        *dispatch.AgentRegistry
+	provider   *dispatch.GitWorktreeProvider
 	entry      dispatch.Entry
 	taskSess   session.Session
 	parentSess session.Session
@@ -358,13 +359,12 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 	}
 	f.buildDispatched(t, model, dispatchedSettings, nil)
 
-	ws, err := dispatch.NewWorkspace(env.workingDir, filepath.Join(env.workingDir, "worktrees"))
+	f.reg = dispatch.NewAgentRegistry()
+	ws, err := dispatch.NewGitWorktreeProvider(env.workingDir, filepath.Join(env.workingDir, "worktrees"), f.reg)
 	require.NoError(t, err)
-	f.ws = ws
+	f.provider = ws
 
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
-	f.entry = entry
+	f.entry = provisionProviderEntry(t, f.provider, f.reg, dispatch.ProvisionOptions{})
 
 	parent, err := env.sessions.Create(t.Context(), "parent")
 	require.NoError(t, err)
@@ -373,9 +373,9 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 	require.NoError(t, err)
 	f.taskSess = task
 
-	ws.SetSession(entry.ID, task.ID)
-	ws.SetStatus(entry.ID, dispatch.StatusRunning)
-	if _, ok := ws.AssignHandle(entry.ID, "tester", "dispatch tester"); !ok {
+	f.reg.SetSession(f.entry.ID, task.ID)
+	f.reg.SetStatus(f.entry.ID, dispatch.StatusRunning)
+	if _, ok := f.reg.AssignHandle(f.entry.ID, "tester", "dispatch tester"); !ok {
 		t.Fatal("assign dispatch handle")
 	}
 
@@ -416,7 +416,8 @@ func (f *wanderKillFixture) buildDispatched(t *testing.T, model fantasy.Language
 // transport wiring can build the same served call the run carries.
 func (f *wanderKillFixture) buildRun() dispatchRun {
 	return dispatchRun{
-		workspace:       f.ws,
+		reg:             f.reg,
+		provider:        f.provider,
 		entry:           f.entry,
 		agent:           f.dispatched,
 		model:           Model{Model: f.runModel, CatwalkCfg: catwalkModelCfg()},
@@ -455,14 +456,14 @@ func (f *wanderKillFixture) wireTransport(t *testing.T, rt *runnerTransport) {
 	t.Helper()
 	run := f.buildRun()
 	f.c.SetDispatchServerStarter(rt)
-	stop := f.c.startDispatchServer(context.Background(), f.ws, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current)
+	stop := f.c.startDispatchServer(context.Background(), f.provider, f.reg, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current)
 	t.Cleanup(func() {
 		if stop != nil {
 			stop()
 		}
-		f.c.stopDispatchServer(f.ws, f.entry.ID, nil)
+		f.c.stopDispatchServer(f.reg, f.entry.ID, nil)
 	})
-	entry, ok := f.ws.Get(f.entry.ID)
+	entry, ok := f.reg.Get(f.entry.ID)
 	require.True(t, ok)
 	require.NotEmpty(t, entry.Endpoint, "the dispatch must be served for the transport to drive it")
 }
@@ -471,7 +472,7 @@ func (f *wanderKillFixture) wireTransport(t *testing.T, rt *runnerTransport) {
 // workspace.
 func (f *wanderKillFixture) requireKilled(t *testing.T, reason string) dispatch.Entry {
 	t.Helper()
-	entry, ok := f.ws.Get(f.entry.ID)
+	entry, ok := f.reg.Get(f.entry.ID)
 	require.True(t, ok, "a killed dispatch's registry entry must survive (cleanup defers to the parent)")
 	require.Equal(t, dispatch.StatusKilled, entry.Status)
 	require.NotNil(t, entry.Result)
@@ -696,7 +697,8 @@ func TestWanderKill_CompletionWinsOverLateKill(t *testing.T) {
 	f.kill.kill(dispatch.ReasonHardTimeout)
 
 	run := dispatchRun{
-		workspace:    f.ws,
+		reg:          f.reg,
+		provider:     f.provider,
 		entry:        f.entry,
 		model:        Model{Model: f.runModel, CatwalkCfg: catwalkModelCfg()},
 		sessionID:    f.taskSess.ID,
@@ -707,7 +709,7 @@ func TestWanderKill_CompletionWinsOverLateKill(t *testing.T) {
 		completed: true,
 		findings:  "all done",
 		diff: func(ctx context.Context) (string, error) {
-			return run.workspace.Diff(ctx, run.entry.ID)
+			return run.provider.Diff(ctx, run.entry)
 		},
 	})
 
@@ -733,7 +735,7 @@ func TestWanderKill_KilledCarriesLastStateAndDiff(t *testing.T) {
 		Enabled:         true,
 		NudgeThreshold:  1,
 		KillAfterNudges: 1,
-	}, []fantasy.AgentTool{writeMarkerTool(f.ws, f.entry.ID)})
+	}, []fantasy.AgentTool{writeMarkerTool(f.reg, f.entry.ID)})
 
 	f.runDispatchSync(t)
 
@@ -747,12 +749,12 @@ func TestWanderKill_KilledCarriesLastStateAndDiff(t *testing.T) {
 // writeMarkerTool is a bash-named tool that writes a marker file into
 // the dispatch's workspace, giving the diff something salvageable to
 // show. It resolves the workspace path at call time from the registry.
-func writeMarkerTool(ws *dispatch.Workspace, id string) fantasy.AgentTool {
+func writeMarkerTool(reg *dispatch.AgentRegistry, id string) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		"bash",
 		"Write the marker.",
 		func(ctx context.Context, params struct{}, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			entry, ok := ws.Get(id)
+			entry, ok := reg.Get(id)
 			if !ok {
 				return fantasy.NewTextErrorResponse("unknown dispatch"), nil
 			}
