@@ -375,6 +375,6 @@ func (c *recordingCoordinator) DispatchByHandle(sessionID, handle string) (dispa
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (c *recordingCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+func (c *recordingCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	return errors.New("not implemented")
 }

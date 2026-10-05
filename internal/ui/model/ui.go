@@ -3528,7 +3528,10 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 					break
 				}
 
-				// Otherwise, send the message
+				// Otherwise, send the message. Keep the raw editor value
+				// around: a leading @handle that is refused or fails to
+				// deliver restores the pre-submit state (#414).
+				savedValue := value
 				m.textarea.Reset()
 				if cmd := m.handleTextareaHeightChange(prevHeight); cmd != nil {
 					cmds = append(cmds, cmd)
@@ -3555,6 +3558,8 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				}
 
 				attachments := m.attachments.List()
+				savedMentionAttachments := m.mentionAttachments
+				savedDiscardedMentions := m.discardedMentions
 				m.attachments.Reset()
 				m.resetMentionTracking()
 				if len(value) == 0 && !message.ContainsTextAttachment(attachments) {
@@ -3571,9 +3576,22 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 
 				// A prompt that opens with a live agent's @handle routes to
 				// that agent's injection queue instead of starting a parent
-				// turn (#313). The editor was already reset above, exactly
-				// like a sent prompt.
-				if cmd, handled := m.routeLeadingAgentHandle(value); handled {
+				// turn (#313), the editor's attachments included (#414). A
+				// steer that is refused or fails to deliver restores the
+				// editor's pre-submit state: the typed text, the chips and
+				// the mention tracking, with the warning or error still
+				// shown.
+				if cmd, handled, delivered := m.routeLeadingAgentHandle(value, attachments); handled {
+					if !delivered {
+						restoredHeight := m.textarea.Height()
+						m.textarea.SetValue(savedValue)
+						if cmd := m.handleTextareaHeightChange(restoredHeight); cmd != nil {
+							cmds = append(cmds, cmd)
+						}
+						m.attachments.Set(attachments)
+						m.mentionAttachments = savedMentionAttachments
+						m.discardedMentions = savedDiscardedMentions
+					}
 					return tea.Batch(cmd, m.loadPromptHistory())
 				}
 

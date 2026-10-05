@@ -349,8 +349,8 @@ func (w *AppWorkspace) DispatchByHandle(sessionID, handle string) (dispatch.Todo
 	return w.app.DispatchByHandle(sessionID, handle)
 }
 
-func (w *AppWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
-	return w.app.DeliverAgentMessageByHandle(ctx, sessionID, handle, text)
+func (w *AppWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
+	return w.app.DeliverAgentMessageByHandle(ctx, sessionID, handle, text, attachments)
 }
 
 func (w *AppWorkspace) CancelDispatch(ctx context.Context, ref string) error {

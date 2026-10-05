@@ -361,6 +361,6 @@ func (s *stubCoordinator) DispatchByHandle(sessionID, handle string) (dispatch.T
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (s *stubCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+func (s *stubCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	return errors.New("not implemented")
 }
