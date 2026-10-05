@@ -161,6 +161,19 @@ func TestBuildToolsGatesDispatchOnInteractive(t *testing.T) {
 			c := newDispatchTestCoordinator(t, testEnv(t))
 			c.interactive = tt.interactive
 
+			const providerID = "test-provider"
+			c.cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+				ID:      providerID,
+				Name:    "Test",
+				Type:    openaicompat.Name,
+				BaseURL: "http://127.0.0.1:0/v1",
+				APIKey:  "test",
+				Models:  []catwalk.Model{{ID: "test-model", DefaultMaxTokens: 4096}},
+			})
+			selected := config.SelectedModel{Provider: providerID, Model: "test-model"}
+			c.cfg.OverridePreferredModel(config.SelectedModelTypeLarge, selected)
+			c.cfg.OverridePreferredModel(config.SelectedModelTypeSmall, selected)
+
 			agentCfg := c.cfg.Config().Agents[config.AgentCoder]
 			built, err := c.buildTools(t.Context(), agentCfg, tt.subAgent)
 			require.NoError(t, err)
