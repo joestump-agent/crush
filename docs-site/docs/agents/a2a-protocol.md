@@ -144,7 +144,7 @@ streams:
 | 1 | `task` | `TASK_STATE_SUBMITTED` | The new task, with its IDs. |
 | 2 | `statusUpdate` | `TASK_STATE_WORKING` | No message. The run has started. |
 | 3 | `statusUpdate` × 0..n | `TASK_STATE_WORKING` | One per todo-list change: the current todo as message text, and the list in `metadata.todos`. |
-| 4 | `artifactUpdate` | — | The work product: one text part holding the full unified diff. |
+| 4 | `artifactUpdate` × 1..n | — | The work product: the diff as chunked `text/x-diff` parts (artifact `diff`), then the typed outcome as a data part (artifact `dispatch-result`). |
 | 5 | `statusUpdate` | `TASK_STATE_COMPLETED` | The agent's final text as an agent message. |
 
 ### Todo progress events
@@ -185,14 +185,25 @@ A progress event looks like this:
 - **Ordering.** Progress events and the terminal status are yielded from
   one goroutine, so no progress event follows a terminal one.
 
-### The artifact
+### The artifacts
 
-The artifact is emitted only after a successful run, and only when the diff
+Two artifacts carry the work product.
+
+**`diff`.** Emitted only after a successful run, and only when the diff
 is non-empty and could be captured. It is the workspace's diff against the
 merge-base of its base and `HEAD`, falling back to the base SHA recorded at
-provision. It covers committed, uncommitted and untracked files. It is
-sent in full: the 250-line cut is applied later, by the coordinator, when
-it builds `diff_summary`.
+provision. It covers committed, uncommitted and untracked files. The diff
+streams as `text/x-diff` chunks of at most 256 KiB, named `dispatch.diff`:
+the first chunk creates the artifact, the rest append, and the last closes
+it, so no message can exceed the transport's line limits however large the
+diff grows. It is sent in full: the coordinator's line and byte cuts are
+applied later, when it builds `diff_summary`.
+
+**`dispatch-result`.** Emitted on every completed run, with or without a
+diff. One data part carries the typed outcome: `diff_bytes`,
+`files_changed`, and `diff_error` when the diff could not be captured. A
+diff error does not fail the run: the task still completes, and the error
+rides the result.
 
 ### Other endings
 
@@ -208,7 +219,7 @@ it builds `diff_summary`.
 
 | Stream outcome | `DispatchResult` |
 | --- | --- |
-| `TASK_STATE_COMPLETED` | `completed`. `key_findings` is the message text. `diff_summary` comes from the artifact, or is `(no changes)`. |
+| `TASK_STATE_COMPLETED` | `completed`. `key_findings` is the message text. `diff_summary` comes from the `diff` artifact: `(no changes)` when it is empty, `(diff unavailable: …)` when the result artifact carries a `diff_error`. |
 | `TASK_STATE_FAILED`, `TASK_STATE_REJECTED` | `failed`. `error` is the message text. |
 | `TASK_STATE_CANCELED` | `failed`, with `error` "dispatch canceled: …". |
 | Stream error before a terminal state | `failed`, with `error` "a2a: dispatch stream: …". |
@@ -221,8 +232,7 @@ renders from the in-process todo collector.
 :::warning[Known issue]
 The client uses the SDK's default HTTP client, whose 3-minute total
 timeout also bounds the SSE body. Every dispatch longer than 3 minutes
-ends as a stream error while the agent keeps running ([#344](https://github.com/joestump-agent/crush/issues/344)). A diff
-larger than the SDK's 10 MB line limit fails a completed run ([#361](https://github.com/joestump-agent/crush/issues/361)). A
+ends as a stream error while the agent keeps running ([#344](https://github.com/joestump-agent/crush/issues/344)). A
 panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/crush/issues/345)).
 :::
 
