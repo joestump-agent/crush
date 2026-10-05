@@ -11,6 +11,7 @@ import (
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/config"
@@ -67,6 +68,11 @@ type ServerParams struct {
 	// the production value is the dispatch run's kill reason. A nil func
 	// or an empty string falls back to "canceled".
 	CancelReason func() string
+	// TaskStore persists served tasks durably (#354) instead of the
+	// SDK's in-process default, so task state survives a restart.
+	// Optional; the production store arrives with #355. nil keeps
+	// today's in-memory behavior.
+	TaskStore taskstore.Store
 }
 
 // Server is one dispatched agent's in-process A2A server (#70): JSON-RPC
@@ -148,6 +154,9 @@ func StartServer(ctx context.Context, p ServerParams) (*Server, error) {
 	var handlerOpts []a2asrv.RequestHandlerOption
 	if p.InactivityTimeout > 0 {
 		handlerOpts = append(handlerOpts, a2asrv.WithAgentInactivityTimeout(p.InactivityTimeout+time.Minute))
+	}
+	if p.TaskStore != nil {
+		handlerOpts = append(handlerOpts, a2asrv.WithTaskStore(p.TaskStore))
 	}
 	handler := a2asrv.NewHandler(executor, handlerOpts...)
 	mux := http.NewServeMux()
