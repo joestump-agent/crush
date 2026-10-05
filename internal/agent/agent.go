@@ -879,7 +879,17 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	}
 	var todoRun *todoEnforcementRun
 	if hasTodosTool(agentTools) {
-		todoRun = a.todoEnforcement.newRun(len(currentSession.Todos) > 0, onKill)
+		// The ladder classifies each call against the tool itself (an
+		// MCP read-only hint), so it keeps the run's tools by name; a
+		// gated tool is classified as the tool it wraps.
+		toolByName := make(map[string]fantasy.AgentTool, len(agentTools))
+		for _, tool := range agentTools {
+			if gate, ok := tool.(*todoGateTool); ok {
+				tool = gate.inner
+			}
+			toolByName[tool.Info().Name] = tool
+		}
+		todoRun = a.todoEnforcement.newRun(len(currentSession.Todos) > 0, onKill, toolByName)
 	}
 
 	msgs, err := a.getSessionMessages(ctx, currentSession)
@@ -1146,7 +1156,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			return m.Model
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
-			todoRun.recordToolCall(tc.ToolName)
+			todoRun.recordToolCall(tc.ToolName, tc.Input)
 			input, wasSanitized := sanitizeToolInput(tc.ToolName, tc.ToolCallID, tc.Input)
 			if wasSanitized {
 				sanitizedToolCalls[tc.ToolCallID] = true

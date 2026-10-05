@@ -45,3 +45,55 @@ func TestContainsCommandChaining(t *testing.T) {
 		})
 	}
 }
+
+func TestIsReadOnlyCommand(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{"plain ls", "ls -la", true},
+		{"bare ls", "ls", true},
+		{"git status", "git status", true},
+		{"git log", "git log --oneline", true},
+		{"git blame", "git blame main", true},
+		{"git config get", "git config --get user.name", true},
+		{"git config list", "git config --list", true},
+		{"uppercase", "GIT STATUS", true},
+		{"echo", "echo hello", true},
+		{"id with flag", "id -u", true},
+		{"rm", "rm x", false},
+		{"chained mutating", "git status && rm x", false},
+		{"chained with semicolon", "ls; rm x", false},
+		{"substitution", "echo $(rm x)", false},
+		{"backtick substitution", "ls `rm x`", false},
+		{"timeout wraps a mutating command", "timeout 5 rm x", false},
+		{"timeout wraps a read-only command", "timeout 5 ls", false},
+		{"nice wraps a command", "nice ls", false},
+		{"nohup wraps a command", "nohup ls", false},
+		{"time wraps a command", "time ls", false},
+		{"env runs another command", "env FOO=bar ls", false},
+		{"set changes shell state", "set -x", false},
+		{"unset changes shell state", "unset FOO", false},
+		{"kill terminates a process", "kill 1234", false},
+		{"killall terminates processes", "killall frob", false},
+		{"git branch", "git branch", false},
+		{"git branch create", "git branch feature", false},
+		{"git tag", "git tag v1.0", false},
+		{"git remote", "git remote add origin url", false},
+		{"unknown command", "frobnicate", false},
+		{"empty string", "", false},
+		{"prefix with attached text", "git statusx", false},
+		{"id with attached text", "idontexist", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := IsReadOnlyCommand(tt.input)
+			assert.Equal(t, tt.expected, got, "IsReadOnlyCommand(%q)", tt.input)
+		})
+	}
+}
