@@ -145,6 +145,11 @@ type Entry struct {
 	// completed agent block (#65) renders its durable record — the
 	// findings summary and diff stat — from it.
 	Result *DispatchResult
+	// Disposition is what a human decided about the work (#367):
+	// pending review until they act, then applied or dismissed. Exit
+	// cleanup and startup reconciliation remove applied and dismissed
+	// workspaces and keep pending ones that produced work.
+	Disposition Disposition
 }
 
 // clone returns a copy of the entry.
@@ -223,7 +228,7 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 		return nil, fmt.Errorf("prune stale worktrees: %w", err)
 	}
 
-	return &Workspace{
+	w := &Workspace{
 		repoRoot:     root,
 		worktreesDir: dir,
 		commonDir:    commonDir,
@@ -231,7 +236,89 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 		entries:      make(map[string]Entry),
 		instanceID:   uuid.New().String(),
 		leases:       make(map[string]func()),
-	}, nil
+	}
+	// Startup reconciliation (#367): workspaces a human decided about,
+	// and dead owners' workspaces that never produced work, are removed;
+	// everything else is kept for salvage.
+	w.reconcileStartup(context.Background())
+	return w, nil
+}
+
+// reconcileStartup applies the decisions recorded in the worktrees
+// directory's owner markers (#367): applied and dismissed workspaces
+// are removed, and a dead owner's workspace that never produced work —
+// no commits ahead of its recorded base and a clean tree — is removed
+// too. Everything else is kept: pending work from a crashed run stays
+// on disk for salvage, and a live owner's entries are never touched.
+// Failures are logged and left for a later reconciliation or cleanup;
+// startup never fails because leftovers could not be removed.
+func (w *Workspace) reconcileStartup(ctx context.Context) {
+	markers, err := filepath.Glob(filepath.Join(w.worktreesDir, "*"+ownerMarkerSuffix))
+	if err != nil {
+		return
+	}
+	for _, path := range markers {
+		branch := strings.TrimSuffix(filepath.Base(path), ownerMarkerSuffix)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			slog.Debug("Skipping unreadable dispatch owner marker", "path", path, "error", err)
+			continue
+		}
+		var m ownerMarker
+		if err := json.Unmarshal(data, &m); err != nil {
+			slog.Debug("Skipping malformed dispatch owner marker", "path", path, "error", err)
+			continue
+		}
+
+		// Take the lease: a contended lease belongs to a live process,
+		// whose entries are never touched; a free lease means the owner
+		// died and the decision is ours to apply.
+		release, err := lock.TryFile(w.leasePath(branch))
+		if err != nil {
+			continue
+		}
+		entry := Entry{
+			Path:    filepath.Join(w.worktreesDir, branch),
+			Branch:  branch,
+			BaseSHA: m.BaseSHA,
+		}
+		if m.Disposition != DispositionApplied && m.Disposition != DispositionDismissed && w.hasWork(ctx, entry) {
+			release()
+			continue
+		}
+		if err := w.removeEntry(ctx, entry, release); err != nil {
+			slog.Debug("Startup reconciliation left a dispatch workspace in place", "branch", branch, "error", err)
+		}
+	}
+	_ = runGit(ctx, w.repoRoot, nil, "worktree", "prune")
+}
+
+// hasWork reports whether the workspace produced work a human might
+// want (#367): commits on its branch ahead of the recorded base, or
+// uncommitted changes on disk. An unknown base, a branch that no longer
+// resolves, or a git probe error count as work — the fail-safe is to
+// keep the workspace, never to discard it.
+func (w *Workspace) hasWork(ctx context.Context, entry Entry) bool {
+	if entry.BaseSHA == "" {
+		return true
+	}
+	out, err := gitOutput(ctx, w.repoRoot, nil, "rev-list", "--count", entry.BaseSHA+".."+entry.Branch)
+	if err != nil {
+		return true
+	}
+	if strings.TrimSpace(string(out)) != "0" {
+		return true
+	}
+	if entry.Path != "" {
+		out, err = gitOutput(ctx, entry.Path, nil, "status", "--porcelain")
+		if err != nil {
+			return true
+		}
+		if strings.TrimSpace(string(out)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // provisionLocks serializes the worktree add step per repository:
@@ -316,19 +403,20 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 		w.removeEntry(ctx, Entry{Path: path, Branch: branch}, nil)
 		return Entry{}, fmt.Errorf("take ownership lease: %w", err)
 	}
-	if err := w.writeOwnerMarker(branch); err != nil {
+	if err := w.writeOwnerMarker(branch, baseSHA); err != nil {
 		release()
 		w.removeEntry(ctx, Entry{Path: path, Branch: branch}, nil)
 		return Entry{}, fmt.Errorf("write owner marker: %w", err)
 	}
 
 	entry := Entry{
-		ID:      id,
-		Path:    path,
-		Branch:  branch,
-		Base:    base,
-		BaseSHA: baseSHA,
-		Status:  StatusProvisioned,
+		ID:          id,
+		Path:        path,
+		Branch:      branch,
+		Base:        base,
+		BaseSHA:     baseSHA,
+		Status:      StatusProvisioned,
+		Disposition: DispositionPendingReview,
 	}
 
 	w.mu.Lock()
@@ -369,23 +457,35 @@ func (w *Workspace) leasePath(branch string) string {
 // ownerPath is the human-readable owner marker for branch. It carries
 // no authority: the lock file is what ownership is proven with.
 func (w *Workspace) ownerPath(branch string) string {
-	return filepath.Join(w.worktreesDir, branch+".owner.json")
+	return filepath.Join(w.worktreesDir, branch+ownerMarkerSuffix)
 }
 
-// ownerMarker records who holds a workspace's lease.
+// ownerMarkerSuffix is the filename suffix of an owner marker next to
+// its worktree.
+const ownerMarkerSuffix = ".owner.json"
+
+// ownerMarker records who holds a workspace's lease, plus what the
+// workspace needs to be judged without the registry (#367): the base
+// it was cut from, so commits-ahead can be counted after a crash, and
+// the human's disposition, so decided workspaces can be cleaned up.
 type ownerMarker struct {
-	InstanceID string    `json:"instance_id"`
-	PID        int       `json:"pid"`
-	CreatedAt  time.Time `json:"created_at"`
+	InstanceID  string      `json:"instance_id"`
+	PID         int         `json:"pid"`
+	CreatedAt   time.Time   `json:"created_at"`
+	BaseSHA     string      `json:"base_sha,omitempty"`
+	Disposition Disposition `json:"disposition"`
 }
 
 // writeOwnerMarker atomically records this workspace instance as the
-// owner of branch.
-func (w *Workspace) writeOwnerMarker(branch string) error {
+// owner of branch, with the base the workspace was cut from and the
+// initial pending-review disposition (#367).
+func (w *Workspace) writeOwnerMarker(branch, baseSHA string) error {
 	data, err := json.Marshal(ownerMarker{
-		InstanceID: w.instanceID,
-		PID:        os.Getpid(),
-		CreatedAt:  time.Now().UTC(),
+		InstanceID:  w.instanceID,
+		PID:         os.Getpid(),
+		CreatedAt:   time.Now().UTC(),
+		BaseSHA:     baseSHA,
+		Disposition: DispositionPendingReview,
 	})
 	if err != nil {
 		return err
@@ -536,6 +636,85 @@ func (w *Workspace) SetResult(id string, result DispatchResult) bool {
 // SetSession records the ephemeral session backing the dispatched agent.
 func (w *Workspace) SetSession(id, sessionID string) bool {
 	return w.Update(id, func(e *Entry) { e.SessionID = sessionID })
+}
+
+// Disposition records what a human decided about a workspace's work
+// (#367). A provisioned workspace starts as pending review; #368's
+// apply and dismiss tools move it to applied or dismissed. Exit
+// cleanup and startup reconciliation remove decided workspaces and
+// keep pending ones that produced work — nothing automatically
+// discards work-in-progress a human might want.
+type Disposition string
+
+const (
+	// DispositionPendingReview is the initial disposition: the work is
+	// on disk and on its branch, waiting for the human.
+	DispositionPendingReview Disposition = "pending_review"
+	// DispositionApplied means the work was merged or adopted; the
+	// workspace has nothing left to say and is cleaned up.
+	DispositionApplied Disposition = "applied"
+	// DispositionDismissed means the human decided the work is not
+	// wanted; the workspace is cleaned up.
+	DispositionDismissed Disposition = "dismissed"
+)
+
+// SetDisposition records the human's decision on the entry and in the
+// owner marker (#367), so the decision survives a crash. It reports
+// whether the entry exists.
+func (w *Workspace) SetDisposition(id string, d Disposition) bool {
+	w.mu.Lock()
+	entry, ok := w.entries[id]
+	w.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if err := w.setMarkerDisposition(entry.Branch, d); err != nil {
+		slog.Warn("Failed to record dispatch disposition in owner marker", "dispatch_id", id, "branch", entry.Branch, "error", err)
+	}
+	return w.Update(id, func(e *Entry) { e.Disposition = d })
+}
+
+// setMarkerDisposition rewrites branch's owner marker with the new
+// disposition, atomically. A missing marker is not an error: the
+// provision that writes it failed before the marker step, and the
+// entry-level record still stands.
+func (w *Workspace) setMarkerDisposition(branch string, d Disposition) error {
+	path := w.ownerPath(branch)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var m ownerMarker
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	m.Disposition = d
+	updated, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(w.worktreesDir, ".*.owner.json.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(updated); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return nil
 }
 
 // SetParentSessionID records the session the dispatch was created from
@@ -750,17 +929,79 @@ func (w *Workspace) Remove(ctx context.Context, id string) error {
 	return w.removeEntry(ctx, entry, release)
 }
 
+// Release tears down this instance's dispatch workspaces at exit, the
+// synchronous replacement for the exit-time Sweep (#367): entries the
+// human decided about (applied or dismissed) and entries that never
+// produced work — no commits ahead of the recorded base and a clean
+// tree — are removed with their branches. Completed and killed entries
+// that produced work stay on disk and on their branch for salvage, and
+// another instance's live entries are never touched: only this
+// registry's entries are considered. The orphan pass is not part of
+// exit — startup reconciliation owns it. A stubborn entry stays
+// registered so a later Release or Remove can retry it, and the errors
+// are joined and returned.
+func (w *Workspace) Release(ctx context.Context) error {
+	w.mu.Lock()
+	type releaseEntry struct {
+		entry   Entry
+		release func()
+	}
+	var doomed []releaseEntry
+	for id, e := range w.entries {
+		if w.entryDisposable(ctx, e) {
+			doomed = append(doomed, releaseEntry{e, w.leases[id]})
+			delete(w.entries, id)
+			delete(w.leases, id)
+		}
+	}
+	w.mu.Unlock()
+
+	var errs []error
+	for _, item := range doomed {
+		if err := w.removeEntry(ctx, item.entry, item.release); err != nil {
+			errs = append(errs, err)
+			// The removal failed, so the entry and its lease stay
+			// registered for a later Release or Remove to retry.
+			w.mu.Lock()
+			w.entries[item.entry.ID] = item.entry
+			if item.release != nil {
+				w.leases[item.entry.ID] = item.release
+			}
+			w.mu.Unlock()
+		}
+	}
+	if err := runGit(ctx, w.repoRoot, nil, "worktree", "prune"); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// entryDisposable reports whether exit cleanup may remove the entry
+// (#367): a disposition the human recorded (applied or dismissed), or
+// a pending workspace that never produced work. A git probe error or
+// an unknown base keeps the workspace — the fail-safe is never to
+// discard work a human might want.
+func (w *Workspace) entryDisposable(ctx context.Context, entry Entry) bool {
+	switch entry.Disposition {
+	case DispositionApplied, DispositionDismissed:
+		return true
+	default:
+		return !w.hasWork(ctx, entry)
+	}
+}
+
 // Sweep removes every tracked workspace plus every orphaned
 // crush-dispatch-* directory whose ownership lease is free (from a
 // crashed run whose registry was lost). Orphans a live process still
 // holds — another Workspace on the same repository — and orphans with
 // no lease file at all, whose ownership cannot be proven, are left
 // alone (#369 is the explicit cleanup tool for those). It is the
-// session-end backstop: nothing dispatch created survives it, and no
-// dangling branches or .crush/worktrees/ entries are left behind. One
-// stubborn workspace does not stop the sweep: every entry and every
-// orphan is attempted, the errors are joined and returned, and a failed
-// entry stays registered so a later sweep or Remove can retry it.
+// explicit "discard everything" cleanup: nothing dispatch created
+// survives it, and no dangling branches or .crush/worktrees/ entries
+// are left behind. One stubborn workspace does not stop the sweep:
+// every entry and every orphan is attempted, the errors are joined and
+// returned, and a failed entry stays registered so a later sweep or
+// Remove can retry it.
 func (w *Workspace) Sweep(ctx context.Context) error {
 	w.mu.Lock()
 	type sweepEntry struct {

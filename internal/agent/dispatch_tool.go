@@ -51,8 +51,9 @@ type DispatchAgentParams struct {
 	Role string `json:"role,omitempty" description:"One-line role label for the dispatched agent (e.g. \"tester\", \"docs writer\"), shown in the @ completions and used to derive its handle"`
 }
 
-// dispatchSweepTimeout bounds the session-end sweep: it runs git commands
-// against every workspace, and a wedged worktree must not hang shutdown.
+// dispatchSweepTimeout bounds the session-end ReleaseDispatches: it runs
+// git commands against every workspace, and a wedged worktree must not
+// hang shutdown.
 const dispatchSweepTimeout = 30 * time.Second
 
 // dispatchAgentOptions configures the dispatched-agent constructor.
@@ -918,29 +919,24 @@ func (c *coordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, b
 	return collector.Snapshot(sessionID)
 }
 
-// sweepDispatchOnDone is the session-end backstop (#63's Sweep): when the
-// coordinator's context ends — app shutdown — every workspace dispatch
-// created is torn down, in-flight runs included (their runs fail against
-// a removed workspace; wander kill in #316 owns deterministic
-// cancellation of live runs).
-func (c *coordinator) sweepDispatchOnDone(ctx context.Context) {
-	<-ctx.Done()
-	c.sweepDispatch()
-}
-
-// sweepDispatch sweeps the dispatch workspace registry if one exists.
-func (c *coordinator) sweepDispatch() {
+// ReleaseDispatches is the synchronous session-end cleanup (#367): it
+// tears down this session's dispatch workspaces that are safe to remove
+// — decided entries (applied or dismissed) and pending ones with no
+// work — and leaves completed or killed work with commits on disk for
+// salvage. It is called from App.Shutdown on the live coordinator
+// context, bounded by dispatchSweepTimeout so a wedged worktree cannot
+// hang shutdown.
+func (c *coordinator) ReleaseDispatches(ctx context.Context) {
 	c.dispatchMu.Lock()
 	workspace := c.dispatchWS
 	c.dispatchMu.Unlock()
 	if workspace == nil {
 		return
 	}
-	// A fresh, bounded context: the coordinator's own is already done.
-	ctx, cancel := context.WithTimeout(context.Background(), dispatchSweepTimeout)
+	ctx, cancel := context.WithTimeout(ctx, dispatchSweepTimeout)
 	defer cancel()
-	if err := workspace.Sweep(ctx); err != nil {
-		slog.Error("Dispatch workspace sweep failed", "error", err)
+	if err := workspace.Release(ctx); err != nil {
+		slog.Error("Dispatch workspace release failed", "error", err)
 	}
 }
 

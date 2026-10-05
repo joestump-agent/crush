@@ -100,7 +100,7 @@ func (r DispatchResult) TerminalMessage() string {
 		b.WriteString(r.Render())
 		return b.String()
 	}
-	fmt.Fprintf(&b, "A dispatched agent finished with status %q (dispatch %s, branch %s). Its result is below. Review the diff and decide whether to merge or dismiss it — the dispatch never merges itself; dismissal should clean up the workspace (git worktree remove and branch delete).\n\n", r.Status, r.DispatchID, r.Branch)
+	fmt.Fprintf(&b, "A dispatched agent finished with status %q (dispatch %s, branch %s). Its result is below. Review the diff and decide whether to merge or dismiss it — the dispatch never merges itself. The workspace and its branch are preserved until the work is applied or dismissed; uncommitted changes count as part of the work, so cleanup waits on your decision and nothing was discarded at exit.\n\n", r.Status, r.DispatchID, r.Branch)
 	b.WriteString(r.Render())
 	return b.String()
 }

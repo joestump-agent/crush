@@ -1089,3 +1089,139 @@ func TestGitEnvScrubbed(t *testing.T) {
 	require.Empty(t, strings.TrimSpace(gitIn(t, decoy, "status", "--porcelain")),
 		"decoy repository was modified")
 }
+
+// Release is the selective exit cleanup (#367): entries the human
+// decided about (applied or dismissed) and pending ones that never
+// produced work are removed with their branches; pending ones with
+// work — committed or just uncommitted — stay on disk for salvage and
+// stay registered.
+func TestReleaseSelectivity(t *testing.T) {
+	ctx := t.Context()
+	tests := []struct {
+		name        string
+		disposition Disposition
+		work        func(t *testing.T, ws *Workspace, entry Entry)
+		wantKept    bool
+	}{
+		{
+			name: "pending with uncommitted changes is kept",
+			work: func(t *testing.T, ws *Workspace, entry Entry) {
+				write(t, filepath.Join(entry.Path, "wip.txt"), "wip")
+			},
+			wantKept: true,
+		},
+		{
+			name: "pending with a commit is kept",
+			work: func(t *testing.T, ws *Workspace, entry Entry) {
+				write(t, filepath.Join(entry.Path, "done.txt"), "done")
+				gitIn(t, entry.Path, "add", "-A")
+				commitIn(t, entry.Path, "dispatched work")
+			},
+			wantKept: true,
+		},
+		{
+			name:     "pending and clean is removed",
+			wantKept: false,
+		},
+		{
+			name:        "dismissed with work is removed",
+			disposition: DispositionDismissed,
+			work: func(t *testing.T, ws *Workspace, entry Entry) {
+				write(t, filepath.Join(entry.Path, "done.txt"), "done")
+				gitIn(t, entry.Path, "add", "-A")
+				commitIn(t, entry.Path, "dispatched work")
+			},
+			wantKept: false,
+		},
+		{
+			name:        "applied with work is removed",
+			disposition: DispositionApplied,
+			work: func(t *testing.T, ws *Workspace, entry Entry) {
+				write(t, filepath.Join(entry.Path, "done.txt"), "done")
+				gitIn(t, entry.Path, "add", "-A")
+				commitIn(t, entry.Path, "dispatched work")
+			},
+			wantKept: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newTestRepo(t)
+			ws, err := NewWorkspace(repo)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+
+			entry, err := ws.Provision(ctx, ProvisionOptions{})
+			require.NoError(t, err)
+			if tt.work != nil {
+				tt.work(t, ws, entry)
+			}
+			if tt.disposition != "" {
+				require.True(t, ws.SetDisposition(entry.ID, tt.disposition))
+			}
+
+			require.NoError(t, ws.Release(ctx))
+
+			if tt.wantKept {
+				require.DirExists(t, entry.Path)
+				require.True(t, branchExists(t, repo, entry.Branch))
+				got, ok := ws.Get(entry.ID)
+				require.True(t, ok, "kept entry stays registered so Remove can still decide it")
+				require.Equal(t, entry.ID, got.ID)
+			} else {
+				_, err := os.Stat(entry.Path)
+				require.True(t, os.IsNotExist(err), "released workspace directory survived")
+				require.False(t, branchExists(t, repo, entry.Branch), "released branch survived")
+				_, ok := ws.Get(entry.ID)
+				require.False(t, ok, "released entry stayed registered")
+			}
+		})
+	}
+}
+
+// Startup reconciliation (#367): after a crash — leases released,
+// registry gone, owner markers on disk — a fresh Workspace removes a
+// dead owner's workless workspace and a decided one, and keeps a dead
+// owner's workspace that produced work.
+func TestStartupReconciliation(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := t.Context()
+
+	ws, err := NewWorkspace(repo)
+	require.NoError(t, err)
+
+	kept, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	write(t, filepath.Join(kept.Path, "salvage.txt"), "salvage")
+	gitIn(t, kept.Path, "add", "-A")
+	commitIn(t, kept.Path, "dispatched work")
+
+	empty, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+
+	decided, err := ws.Provision(ctx, ProvisionOptions{})
+	require.NoError(t, err)
+	write(t, filepath.Join(decided.Path, "done.txt"), "done")
+	gitIn(t, decided.Path, "add", "-A")
+	commitIn(t, decided.Path, "dispatched work")
+	require.True(t, ws.SetDisposition(decided.ID, DispositionDismissed))
+
+	// The crash: every lease released, nothing else cleaned up.
+	dropLeases(ws)
+
+	fresh, err := NewWorkspace(repo)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fresh.Sweep(context.Background()) })
+
+	_, err = os.Stat(kept.Path)
+	require.NoError(t, err, "crashed run's workspace with work must survive startup reconciliation")
+	require.True(t, branchExists(t, repo, kept.Branch))
+
+	_, err = os.Stat(empty.Path)
+	require.True(t, os.IsNotExist(err), "crashed run's workless workspace must be reconciled away")
+	require.False(t, branchExists(t, repo, empty.Branch))
+
+	_, err = os.Stat(decided.Path)
+	require.True(t, os.IsNotExist(err), "decided workspace must be reconciled away")
+	require.False(t, branchExists(t, repo, decided.Branch))
+}

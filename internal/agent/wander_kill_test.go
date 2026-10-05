@@ -499,6 +499,16 @@ func TestWanderKill_IgnoredNudgesEndToEnd(t *testing.T) {
 	f.requireKilled(t, dispatch.ReasonIgnoredNudges)
 	assert.True(t, f.killHookInvoked, "the enforcement hook must have fired")
 	f.requireParentKilledDelivery(t)
+
+	// Session-end release keeps a killed workspace that holds work a
+	// human might want (#367): uncommitted changes count, so the
+	// directory and branch survive and the entry stays registered.
+	require.NoError(t, os.WriteFile(filepath.Join(f.entry.Path, "salvage.txt"), []byte("keep"), 0o644))
+	f.c.ReleaseDispatches(context.Background())
+	require.DirExists(t, f.entry.Path, "release must not discard a killed workspace's work")
+	require.True(t, branchExists(t, f.env.workingDir, f.entry.Branch))
+	_, ok := f.ws.Get(f.entry.ID)
+	require.True(t, ok, "the killed entry stays registered so Remove can still decide it")
 }
 
 // TestWanderKill_HardTimeout pins the watchdog's hard timeout: a run

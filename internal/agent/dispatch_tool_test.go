@@ -345,40 +345,71 @@ func TestRunDispatchRecordsTerminalStatus(t *testing.T) {
 	}
 }
 
-// The session-end backstop: when the coordinator's context ends, every
-// workspace dispatch created is swept away.
-func TestSweepDispatchOnCoordinatorEnd(t *testing.T) {
+// branchExists reports whether the repo at dir currently has the branch.
+func branchExists(t *testing.T, dir, branch string) bool {
+	t.Helper()
+	out, err := exec.CommandContext(t.Context(), "git", "-C", dir, "branch", "--list", branch).CombinedOutput()
+	require.NoError(t, err, "git branch --list %s: %s", branch, out)
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// ReleaseDispatches is the synchronous session-end cleanup (#367): a
+// completed dispatch whose workspace holds work the human might want —
+// even just uncommitted changes — survives it, and a pending workspace
+// that never produced work is removed.
+func TestReleaseDispatchesKeepsWork(t *testing.T) {
 	agent := &dispatchTestAgent{
 		model:  dispatchTestModel(),
 		result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
 	}
-	c, _ := newDispatchToolEnv(t, agent)
+	c, env := newDispatchToolEnv(t, agent)
 	tool := c.dispatchTool()
 
-	ctx, cancel := context.WithCancel(t.Context())
-	go c.sweepDispatchOnDone(ctx)
-
-	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work"})
-	handle := decodeDispatchHandle(t, resp)
+	// Each dispatch keys its task session off the tool-call and message
+	// IDs, so both must be unique per dispatch.
+	dispatchOnce := func(messageID string) dispatch.DispatchResult {
+		t.Helper()
+		input, err := json.Marshal(DispatchAgentParams{Prompt: "do work"})
+		require.NoError(t, err)
+		ctx := context.WithValue(context.Background(), tools.SessionIDContextKey, "dispatch-parent-session")
+		ctx = context.WithValue(ctx, tools.MessageIDContextKey, messageID)
+		ctx = context.WithValue(ctx, tools.ContentWidthContextKey, 80)
+		resp, err := tool.Run(ctx, fantasy.ToolCall{
+			ID:    "dispatch-tool-call-" + messageID,
+			Name:  DispatchAgentToolName,
+			Input: string(input),
+		})
+		require.NoError(t, err)
+		return decodeDispatchHandle(t, resp)
+	}
+	withWork := dispatchOnce("release-with-work")
+	empty := dispatchOnce("release-empty")
 
 	ws, err := c.dispatchWorkspace()
 	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		entry, ok := ws.Get(handle.DispatchID)
-		return ok && entry.Status == dispatch.StatusCompleted
-	}, 10*time.Second, 50*time.Millisecond)
+	for _, handle := range []dispatch.DispatchResult{withWork, empty} {
+		require.Eventually(t, func() bool {
+			entry, ok := ws.Get(handle.DispatchID)
+			return ok && entry.Status == dispatch.StatusCompleted
+		}, 10*time.Second, 50*time.Millisecond)
+	}
 
-	cancel()
+	// Uncommitted changes count as work (#367): no commit needed.
+	require.NoError(t, os.WriteFile(filepath.Join(withWork.WorkspacePath, "salvage.txt"), []byte("keep"), 0o644))
 
-	require.Eventually(t, func() bool {
-		_, err := os.Stat(handle.WorkspacePath)
-		return os.IsNotExist(err)
-	}, 10*time.Second, 50*time.Millisecond)
-	// Sweep unregisters an entry only after its removal succeeds, so the
-	// registry can drain a few git invocations behind the directory.
-	require.Eventually(t, func() bool {
-		return len(ws.List()) == 0
-	}, 10*time.Second, 50*time.Millisecond)
+	c.ReleaseDispatches(context.Background())
+
+	_, err = os.Stat(withWork.WorkspacePath)
+	require.NoError(t, err, "completed workspace with work must survive release")
+	require.True(t, branchExists(t, env.workingDir, withWork.Branch), "branch of kept workspace must survive")
+	entry, ok := ws.Get(withWork.DispatchID)
+	require.True(t, ok, "kept workspace stays registered so Remove can still decide it")
+	require.Equal(t, dispatch.StatusCompleted, entry.Status)
+
+	_, err = os.Stat(empty.WorkspacePath)
+	require.True(t, os.IsNotExist(err), "workless workspace must be released")
+	require.False(t, branchExists(t, env.workingDir, empty.Branch), "branch of released workspace must be gone")
+	require.Len(t, ws.List(), 1, "only the kept workspace stays registered")
 }
 
 // buildDispatchedAgent constructs a real dispatched agent offline: the

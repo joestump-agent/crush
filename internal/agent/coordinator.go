@@ -392,11 +392,6 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 	cronScheduler := scheduler.NewScheduler(c.cronStore, c.fireScheduledTask)
 	go cronScheduler.Run(ctx)
 
-	// Dispatch session-end backstop: sweep every workspace dispatch
-	// created when the coordinator's context ends (#63's Sweep, wired
-	// here per #64).
-	go c.sweepDispatchOnDone(ctx)
-
 	c.mainAgent = agent
 	c.mainAgentName = config.AgentCoder
 	return c, nil

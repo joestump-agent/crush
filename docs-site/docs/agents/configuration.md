@@ -197,8 +197,9 @@ dispatch from repositories whose branches you trust. Tracked in [#374](https://g
 - One A2A host per Crush process, on a unix socket with `0600` permissions
   instead of a TCP port per dispatch ([#346](https://github.com/joestump-agent/crush/issues/346)). A TCP listener with TLS
   becomes opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)).
-- Worktrees are preserved until you apply or dismiss them explicitly
-  ([#368](https://github.com/joestump-agent/crush/issues/368)), and are never discarded at exit ([#367](https://github.com/joestump-agent/crush/issues/367)).
+- `apply_dispatch` and `dismiss_dispatch` will record your decision about a
+  workspace explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)). Exit and startup already keep decided and
+  work-producing workspaces and remove only the rest ([#367](https://github.com/joestump-agent/crush/issues/367)).
 :::
 
 ## Turning dispatch off
