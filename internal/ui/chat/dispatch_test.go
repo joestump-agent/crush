@@ -327,3 +327,60 @@ func TestDispatchCardShowsHandle(t *testing.T) {
 	out = dispatchTestRender(t, item, dispatchToolOpts(result, false))
 	require.Contains(t, out, "tester-2", "the live snapshot's handle wins over the persisted one")
 }
+
+// The card label distinguishes a user cancel (#373) from the other kill
+// reasons at a glance: "canceled" only for the user-cancel reason,
+// "killed" for every other kill, and the existing labels otherwise.
+func TestDispatchStateLabelCanceledVsKilled(t *testing.T) {
+	tests := []struct {
+		status       dispatch.Status
+		killedReason string
+		want         string
+	}{
+		{dispatch.StatusProvisioned, "", "queued"},
+		{dispatch.StatusRunning, "", "working"},
+		{dispatch.StatusCompleted, "", "complete"},
+		{dispatch.StatusFailed, "", "failed"},
+		{dispatch.StatusKilled, dispatch.ReasonCanceled, "canceled"},
+		{dispatch.StatusKilled, dispatch.ReasonHardTimeout, "killed"},
+		{dispatch.StatusKilled, dispatch.ReasonStalledTodos, "killed"},
+		{dispatch.StatusKilled, "", "killed"},
+	}
+	for _, tt := range tests {
+		require.Equal(t, tt.want, dispatchStateLabel(tt.status, tt.killedReason),
+			"status %q reason %q", tt.status, tt.killedReason)
+	}
+}
+
+// A killed card whose terminal payload carries the user-cancel reason
+// renders "canceled" in the status line (#373); the other kills keep
+// "killed".
+func TestDispatchCardCanceledLabel(t *testing.T) {
+	tests := []struct {
+		name         string
+		killedReason string
+		want         string
+	}{
+		{"user cancel", dispatch.ReasonCanceled, "canceled ·"},
+		{"other kill", dispatch.ReasonHardTimeout, "killed ·"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+			item.SetDispatchSnapshot(dispatch.TodoSnapshot{
+				Entry: dispatch.Entry{
+					ID:        "dispatch-1",
+					SessionID: "msg$$call-dispatch-1",
+					Status:    dispatch.StatusKilled,
+					StartedAt: time.Now().Add(-30 * time.Second),
+					Result: &dispatch.DispatchResult{
+						Status:       dispatch.StatusKilled,
+						KilledReason: tt.killedReason,
+					},
+				},
+			})
+			out := dispatchTestRender(t, item, dispatchToolOpts(nil, false))
+			require.Contains(t, out, tt.want)
+		})
+	}
+}

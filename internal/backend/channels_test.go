@@ -148,9 +148,12 @@ func (c *recordingCoordinator) RunAccepted(ctx context.Context, _ *agent.Accepte
 	return nil, nil
 }
 
-func (c *recordingCoordinator) BeginAccepted(string) *agent.AcceptedRun       { return nil }
-func (c *recordingCoordinator) Cancel(string)                                 {}
-func (c *recordingCoordinator) CancelAll()                                    {}
+func (c *recordingCoordinator) BeginAccepted(string) *agent.AcceptedRun { return nil }
+func (c *recordingCoordinator) Cancel(string)                           {}
+func (c *recordingCoordinator) CancelAll()                              {}
+func (c *recordingCoordinator) CancelDispatch(context.Context, string) error {
+	return errors.New("not implemented")
+}
 func (c *recordingCoordinator) IsBusy() bool                                  { return false }
 func (c *recordingCoordinator) IsSessionBusy(string) bool                     { return false }
 func (c *recordingCoordinator) QueuedPrompts(string) int                      { return 0 }

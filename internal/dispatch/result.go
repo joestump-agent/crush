@@ -41,6 +41,9 @@ const (
 	ReasonToolLoop = "tool loop"
 	// ReasonHardTimeout: the run outlived the configured hard timeout.
 	ReasonHardTimeout = "hard timeout"
+	// ReasonCanceled: a user or the parent agent canceled the run on
+	// demand (#373) — the cancel_dispatch tool or the UI binding.
+	ReasonCanceled = "canceled by user"
 	// ReasonShutdown: the run was canceled because the application is
 	// shutting down (#372).
 	ReasonShutdown = "crush exited"

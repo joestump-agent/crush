@@ -215,6 +215,10 @@ func (c *scriptedCoordinator) CancelAll() {
 	}
 }
 
+func (c *scriptedCoordinator) CancelDispatch(context.Context, string) error {
+	return errors.New("not implemented")
+}
+
 func (c *scriptedCoordinator) IsBusy() bool                                  { return false }
 func (c *scriptedCoordinator) IsSessionBusy(string) bool                     { return false }
 func (c *scriptedCoordinator) QueuedPrompts(string) int                      { return 0 }

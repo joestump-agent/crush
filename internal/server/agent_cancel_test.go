@@ -76,7 +76,10 @@ func (s *runCoordinator) BeginAccepted(sessionID string) *agent.AcceptedRun {
 }
 func (s *runCoordinator) Cancel(string) {}
 func (s *runCoordinator) CancelAll()    {}
-func (s *runCoordinator) IsBusy() bool  { return s.busy }
+func (s *runCoordinator) CancelDispatch(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *runCoordinator) IsBusy() bool { return s.busy }
 func (s *runCoordinator) IsSessionBusy(string) bool {
 	return false
 }

@@ -171,6 +171,13 @@ type Coordinator interface {
 	// @handle routing. A finished, unknown, or foreign-session handle
 	// refuses cleanly (#399).
 	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error
+	// CancelDispatch stops one dispatched agent on demand (#373): the
+	// ref resolves through the registry as a dispatch ID, an @handle, or
+	// the dispatched agent's child session ID. The dispatch ends killed
+	// with reason "canceled by user" and its workspace is preserved; the
+	// parent's run is untouched. An unknown ref, a finished dispatch, or
+	// a ref with no live run in this process is an error.
+	CancelDispatch(ctx context.Context, ref string) error
 }
 
 // liveDispatch is the coordinator's record of one running dispatch
@@ -1059,6 +1066,14 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// turn, so there is no live run left to inject into.
 	if !isSubAgent && c.interactive && slices.Contains(agent.AllowedTools, MessageAgentToolName) {
 		allTools = append(allTools, c.messageAgentTool())
+	}
+
+	// On-demand cancel (#373) is the model-facing front door for stopping
+	// one dispatched agent. It rides the same gate as dispatch and
+	// message: main agents only, interactive only — the same reasons
+	// apply, and a tool with nothing running behind it is dead weight.
+	if !isSubAgent && c.interactive && slices.Contains(agent.AllowedTools, CancelDispatchToolName) {
+		allTools = append(allTools, c.cancelDispatchTool())
 	}
 
 	// Get the model name for the agent

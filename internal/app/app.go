@@ -814,6 +814,16 @@ func (app *App) DeliverAgentMessageByHandle(ctx context.Context, sessionID, hand
 	return app.AgentCoordinator.DeliverAgentMessageByHandle(ctx, sessionID, handle, text)
 }
 
+// CancelDispatch stops one dispatched agent on demand (#373): the ref
+// resolves through the dispatch registry as a dispatch ID, an @handle,
+// or the dispatched agent's child session ID.
+func (app *App) CancelDispatch(ctx context.Context, ref string) error {
+	if app.AgentCoordinator == nil {
+		return errors.New("no agent coordinator")
+	}
+	return app.AgentCoordinator.CancelDispatch(ctx, ref)
+}
+
 // InitCoderAgentNonInteractive initializes the coder agent without
 // interactive-only tools (e.g. question).
 func (app *App) InitCoderAgentNonInteractive(ctx context.Context) error {
