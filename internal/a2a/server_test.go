@@ -207,7 +207,10 @@ func TestServerStopReleasesSocket(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
 	require.NoError(t, factory.Close(context.Background()))
-	_, err = postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "x"))
+	resp, err = postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "x"))
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
 	require.Error(t, err, "the socket must be dead after Close")
 
 	_, statErr := os.Stat(factory.socketPath())
@@ -311,11 +314,11 @@ func TestHostSocketPermissions(t *testing.T) {
 
 	info, err := os.Stat(factory.socketPath())
 	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0600), info.Mode().Perm(), "the socket must be 0600")
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "the socket must be 0600")
 
 	dir, err := os.Stat(filepath.Dir(factory.socketPath()))
 	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0700), dir.Mode().Perm(), "the socket directory must be 0700")
+	require.Equal(t, os.FileMode(0o700), dir.Mode().Perm(), "the socket directory must be 0700")
 }
 
 // Two concurrent dispatches each reach their own executor through the
@@ -411,8 +414,8 @@ func TestHostLongDataDirFallsBack(t *testing.T) {
 func TestHostReplacesStaleSocket(t *testing.T) {
 	dataDir := t.TempDir()
 	stale := filepath.Join(dataDir, a2aSocketDirName, fmt.Sprintf("%d.sock", os.Getpid()))
-	require.NoError(t, os.MkdirAll(filepath.Dir(stale), 0700))
-	require.NoError(t, os.WriteFile(stale, []byte("stale"), 0600))
+	require.NoError(t, os.MkdirAll(filepath.Dir(stale), 0o700))
+	require.NoError(t, os.WriteFile(stale, []byte("stale"), 0o600))
 
 	factory := NewServerFactory(dataDir)
 	server, err := factory.StartServer(t.Context(), ServerParams{

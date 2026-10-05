@@ -321,7 +321,7 @@ func (f *ServerFactory) ensureHost(ctx context.Context) error {
 		return fmt.Errorf("a2a: bind unix listener: %w", err)
 	}
 	if runtime.GOOS != "windows" {
-		if err := os.Chmod(path, 0600); err != nil {
+		if err := os.Chmod(path, 0o600); err != nil {
 			_ = listener.Close()
 			return fmt.Errorf("a2a: chmod socket: %w", err)
 		}
@@ -356,7 +356,7 @@ func a2aSocketPath(dataDir string) (string, error) {
 	}
 	name := fmt.Sprintf("%d.sock", os.Getpid())
 	dir := filepath.Join(dataDir, a2aSocketDirName)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("a2a: create socket dir: %w", err)
 	}
 	path := filepath.Join(dir, name)
@@ -364,7 +364,7 @@ func a2aSocketPath(dataDir string) (string, error) {
 		return path, nil
 	}
 	dir = filepath.Join(os.TempDir(), "crush-a2a-"+uid)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("a2a: create fallback socket dir: %w", err)
 	}
 	return filepath.Join(dir, name), nil
