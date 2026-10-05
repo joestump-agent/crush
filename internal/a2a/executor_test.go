@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -579,6 +580,43 @@ func TestGitDiffNotARepo(t *testing.T) {
 	diff, err := GitDiff(t.TempDir())(t.Context())
 	require.Error(t, err)
 	require.Empty(t, diff)
+}
+
+// TestGitDiffIgnoresUserDiffConfig verifies GitDiff returns a plain
+// unified diff even when the user's global git config forces an external
+// diff driver and always-on color: the diff keeps its a/ b/ headers and
+// carries no external-tool output or escape sequences.
+func TestGitDiffIgnoresUserDiffConfig(t *testing.T) {
+	// A shell script only runs on Unix; on Windows git would fail to
+	// invoke it, so the external-diff half of the test cannot apply.
+	if runtime.GOOS == "windows" {
+		t.Skip("diff.external script requires a Unix shell")
+	}
+
+	dir := initTestRepo(t)
+
+	// A global config that forces an external diff driver (a script
+	// that prints EXTERNAL) and always-on color.
+	cfg := t.TempDir()
+	script := filepath.Join(cfg, "ext-diff.sh")
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\necho EXTERNAL\n"), 0o755))
+	global := filepath.Join(cfg, "gitconfig")
+	require.NoError(t, os.WriteFile(global,
+		[]byte("[diff]\n\texternal = "+script+"\n[color]\n\tui = always\n"), 0o644))
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+
+	// An unstaged change and a new file: both are the agent's work
+	// product and must appear as a unified diff.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "tracked.txt"), []byte("modified\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "created.txt"), []byte("new file\n"), 0o644))
+
+	diff, err := GitDiff(dir)(t.Context())
+	require.NoError(t, err)
+	require.Contains(t, diff, "+++ b/")
+	require.Contains(t, diff, "tracked.txt")
+	require.Contains(t, diff, "created.txt")
+	require.NotContains(t, diff, "EXTERNAL")
+	require.NotContains(t, diff, "\x1b")
 }
 
 // inactivityRunner is a runner whose Run blocks until released, so a

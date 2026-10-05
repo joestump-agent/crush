@@ -97,6 +97,10 @@ func (m *mockSessionService) ListChildren(context.Context, string) ([]session.Se
 	return nil, nil
 }
 
+func (m *mockSessionService) ListAllChildren(context.Context) ([]session.Session, error) {
+	return nil, nil
+}
+
 func newTestApp(sessions session.Service) *App {
 	return &App{Sessions: sessions}
 }

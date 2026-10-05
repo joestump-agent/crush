@@ -24,6 +24,7 @@ var forkOnlyRoutes = []struct {
 	{"POST", "/v1/workspaces/{id}/skills/reload"},
 	{"POST", "/v1/workspaces/{id}/mcp/call-tool"},
 	{"POST", "/v1/workspaces/{id}/mcp/reconnect"},
+	{"GET", "/v1/workspaces/{id}/child-sessions"},
 }
 
 // TestEndpoints_ForkRoutesRegistered asserts every fork-only route is

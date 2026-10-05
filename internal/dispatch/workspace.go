@@ -765,19 +765,31 @@ func (w *Workspace) Diff(ctx context.Context, id string) (string, error) {
 	tmp.Close()
 	defer os.Remove(tmp.Name())
 
-	env := append(os.Environ(), "GIT_INDEX_FILE="+tmp.Name())
+	// The temporary index is the only git variable this call adds;
+	// gitCmd scrubs the inherited ones so an outer GIT_DIR,
+	// GIT_INDEX_FILE or GIT_WORK_TREE cannot redirect the commands.
+	extraEnv := []string{"GIT_INDEX_FILE=" + tmp.Name()}
 
 	// Seed the temp index from HEAD, stage the whole workspace into it
 	// (respecting .gitignore so untracked files are included), and diff
 	// it against the base. Committed changes are in the index via HEAD;
 	// uncommitted changes via the add.
-	if err := runGit(ctx, entry.Path, env, "read-tree", "HEAD"); err != nil {
+	if err := runGit(ctx, entry.Path, extraEnv, "read-tree", "HEAD"); err != nil {
 		return "", fmt.Errorf("seed temp index: %w", err)
 	}
-	if err := runGit(ctx, entry.Path, env, "add", "-A"); err != nil {
+	if err := runGit(ctx, entry.Path, extraEnv, "add", "-A"); err != nil {
 		return "", fmt.Errorf("stage workspace: %w", err)
 	}
-	out, err := gitOutput(ctx, entry.Path, env, "diff", "--cached", entry.BaseSHA)
+	// The diff's output is parsed by SummarizeDiff, so pin the format on
+	// the command line: no external diff driver or textconv, no color,
+	// and the a/ b/ prefixes the parser expects.
+	out, err := gitOutput(ctx, entry.Path, extraEnv,
+		"-c", "color.ui=never",
+		"-c", "diff.noprefix=false",
+		"-c", "diff.mnemonicPrefix=false",
+		"diff", "--no-ext-diff", "--no-textconv", "--no-color",
+		"--src-prefix=a/", "--dst-prefix=b/",
+		"--cached", entry.BaseSHA)
 	if err != nil {
 		return "", fmt.Errorf("diff against base: %w", err)
 	}
@@ -956,8 +968,7 @@ func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) 
 // hasBranch reports whether the repository has the local branch, decided
 // by git's exit code so the check never reads localized message text.
 func hasBranch(ctx context.Context, dir, branch string) bool {
-	cmd := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
-	cmd.Dir = dir
+	cmd := gitCmd(ctx, dir, nil, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
 	return cmd.Run() == nil
 }
 
@@ -986,22 +997,48 @@ func revisionSHA(ctx context.Context, repoRoot, rev string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// gitOutput runs git in dir with env and returns stdout.
-func gitOutput(ctx context.Context, dir string, env []string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	cmd.Env = env
-	return cmd.Output()
-}
-
-// runGit runs git in dir with env, attaching stderr to the error.
-func runGit(ctx context.Context, dir string, env []string, args ...string) error {
+// gitCmd builds a git command that runs hermetically. It starts from
+// the current environment and strips the git variables that leak in
+// from a surrounding shell or hook: GIT_DIR, GIT_WORK_TREE,
+// GIT_INDEX_FILE, GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY,
+// GIT_ALTERNATE_OBJECT_DIRECTORIES and GIT_PREFIX. With them gone the
+// command can only act on the repository rooted at dir. LC_ALL is
+// pinned to C for stable, locale-independent output, and extraEnv is
+// appended on top so callers can still override, for example a
+// temporary GIT_INDEX_FILE.
+func gitCmd(ctx context.Context, dir string, extraEnv []string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	env := make([]string, 0, len(os.Environ())+1+len(extraEnv))
+	for _, kv := range os.Environ() {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		switch key {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+			"GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+			"GIT_PREFIX":
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "LC_ALL=C")
+	env = append(env, extraEnv...)
 	cmd.Env = env
-	out, err := cmd.CombinedOutput()
+	return cmd
+}
+
+// gitOutput runs git in dir with extraEnv and returns stdout.
+func gitOutput(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
+	return gitCmd(ctx, dir, extraEnv, args...).Output()
+}
+
+// runGit runs git in dir with extraEnv, attaching stderr to the error.
+func runGit(ctx context.Context, dir string, extraEnv []string, args ...string) error {
+	out, err := gitCmd(ctx, dir, extraEnv, args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}

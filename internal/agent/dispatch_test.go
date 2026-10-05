@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"testing"
 	"time"
 
@@ -316,4 +318,90 @@ func TestDispatchPermissionFollowsParentSkipOnToggle(t *testing.T) {
 		t.Fatalf("parent saw an unexpected request event: %v", ev.Payload)
 	default:
 	}
+}
+
+// With the default config a dispatched agent gets exactly the task
+// agent's read-only set widened with the dispatch write tools (#64) and
+// the dispatch support tools (#384): job_output and job_kill read back
+// and stop the background shells bash auto-starts, and lsp_diagnostics
+// checks the LSP's view of an edit (constructed only while the LSP tools
+// are registered, which the default config satisfies). The set is
+// compared as a sorted list so future drift in the union shows up here.
+func TestBuildDispatchToolchainDefaultToolSet(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: t.TempDir()})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	names := make([]string, 0, len(tc.Tools()))
+	for _, tool := range tc.Tools() {
+		names = append(names, tool.Info().Name)
+	}
+	slices.Sort(names)
+	require.Equal(t, []string{
+		tools.BashToolName,
+		tools.EditToolName,
+		tools.GlobToolName,
+		tools.GrepToolName,
+		tools.JobKillToolName,
+		tools.JobOutputToolName,
+		tools.LSToolName,
+		tools.CallHierarchyToolName,
+		tools.DefinitionToolName,
+		tools.DiagnosticsToolName,
+		tools.SymbolsToolName,
+		tools.MultiEditToolName,
+		tools.TodosToolName,
+		tools.ViewToolName,
+		tools.WriteToolName,
+	}, names)
+}
+
+// A dispatched bash command started with run_in_background lands in the
+// in-process background-shell buffer, and the dispatched job_output reads
+// it back by shell ID (#384). Before the fix job_output was not in the
+// dispatched tool set, so the result of any auto-backgrounded command
+// was unreachable from the dispatched agent.
+func TestBuildDispatchToolchainBashBackgroundJobReadBack(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: t.TempDir()})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	byName := make(map[string]fantasy.AgentTool, len(tc.Tools()))
+	for _, tool := range tc.Tools() {
+		byName[tool.Info().Name] = tool
+	}
+
+	bashResp := runTool(t, byName[tools.BashToolName], tools.BashToolName, map[string]any{
+		// Over a second: shorter commands finish inside the bash tool's
+		// fast-failure check and come back inline, not as a background
+		// job.
+		"command":           "sleep 2 && echo dispatched-background-marker",
+		"description":       "run a short command in the background",
+		"run_in_background": true,
+	})
+	shellID := extractBackgroundShellID(t, bashResp.Content)
+
+	outputResp := runTool(t, byName[tools.JobOutputToolName], tools.JobOutputToolName, map[string]any{
+		"shell_id": shellID,
+		"wait":     true,
+	})
+	require.Contains(t, outputResp.Content, "Status: completed")
+	require.Contains(t, outputResp.Content, "dispatched-background-marker")
+}
+
+// extractBackgroundShellID pulls the shell ID out of the bash tool's
+// background response, which renders it as "Background shell started
+// with ID: <id>" (explicit) or "Background shell ID: <id>" (auto).
+func extractBackgroundShellID(t *testing.T, content string) string {
+	t.Helper()
+
+	matches := regexp.MustCompile(`Background shell (?:started with )?ID: (\S+)`).FindStringSubmatch(content)
+	require.NotEmpty(t, matches, "no background shell ID in %q", content)
+	return matches[1]
 }

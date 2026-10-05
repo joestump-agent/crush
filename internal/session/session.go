@@ -76,6 +76,11 @@ type Service interface {
 	// parent-only filter (#314). Includes every child kind (task
 	// sessions and title sessions); callers filter by kind.
 	ListChildren(ctx context.Context, parentID string) ([]Session, error)
+	// ListAllChildren returns every child session of every parent in
+	// one grouped query (#408), grouped by parent and oldest-created
+	// first. Includes every child kind; callers filter by kind.
+	// Never contains a top-level session.
+	ListAllChildren(ctx context.Context) ([]Session, error)
 	Save(ctx context.Context, session Session) (Session, error)
 	SetChannel(ctx context.Context, sessionID, channel string) (Session, error)
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
@@ -295,6 +300,21 @@ func (s *service) ListChildren(ctx context.Context, parentID string) ([]Session,
 		String: parentID,
 		Valid:  parentID != "",
 	})
+	if err != nil {
+		return nil, err
+	}
+	sessions := make([]Session, len(dbSessions))
+	for i, dbSession := range dbSessions {
+		sessions[i] = s.fromDBItem(dbSession)
+		s.applyEstimatedUsageState(&sessions[i])
+	}
+	return sessions, nil
+}
+
+// ListAllChildren lists every child session of every parent in one
+// grouped query (#408) instead of one query per parent.
+func (s *service) ListAllChildren(ctx context.Context) ([]Session, error) {
+	dbSessions, err := s.q.ListAllChildSessions(ctx)
 	if err != nil {
 		return nil, err
 	}
