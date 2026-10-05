@@ -24,6 +24,8 @@ package dispatch
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -156,7 +158,7 @@ func (e Entry) clone() Entry { return e }
 type Workspace struct {
 	repoRoot string
 	// worktreesDir is the directory provisioned workspaces are created
-	// under, <repoRoot>/.crush/worktrees.
+	// under, [WorktreesDir]'s result.
 	worktreesDir string
 	// commonDir is the repository's git common dir, resolved in
 	// NewWorkspace. It keys the per-repo provision lock, so two
@@ -186,9 +188,15 @@ type Workspace struct {
 }
 
 // NewWorkspace returns a Workspace managing isolated workspaces for the
-// git repository rooted at repoRoot. It prunes stale worktree admin
-// entries left by previous runs and creates the worktrees directory.
-func NewWorkspace(repoRoot string) (*Workspace, error) {
+// git repository rooted at repoRoot, created under worktreesDir — the
+// caller passes [WorktreesDir]'s result for the active data directory
+// (#383). It prunes stale worktree admin entries left by previous runs,
+// creates the worktrees directory, and keeps the location invisible to
+// git by writing a "*" .gitignore beside it when one is missing: the
+// data directory the worktrees live under is often inside the
+// repository, and the ignore file must hold even when nothing else
+// gitignores it.
+func NewWorkspace(repoRoot, worktreesDir string) (*Workspace, error) {
 	root, err := filepath.Abs(repoRoot)
 	if err != nil {
 		return nil, err
@@ -197,24 +205,23 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 		return nil, fmt.Errorf("%s is not a git repository: %w", repoRoot, err)
 	}
 
-	// The provision lock key: the git common dir, so every checkout of
-	// the same repository — this one or a worktree — shares a lock.
-	common, err := gitOutput(context.Background(), root, nil, "rev-parse", "--git-common-dir")
-	if err != nil {
-		return nil, fmt.Errorf("resolve git common dir: %w", err)
-	}
-	commonDir := strings.TrimSpace(string(common))
-	if !filepath.IsAbs(commonDir) {
-		commonDir = filepath.Join(root, commonDir)
-	}
-	commonDir, err = filepath.Abs(commonDir)
+	// The provision lock key: the canonical git common dir, so every
+	// checkout of the same repository — this one or a worktree —
+	// shares a lock.
+	commonDir, err := gitCommonDir(root)
 	if err != nil {
 		return nil, err
 	}
 
-	dir := filepath.Join(root, ".crush", "worktrees")
+	dir, err := filepath.Abs(worktreesDir)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create worktrees directory: %w", err)
+	}
+	if err := ignoreDir(dir); err != nil {
+		return nil, fmt.Errorf("keep worktrees directory out of git: %w", err)
 	}
 
 	// Clear admin entries for worktrees whose directories are gone, so a
@@ -258,6 +265,61 @@ func provisionLock(key string) *sync.Mutex {
 	return lock
 }
 
+// gitCommonDir returns the repository's canonical git common dir: the
+// absolute path, resolved through symlinks so every checkout of the
+// same repository — whatever the spelling of its path — resolves to
+// the same string. It keys the per-repo provision lock (#452) and the
+// per-repo worktrees directory (#383).
+func gitCommonDir(repoRoot string) (string, error) {
+	root, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return "", err
+	}
+	out, err := gitOutput(context.Background(), root, nil, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return "", fmt.Errorf("%s is not a git repository: %w", repoRoot, err)
+	}
+	dir := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(root, dir)
+	}
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	return filepath.Clean(dir), nil
+}
+
+// WorktreesDir returns the directory dispatch workspaces for the
+// repository containing repoRoot are created in:
+// <dataDir>/worktrees/<repo-key>, where repo-key is a short stable hash
+// of the repository's canonical git common dir (#383). The key keeps
+// repositories sharing one data directory apart and gives #367's "this
+// repo's entries" a directory boundary. The common dir — not the
+// working directory — is hashed, so every checkout of the same
+// repository lands in the same key.
+func WorktreesDir(dataDir, repoRoot string) (string, error) {
+	common, err := gitCommonDir(repoRoot)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(common))
+	return filepath.Join(dataDir, "worktrees", hex.EncodeToString(sum[:6])), nil
+}
+
+// ignoreDir writes a "*" .gitignore beside dir — one level up, so a
+// single file covers every repository key sharing the worktrees root —
+// when it is missing (#383). Idempotent: a successful Stat means the
+// file is already in place, and any other Stat error is fatal.
+func ignoreDir(dir string) error {
+	ignorePath := filepath.Join(filepath.Dir(dir), ".gitignore")
+	if _, err := os.Stat(ignorePath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.WriteFile(ignorePath, []byte("*\n"), 0o644)
+}
+
 // ProvisionOptions configures Provision.
 type ProvisionOptions struct {
 	// Base is the revision the workspace is cut from — a branch, tag, or
@@ -267,8 +329,9 @@ type ProvisionOptions struct {
 }
 
 // Provision creates an isolated workspace: a git worktree on a fresh
-// crush-dispatch-{uuid} branch under .crush/worktrees/, registers it,
-// and returns the new entry. The workspace starts as StatusProvisioned.
+// crush-dispatch-{uuid} branch under the workspace's worktrees directory,
+// registers it, and returns the new entry. The workspace starts as
+// StatusProvisioned.
 func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry, error) {
 	base := opts.Base
 	if base == "" {
@@ -745,7 +808,7 @@ func (w *Workspace) Remove(ctx context.Context, id string) error {
 // no lease file at all, whose ownership cannot be proven, are left
 // alone (#369 is the explicit cleanup tool for those). It is the
 // session-end backstop: nothing dispatch created survives it, and no
-// dangling branches or .crush/worktrees/ entries are left behind. One
+// dangling branches or worktrees-directory entries are left behind. One
 // stubborn workspace does not stop the sweep: every entry and every
 // orphan is attempted, the errors are joined and returned, and a failed
 // entry stays registered so a later sweep or Remove can retry it.

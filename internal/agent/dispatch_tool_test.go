@@ -119,6 +119,80 @@ func decodeDispatchHandle(t *testing.T, resp fantasy.ToolResponse) dispatch.Disp
 	return handle
 }
 
+// mustWorktreesDir returns the worktrees directory the coordinator
+// provisions into — the repo-keyed path under the data directory (#383).
+func mustWorktreesDir(t *testing.T, c *coordinator) string {
+	t.Helper()
+	dir, err := dispatch.WorktreesDir(c.cfg.Config().Options.DataDirectory, c.cfg.WorkingDir())
+	require.NoError(t, err)
+	return dir
+}
+
+// Dispatch worktrees live under the data directory, never beside the
+// working directory (#383): a coordinator started in a repo
+// subdirectory provisions into <dataDir>/worktrees/<repo-key>/ without
+// creating <cwd>/.crush, and the parent repo's git view stays clean —
+// nothing for git status to list, no gitlink for git add -A to stage.
+// Both data-directory placements are exercised: the default lookup
+// finding <repo>/.crush, and a custom data directory outside the repo.
+func TestDispatchWorktreesLiveUnderDataDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		dataDir func(*testing.T) string
+	}{
+		{"data directory inside the repo", func(*testing.T) string { return "" }},
+		{"custom data directory outside the repo", func(t *testing.T) string { return t.TempDir() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &dispatchTestAgent{
+				model:  dispatchTestModel(),
+				result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
+			}
+			env := testEnv(t)
+			repo := env.workingDir
+			initGitRepo(t, repo)
+			// A .crush at the repo root, as after any launch from the
+			// root: root.go gitignores it with a "*".
+			require.NoError(t, os.MkdirAll(filepath.Join(repo, ".crush"), 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(repo, ".crush", ".gitignore"), []byte("*\n"), 0o644))
+			sub := filepath.Join(repo, "sub")
+			require.NoError(t, os.MkdirAll(sub, 0o755))
+			env.workingDir = sub
+
+			c := newDispatchTestCoordinatorAt(t, env, sub, tc.dataDir(t))
+			c.dispatchAgentBuilder = func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error) {
+				return &dispatchedAgent{
+					agent:       agent,
+					model:       agent.model,
+					providerCfg: config.ProviderConfig{ID: "test-provider"},
+				}, nil
+			}
+			tool := c.dispatchTool()
+
+			resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work", Branch: "main"})
+			handle := decodeDispatchHandle(t, resp)
+
+			// The workspace is <dataDir>/worktrees/<repo-key>/<branch>,
+			// under the resolved data directory — never beside the cwd.
+			wtDir := mustWorktreesDir(t, c)
+			require.True(t, strings.HasPrefix(
+				filepath.ToSlash(handle.WorkspacePath),
+				filepath.ToSlash(wtDir)+"/",
+			), "workspace %q is not under %q", handle.WorkspacePath, wtDir)
+			require.NoDirExists(t, filepath.Join(sub, ".crush"))
+
+			// The parent repo's git view is untouched by the dispatch.
+			out, err := exec.CommandContext(t.Context(), "git", "-C", repo, "status", "--porcelain").CombinedOutput()
+			require.NoError(t, err)
+			require.Empty(t, strings.TrimSpace(string(out)), "git status is not clean: %s", out)
+
+			out, err = exec.CommandContext(t.Context(), "git", "-C", repo, "add", "-A", "--dry-run").CombinedOutput()
+			require.NoError(t, err)
+			require.NotContains(t, string(out), "crush-dispatch-", "git add -A stages dispatch worktree paths: %s", out)
+		})
+	}
+}
+
 // The tool validates its arguments before touching git: a missing prompt
 // and an unknown model type are tool errors, not failed dispatches.
 func TestDispatchAgentToolValidatesArgs(t *testing.T) {
@@ -222,12 +296,14 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 	require.Equal(t, dispatch.StatusRunning, handle.Status)
 	require.NotEmpty(t, handle.DispatchID)
 	require.Equal(t, dispatch.BranchPrefix+handle.DispatchID, handle.Branch)
-	// Path-form-agnostic: the workspace is the worktrees dir + branch,
-	// under the repo root (which the Workspace absolutizes — on Windows
-	// the test env's /tmp prefix gains a drive letter).
+	// Path-form-agnostic: the workspace is the worktrees dir + branch
+	// under the data directory (which the Workspace absolutizes — on
+	// Windows the test env's /tmp prefix gains a drive letter).
+	wtDir, werr := dispatch.WorktreesDir(c.cfg.Config().Options.DataDirectory, c.cfg.WorkingDir())
+	require.NoError(t, werr)
 	require.True(t, strings.HasSuffix(
 		filepath.ToSlash(handle.WorkspacePath),
-		"/.crush/worktrees/"+handle.Branch,
+		filepath.ToSlash(wtDir)+"/"+handle.Branch,
 	), "workspace path %q is not the worktrees dir + branch", handle.WorkspacePath)
 	require.NotEmpty(t, handle.SessionID)
 	require.DirExists(t, handle.WorkspacePath)
@@ -239,7 +315,7 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 	require.Equal(t, handle.SessionID, entry.SessionID)
 	require.True(t, strings.HasSuffix(
 		filepath.ToSlash(entry.Path),
-		"/.crush/worktrees/"+entry.Branch,
+		filepath.ToSlash(wtDir)+"/"+entry.Branch,
 	))
 
 	// The background run completes and records the terminal status in
@@ -280,7 +356,7 @@ func TestDispatchAgentToolCleansUpFailedSetup(t *testing.T) {
 	out, err := exec.CommandContext(t.Context(), "git", "-C", env.workingDir, "branch", "--list", dispatch.BranchPrefix+"*").CombinedOutput()
 	require.NoError(t, err)
 	require.Empty(t, strings.TrimSpace(string(out)), "dispatch branch left behind")
-	entries, err := os.ReadDir(filepath.Join(env.workingDir, ".crush", "worktrees"))
+	entries, err := os.ReadDir(mustWorktreesDir(t, c))
 	require.NoError(t, err)
 	for _, e := range entries {
 		require.False(t, e.IsDir(), "worktree directory left behind: %s", e.Name())
