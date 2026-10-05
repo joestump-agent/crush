@@ -1025,6 +1025,38 @@ type Agent struct {
 	// TodoEnforcement overrides the global todo enforcement settings
 	// (#315) for this agent type, field by field.
 	TodoEnforcement *TodoEnforcementConfig `json:"todo_enforcement,omitempty" jsonschema:"description=Todo enforcement overrides for this agent: nudge injection and the opt-in mutating-tool gate"`
+
+	// The fields below come from the agent's definition (#333). They are
+	// resolved runtime values, not config: no config file loads them.
+	// Until #432 builds agents from definitions, the ones marked as such
+	// are carried and warned about instead of honored.
+	//
+	// Role classifies the agent: main, subagent, or dispatch.
+	Role string `json:"-"`
+	// Runtime selects the execution path: builtin or a2a. Not honored
+	// until #392 and #432.
+	Runtime string `json:"-"`
+	// Prompt is builtin:<id> or file:<path>. Not honored until #432.
+	Prompt string `json:"-"`
+	// PromptAppend is a file:<path> appended to the prompt. Not honored
+	// until #432.
+	PromptAppend string `json:"-"`
+	// ModelRef pins an explicit provider and model, overriding the
+	// large/small slot. Not honored until #432.
+	ModelRef *AgentModelRef `json:"-"`
+	// Skills lists skill names for the agent. Not honored until #432.
+	Skills []string `json:"-"`
+	// Workspace selects dispatch isolation: worktree or none. Not
+	// honored until #432.
+	Workspace string `json:"-"`
+	// Card is the external Agent Card URL for runtime a2a agents. Not
+	// honored until #432 and #434.
+	Card string `json:"-"`
+	// Auth configures bearer auth for runtime a2a agents. Not honored
+	// until #432 and #434.
+	Auth *AgentAuth `json:"-"`
+	// Transport tunes an a2a agent's connection. Not honored until #432.
+	Transport *AgentTransport `json:"-"`
 }
 
 type Tools struct {
@@ -1146,6 +1178,14 @@ type Config struct {
 	// Env is a map of environment variables set on startup.
 	Env map[string]string `json:"env,omitempty" jsonschema:"description=Environment variables to set on startup"`
 
+	// AgentDefinitions is the user's agents block (#333): built-in
+	// agents overlaid field by field, plus new dispatch agents. The
+	// resolved form lives in Agents; validation runs in ValidateAgents.
+	AgentDefinitions map[string]AgentDefinition `json:"agents,omitempty" jsonschema:"description=Agent definitions: override a built-in agent field by field, or add dispatch agents"`
+
+	// Agents is the resolved agent map the coordinator reads. It is
+	// built by SetupAgents from the built-in definitions plus
+	// AgentDefinitions, so it is never loaded from a config file.
 	Agents map[string]Agent `json:"-"`
 }
 
@@ -1359,30 +1399,6 @@ func resolveAllowedTools(allTools []string, disabledTools []string) []string {
 	return filterSlice(allTools, disabledTools, false)
 }
 
-func resolveReadOnlyTools(tools []string) []string {
-	readOnlyTools := []string{"glob", "grep", "ls", "lsp_call_hierarchy", "lsp_definition", "lsp_symbols", "semantic_search", "sourcegraph", "view"}
-	// filter to only include tools that are in allowedtools (include mode)
-	return filterSlice(tools, readOnlyTools, true)
-}
-
-func resolvePlanTools(tools []string) []string {
-	// The read-only LSP lookups mirror the task agent's tool set: planning
-	// needs symbol navigation just as much as research does.
-	planTools := []string{
-		"agent",
-		"glob",
-		"grep",
-		"ls",
-		"lsp_call_hierarchy",
-		"lsp_definition",
-		"lsp_symbols",
-		"question",
-		"sourcegraph",
-		"view",
-	}
-	return filterSlice(tools, planTools, true)
-}
-
 func filterSlice(data []string, mask []string, include bool) []string {
 	var filtered []string
 	for _, s := range data {
@@ -1395,42 +1411,99 @@ func filterSlice(data []string, mask []string, include bool) []string {
 	return filtered
 }
 
+// SetupAgents resolves the agent map from the built-in definitions plus
+// the user's agents block (#333). It stays error-free: validation runs
+// in ValidateAgents and ValidateAgentModelRefs at load and reload time,
+// so a bad definition never reaches this point.
 func (c *Config) SetupAgents() {
-	allowedTools := resolveAllowedTools(allToolNames(), c.Options.DisabledTools)
-
-	agents := map[string]Agent{
-		AgentCoder: {
-			ID:           AgentCoder,
-			Name:         "Coder",
-			Description:  "An agent that helps with executing coding tasks.",
-			Model:        SelectedModelTypeLarge,
-			ContextPaths: c.Options.ContextPaths,
-			AllowedTools: allowedTools,
-		},
-
-		AgentTask: {
-			ID:           AgentTask,
-			Name:         "Task",
-			Description:  "An agent that helps with searching for context and finding implementation details.",
-			Model:        SelectedModelTypeLarge,
-			ContextPaths: c.Options.ContextPaths,
-			AllowedTools: resolveReadOnlyTools(allowedTools),
-			// NO MCPs or LSPs by default
-			AllowedMCP: map[string][]string{},
-		},
-
-		AgentPlan: {
-			ID:           AgentPlan,
-			Name:         "Plan",
-			Description:  "An agent that performs deep analysis and prepares implementation plans without modifying files.",
-			Model:        SelectedModelTypeLarge,
-			ContextPaths: c.Options.ContextPaths,
-			AllowedTools: resolvePlanTools(allowedTools),
-			// NO MCPs or LSPs by default
-			AllowedMCP: map[string][]string{},
-		},
+	agents := make(map[string]Agent, len(c.AgentDefinitions)+4)
+	for id, def := range effectiveAgentDefinitions(c.AgentDefinitions) {
+		agents[id] = c.agentFromDefinition(id, def)
 	}
 	c.Agents = agents
+}
+
+// agentFromDefinition resolves one definition into the Agent the
+// coordinator reads. Effective tools are expand(allow) minus
+// expand(deny) minus the user's disabled_tools, so a definition can
+// narrow but never widen user policy.
+func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
+	warnUnhonoredFields(id, def)
+
+	var toolsSpec AgentTools
+	if def.Tools != nil {
+		toolsSpec = *def.Tools
+	}
+	allow := expandToolRefs(toolsSpec.Allow)
+	if allow == nil {
+		allow = allToolNames()
+	}
+	if deny := expandToolRefs(toolsSpec.Deny); len(deny) > 0 {
+		allow = slices.DeleteFunc(allow, func(name string) bool {
+			return slices.Contains(deny, name)
+		})
+	}
+	allowedTools := resolveAllowedTools(allow, c.Options.DisabledTools)
+
+	var mcpAllow []string
+	if def.MCP != nil {
+		mcpAllow = def.MCP.Allow
+	}
+
+	modelType := SelectedModelTypeLarge
+	var modelRef *AgentModelRef
+	if def.Model != nil {
+		modelType = def.Model.Type
+		modelRef = def.Model.Ref
+	}
+
+	contextPaths := def.ContextPaths
+	if contextPaths == nil {
+		contextPaths = c.Options.ContextPaths
+	}
+
+	return Agent{
+		ID:              id,
+		Name:            orString(def.Name, id),
+		Description:     orString(def.Description, ""),
+		Disabled:        def.Disabled != nil && *def.Disabled,
+		Model:           modelType,
+		AllowedTools:    allowedTools,
+		AllowedMCP:      expandMCPAllow(mcpAllow),
+		ContextPaths:    contextPaths,
+		TodoEnforcement: todoEnforcementFromDefinition(def),
+		Role:            definitionRole(id, def),
+		Runtime:         orString(def.Runtime, AgentRuntimeBuiltin),
+		Prompt:          orString(def.Prompt, ""),
+		PromptAppend:    orString(def.PromptAppend, ""),
+		ModelRef:        modelRef,
+		Skills:          def.Skills,
+		Workspace:       orString(def.Workspace, ""),
+		Card:            orString(def.Card, ""),
+		Auth:            def.Auth,
+		Transport:       def.Transport,
+	}
+}
+
+// todoEnforcementFromDefinition maps a definition's todos and kill
+// blocks onto the resolved TodoEnforcementConfig, nil when neither
+// block set anything.
+func todoEnforcementFromDefinition(def AgentDefinition) *TodoEnforcementConfig {
+	if def.Todos == nil && def.Kill == nil {
+		return nil
+	}
+	cfg := &TodoEnforcementConfig{}
+	if def.Todos != nil {
+		cfg.Enabled = def.Todos.Nudge
+		cfg.NudgeThreshold = def.Todos.NudgeAfterToolCalls
+		cfg.HardGate = def.Todos.HardGate
+	}
+	if def.Kill != nil {
+		cfg.KillAfterNudges = def.Kill.AfterIgnoredNudges
+		cfg.StallWindow = def.Kill.Stall
+		cfg.HardTimeout = def.Kill.Timeout
+	}
+	return cfg
 }
 
 func (c *ProviderConfig) TestConnection(resolver VariableResolver) error {

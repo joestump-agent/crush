@@ -3,6 +3,225 @@
   "$id": "https://github.com/charmbracelet/crush/internal/config/config",
   "$ref": "#/$defs/Config",
   "$defs": {
+    "AgentAuth": {
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "bearer"
+          ],
+          "description": "Auth scheme"
+        },
+        "token": {
+          "type": "string",
+          "description": "Bearer token"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AgentDefinition": {
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": [
+            "main",
+            "subagent",
+            "dispatch"
+          ],
+          "description": "Agent role"
+        },
+        "runtime": {
+          "type": "string",
+          "enum": [
+            "builtin",
+            "a2a"
+          ],
+          "description": "Execution runtime"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name"
+        },
+        "description": {
+          "type": "string",
+          "description": "Agent description"
+        },
+        "disabled": {
+          "type": "boolean",
+          "description": "Disable this agent"
+        },
+        "model": {
+          "$ref": "#/$defs/AgentModel",
+          "description": "The large or small model slot"
+        },
+        "prompt": {
+          "type": "string",
+          "description": "System prompt: builtin:\u003cid\u003e or file:\u003cpath\u003e"
+        },
+        "prompt_append": {
+          "type": "string",
+          "description": "Appended system prompt: file:\u003cpath\u003e"
+        },
+        "tools": {
+          "$ref": "#/$defs/AgentTools",
+          "description": "Tool allow and deny lists; entries are tool names or the @read and @write groups"
+        },
+        "mcp": {
+          "$ref": "#/$defs/AgentMCP",
+          "description": "MCP servers available to the agent: *"
+        },
+        "skills": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Skill names for this agent"
+        },
+        "context_paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Context file paths for this agent"
+        },
+        "workspace": {
+          "type": "string",
+          "enum": [
+            "worktree",
+            "none"
+          ],
+          "description": "Dispatch workspace isolation"
+        },
+        "todos": {
+          "$ref": "#/$defs/AgentTodos",
+          "description": "Todo enforcement knobs for this agent"
+        },
+        "kill": {
+          "$ref": "#/$defs/AgentKill",
+          "description": "Kill thresholds for this agent; dispatch agents only"
+        },
+        "card": {
+          "type": "string",
+          "description": "External Agent Card URL for runtime a2a agents"
+        },
+        "auth": {
+          "$ref": "#/$defs/AgentAuth",
+          "description": "Bearer auth for runtime a2a agents"
+        },
+        "transport": {
+          "$ref": "#/$defs/AgentTransport",
+          "description": "Transport tuning for runtime a2a agents"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AgentKill": {
+      "properties": {
+        "after_ignored_nudges": {
+          "$ref": "#/$defs/IntOrOff",
+          "description": "Ignored nudges before the agent is killed; 0 or off disables"
+        },
+        "stall": {
+          "$ref": "#/$defs/ConfigDuration",
+          "description": "Time without a todo update that marks the run stalled; 0 or off disables"
+        },
+        "timeout": {
+          "$ref": "#/$defs/ConfigDuration",
+          "description": "Total run time before the agent is killed; 0 or off disables"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AgentMCP": {
+      "properties": {
+        "allow": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "MCP servers: *"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AgentModel": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "large",
+            "small"
+          ]
+        },
+        {
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "type": "object",
+          "required": [
+            "provider",
+            "model"
+          ]
+        }
+      ]
+    },
+    "AgentTodos": {
+      "properties": {
+        "nudge": {
+          "type": "boolean",
+          "description": "Inject a nudge when the agent works without a todo list"
+        },
+        "nudge_after_tool_calls": {
+          "$ref": "#/$defs/IntOrOff",
+          "description": "Tool calls without todos activity before a nudge is injected; 0 or off disables"
+        },
+        "hard_gate": {
+          "type": "boolean",
+          "description": "Reject mutating tools until a todo list exists"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AgentTools": {
+      "properties": {
+        "allow": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Tools to allow: names"
+        },
+        "deny": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Tools to deny: names or groups"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AgentTransport": {
+      "properties": {
+        "idle_timeout": {
+          "$ref": "#/$defs/ConfigDuration",
+          "description": "How long a run may stay silent before it is ended; 0 or off disables"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
     "Attribution": {
       "properties": {
         "trailer_style": {
@@ -110,6 +329,13 @@
           },
           "type": "object",
           "description": "Environment variables to set on startup"
+        },
+        "agents": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AgentDefinition"
+          },
+          "type": "object",
+          "description": "Agent definitions: override a built-in agent field by field"
         }
       },
       "additionalProperties": false,
