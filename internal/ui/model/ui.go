@@ -3493,7 +3493,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 	}
 
 	// Handle cancel key when agent is busy.
-	if key.Matches(msg, m.keyMap.Chat.Cancel) {
+	if key.Matches(msg, m.keyMap.Chat.Cancel) && !m.isInspecting() {
 		if m.isAgentBusy() {
 			if cmd := m.cancelAgent(); cmd != nil {
 				cmds = append(cmds, cmd)
@@ -4326,7 +4326,7 @@ func (m *UI) ShortHelp() []key.Binding {
 		binds = append(binds, k.Quit)
 	case uiChat:
 		// Show cancel binding if agent is busy.
-		if m.isAgentBusy() {
+		if m.isAgentBusy() && !m.isInspecting() {
 			cancelBinding := k.Chat.Cancel
 			if m.isCanceling {
 				cancelBinding.SetHelp("esc", "press again to cancel")
@@ -4439,7 +4439,7 @@ func (m *UI) FullHelp() [][]key.Binding {
 			})
 	case uiChat:
 		// Show cancel binding if agent is busy.
-		if m.isAgentBusy() {
+		if m.isAgentBusy() && !m.isInspecting() {
 			cancelBinding := k.Chat.Cancel
 			if m.isCanceling {
 				cancelBinding.SetHelp("esc", "press again to cancel")
