@@ -70,9 +70,7 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 		case *a2aspec.TaskStatusUpdateEvent:
 			applyStatusUpdate(&outcome, e)
 		case *a2aspec.TaskArtifactUpdateEvent:
-			if artifact := artifactText(e); artifact != "" {
-				outcome.Diff = artifact
-			}
+			applyArtifactUpdate(&outcome, e)
 		case *a2aspec.Task:
 			// The task snapshot may carry the terminal state directly
 			// (a consumer that missed the status event); fold it in.
@@ -120,6 +118,37 @@ func applyTaskSnapshot(outcome *agent.DispatchTransportOutcome, task *a2aspec.Ta
 	}
 }
 
+// applyArtifactUpdate folds one artifact update into the outcome (#361):
+// the named diff artifact reassembles by artifact ID — capped at
+// maxReassembledDiffBytes, anything past the cap marks the outcome
+// truncated — and the dispatch-result artifact decodes into the outcome's
+// typed fields. Unrecognized artifacts are ignored.
+func applyArtifactUpdate(outcome *agent.DispatchTransportOutcome, ev *a2aspec.TaskArtifactUpdateEvent) {
+	if ev == nil || ev.Artifact == nil {
+		return
+	}
+	switch ev.Artifact.ID {
+	case DiffArtifactID:
+		for _, part := range ev.Artifact.Parts {
+			if part == nil {
+				continue
+			}
+			text := part.Text()
+			if len(outcome.Diff)+len(text) > maxReassembledDiffBytes {
+				outcome.DiffTruncated = true
+				break
+			}
+			outcome.Diff += text
+		}
+	case ResultArtifactID:
+		for _, part := range ev.Artifact.Parts {
+			if decoded, ok := decodeDispatchOutcome(part); ok {
+				outcome.DiffError = decoded.DiffError
+			}
+		}
+	}
+}
+
 // isTerminalTaskState reports whether the state ends the task.
 func isTerminalTaskState(state a2aspec.TaskState) bool {
 	switch state {
@@ -137,27 +166,6 @@ func statusUpdateMessageText(ev *a2aspec.TaskStatusUpdateEvent) string {
 	}
 	var b strings.Builder
 	for _, part := range ev.Status.Message.Parts {
-		if part == nil {
-			continue
-		}
-		if t := part.Text(); t != "" {
-			if b.Len() > 0 {
-				b.WriteByte('\n')
-			}
-			b.WriteString(t)
-		}
-	}
-	return b.String()
-}
-
-// artifactText extracts the text carried by a task artifact update —
-// the dispatched agent's diff.
-func artifactText(ev *a2aspec.TaskArtifactUpdateEvent) string {
-	if ev == nil || ev.Artifact == nil {
-		return ""
-	}
-	var b strings.Builder
-	for _, part := range ev.Artifact.Parts {
 		if part == nil {
 			continue
 		}
