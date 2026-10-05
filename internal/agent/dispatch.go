@@ -119,7 +119,9 @@ type DispatchToolchainOptions struct {
 // data directory is reused so no second database or lock is taken.
 //
 // #64's DispatchAgent tool consumes this: provision a clean workspace,
-// bootstrap the toolchain against its path, run.
+// bootstrap the toolchain against its path, run. The caller's context is
+// the permission bridge's lifetime (#371): the tool passes the dispatch's
+// root, never the tool-call context.
 func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchToolchainOptions) (*DispatchToolchain, error) {
 	if opts.WorkingDir == "" {
 		return nil, ErrNoWorkingDir
@@ -269,8 +271,11 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 // scope to the parent workspace's permission service, so dispatched-agent
 // tool calls surface in the same approval flow as the main agent's. Each
 // forwarded request resolves the scoped service's pending request with
-// the parent's verdict. The bridge runs until cancel is called; requests
-// still waiting when the bridge stops are denied by the canceled context.
+// the parent's verdict. The bridge's context is the dispatch's root, not
+// the parent turn's tool-call context: it lives as long as the dispatch
+// (#371), so requests raised after the turn ends still reach the parent's
+// subscribers. Requests still waiting when the bridge stops are denied by
+// the canceled context.
 func bridgePermissions(ctx context.Context, parent, scoped permission.Service) context.CancelFunc {
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
