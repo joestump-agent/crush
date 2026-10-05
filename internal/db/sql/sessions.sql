@@ -46,6 +46,12 @@ FROM sessions
 WHERE parent_session_id = ?
 ORDER BY updated_at ASC;
 
+-- name: ListAllChildSessions :many
+SELECT *
+FROM sessions
+WHERE parent_session_id IS NOT NULL
+ORDER BY parent_session_id, created_at, rowid;
+
 -- name: UpdateSession :one
 UPDATE sessions
 SET

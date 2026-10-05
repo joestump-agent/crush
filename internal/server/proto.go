@@ -342,6 +342,25 @@ func (c *controllerV1) handleGetWorkspaceSessionChildren(w http.ResponseWriter, 
 	jsonEncode(w, result)
 }
 
+// handleGetWorkspaceChildSessions lists every child session of every
+// parent in the workspace in one grouped query (#408).
+func (c *controllerV1) handleGetWorkspaceChildSessions(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sessions, err := c.backend.ListAllChildSessions(r.Context(), id)
+	if err != nil {
+		c.handleError(w, r, err)
+		return
+	}
+	ws, _ := c.backend.GetWorkspace(id)
+	result := make([]proto.Session, len(sessions))
+	for i, s := range sessions {
+		result[i] = sessionToProto(s)
+		result[i].IsBusy = isSessionBusy(ws, s.ID)
+		result[i].AttachedClients = attachedClients(ws, s.ID)
+	}
+	jsonEncode(w, result)
+}
+
 // handleGetWorkspaceSessionHistory returns the history for a session.
 func (c *controllerV1) handleGetWorkspaceSessionHistory(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
