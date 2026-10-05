@@ -155,6 +155,9 @@ type DispatchTaskStatus struct {
 // counts the non-terminal progress events observed on the wire —
 // consumed, not re-published: in-process the agent block renders from
 // the todo collector, and this count is the seam #72/#73 pick up.
+// TodoProgress carries the typed todo progress decoded from the
+// declared todos/v1 extension metadata, when the remote agent declared
+// and emitted it.
 type DispatchTransportOutcome struct {
 	Status        string
 	Text          string
@@ -162,6 +165,38 @@ type DispatchTransportOutcome struct {
 	DiffError     string
 	DiffTruncated bool
 	WorkingEvents int
+	// TodoProgress is the decoded todo progress from the dispatch's
+	// TaskStatusUpdateEvent metadata (extension
+	// https://crush.charm.land/ext/todos/v1), from the last progress
+	// event that carried it. Nil when the agent did not declare the
+	// extension, never emitted it, or emitted a value that failed to
+	// decode — a malformed extension value is logged and dropped, not a
+	// stream failure.
+	TodoProgress *TodoProgress
+}
+
+// TodoItem is one entry of the todos/v1 extension's todo list, the
+// transport-vocabulary mirror of session.Todo (json tag names kept
+// identical) so the wire shape stays stable as the session type evolves.
+type TodoItem struct {
+	Content    string `json:"content"`
+	Status     string `json:"status"`
+	ActiveForm string `json:"active_form"`
+}
+
+// TodoProgress is the statically typed payload the todos/v1 extension
+// carries in TaskStatusUpdateEvent metadata: the in-progress todo, an
+// N/M completed count, and the full structured todo list, so a consumer
+// renders a checklist without parsing the message prose.
+type TodoProgress struct {
+	// Current is the in-progress todo's active form when set, its
+	// content otherwise. Empty when no todo is in progress.
+	Current string `json:"current"`
+	// Completed and Total count the todos.
+	Completed int `json:"completed"`
+	Total     int `json:"total"`
+	// Todos is the full structured todo list.
+	Todos []TodoItem `json:"todos"`
 }
 
 // Transport status tokens (#71), spelled identically to the a2a
