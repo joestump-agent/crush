@@ -259,6 +259,18 @@ func (w *Workspace) reconcileStartup(ctx context.Context) {
 	}
 	for _, path := range markers {
 		branch := strings.TrimSuffix(filepath.Base(path), ownerMarkerSuffix)
+		// A marker's file name is the only thing naming the workspace it
+		// describes, and that name feeds every path below, so refuse
+		// anything that is not a plain dispatch branch name: a stray or
+		// malicious file in the worktrees directory cannot point cleanup
+		// outside it.
+		if !strings.HasPrefix(branch, BranchPrefix) || strings.ContainsAny(branch, `/\`) || strings.Contains(branch, "..") {
+			slog.Debug("Skipping dispatch owner marker with unusable name", "path", path)
+			continue
+		}
+		// codeql[go/path-injection] the name is validated to BranchPrefix
+		// with no separators or traversal above, so path stays inside
+		// worktreesDir.
 		data, err := os.ReadFile(path)
 		if err != nil {
 			slog.Debug("Skipping unreadable dispatch owner marker", "path", path, "error", err)

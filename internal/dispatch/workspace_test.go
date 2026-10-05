@@ -1209,9 +1209,20 @@ func TestStartupReconciliation(t *testing.T) {
 	// The crash: every lease released, nothing else cleaned up.
 	dropLeases(ws)
 
+	// Stray marker files with unusable names must be skipped, not fed
+	// into cleanup (#367): a name that is not a plain dispatch branch
+	// name never names a workspace.
+	stray := filepath.Join(ws.worktreesDir, "zz.owner.json")
+	write(t, stray, "{}")
+	traversal := filepath.Join(ws.worktreesDir, BranchPrefix+"..owner.json")
+	write(t, traversal, "{}")
+
 	fresh, err := NewWorkspace(repo)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = fresh.Sweep(context.Background()) })
+
+	require.FileExists(t, stray, "a stray marker is left alone")
+	require.FileExists(t, traversal, "a traversal-shaped marker is left alone")
 
 	_, err = os.Stat(kept.Path)
 	require.NoError(t, err, "crashed run's workspace with work must survive startup reconciliation")
