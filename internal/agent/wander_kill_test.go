@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
@@ -284,10 +285,16 @@ type blockingScriptedModel struct {
 }
 
 func (m *blockingScriptedModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
-	select {
-	case <-m.hold:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	// The title goroutine is detached from the run's cancel by design
+	// (the GenerateTitle wiring in agent.go), so holding its stream
+	// would keep a killed run's bubble from ever draining. Titles are
+	// served immediately; only the dispatched turn holds.
+	if !isTitleCall(call) {
+		select {
+		case <-m.hold:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	return m.scriptedModel.Stream(ctx, call)
 }
@@ -310,9 +317,14 @@ type wanderKillFixture struct {
 	// killSettings ride the dispatchRun, the way the tool resolves them.
 	killSettings config.TodoEnforcementSettings
 
-	dispatched      *sessionAgent
+	dispatched      SessionAgent
 	killHookInvoked bool
 	main            *fakeMainAgent
+	// runCtx and runCancel mirror the dispatch root (#371) production
+	// wires: buildRun hands the cancel to the run, and the watchdog's
+	// kill fires it. Nil when a test drives the run without a root.
+	runCtx    context.Context
+	runCancel context.CancelFunc
 }
 
 func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings config.TodoEnforcementSettings) *wanderKillFixture {
@@ -413,13 +425,26 @@ func (f *wanderKillFixture) buildRun() dispatchRun {
 		parentSessionID: f.parentSess.ID,
 		kill:            f.kill,
 		killSettings:    f.killSettings,
+		cancel:          f.runCancel,
 	}
+}
+
+// armRunRoot wires the fixture's run the way the dispatch tool does
+// (#371): the run rides a root context whose cancel the watchdog's kill
+// must fire. Call it inside a synctest bubble so the root's goroutines
+// belong to the bubble.
+func (f *wanderKillFixture) armRunRoot() {
+	f.runCtx, f.runCancel = context.WithCancel(context.WithoutCancel(context.Background()))
 }
 
 // runDispatchSync drives the fixture's dispatch to completion.
 func (f *wanderKillFixture) runDispatchSync(t *testing.T) {
 	t.Helper()
-	f.c.runDispatch(context.WithoutCancel(t.Context()), f.buildRun())
+	ctx := context.WithoutCancel(t.Context())
+	if f.runCtx != nil {
+		ctx = f.runCtx
+	}
+	f.c.runDispatch(ctx, f.buildRun())
 }
 
 // wireTransport serves the fixture's dispatch through rt: the real
@@ -513,79 +538,138 @@ func TestWanderKill_IgnoredNudgesEndToEnd(t *testing.T) {
 
 // TestWanderKill_HardTimeout pins the watchdog's hard timeout: a run
 // held open past the timeout is canceled and recorded as killed with the
-// hard-timeout reason, workspace intact.
+// hard-timeout reason, workspace intact. It runs under synctest on
+// production-scale settings (#430): the bubble's fake clock makes a
+// 30-minute timeout free, and a lost kill deadlocks the bubble instead
+// of hiding behind a real-clock cap.
 func TestWanderKill_HardTimeout(t *testing.T) {
 	t.Parallel()
-	model := &scriptedModel{steps: []scriptedStep{
-		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
-		{text: "done"},
-	}}
-	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
-	settings := config.TodoEnforcementSettings{
-		Enabled:     false,
-		HardTimeout: 200 * time.Millisecond,
-	}
-	f := newWanderKillFixture(t, model, settings)
-	f.runModel = blocked
-	f.buildDispatched(t, blocked, settings, nil)
+	synctest.Test(t, func(t *testing.T) {
+		model := &scriptedModel{steps: []scriptedStep{
+			{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+			{text: "done"},
+		}}
+		blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+		settings := config.TodoEnforcementSettings{
+			Enabled:     false,
+			HardTimeout: 30 * time.Minute,
+		}
+		f := newWanderKillFixture(t, model, settings)
+		f.runModel = blocked
+		f.buildDispatched(t, blocked, settings, nil)
+		f.armRunRoot()
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		f.runDispatchSync(t)
-	}()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			f.runDispatchSync(t)
+		}()
 
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		close(blocked.hold)
-		t.Fatal("hard-timeout kill did not end the dispatch")
-	}
+		<-done
 
-	f.requireKilled(t, dispatch.ReasonHardTimeout)
-	assert.False(t, f.killHookInvoked, "the watchdog kills, not the ladder")
+		f.requireKilled(t, dispatch.ReasonHardTimeout)
+		assert.False(t, f.killHookInvoked, "the watchdog kills, not the ladder")
+	})
 }
 
 // TestWanderKill_StalledTodos pins the stall window: a run whose todo
 // list goes untouched for the configured window is killed with the
-// stalled-todos reason even though it keeps tool-calling.
+// stalled-todos reason even though it keeps tool-calling. It runs under
+// synctest on production-scale settings (#430): the bubble's fake clock
+// advances a 10-minute window without wall time, and a lost kill
+// deadlocks the bubble instead of hiding behind a real-clock cap.
 func TestWanderKill_StalledTodos(t *testing.T) {
 	t.Parallel()
-	model := &scriptedModel{steps: []scriptedStep{
-		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
-		{text: "done"},
-	}}
-	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
-	settings := config.TodoEnforcementSettings{
-		Enabled:     false,
-		StallWindow: 400 * time.Millisecond,
-	}
-	f := newWanderKillFixture(t, model, settings)
-	f.runModel = blocked
-	f.buildDispatched(t, blocked, settings, nil)
+	synctest.Test(t, func(t *testing.T) {
+		model := &scriptedModel{steps: []scriptedStep{
+			{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+			{text: "done"},
+		}}
+		blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+		settings := config.TodoEnforcementSettings{
+			Enabled:     false,
+			StallWindow: 10 * time.Minute,
+		}
+		f := newWanderKillFixture(t, model, settings)
+		f.runModel = blocked
+		f.buildDispatched(t, blocked, settings, nil)
+		f.armRunRoot()
 
-	// The dispatched session starts with todos, then never updates them:
-	// the definition of a stall.
-	sess, err := f.env.sessions.Get(t.Context(), f.taskSess.ID)
-	require.NoError(t, err)
-	sess.Todos = []session.Todo{{Content: "stale plan", Status: session.TodoStatusInProgress, ActiveForm: "Stalling"}}
-	_, err = f.env.sessions.Save(t.Context(), sess)
-	require.NoError(t, err)
+		// The dispatched session starts with todos, then never updates
+		// them: the definition of a stall.
+		sess, err := f.env.sessions.Get(t.Context(), f.taskSess.ID)
+		require.NoError(t, err)
+		sess.Todos = []session.Todo{{Content: "stale plan", Status: session.TodoStatusInProgress, ActiveForm: "Stalling"}}
+		_, err = f.env.sessions.Save(t.Context(), sess)
+		require.NoError(t, err)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		f.runDispatchSync(t)
-	}()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			f.runDispatchSync(t)
+		}()
 
+		<-done
+
+		f.requireKilled(t, dispatch.ReasonStalledTodos)
+	})
+}
+
+// lateStartAgent delays every Run past a fixed duration: the real agent
+// registers its session only after the wrapper's delay elapses. Under
+// synctest's fake clock the watchdog's hard timeout can be made to fire
+// strictly inside that delay (while the dispatched agent's Cancel is
+// still a no-op for the unregistered session), which is exactly the
+// kill the old wiring lost (#430).
+type lateStartAgent struct {
+	*sessionAgent
+	delay time.Duration
+}
+
+func (a *lateStartAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+	timer := time.NewTimer(a.delay)
+	defer timer.Stop()
 	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		close(blocked.hold)
-		t.Fatal("stall kill did not end the dispatch")
+	case <-timer.C:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
+	return a.sessionAgent.Run(ctx, call)
+}
 
-	f.requireKilled(t, dispatch.ReasonStalledTodos)
+// TestWanderKill_KillsBeforeRunRegisters pins the lost early kill
+// (#430): the watchdog fires before the dispatched agent's Run has
+// registered the session, so agent.Cancel alone cannot end it. The
+// dispatch must still end killed with the hard-timeout reason (only
+// the run context's cancel can reach a run that has not started).
+func TestWanderKill_KillsBeforeRunRegisters(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		model := &scriptedModel{steps: []scriptedStep{
+			{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+			{text: "done"},
+		}}
+		blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+		settings := config.TodoEnforcementSettings{
+			Enabled:     false,
+			HardTimeout: 30 * time.Minute,
+		}
+		f := newWanderKillFixture(t, model, settings)
+		f.runModel = blocked
+		f.buildDispatched(t, blocked, settings, nil)
+		f.dispatched = &lateStartAgent{sessionAgent: f.dispatched.(*sessionAgent), delay: 45 * time.Minute}
+		f.armRunRoot()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			f.runDispatchSync(t)
+		}()
+
+		<-done
+
+		f.requireKilled(t, dispatch.ReasonHardTimeout)
+	})
 }
 
 // TestWanderKill_ToolLoop pins the tool-loop kill reason: a run that

@@ -3,6 +3,7 @@ package a2a
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,4 +170,65 @@ func TestStreamDispatchTransportErrors(t *testing.T) {
 		Card:     dead,
 	})
 	require.ErrorContains(t, err, "prompt is empty")
+}
+
+// An 11 MB diff survives the wire end to end (#361): the executor's
+// chunks each stay under the SDK's SSE line cap, and the client
+// reassembles them byte for byte onto the outcome.
+func TestStreamDispatchLargeDiffRoundTrips(t *testing.T) {
+	line := strings.Repeat("-", 4096) + "\n"
+	var b strings.Builder
+	for len(b.String()) < 11*1024*1024 {
+		b.WriteString(line)
+	}
+	diff := b.String()
+
+	runner := &fakeRunner{result: textResult("big change")}
+	server, err := StartServer(t.Context(), ServerParams{
+		Runner:    runner,
+		SessionID: "dispatch-session",
+		Diff: func(ctx context.Context) (string, error) {
+			return diff, nil
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+
+	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "change everything",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Len(t, outcome.Diff, len(diff))
+	require.Equal(t, diff, outcome.Diff, "the reassembled diff matches byte for byte")
+	require.False(t, outcome.DiffTruncated)
+	require.Empty(t, outcome.DiffError)
+}
+
+// A diff-capture error crosses the wire on the dispatch-result artifact:
+// the run still completes, and the outcome carries the error instead of
+// a diff (#361).
+func TestStreamDispatchDiffErrorStillCompletes(t *testing.T) {
+	runner := &fakeRunner{result: textResult("done, but the diff blew up")}
+	server, err := StartServer(t.Context(), ServerParams{
+		Runner:    runner,
+		SessionID: "dispatch-session",
+		Diff: func(ctx context.Context) (string, error) {
+			return "", errors.New("not a git repo")
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+
+	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "fix the bug",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Equal(t, "not a git repo", outcome.DiffError)
+	require.Empty(t, outcome.Diff)
 }

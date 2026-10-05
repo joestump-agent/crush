@@ -1011,8 +1011,11 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 
 	// Worktree dispatch (#64) is a coder-level tool. Sub-agents never
 	// get it: dispatching from inside a dispatch would recurse across
-	// the isolation boundary the dispatch toolchain enforces.
-	if !isSubAgent && slices.Contains(agent.AllowedTools, DispatchAgentToolName) {
+	// the isolation boundary the dispatch toolchain enforces. It is also
+	// interactive-only (#387): a non-interactive `crush run` exits when
+	// the parent's turn ends, so a dispatch would die mid-run with its
+	// result undelivered.
+	if !isSubAgent && c.interactive && slices.Contains(agent.AllowedTools, DispatchAgentToolName) {
 		allTools = append(allTools, c.dispatchTool())
 	}
 
@@ -1020,8 +1023,10 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// the injection queue. Main agents only: a dispatched agent steering
 	// a sibling would cross the same isolation boundary the dispatch
 	// toolchain enforces, and worker-to-worker routing is deliberately
-	// deferred (A2A epic #67).
-	if !isSubAgent && slices.Contains(agent.AllowedTools, MessageAgentToolName) {
+	// deferred (A2A epic #67). Interactive-only for the same reason
+	// dispatch is (#387): a non-interactive run ends with the parent's
+	// turn, so there is no live run left to inject into.
+	if !isSubAgent && c.interactive && slices.Contains(agent.AllowedTools, MessageAgentToolName) {
 		allTools = append(allTools, c.messageAgentTool())
 	}
 
@@ -1951,22 +1956,22 @@ func subAgentOutput(result *fantasy.AgentResult) string {
 	return result.Response.Content.Text()
 }
 
-// updateParentSessionCost accumulates the cost from a child session to its parent session.
+// updateParentSessionCost accumulates the cost from a child session to its
+// parent session. The parent row is read only to confirm it exists. The
+// cost is applied with a single atomic increment, so the parent's own
+// full-row saves during its turn cannot race the write (#389).
 func (c *coordinator) updateParentSessionCost(ctx context.Context, childSessionID, parentSessionID string) error {
 	childSession, err := c.sessions.Get(ctx, childSessionID)
 	if err != nil {
 		return fmt.Errorf("get child session: %w", err)
 	}
 
-	parentSession, err := c.sessions.Get(ctx, parentSessionID)
-	if err != nil {
+	if _, err := c.sessions.Get(ctx, parentSessionID); err != nil {
 		return fmt.Errorf("get parent session: %w", err)
 	}
 
-	parentSession.Cost += childSession.Cost
-
-	if _, err := c.sessions.Save(ctx, parentSession); err != nil {
-		return fmt.Errorf("save parent session: %w", err)
+	if err := c.sessions.AddCost(ctx, parentSessionID, childSession.Cost); err != nil {
+		return fmt.Errorf("add cost to parent session: %w", err)
 	}
 
 	return nil

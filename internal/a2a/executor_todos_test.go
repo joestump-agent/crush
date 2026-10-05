@@ -171,6 +171,7 @@ func TestExecuteTodoHappyPath(t *testing.T) {
 			todoState,
 			todoState,
 			artifactState,
+			artifactState,
 			a2aspec.TaskStateCompleted,
 		}
 		require.Equal(t, want, statesWithTodos(t, evs))

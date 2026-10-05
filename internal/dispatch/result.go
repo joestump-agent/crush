@@ -12,6 +12,21 @@ import (
 // parent agent can always read the workspace files for full detail.
 const MaxDiffLines = 250
 
+const (
+	// MaxDiffSummaryBytes caps a DiffSummary in bytes, on top of
+	// MaxDiffLines (#361): the line cap alone lets a single 3 MB minified
+	// line land in the parent's context. A summary may exceed the budget
+	// only by its truncation markers.
+	MaxDiffSummaryBytes = 32 * 1024
+	// MaxDiffStatFiles caps the per-file stat table; past it the summary
+	// names the remaining count instead of listing every file.
+	MaxDiffStatFiles = 100
+)
+
+// lineCutMarker closes a diff line that was longer than the space left
+// in the summary budget.
+const lineCutMarker = " ... (line truncated)"
+
 // Kill reasons recorded on a killed dispatch (#316). A killed run is
 // deterministic cancellation, and the reason is the parent agent's (and
 // the human's) explanation of why.
@@ -204,7 +219,13 @@ func SummarizeDiff(diff string) string {
 		// fall back to the raw text, still truncated.
 		b.WriteString("(no per-file stats; raw diff)\n")
 	} else {
-		for _, file := range order {
+		// The stat table is capped (#361): a thousand-file refactor
+		// must not drown the summary in stat lines.
+		shown := order
+		if len(order) > MaxDiffStatFiles {
+			shown = order[:MaxDiffStatFiles]
+		}
+		for _, file := range shown {
 			s := stats[file]
 			switch {
 			case s.binary:
@@ -215,21 +236,44 @@ func SummarizeDiff(diff string) string {
 				fmt.Fprintf(&b, "%s | +%d -%d\n", s.display, s.added, s.removed)
 			}
 		}
+		if len(order) > MaxDiffStatFiles {
+			fmt.Fprintf(&b, "... %d more files\n", len(order)-MaxDiffStatFiles)
+		}
 	}
 	b.WriteString("\n")
 
+	// The diff body is line-capped and byte-capped (#361): whichever
+	// budget runs out first stops it, and a line longer than the space
+	// left is cut with a marker, so a single 3 MB minified line cannot
+	// land in the parent's context. The summary may exceed the budget
+	// only by its truncation markers.
 	lines := strings.Split(strings.TrimSuffix(diff, "\n"), "\n")
-	if len(lines) > MaxDiffLines {
-		for _, line := range lines[:MaxDiffLines] {
-			b.WriteString(line)
-			b.WriteString("\n")
+	remaining := MaxDiffSummaryBytes - b.Len()
+	written := 0
+	truncated := false
+	for _, line := range lines {
+		if written >= MaxDiffLines || remaining <= 0 {
+			truncated = true
+			break
 		}
-		fmt.Fprintf(&b, "... (%d more diff lines truncated; read the workspace files for full detail)\n", len(lines)-MaxDiffLines)
-	} else {
-		b.WriteString(diff)
-		if !strings.HasSuffix(diff, "\n") {
-			b.WriteString("\n")
+		if len(line)+1 > remaining {
+			if cut := remaining - len(lineCutMarker) - 1; cut > 0 {
+				b.WriteString(line[:cut])
+				b.WriteString("\n")
+				b.WriteString(lineCutMarker)
+				b.WriteString("\n")
+			}
+			remaining = 0
+			truncated = true
+			break
 		}
+		b.WriteString(line)
+		b.WriteString("\n")
+		remaining -= len(line) + 1
+		written++
+	}
+	if truncated {
+		fmt.Fprintf(&b, "... (%d more diff lines truncated; read the workspace files for full detail)\n", len(lines)-written)
 	}
 	return b.String()
 }

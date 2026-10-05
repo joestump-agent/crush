@@ -82,6 +82,12 @@ SET
 WHERE id = ?;
 
 
+-- name: AddSessionCost :exec
+UPDATE sessions
+SET
+    cost = cost + ?
+WHERE id = ?;
+
 -- name: RenameSession :exec
 UPDATE sessions
 SET

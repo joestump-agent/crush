@@ -218,7 +218,7 @@ what the re-base changes.
 | Dispatched agents use the small model by default. | The `worker` definition decides ([#433](https://github.com/joestump-agent/crush/issues/433)). |
 | Dispatched tools are the read-only preset plus write tools; no MCP, sub-agents, questions or semantic search. | Comes from the definition, with deny lists, hooks and live yolo applied on top ([#376](https://github.com/joestump-agent/crush/issues/376), [#377](https://github.com/joestump-agent/crush/issues/377), [#378](https://github.com/joestump-agent/crush/issues/378)). |
 | Results arrive as a hidden follow-up turn on the parent. | Redelivered until consumed, and batched ([#388](https://github.com/joestump-agent/crush/issues/388)). |
-| The diff summary is capped at 250 lines. | The full patch ships as a chunked artifact ([#361](https://github.com/joestump-agent/crush/issues/361)). |
+| The diff summary is capped at 250 lines. | Kept, plus a 32 KiB byte budget and a 100-file stat cap; the full patch ships as a chunked artifact ([#361](https://github.com/joestump-agent/crush/issues/361)). |
 
 ## Superseded decisions
 

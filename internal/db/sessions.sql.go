@@ -10,6 +10,23 @@ import (
 	"database/sql"
 )
 
+const addSessionCost = `-- name: AddSessionCost :exec
+UPDATE sessions
+SET
+    cost = cost + ?
+WHERE id = ?
+`
+
+type AddSessionCostParams struct {
+	Cost float64 `json:"cost"`
+	ID   string  `json:"id"`
+}
+
+func (q *Queries) AddSessionCost(ctx context.Context, arg AddSessionCostParams) error {
+	_, err := q.exec(ctx, q.addSessionCostStmt, addSessionCost, arg.Cost, arg.ID)
+	return err
+}
+
 const createSession = `-- name: CreateSession :one
 INSERT INTO sessions (
     id,

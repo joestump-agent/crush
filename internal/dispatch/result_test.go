@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -241,4 +242,39 @@ func TestDispatchResultFailedShape(t *testing.T) {
 	require.Contains(t, rendered, `"error": "boom"`)
 	require.NotContains(t, rendered, "key_findings")
 	require.NotContains(t, rendered, "diff_summary")
+}
+
+// One 100 KB minified line must not land whole in the parent's
+// context: the byte budget cuts it and the summary stays within the
+// budget plus its truncation markers (#361).
+func TestSummarizeDiffByteBudgetCutsLongLine(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("diff --git a/min.txt b/min.txt\n--- a/min.txt\n+++ b/min.txt\n@@ -1 +1,2 @@\n")
+	b.WriteString("+" + strings.Repeat("x", 100_000))
+	b.WriteString("\n")
+
+	summary := SummarizeDiff(b.String())
+
+	require.Contains(t, summary, "min.txt | +1 -0")
+	require.Contains(t, summary, lineCutMarker)
+	// The summary may exceed the budget only by its markers.
+	marker := fmt.Sprintf("... (%d more diff lines truncated; read the workspace files for full detail)\n", 1)
+	require.LessOrEqual(t, len(summary), MaxDiffSummaryBytes+len(lineCutMarker)+len(marker))
+}
+
+// A thousand-file refactor must not drown the summary in stat lines:
+// the table stops at MaxDiffStatFiles and names the remaining count
+// (#361).
+func TestSummarizeDiffFileCap(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 150; i++ {
+		fmt.Fprintf(&b, "diff --git a/f%03d.txt b/f%03d.txt\n--- a/f%03d.txt\n+++ b/f%03d.txt\n@@ -1 +1,2 @@\n+added\n", i, i, i, i)
+	}
+
+	summary := SummarizeDiff(b.String())
+
+	require.Equal(t, MaxDiffStatFiles, strings.Count(summary, " | +1 -0\n"))
+	require.Contains(t, summary, "f099.txt | +1 -0\n")
+	require.Contains(t, summary, "... 50 more files\n")
+	require.NotContains(t, summary, "f100.txt |")
 }

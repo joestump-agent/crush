@@ -63,7 +63,13 @@ func (f *runnerTransport) StreamDispatch(ctx context.Context, _ DispatchTranspor
 		Text:   subAgentOutput(result),
 	}
 	if params.Diff != nil {
-		if diff, derr := params.Diff(ctx); derr == nil {
+		// The wire carries the diff verdict itself (#361): the diff, or
+		// the capture error when it failed.
+		diff, derr := params.Diff(ctx)
+		switch {
+		case derr != nil:
+			outcome.DiffError = derr.Error()
+		case diff != "":
 			outcome.Diff = diff
 		}
 	}
@@ -238,14 +244,15 @@ func TestServedButNotTransportedRunsDirectly(t *testing.T) {
 func assembleFromTransport(t *testing.T, run dispatchRun, outcome DispatchTransportOutcome) dispatch.DispatchResult {
 	t.Helper()
 	c := newDispatchTestCoordinator(t, testEnv(t))
-	return c.assembleTerminalDispatchResult(t.Context(), run, dispatchNaturalOutcomeFromTransport(run, outcome))
+	return c.assembleTerminalDispatchResult(t.Context(), run, dispatchNaturalOutcomeFromTransport(outcome))
 }
 
 // The outcome mapping mirrors the direct path's semantics: completed
 // keeps findings and diff, failed records the reason, canceled stays
-// failed (parity — StatusKilled is wander kill's, #316), and the empty
-// completed diff re-captures in-process so a capture error can surface
-// as "(diff unavailable: ...)" (#343).
+// failed (parity — StatusKilled is wander kill's, #316), and the wire
+// carries the diff verdict itself (#361): a capture error surfaces as
+// "(diff unavailable: ...)", an arrived diff is used as-is, and nothing
+// on the wire is "(no changes)" — there is no in-process re-diff.
 func TestDispatchFromTransportOutcome(t *testing.T) {
 	t.Parallel()
 
@@ -274,6 +281,18 @@ func TestDispatchFromTransportOutcome(t *testing.T) {
 		Status: transportStatusCompleted,
 		Text:   "nothing changed",
 	}).DiffSummary)
+
+	// A wire-carried capture error (#361) maps onto the same "(diff
+	// unavailable: ...)" summary the direct path produces, with the run
+	// still completing.
+	diffErr := assembleFromTransport(t, run, DispatchTransportOutcome{
+		Status:    transportStatusCompleted,
+		Text:      "done, but the diff blew up",
+		DiffError: "not a git repo",
+	})
+	require.Equal(t, dispatch.StatusCompleted, diffErr.Status)
+	require.Equal(t, "done, but the diff blew up", diffErr.KeyFindings)
+	require.Contains(t, diffErr.DiffSummary, "(diff unavailable: not a git repo)")
 
 	failed := assembleFromTransport(t, run, DispatchTransportOutcome{
 		Status: transportStatusFailed,

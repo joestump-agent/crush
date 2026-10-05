@@ -2,8 +2,10 @@ package session
 
 import (
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/crush/internal/db"
+	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,6 +48,45 @@ func TestEstimatedUsageStateSurvivesFetchModifySave(t *testing.T) {
 	refetched, err := sessions.Get(t.Context(), created.ID)
 	require.NoError(t, err)
 	require.True(t, refetched.EstimatedUsage)
+}
+
+func TestAddCostIncrementsAndPublishesUpdate(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Cleanup(func() {
+		require.NoError(t, db.Release(dataDir))
+	})
+
+	conn, err := db.Connect(t.Context(), dataDir)
+	require.NoError(t, err)
+	sessions := NewService(db.New(conn), conn)
+	ctx := t.Context()
+
+	created, err := sessions.Create(ctx, "cost")
+	require.NoError(t, err)
+
+	events := sessions.Subscribe(ctx)
+
+	require.NoError(t, sessions.AddCost(ctx, created.ID, 0.10))
+	require.NoError(t, sessions.AddCost(ctx, created.ID, 0.05))
+
+	fetched, err := sessions.Get(ctx, created.ID)
+	require.NoError(t, err)
+	require.InDelta(t, 0.15, fetched.Cost, 1e-9)
+	require.Equal(t, "cost", fetched.Title)
+
+	var updatedCost float64
+	require.Eventually(t, func() bool {
+		select {
+		case ev := <-events:
+			if ev.Type == pubsub.UpdatedEvent && ev.Payload.Cost > 0.14 {
+				updatedCost = ev.Payload.Cost
+				return true
+			}
+		default:
+		}
+		return false
+	}, time.Second, time.Millisecond)
+	require.InDelta(t, 0.15, updatedCost, 1e-9)
 }
 
 func TestSessionChannelPersists(t *testing.T) {

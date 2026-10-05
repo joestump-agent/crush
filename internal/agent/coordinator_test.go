@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 
 	"charm.land/catwalk/pkg/catwalk"
@@ -14,6 +15,7 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/discover"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -527,6 +529,86 @@ func TestUpdateParentSessionCost(t *testing.T) {
 		updated, err := env.sessions.Get(t.Context(), parent.ID)
 		require.NoError(t, err)
 		assert.InDelta(t, 0.0, updated.Cost, 1e-9)
+	})
+
+	t.Run("concurrent child cost updates sum exactly", func(t *testing.T) {
+		env := testEnv(t)
+		cfg, err := config.Init(env.workingDir, "", false)
+		require.NoError(t, err)
+		coord := &coordinator{cfg: cfg, sessions: env.sessions}
+
+		parent, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+
+		const n = 20
+		childIDs := make([]string, n)
+		for i := 0; i < n; i++ {
+			child, err := env.sessions.CreateTaskSession(t.Context(), fmt.Sprintf("tool-%d", i), parent.ID, fmt.Sprintf("Child%d", i))
+			require.NoError(t, err)
+			child.Cost = 0.01
+			_, err = env.sessions.Save(t.Context(), child)
+			require.NoError(t, err)
+			childIDs[i] = child.ID
+		}
+
+		var wg sync.WaitGroup
+		errs := make([]error, n)
+		for i, childID := range childIDs {
+			wg.Add(1)
+			go func(i int, childID string) {
+				defer wg.Done()
+				errs[i] = coord.updateParentSessionCost(t.Context(), childID, parent.ID)
+			}(i, childID)
+		}
+		wg.Wait()
+		for _, err := range errs {
+			require.NoError(t, err)
+		}
+
+		updated, err := env.sessions.Get(t.Context(), parent.ID)
+		require.NoError(t, err)
+		assert.InDelta(t, 0.20, updated.Cost, 1e-9)
+	})
+
+	t.Run("parent fields written after child creation survive the cost update", func(t *testing.T) {
+		env := testEnv(t)
+		cfg, err := config.Init(env.workingDir, "", false)
+		require.NoError(t, err)
+		coord := &coordinator{cfg: cfg, sessions: env.sessions}
+
+		parent, err := env.sessions.Create(t.Context(), "Parent")
+		require.NoError(t, err)
+
+		child, err := env.sessions.CreateTaskSession(t.Context(), "tool-1", parent.ID, "Child")
+		require.NoError(t, err)
+
+		// Write the parent's fields after the child is created and before
+		// the cost update, mirroring the dispatch completion ordering.
+		parent.Title = "Parent title"
+		parent.SummaryMessageID = "msg-9"
+		parent.Todos = []session.Todo{{
+			Content:    "Write the plan",
+			Status:     session.TodoStatusInProgress,
+			ActiveForm: "Writing the plan",
+		}}
+		_, err = env.sessions.Save(t.Context(), parent)
+		require.NoError(t, err)
+
+		child.Cost = 0.07
+		_, err = env.sessions.Save(t.Context(), child)
+		require.NoError(t, err)
+
+		err = coord.updateParentSessionCost(t.Context(), child.ID, parent.ID)
+		require.NoError(t, err)
+
+		updated, err := env.sessions.Get(t.Context(), parent.ID)
+		require.NoError(t, err)
+		assert.InDelta(t, 0.07, updated.Cost, 1e-9)
+		assert.Equal(t, "Parent title", updated.Title)
+		assert.Equal(t, "msg-9", updated.SummaryMessageID)
+		require.Len(t, updated.Todos, 1)
+		assert.Equal(t, "Write the plan", updated.Todos[0].Content)
+		assert.Equal(t, session.TodoStatusInProgress, updated.Todos[0].Status)
 	})
 }
 
