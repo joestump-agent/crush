@@ -293,6 +293,10 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 // branch -D: while a worktree admin entry remains, git still regards
 // the branch as checked out and refuses to delete it.
 func (w *Workspace) cleanupFailedProvision(ctx context.Context, branch, path string) {
+	// codeql[go/path-injection] branch is generated here from a UUID, so
+	// path always stays inside worktreesDir: RemoveAll cannot escape the
+	// worktrees directory, and the repo root is the directory the client
+	// asked the server to open.
 	_ = os.RemoveAll(path)
 	_ = runGit(ctx, w.repoRoot, nil, "worktree", "prune")
 	if _, err := gitOutput(ctx, w.repoRoot, nil, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
