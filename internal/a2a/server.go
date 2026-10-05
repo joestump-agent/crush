@@ -36,7 +36,7 @@ type ServerParams struct {
 	// Required.
 	SessionID string
 	// Diff collects the completion artifact. Optional; the a2a.GitDiff
-	// or dispatch.Workspace.Diff contracts both fit.
+	// or dispatch.WorkspaceProvider.Diff contracts both fit.
 	Diff DiffFunc
 	// Todos streams per-session progress as TaskStatusUpdateEvents
 	// (#174). Optional; the production source is the dispatch

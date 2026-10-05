@@ -117,15 +117,15 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 
 	c.dispatchMu.Lock()
 	target := c.dispatchRuns[msg.SessionID]
-	workspace := c.dispatchWS
 	c.dispatchMu.Unlock()
+	reg := c.dispatchRegistry()
 
 	// Scope to the caller's session (#399): a message carrying a
 	// FromSessionID that does not own this dispatch refuses exactly like
 	// an unknown one, so the caller learns nothing about the other
 	// session's agent.
-	if msg.FromSessionID != "" && workspace != nil {
-		if entry, ok := workspace.BySession(msg.SessionID); ok && entry.ParentSessionID != "" && entry.ParentSessionID != msg.FromSessionID {
+	if msg.FromSessionID != "" {
+		if entry, ok := reg.BySession(msg.SessionID); ok && entry.ParentSessionID != "" && entry.ParentSessionID != msg.FromSessionID {
 			return fmt.Errorf("no running agent for session %s in this session; dispatch one first", msg.SessionID)
 		}
 	}
@@ -137,10 +137,8 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 		// being returned and the background run registering its injection
 		// target) must not claim "finished": the entry is not done, and
 		// the caller would be told to dispatch a duplicate.
-		if workspace != nil {
-			if entry, ok := workspace.BySession(msg.SessionID); ok && entry.Status != dispatch.StatusRunning && entry.Status != dispatch.StatusProvisioned {
-				return fmt.Errorf("agent %s finished (%s); task sessions are never continuable — dispatch a new agent instead", msg.SessionID, entry.Status)
-			}
+		if entry, ok := reg.BySession(msg.SessionID); ok && entry.Status != dispatch.StatusRunning && entry.Status != dispatch.StatusProvisioned {
+			return fmt.Errorf("agent %s finished (%s); task sessions are never continuable — dispatch a new agent instead", msg.SessionID, entry.Status)
 		}
 		return fmt.Errorf("no running agent for session %s; dispatch one first", msg.SessionID)
 	}
