@@ -835,6 +835,17 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 	if coderAgentCfg.ID == "" {
 		return fmt.Errorf("coder agent configuration is missing")
 	}
+
+	// #420: the coordinator is a per-App singleton. Every client attach
+	// (TUI startup, `crush run`, a reconnect) lands here, and rebuilding
+	// the coordinator would drop the dispatch registry, the injection
+	// targets and the cron scheduler with the old instance. Reuse it and
+	// only flip the tool palette to the mode the attach asks for; the
+	// last attach still decides the mode.
+	if app.AgentCoordinator != nil {
+		return app.AgentCoordinator.SetInteractive(ctx, interactive)
+	}
+
 	var err error
 	coordinatorOpts := agent.CoordinatorOptions{
 		Config:      app.config,

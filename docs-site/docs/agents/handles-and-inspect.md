@@ -245,12 +245,6 @@ server, and no API exposes them yet.
 | Inspect mode | A selected block opens, but there are no live agents to cycle |
 | Sessions tree | Works |
 
-:::warning[Known issue]
-The server builds its coordinator on a short-lived request context, so dispatch
-progress tracking stops at once ([#419](https://github.com/joestump-agent/crush/issues/419)), and each attaching client replaces
-the coordinator, orphaning running dispatches ([#420](https://github.com/joestump-agent/crush/issues/420)).
-:::
-
 :::info[Planned]
 The TUI becomes an A2A client of the per-process A2A host, so status, steering,
 and cancellation work the same in both modes ([#421](https://github.com/joestump-agent/crush/issues/421)).

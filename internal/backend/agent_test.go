@@ -68,6 +68,7 @@ func (c *blockingCoordinator) ListCronTasks(string) []scheduler.Task         { r
 func (c *blockingCoordinator) Summarize(context.Context, string) error       { return nil }
 func (c *blockingCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (c *blockingCoordinator) UpdateModels(context.Context) error            { return nil }
+func (c *blockingCoordinator) SetInteractive(context.Context, bool) error    { return nil }
 func (c *blockingCoordinator) GenerateTitle(context.Context, string, string) {}
 func (c *blockingCoordinator) SetMainAgent(agentName string) error {
 	c.lastMainAgentSet.Store(agentName)

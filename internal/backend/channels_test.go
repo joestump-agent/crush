@@ -164,6 +164,7 @@ func (c *recordingCoordinator) ListCronTasks(string) []scheduler.Task         { 
 func (c *recordingCoordinator) Summarize(context.Context, string) error       { return nil }
 func (c *recordingCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (c *recordingCoordinator) UpdateModels(context.Context) error            { return nil }
+func (c *recordingCoordinator) SetInteractive(context.Context, bool) error    { return nil }
 func (c *recordingCoordinator) GenerateTitle(context.Context, string, string) {}
 
 // fullFakeSessions adapts fakeChannelSessions to the full session.Service
