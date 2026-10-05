@@ -724,7 +724,12 @@ func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) 
 		// tolerated under any locale.
 		if hasBranch(ctx, w.repoRoot, entry.Branch) {
 			if err := runGit(ctx, w.repoRoot, nil, "branch", "-D", entry.Branch); err != nil {
-				return fmt.Errorf("dispatch %s: delete branch %s: %w", label, entry.Branch, err)
+				// A concurrent Remove may have deleted the branch
+				// between the existence check and -D; gone is gone, so
+				// only an error on a branch still there is real.
+				if hasBranch(ctx, w.repoRoot, entry.Branch) {
+					return fmt.Errorf("dispatch %s: delete branch %s: %w", label, entry.Branch, err)
+				}
 			}
 		}
 	}
