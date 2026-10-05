@@ -137,11 +137,21 @@ type Workspace struct {
 	// worktreesDir is the directory provisioned workspaces are created
 	// under, <repoRoot>/.crush/worktrees.
 	worktreesDir string
+	// commonDir is the repository's git common dir, resolved in
+	// NewWorkspace. It keys the per-repo provision lock, so two
+	// Workspaces on the same repository serialize their worktree adds.
+	commonDir string
 
 	// events re-publishes every registry mutation as an entry event, so
 	// the todo collector (#65) and later sinks observe lifecycle
 	// transitions without the mutation call sites knowing about them.
 	events *pubsub.Broker[Entry]
+
+	// provisionHook, when set, runs just before the locked worktree add
+	// with the branch and path about to be created. Tests use it to
+	// force a deterministic failure, such as a pre-created non-empty
+	// target directory.
+	provisionHook func(branch, path string)
 
 	// instanceID identifies this Workspace instance in the owner
 	// markers it writes, so humans can tell concurrent processes apart.
@@ -166,6 +176,21 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 		return nil, fmt.Errorf("%s is not a git repository: %w", repoRoot, err)
 	}
 
+	// The provision lock key: the git common dir, so every checkout of
+	// the same repository — this one or a worktree — shares a lock.
+	common, err := gitOutput(context.Background(), root, nil, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return nil, fmt.Errorf("resolve git common dir: %w", err)
+	}
+	commonDir := strings.TrimSpace(string(common))
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(root, commonDir)
+	}
+	commonDir, err = filepath.Abs(commonDir)
+	if err != nil {
+		return nil, err
+	}
+
 	dir := filepath.Join(root, ".crush", "worktrees")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create worktrees directory: %w", err)
@@ -180,11 +205,36 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 	return &Workspace{
 		repoRoot:     root,
 		worktreesDir: dir,
+		commonDir:    commonDir,
 		events:       pubsub.NewBroker[Entry](),
 		entries:      make(map[string]Entry),
 		instanceID:   uuid.New().String(),
 		leases:       make(map[string]func()),
 	}, nil
+}
+
+// provisionLocks serializes the worktree add step per repository:
+// git's .git/config lock makes concurrent worktree add calls fail
+// ("could not lock config file") even when they create disjoint
+// branches, so the add and its failure cleanup run one at a time per
+// repo. Keying by git's common dir means two Workspaces on the same
+// repository in one process serialize on the same lock.
+var (
+	provisionLocksMu sync.Mutex
+	provisionLocks   = make(map[string]*sync.Mutex)
+)
+
+// provisionLock returns the lock guarding worktree add for the repo
+// whose git common dir is key, creating it on first use.
+func provisionLock(key string) *sync.Mutex {
+	provisionLocksMu.Lock()
+	defer provisionLocksMu.Unlock()
+	lock, ok := provisionLocks[key]
+	if !ok {
+		lock = &sync.Mutex{}
+		provisionLocks[key] = lock
+	}
+	return lock
 }
 
 // ProvisionOptions configures Provision.
@@ -221,11 +271,22 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 	branch := BranchPrefix + id
 	path := filepath.Join(w.worktreesDir, branch)
 
+	// The add and its failure cleanup run one at a time per
+	// repository, but nothing else in the provision is locked.
+	addLock := provisionLock(w.commonDir)
+	addLock.Lock()
+	if w.provisionHook != nil {
+		w.provisionHook(branch, path)
+	}
 	// The resolved SHA is what worktree add gets, never the raw base
 	// string, and "--" ends option parsing before the positionals.
-	if err := runGit(ctx, w.repoRoot, nil, "worktree", "add", "-b", branch, "--", path, baseSHA); err != nil {
+	err = runGit(ctx, w.repoRoot, nil, "worktree", "add", "--no-track", "-b", branch, "--", path, baseSHA)
+	if err != nil {
+		w.cleanupFailedProvision(ctx, branch, path)
+		addLock.Unlock()
 		return Entry{}, fmt.Errorf("create worktree: %w", err)
 	}
+	addLock.Unlock()
 
 	// The lease and marker live next to the worktree, never inside it,
 	// because Diff stages the whole workspace with git add -A.
@@ -254,6 +315,27 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 	w.leases[id] = release
 	w.mu.Unlock()
 	return entry, nil
+}
+
+// cleanupFailedProvision removes what a failed worktree add may have
+// left behind: the branch -b can create before the add fails, a
+// partially created directory, and stale worktree admin entries. It
+// runs under the repository's provision lock, and its own failures are
+// ignored: the caller returns the original error either way. The
+// directory is removed before the branch, and prune runs before
+// branch -D: while a worktree admin entry remains, git still regards
+// the branch as checked out and refuses to delete it.
+func (w *Workspace) cleanupFailedProvision(ctx context.Context, branch, path string) {
+	// False positive: branch is generated here from a UUID, so path
+	// always stays inside worktreesDir and RemoveAll cannot escape the
+	// worktrees directory; the repo root is the directory the client
+	// asked the server to open.
+	// codeql[go/path-injection]
+	_ = os.RemoveAll(path)
+	_ = runGit(ctx, w.repoRoot, nil, "worktree", "prune")
+	if _, err := gitOutput(ctx, w.repoRoot, nil, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
+		_ = runGit(ctx, w.repoRoot, nil, "branch", "-D", branch)
+	}
 }
 
 // leasePath is the flock file guarding branch's workspace. It lives
