@@ -142,18 +142,18 @@ func TestBuildToolsGatesDispatchOnInteractive(t *testing.T) {
 		{
 			name:        "interactive main agent keeps both",
 			interactive: true,
-			want:        map[string]bool{DispatchAgentToolName: true, MessageAgentToolName: true},
+			want:        map[string]bool{DispatchAgentToolName: true, MessageAgentToolName: true, CancelDispatchToolName: true},
 		},
 		{
 			name:        "non-interactive main agent drops both",
 			interactive: false,
-			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false},
+			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false, CancelDispatchToolName: false},
 		},
 		{
 			name:        "interactive sub-agent still drops both",
 			interactive: true,
 			subAgent:    true,
-			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false},
+			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false, CancelDispatchToolName: false},
 		},
 	}
 	for _, tt := range tests {

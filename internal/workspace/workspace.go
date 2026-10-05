@@ -241,6 +241,13 @@ type Workspace interface {
 	// refusal error (#399); in client/server mode it reports that
 	// dispatch steering needs a local process.
 	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error
+	// CancelDispatch stops one dispatched agent on demand (#373): the
+	// ref resolves through the dispatch registry as a dispatch ID, an
+	// @handle, or the dispatched agent's child session ID — the ID a
+	// dispatch card carries. Unknown and finished dispatches return a
+	// refusal error; in client/server mode it reports that canceling a
+	// dispatched agent needs a local process.
+	CancelDispatch(ctx context.Context, ref string) error
 
 	// LSP
 	LSPStart(ctx context.Context, path string)

@@ -29,6 +29,11 @@ type gatedDispatchAgent struct {
 	queued    []SessionAgentCall
 	lastCall  *SessionAgentCall
 	canceled  []string
+
+	// cancelCh closes on the first Cancel so a parked Run returns as if
+	// the cancel reached it (#373); cancelOnce keeps the close idempotent.
+	cancelCh   chan struct{}
+	cancelOnce sync.Once
 }
 
 func (f *gatedDispatchAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
@@ -39,6 +44,8 @@ func (f *gatedDispatchAgent) Run(ctx context.Context, call SessionAgentCall) (*f
 	f.enterOnce.Do(func() { close(f.entered) })
 	select {
 	case <-f.gate:
+	case <-f.cancelCh:
+		return nil, context.Canceled
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -81,11 +88,15 @@ func (f *gatedDispatchAgent) EnqueueWhenBusy(call SessionAgentCall) bool {
 }
 
 // Cancel records the cancel so a test can assert the coordinator tore
-// down an orphaned dispatched run after a transport stream error (#344).
+// down an orphaned dispatched run after a transport stream error (#344)
+// and that CancelDispatch reached the dispatched agent, never the parent
+// (#373). Closing cancelCh un-parks a Run parked on the gate, mirroring a
+// real agent whose active request aborts on Cancel.
 func (f *gatedDispatchAgent) Cancel(sessionID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.canceled = append(f.canceled, sessionID)
+	f.cancelOnce.Do(func() { close(f.cancelCh) })
 }
 
 // IsSessionBusy reports the session not busy, so the coordinator's
@@ -129,10 +140,11 @@ func newInjectionEnv(t *testing.T, agent *gatedDispatchAgent) (*coordinator, fak
 
 func newGatedDispatchAgent() *gatedDispatchAgent {
 	return &gatedDispatchAgent{
-		model:   dispatchTestModel(),
-		gate:    make(chan struct{}),
-		entered: make(chan struct{}),
-		result:  &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
+		model:    dispatchTestModel(),
+		gate:     make(chan struct{}),
+		entered:  make(chan struct{}),
+		cancelCh: make(chan struct{}),
+		result:   &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
 	}
 }
 
