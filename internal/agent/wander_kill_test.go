@@ -650,7 +650,7 @@ func TestWanderKill_StalledTodosWrittenAfterStart(t *testing.T) {
 	}()
 
 	require.Eventually(t, func() bool {
-		entry, ok := f.ws.Get(f.entry.ID)
+		entry, ok := f.reg.Get(f.entry.ID)
 		return ok && entry.Status == dispatch.StatusKilled
 	}, 5*time.Second, 25*time.Millisecond,
 		"a todo list that never updates after its first write must be stall-killed")
@@ -690,7 +690,7 @@ func TestWanderKill_NoTodosNeverStallKilled(t *testing.T) {
 	close(blocked.hold)
 	<-done
 
-	entry, ok := f.ws.Get(f.entry.ID)
+	entry, ok := f.reg.Get(f.entry.ID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusCompleted, entry.Status, "a run that never writes todos must not be stall-killed")
 	require.NotNil(t, entry.Result)
@@ -754,7 +754,7 @@ func TestWanderKill_TodosUpdatedWithinWindowNotKilled(t *testing.T) {
 	<-done
 	<-updated
 
-	entry, ok := f.ws.Get(f.entry.ID)
+	entry, ok := f.reg.Get(f.entry.ID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusCompleted, entry.Status, "a run that refreshes its todos within each window must not be stall-killed")
 	require.NotNil(t, entry.Result)
