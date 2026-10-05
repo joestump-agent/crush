@@ -280,7 +280,9 @@ func (app *App) resolveSession(ctx context.Context, continueSessionID string, us
 
 	case useLast:
 		sess, err := app.Sessions.GetLast(ctx)
-		if err != nil {
+		// GetLastSession selects top-level sessions only; the guard
+		// keeps --continue safe if that ever changes (#413).
+		if err != nil || sess.ParentSessionID != "" {
 			return session.Session{}, fmt.Errorf("no sessions found to continue")
 		}
 		return sess, nil

@@ -590,3 +590,56 @@ func TestInspectPlaceholderKeepsTheWayBack(t *testing.T) {
 	require.Contains(t, placeholder, "ctrl+[ returns")
 	require.LessOrEqual(t, ansi.StringWidth(placeholder), m.textarea.Width())
 }
+
+// TestInitialTaskSessionOpensParentInInspect pins the crush -s routing
+// (#413): starting on the landing screen with a task session ID loads
+// the parent as the active session and opens the task session in the
+// read-only inspect view, and a prompt submitted there runs on the
+// parent.
+func TestInitialTaskSessionOpensParentInInspect(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+
+	// A fresh start: landing state, no active session, the task
+	// session as the initial one, as crush -s <task-session-id> does.
+	m.session = nil
+	m.state = uiLanding
+	m.initialSessionID = inspectChildID
+
+	runInspectCmds(m, m.loadInitialSession())
+
+	require.Equal(t, inspectParentID, m.session.ID,
+		"the parent must become the active session, never the task session")
+	require.Equal(t, uiChat, m.state)
+	require.True(t, m.isInspecting(), "the task session must open in inspect mode")
+	require.Equal(t, inspectChildID, m.inspectingSessionID())
+
+	// A prompt submitted from the inspect view runs on the parent.
+	m.textarea.SetValue("keep working")
+	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	runInspectCmds(m, cmd)
+
+	require.Equal(t, []string{inspectParentID}, ws.agentRuns,
+		"a prompt submitted after a -s start must run against the parent")
+}
+
+// TestInitialTopLevelSessionLoadsActive pins the unchanged -s behavior:
+// a top-level session ID still loads as the active session.
+func TestInitialTopLevelSessionLoadsActive(t *testing.T) {
+	const otherID = "other-top"
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	ws.sessions[otherID] = session.Session{ID: otherID, Title: "Other"}
+	ws.messages[otherID] = []message.Message{{ID: "t0", SessionID: otherID, Role: message.User}}
+
+	m.session = nil
+	m.state = uiLanding
+	m.initialSessionID = otherID
+
+	runInspectCmds(m, m.loadInitialSession())
+
+	require.Equal(t, otherID, m.session.ID, "a top-level session loads as active")
+	require.Equal(t, uiChat, m.state)
+	require.False(t, m.isInspecting())
+}

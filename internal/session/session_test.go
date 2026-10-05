@@ -215,3 +215,66 @@ func TestListAllChildrenGroupsEveryParent(t *testing.T) {
 	require.Equal(t, []string{titleB.ID, taskB1.ID}, groups[parentB.ID],
 		"oldest-created first within the parent, title sessions included")
 }
+
+// TestGetLastIgnoresChildSessions pins #413: a background dispatch keeps
+// updating its task session, so the most recently updated session of any
+// kind is usually a child. GetLast must return the most recently
+// updated top-level session, or nothing at all.
+//
+// Not parallel: the other pool tests share the global db pool; Release
+// only this test's entry.
+func TestGetLastIgnoresChildSessions(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Cleanup(func() {
+		require.NoError(t, db.Release(dataDir))
+	})
+
+	conn, err := db.Connect(t.Context(), dataDir)
+	require.NoError(t, err)
+	sessions := NewService(db.New(conn), conn)
+	ctx := t.Context()
+
+	// Insert rows with explicit updated_at through raw SQL: the
+	// AFTER UPDATE trigger rewrites updated_at on UPDATE, so an
+	// UPDATE cannot pin the ordering.
+	insert := func(id string, parent any, updatedAt int64) {
+		t.Helper()
+		_, err := conn.ExecContext(ctx,
+			`INSERT INTO sessions (id, parent_session_id, title, updated_at, created_at)
+			 VALUES (?, ?, 'pinned', ?, ?)`, id, parent, updatedAt, updatedAt-100)
+		require.NoError(t, err)
+	}
+
+	// A parent, then a task session under it updated later.
+	insert("parent-1", nil, 1000)
+	insert("msg-1$$call-1", "parent-1", 2000)
+
+	last, err := sessions.GetLast(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "parent-1", last.ID,
+		"the newest top-level session wins over a newer child")
+}
+
+func TestGetLastWithOnlyChildrenReportsNone(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Cleanup(func() {
+		require.NoError(t, db.Release(dataDir))
+	})
+
+	conn, err := db.Connect(t.Context(), dataDir)
+	require.NoError(t, err)
+	sessions := NewService(db.New(conn), conn)
+	ctx := t.Context()
+
+	_, err = conn.ExecContext(ctx,
+		`INSERT INTO sessions (id, parent_session_id, title, updated_at, created_at)
+		 VALUES ('msg-1$$call-1', 'parent-1', 'task', 2000, 1900)`)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(ctx,
+		`INSERT INTO sessions (id, parent_session_id, title, updated_at, created_at)
+		 VALUES ('title-parent-1', 'parent-1', 'title', 3000, 2900)`)
+	require.NoError(t, err)
+
+	_, err = sessions.GetLast(ctx)
+	require.Error(t, err, "children alone must not be continuable")
+}
