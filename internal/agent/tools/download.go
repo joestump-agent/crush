@@ -79,6 +79,10 @@ func NewDownloadTool(permissions permission.Service, workingDir string, client *
 			}
 
 			filePath := filepathext.SmartJoin(workingDir, params.FilePath)
+			filePath, err := ContainPath(ctx, filePath)
+			if err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
 			relPath, _ := filepath.Rel(workingDir, filePath)
 			relPath = filepath.ToSlash(cmp.Or(relPath, filePath))
 

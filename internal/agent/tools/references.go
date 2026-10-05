@@ -36,7 +36,10 @@ func NewReferencesTool(lspManager *lsp.Manager) fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse("symbol is required"), nil
 			}
 
-			workingDir := cmp.Or(params.Path, ".")
+			workingDir, err := ContainPath(ctx, cmp.Or(params.Path, "."))
+			if err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
 			results, err := resolveSymbolResults(ctx, lspManager, params.Symbol, workingDir)
 			if err != nil {
 				return fantasy.NewTextResponse(fmt.Sprintf("Symbol '%s' not found", params.Symbol)), nil

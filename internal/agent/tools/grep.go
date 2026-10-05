@@ -135,7 +135,10 @@ func NewGrepTool(workingDir string, config config.ToolGrep) fantasy.AgentTool {
 				searchPattern = escapeRegexPattern(params.Pattern)
 			}
 
-			searchPath := cmp.Or(params.Path, workingDir)
+			searchPath, err := ContainPath(ctx, cmp.Or(params.Path, workingDir))
+			if err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
 
 			searchCtx, cancel := context.WithTimeout(ctx, config.GetTimeout())
 			defer cancel()
