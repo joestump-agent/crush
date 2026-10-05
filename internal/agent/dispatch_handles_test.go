@@ -165,7 +165,6 @@ func TestDeliverByHandleRoutesAndToolAcceptsHandle(t *testing.T) {
 	close(agent.gate)
 }
 
-<<<<<<< HEAD
 // runToolAsSession is runTool over a caller-supplied session: the
 // message_agent tool scopes its delivery to the session it runs in
 // (#399), so tests must be able to pick it.

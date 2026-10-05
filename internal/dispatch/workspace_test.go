@@ -781,7 +781,6 @@ func TestStatusIsTerminal(t *testing.T) {
 	}
 }
 
-<<<<<<< HEAD
 // HandleSlug caps a slug at MaxHandleLength bytes (#399), trimming a
 // trailing dash the cap leaves.
 func TestHandleSlugLengthCap(t *testing.T) {
