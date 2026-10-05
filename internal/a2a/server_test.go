@@ -413,8 +413,12 @@ func TestHostLongDataDirFallsBack(t *testing.T) {
 // removal before the bind is safe (#346).
 func TestHostReplacesStaleSocket(t *testing.T) {
 	dataDir := t.TempDir()
-	stale := filepath.Join(dataDir, a2aSocketDirName, fmt.Sprintf("%d.sock", os.Getpid()))
-	require.NoError(t, os.MkdirAll(filepath.Dir(stale), 0o700))
+	// The stale file goes exactly where the host will bind, computed by
+	// the same helper (which falls back to the per-user temp dir when the
+	// data dir path would overflow the socket length limit, as it can on
+	// the macOS runners).
+	stale, err := a2aSocketPath(dataDir)
+	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(stale, []byte("stale"), 0o600))
 
 	factory := NewServerFactory(dataDir)
