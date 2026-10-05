@@ -721,7 +721,17 @@ func (m *UI) loadInitialSession() tea.Cmd {
 		// Only load if we're in landing state (i.e., fully configured)
 		return nil
 	case m.initialSessionID != "":
-		return m.loadSession(m.initialSessionID)
+		return func() tea.Msg {
+			sess, err := m.com.Workspace.GetSession(context.Background(), m.initialSessionID)
+			if err != nil {
+				return util.ReportError(err)
+			}
+			// Route through the picker handler (#413): a task session
+			// loads its parent as the active session and opens in the
+			// read-only inspect view; a top-level session loads as
+			// active, as before.
+			return m.handleSelectSession(sess)()
+		}
 	case m.continueLastSession:
 		return func() tea.Msg {
 			sessions, err := m.com.Workspace.ListSessions(context.Background())
