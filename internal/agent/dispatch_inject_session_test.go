@@ -9,6 +9,8 @@ import (
 
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
+	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/stretchr/testify/require"
 )
@@ -279,4 +281,204 @@ func TestEnqueueWhenBusyOrderingAndConcurrency(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("run did not finish after the gates were released")
 	}
+}
+
+// gatedFinalTextModel is a scripted model for #397's final-step window:
+// its first step streams the work's final answer and blocks midway
+// through the text step — the turn has no step left for a queued steer
+// to fold into, yet the session stays busy until Run releases it — and
+// its second step answers the steer.
+type gatedFinalTextModel struct {
+	mu      sync.Mutex
+	calls   int
+	midText chan struct{}
+	gate    chan struct{}
+	midOnce sync.Once
+}
+
+func newGatedFinalTextModel() *gatedFinalTextModel {
+	return &gatedFinalTextModel{
+		midText: make(chan struct{}),
+		gate:    make(chan struct{}),
+	}
+}
+
+func (m *gatedFinalTextModel) Provider() string { return "fake" }
+func (m *gatedFinalTextModel) Model() string    { return "fake-model" }
+
+// callsCount returns how many times the model was called.
+func (m *gatedFinalTextModel) callsCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls
+}
+
+func (m *gatedFinalTextModel) Generate(ctx context.Context, call fantasy.Call) (*fantasy.Response, error) {
+	return &fantasy.Response{
+		Content:      fantasy.ResponseContent{fantasy.TextContent{Text: "ack, noted"}},
+		FinishReason: fantasy.FinishReasonStop,
+	}, nil
+}
+
+func (m *gatedFinalTextModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
+	m.mu.Lock()
+	step := m.calls
+	m.calls++
+	m.mu.Unlock()
+	text := "ORIGINAL FINDINGS: fixed 3 bugs; all verified."
+	if step > 0 {
+		text = "ack, noted"
+	}
+	return func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextStart, ID: "1"}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextDelta, ID: "1", Delta: text}) {
+			return
+		}
+		if step == 0 {
+			// The mid-text block is #397's window: signal, then hold
+			// the stream until the test releases it.
+			m.midOnce.Do(func() { close(m.midText) })
+			select {
+			case <-m.gate:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextEnd, ID: "1"}) {
+			return
+		}
+		yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeFinish, FinishReason: fantasy.FinishReasonStop})
+	}, nil
+}
+
+func (m *gatedFinalTextModel) GenerateObject(ctx context.Context, call fantasy.ObjectCall) (*fantasy.ObjectResponse, error) {
+	return nil, context.DeadlineExceeded
+}
+
+func (m *gatedFinalTextModel) StreamObject(ctx context.Context, call fantasy.ObjectCall) (fantasy.ObjectStreamResponse, error) {
+	return nil, context.DeadlineExceeded
+}
+
+// stepsCount returns how many model steps the two-step model served.
+func (m *twoStepEchoModel) stepsCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.prompts)
+}
+
+// newFinalStepDispatchEnv builds a dispatch environment whose dispatched
+// agent is a real session agent on the given scripted model, so the run
+// and the injection queue both behave for real.
+func newFinalStepDispatchEnv(t *testing.T, env fakeEnv, model fantasy.LanguageModel, tools []fantasy.AgentTool) *coordinator {
+	t.Helper()
+	sa := newInjectionSessionAgent(env, model, tools)
+	c := newDispatchTestCoordinator(t, env)
+	c.dispatchAgentBuilder = func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error) {
+		return &dispatchedAgent{
+			agent:       sa,
+			model:       dispatchTestModel(),
+			providerCfg: config.ProviderConfig{ID: "test-provider"},
+		}, nil
+	}
+	return c
+}
+
+// waitDispatchTerminal waits until the dispatch's registry entry turns
+// terminal and returns it.
+func waitDispatchTerminal(t *testing.T, c *coordinator, dispatchID string) dispatch.Entry {
+	t.Helper()
+	ws, _ := c.dispatchWorkspace()
+	var e dispatch.Entry
+	require.Eventually(t, func() bool {
+		var ok bool
+		e, ok = ws.Get(dispatchID)
+		return ok && e.Status.IsTerminal()
+	}, 10*time.Second, 50*time.Millisecond)
+	return e
+}
+
+// A steer accepted while the final step is streaming (#397) runs as the
+// follow-up turn: the terminal result's key findings are the work turn's
+// report, the steer's reply lands in steer_replies, and the model
+// served exactly two turns.
+func TestFinalStepSteerKeepsDispatchFindings(t *testing.T) {
+	t.Parallel()
+
+	env := testEnv(t)
+	initGitRepo(t, env.workingDir)
+	model := newGatedFinalTextModel()
+	c := newFinalStepDispatchEnv(t, env, model, nil)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{
+		Prompt: "find the bugs",
+		Branch: "main",
+		Handle: "findings",
+	}))
+
+	// The work turn is streaming its final answer: the session is busy
+	// and no step remains for a queued steer to fold into.
+	select {
+	case <-model.midText:
+	case <-time.After(10 * time.Second):
+		t.Fatal("work turn never reached its final text step")
+	}
+	require.NoError(t, c.DeliverAgentMessage(t.Context(), AgentMessage{
+		SessionID: handle.SessionID,
+		Text:      "stop, that is not the issue",
+	}))
+
+	// Release the stream; the steer runs as the follow-up turn.
+	close(model.gate)
+
+	e := waitDispatchTerminal(t, c, handle.DispatchID)
+	require.Equal(t, dispatch.StatusCompleted, e.Status)
+	require.NotNil(t, e.Result)
+	// The findings are the work turn's report, not the steer's reply.
+	require.Equal(t, "ORIGINAL FINDINGS: fixed 3 bugs; all verified.", e.Result.KeyFindings)
+	require.Equal(t, []string{"ack, noted"}, e.Result.SteerReplies)
+	require.Equal(t, 2, model.callsCount(), "the work turn plus the steer's follow-up turn")
+}
+
+// A steer folded into the running turn (#397's other half) is part of
+// the work turn: the findings are unchanged and steer_replies stays
+// empty, with no follow-up turn served.
+func TestFoldedSteerLeavesDispatchFindingsUnchanged(t *testing.T) {
+	t.Parallel()
+
+	env := testEnv(t)
+	initGitRepo(t, env.workingDir)
+	model := &twoStepEchoModel{}
+	echo, echoState := newGatedEchoTool()
+	c := newFinalStepDispatchEnv(t, env, model, []fantasy.AgentTool{echo})
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{
+		Prompt: "original task",
+		Branch: "main",
+		Handle: "folded",
+	}))
+
+	// The first step is executing its tool call: a steer delivered now
+	// folds into the running turn's next step instead of queueing behind
+	// the run.
+	select {
+	case <-echoState.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run never reached the tool call")
+	}
+	require.NoError(t, c.DeliverAgentMessage(t.Context(), AgentMessage{
+		SessionID: handle.SessionID,
+		Text:      "fold me in",
+	}))
+	close(echoState.gate)
+
+	e := waitDispatchTerminal(t, c, handle.DispatchID)
+	require.Equal(t, dispatch.StatusCompleted, e.Status)
+	require.NotNil(t, e.Result)
+	require.Equal(t, "steered answer", e.Result.KeyFindings)
+	require.Empty(t, e.Result.SteerReplies, "a folded steer is part of the work turn and records no reply")
+	require.Equal(t, 2, model.stepsCount(), "the folded steer must not start a follow-up turn")
 }

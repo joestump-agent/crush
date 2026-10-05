@@ -81,6 +81,12 @@ type DispatchResult struct {
 	// completion; on a killed run it carries the run's last assistant
 	// state instead.
 	KeyFindings string `json:"key_findings,omitempty"`
+	// SteerReplies are the replies to steers that arrived as follow-up
+	// turns after the work finished (#397): a steer accepted while the
+	// final step was streaming runs as its own turn, and its reply is
+	// kept here, in turn order, rather than replacing KeyFindings.
+	// Empty when no such steer landed.
+	SteerReplies []string `json:"steer_replies,omitempty"`
 	// DiffSummary is the condensed work product: a per-file change stat
 	// followed by the diff itself, truncated at MaxDiffLines. Populated
 	// on completion and on kill (the salvageable work product); a

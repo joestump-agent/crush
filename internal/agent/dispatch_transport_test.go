@@ -603,3 +603,51 @@ func TestDispatchParityAcrossPaths(t *testing.T) {
 		}
 	}
 }
+
+// The final-step window on the transport path (#397): the served turn
+// runs on the same agent the injection queue addresses, so a steer
+// accepted while the final step is streaming runs as the follow-up
+// turn and the wire's terminal status carries its reply — the run's
+// findings record keeps the work's report on the parent-side result.
+func TestTransportFinalStepSteerKeepsDispatchFindings(t *testing.T) {
+	t.Parallel()
+
+	env := testEnv(t)
+	initGitRepo(t, env.workingDir)
+	model := newGatedFinalTextModel()
+	c := newFinalStepDispatchEnv(t, env, model, nil)
+	transport := &runnerTransport{}
+	c.SetDispatchServerStarter(transport)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{
+		Prompt: "find the bugs",
+		Branch: "main",
+		Handle: "transport",
+	}))
+
+	// The served turn is streaming its final answer: the stream runs
+	// inside the transport's StreamDispatch, against the same agent the
+	// queue addresses.
+	select {
+	case <-model.midText:
+	case <-time.After(10 * time.Second):
+		t.Fatal("work turn never reached its final text step")
+	}
+	require.NoError(t, c.DeliverAgentMessage(t.Context(), AgentMessage{
+		SessionID: handle.SessionID,
+		Text:      "stop, that is not the issue",
+	}))
+
+	// Release the stream; the steer runs as the follow-up turn.
+	close(model.gate)
+
+	e := waitDispatchTerminal(t, c, handle.DispatchID)
+	require.Equal(t, dispatch.StatusCompleted, e.Status)
+	require.NotNil(t, e.Result)
+	// The wire's Completed status carried the steer's reply; the
+	// findings record must win over it.
+	require.Equal(t, "ORIGINAL FINDINGS: fixed 3 bugs; all verified.", e.Result.KeyFindings)
+	require.Equal(t, []string{"ack, noted"}, e.Result.SteerReplies)
+	require.Equal(t, 2, model.callsCount(), "the work turn plus the steer's follow-up turn")
+}

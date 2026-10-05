@@ -71,11 +71,16 @@ type runningDispatch struct {
 	sessionID string
 	agent     injectableAgent
 	baseCall  SessionAgentCall
+	// findings is the run's turn-text record (#397): a steer enqueued
+	// behind a finished work turn runs as a follow-up turn, and its
+	// reply is kept out of the findings.
+	findings *dispatchFindings
 }
 
 // registerDispatchRun makes the dispatched agent running on sessionID
-// addressable for mid-run injection, capturing the run's call shaping.
-func (c *coordinator) registerDispatchRun(sessionID string, agent injectableAgent, baseCall SessionAgentCall) {
+// addressable for mid-run injection, capturing the run's call shaping
+// and findings record.
+func (c *coordinator) registerDispatchRun(sessionID string, agent injectableAgent, baseCall SessionAgentCall, findings *dispatchFindings) {
 	if sessionID == "" || agent == nil {
 		return
 	}
@@ -84,7 +89,7 @@ func (c *coordinator) registerDispatchRun(sessionID string, agent injectableAgen
 	if c.dispatchRuns == nil {
 		c.dispatchRuns = make(map[string]*runningDispatch)
 	}
-	c.dispatchRuns[sessionID] = &runningDispatch{sessionID: sessionID, agent: agent, baseCall: baseCall}
+	c.dispatchRuns[sessionID] = &runningDispatch{sessionID: sessionID, agent: agent, baseCall: baseCall, findings: findings}
 }
 
 // unregisterDispatchRun drops the injection target for sessionID when the
@@ -157,6 +162,11 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 	call.Steer = true
 	call.Accepted = nil
 	call.OnComplete = nil
+	// The steer's own turn observer (#397): a steer folded into the
+	// running turn is part of the work turn and inherits its observer;
+	// a steer that lands as the follow-up turn records its reply in the
+	// run's findings instead of replacing the work's.
+	call.turnText = target.findings.addSteerReply
 
 	if !target.agent.EnqueueWhenBusy(call) {
 		// The run ended between the registry lookup and the enqueue — the
