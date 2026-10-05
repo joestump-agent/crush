@@ -813,6 +813,9 @@ func TestByHandlePrefersLiveEntry(t *testing.T) {
 	repo := newTestRepo(t)
 	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
+	// Sweep releases this process's leases so Windows can unlink the
+	// lock files during TempDir cleanup.
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 	ctx := t.Context()
 
 	a, err := ws.Provision(ctx, ProvisionOptions{})
@@ -915,6 +918,7 @@ func TestProvisionConcurrent(t *testing.T) {
 
 	ws, err := newWorkspace(t, repo)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
 	const n = 12
 	errs := make([]error, n)
