@@ -826,6 +826,40 @@ func (app *App) CancelDispatch(ctx context.Context, ref string) error {
 	return app.AgentCoordinator.CancelDispatch(ctx, ref)
 }
 
+// DeleteSession deletes a session and every descendant session in one
+// transaction (#418). It refuses while a dispatch is still running from
+// the session or from any descendant, because the cascade would delete
+// the dispatched agent's session; dispatch worktrees and branches are
+// never touched, so they stay manageable with `crush dispatch` (#369).
+func (app *App) DeleteSession(ctx context.Context, id string) error {
+	ids := []string{id}
+	queue := []string{id}
+	seen := map[string]bool{id: true}
+	for len(queue) > 0 {
+		var next []string
+		for _, parentID := range queue {
+			children, err := app.Sessions.ListChildren(ctx, parentID)
+			if err != nil {
+				return err
+			}
+			for _, child := range children {
+				if !seen[child.ID] {
+					seen[child.ID] = true
+					ids = append(ids, child.ID)
+					next = append(next, child.ID)
+				}
+			}
+		}
+		queue = next
+	}
+	for _, sessionID := range ids {
+		if len(app.DispatchLive(sessionID)) > 0 {
+			return errors.New("an agent dispatched from this session is still running; cancel it first")
+		}
+	}
+	return app.Sessions.Delete(ctx, id)
+}
+
 // InitCoderAgentNonInteractive initializes the coder agent without
 // interactive-only tools (e.g. question).
 func (app *App) InitCoderAgentNonInteractive(ctx context.Context) error {

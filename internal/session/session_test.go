@@ -1,10 +1,14 @@
 package session
 
 import (
+	"context"
+	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/db"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/stretchr/testify/require"
 )
@@ -277,4 +281,151 @@ func TestGetLastWithOnlyChildrenReportsNone(t *testing.T) {
 
 	_, err = sessions.GetLast(ctx)
 	require.Error(t, err, "children alone must not be continuable")
+}
+
+// newDeleteTestStore builds a session service over a fresh temporary
+// database plus a message service on the same handle, with one message
+// per session in the given tree.
+func newDeleteTestStore(t *testing.T) (conn *sql.DB, sessions Service, messages message.Service, ctx context.Context) {
+	t.Helper()
+	dataDir := t.TempDir()
+	t.Cleanup(func() {
+		require.NoError(t, db.Release(dataDir))
+	})
+
+	var err error
+	conn, err = db.Connect(t.Context(), dataDir)
+	require.NoError(t, err)
+	sessions = NewService(db.New(conn), conn)
+	messages = message.NewService(db.New(conn))
+	ctx = t.Context()
+	return conn, sessions, messages, ctx
+}
+
+func addDeleteTestMessage(t *testing.T, messages message.Service, ctx context.Context, sessionID string) {
+	t.Helper()
+	_, err := messages.Create(ctx, sessionID, message.CreateMessageParams{
+		Role:  message.User,
+		Parts: []message.ContentPart{message.TextContent{Text: "hello"}},
+	})
+	require.NoError(t, err)
+}
+
+func countDeleteTestMessages(t *testing.T, conn *sql.DB, ctx context.Context, sessionID string) int {
+	t.Helper()
+	var count int
+	require.NoError(t, conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM messages WHERE session_id = ?", sessionID).Scan(&count))
+	return count
+}
+
+func TestDeleteCascadesToChildSessions(t *testing.T) {
+	conn, sessions, messages, ctx := newDeleteTestStore(t)
+
+	parent, err := sessions.Create(ctx, "parent")
+	require.NoError(t, err)
+	task1, err := sessions.CreateTaskSession(ctx, "call-1", parent.ID, "task 1")
+	require.NoError(t, err)
+	task2, err := sessions.CreateTaskSession(ctx, "call-2", parent.ID, "task 2")
+	require.NoError(t, err)
+	title, err := sessions.CreateTitleSession(ctx, parent.ID)
+	require.NoError(t, err)
+	grand, err := sessions.CreateTaskSession(ctx, "call-3", task2.ID, "grandchild")
+	require.NoError(t, err)
+
+	tree := []string{parent.ID, task1.ID, task2.ID, title.ID, grand.ID}
+	for _, id := range tree {
+		addDeleteTestMessage(t, messages, ctx, id)
+	}
+
+	events := sessions.Subscribe(ctx)
+
+	require.NoError(t, sessions.Delete(ctx, parent.ID))
+
+	// Every session in the tree is gone, with no children left behind.
+	for _, id := range tree {
+		_, err := sessions.Get(ctx, id)
+		require.ErrorIs(t, err, sql.ErrNoRows, "session %s deleted", id)
+		require.Zero(t, countDeleteTestMessages(t, conn, ctx, id), "messages for %s deleted", id)
+	}
+	kids, err := sessions.ListChildren(ctx, parent.ID)
+	require.NoError(t, err)
+	require.Empty(t, kids)
+
+	// A DeletedEvent arrived for every deleted session.
+	deleted := map[string]bool{}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(deleted) < len(tree) && time.Now().Before(deadline) {
+		select {
+		case ev := <-events:
+			if ev.Type == pubsub.DeletedEvent {
+				deleted[ev.Payload.ID] = true
+			}
+		case <-time.After(time.Millisecond):
+		}
+	}
+	for _, id := range tree {
+		require.True(t, deleted[id], "DeletedEvent for %s", id)
+	}
+}
+
+func TestDeleteRollsBackWholeTreeOnMidTreeFailure(t *testing.T) {
+	conn, sessions, messages, ctx := newDeleteTestStore(t)
+
+	parent, err := sessions.Create(ctx, "parent")
+	require.NoError(t, err)
+	task1, err := sessions.CreateTaskSession(ctx, "call-1", parent.ID, "task 1")
+	require.NoError(t, err)
+	task2, err := sessions.CreateTaskSession(ctx, "call-2", parent.ID, "task 2")
+	require.NoError(t, err)
+	grand, err := sessions.CreateTaskSession(ctx, "call-3", task2.ID, "grandchild")
+	require.NoError(t, err)
+
+	tree := []string{parent.ID, task1.ID, task2.ID, grand.ID}
+	for _, id := range tree {
+		addDeleteTestMessage(t, messages, ctx, id)
+	}
+
+	// Fail the delete partway through the tree: the grandchild is
+	// deleted first (deepest first), so the failure proves the earlier
+	// deletes rolled back as well.
+	_, err = conn.ExecContext(ctx, fmt.Sprintf(
+		`CREATE TRIGGER block_task1_delete BEFORE DELETE ON sessions
+		 WHEN OLD.id = '%s'
+		 BEGIN SELECT RAISE(ABORT, 'blocked by test'); END`, task1.ID))
+	require.NoError(t, err)
+
+	require.Error(t, sessions.Delete(ctx, parent.ID))
+
+	for _, id := range tree {
+		_, err := sessions.Get(ctx, id)
+		require.NoError(t, err, "session %s survived the failed delete", id)
+		require.Equal(t, 1, countDeleteTestMessages(t, conn, ctx, id),
+			"messages for %s survived the failed delete", id)
+	}
+	kids, err := sessions.ListChildren(ctx, parent.ID)
+	require.NoError(t, err)
+	require.Len(t, kids, 2)
+}
+
+func TestDeleteSessionWithoutChildren(t *testing.T) {
+	_, sessions, _, ctx := newDeleteTestStore(t)
+
+	created, err := sessions.Create(ctx, "lonely")
+	require.NoError(t, err)
+
+	events := sessions.Subscribe(ctx)
+
+	require.NoError(t, sessions.Delete(ctx, created.ID))
+
+	_, err = sessions.Get(ctx, created.ID)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
+	select {
+	case ev := <-events:
+		require.Equal(t, pubsub.DeletedEvent, ev.Type)
+		require.Equal(t, created.ID, ev.Payload.ID)
+	case <-time.After(time.Second):
+		t.Fatal("no DeletedEvent published for a childless session")
+	}
 }
