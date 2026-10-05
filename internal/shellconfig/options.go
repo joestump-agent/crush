@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // handleOption implements the `option` builtin.
@@ -107,6 +108,13 @@ func handleOption(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		childMap(o, "attribution")["generated_with"] = bv
 		slog.Info("Option set in shell config", "key", key, "value", bv)
 		return nil
+	}
+
+	// The todo-*/dispatch-* keys write into the nested
+	// options.todo_enforcement block, so they are a special case like
+	// attribution-*, not entries in optionSpecs.
+	if strings.HasPrefix(key, "todo-") || strings.HasPrefix(key, "dispatch-") {
+		return handleTodoDispatchOption(key, val, o, stderr)
 	}
 
 	spec, ok := optionSpecs[key]
@@ -284,11 +292,141 @@ func optionUI(options map[string]any, args []string, stderr io.Writer) error {
 	return nil
 }
 
+// todoDispatchKind is the value type of a todo-*/dispatch-* option key.
+type todoDispatchKind int
+
+const (
+	todoDispatchBool todoDispatchKind = iota
+	todoDispatchCount
+	todoDispatchDuration
+)
+
+// todoDispatchOption describes one todo-*/dispatch-* key: the field it
+// writes under options.todo_enforcement and how its value is parsed.
+type todoDispatchOption struct {
+	jsonKey string
+	kind    todoDispatchKind
+	// min is the smallest accepted count; a value below it is a load
+	// error. todo-nudge-threshold requires at least 1 because 0 would
+	// silently disable nudging; kill-after-nudges accepts 0 as "off".
+	min int
+}
+
+// todoDispatchOptions maps the todo-*/dispatch-* keys to their field under
+// options.todo_enforcement (#403). It is the single source of truth for
+// these keys, handled as a special case in handleOption because they write
+// a nested block rather than a top-level option.
+var todoDispatchOptions = map[string]todoDispatchOption{
+	"todo-nudge":             {jsonKey: "enabled", kind: todoDispatchBool},
+	"todo-nudge-threshold":   {jsonKey: "nudge_threshold", kind: todoDispatchCount, min: 1},
+	"todo-hard-gate":         {jsonKey: "hard_gate", kind: todoDispatchBool},
+	"todo-kill-after-nudges": {jsonKey: "kill_after_nudges", kind: todoDispatchCount, min: 0},
+	"dispatch-stall":         {jsonKey: "stall_window", kind: todoDispatchDuration},
+	"dispatch-timeout":       {jsonKey: "hard_timeout", kind: todoDispatchDuration},
+}
+
+// handleTodoDispatchOption implements the todo-*/dispatch-* family. Every
+// key writes into options.todo_enforcement. Durations accept a Go duration
+// ("5m") or bare integer seconds; counts and durations both accept "off"
+// for zero. Values are stored as whole seconds or integers, the forms the
+// config's Duration and IntOrOff fields decode.
+func handleTodoDispatchOption(key, val string, options map[string]any, stderr io.Writer) error {
+	spec, ok := todoDispatchOptions[key]
+	if !ok {
+		return usage(stderr, fmt.Sprintf("option: unknown key %q", key))
+	}
+	target := childMap(options, "todo_enforcement")
+
+	switch spec.kind {
+	case todoDispatchBool:
+		// Boolean shortcuts match the flat boolean keys: omitting the
+		// value sets the field to true.
+		bv := true
+		if val != "" {
+			parsed, err := parseBool(val)
+			if err != nil {
+				return usage(stderr, fmt.Sprintf("option: %s expects true, false, on, or off, got %q", key, val))
+			}
+			bv = parsed
+		}
+		target[spec.jsonKey] = bv
+		slog.Info("Option set in shell config", "key", key, "value", bv)
+		return nil
+
+	case todoDispatchCount:
+		if val == "" {
+			return usage(stderr, fmt.Sprintf("option: %s requires a value", key))
+		}
+		n, err := parseCountOrOff(val)
+		if err != nil {
+			return usage(stderr, fmt.Sprintf("option: %s: %v", key, err))
+		}
+		if n < spec.min {
+			return usage(stderr, fmt.Sprintf("option: %s must be at least %d, got %d", key, spec.min, n))
+		}
+		target[spec.jsonKey] = n
+		slog.Info("Option set in shell config", "key", key, "value", n)
+		return nil
+
+	default: // todoDispatchDuration
+		if val == "" {
+			return usage(stderr, fmt.Sprintf("option: %s requires a value", key))
+		}
+		seconds, err := parseSecondsOrOff(val)
+		if err != nil {
+			return usage(stderr, fmt.Sprintf("option: %s: %v", key, err))
+		}
+		target[spec.jsonKey] = seconds
+		slog.Info("Option set in shell config", "key", key, "value", seconds)
+		return nil
+	}
+}
+
+// parseCountOrOff parses a count option value: the string "off" is zero,
+// anything else must be a non-negative integer.
+func parseCountOrOff(val string) (int, error) {
+	if strings.EqualFold(val, "off") {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, fmt.Errorf("expects an integer or off, got %q", val)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("expects a non-negative integer or off, got %d", n)
+	}
+	return n, nil
+}
+
+// parseSecondsOrOff parses a duration option value: the string "off" is
+// zero, a bare integer is seconds, anything else is a Go duration string.
+// The result is whole seconds, the form the config's Duration field
+// accepts.
+func parseSecondsOrOff(val string) (int, error) {
+	if strings.EqualFold(val, "off") {
+		return 0, nil
+	}
+	if n, err := strconv.Atoi(val); err == nil {
+		if n < 0 {
+			return 0, fmt.Errorf("expects a non-negative number of seconds or off, got %d", n)
+		}
+		return n, nil
+	}
+	d, err := time.ParseDuration(val)
+	if err != nil {
+		return 0, fmt.Errorf("expects a duration (5m), a number of seconds (300), or off, got %q", val)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("expects a non-negative duration, got %q", val)
+	}
+	return int(d / time.Second), nil
+}
+
 func parseBool(s string) (bool, error) {
 	switch strings.ToLower(s) {
-	case "true", "1", "yes":
+	case "true", "1", "yes", "on":
 		return true, nil
-	case "false", "0", "no":
+	case "false", "0", "no", "off":
 		return false, nil
 	default:
 		return false, fmt.Errorf("invalid boolean %q", s)

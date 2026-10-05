@@ -283,3 +283,121 @@ func TestOption_RequestTimeoutInvalid(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "expects a number of seconds")
 }
+
+// loadTodoEnforcement runs a crushrc script and returns the
+// options.todo_enforcement block it produced.
+func loadTodoEnforcement(t *testing.T, script string) map[string]any {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "crushrc")
+	jsonBytes, err := LoadShellConfig(t.Context(), path, []byte(script))
+	require.NoError(t, err)
+
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(jsonBytes, &result))
+	return result["options"].(map[string]any)["todo_enforcement"].(map[string]any)
+}
+
+func TestOption_TodoNudge(t *testing.T) {
+	t.Parallel()
+
+	todo := loadTodoEnforcement(t, `option todo-nudge false
+option todo-nudge on`)
+	require.Equal(t, true, todo["enabled"], "last assignment wins, on is true")
+
+	todo = loadTodoEnforcement(t, "option todo-nudge")
+	require.Equal(t, true, todo["enabled"], "omitted value defaults to true")
+
+	path := filepath.Join(t.TempDir(), "crushrc")
+	_, err := LoadShellConfig(t.Context(), path, []byte(`option todo-nudge maybe`))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "todo-nudge")
+}
+
+func TestOption_TodoNudgeThreshold(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, float64(3), loadTodoEnforcement(t, `option todo-nudge-threshold 3`)["nudge_threshold"])
+
+	path := filepath.Join(t.TempDir(), "crushrc")
+	for _, script := range []string{
+		`option todo-nudge-threshold 0`,
+		`option todo-nudge-threshold off`,
+		`option todo-nudge-threshold -1`,
+		`option todo-nudge-threshold soon`,
+	} {
+		_, err := LoadShellConfig(t.Context(), path, []byte(script))
+		require.Error(t, err, "script %q should fail", script)
+		require.Contains(t, err.Error(), "todo-nudge-threshold", "script %q", script)
+	}
+}
+
+func TestOption_TodoHardGate(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, false, loadTodoEnforcement(t, `option todo-hard-gate off`)["hard_gate"])
+	require.Equal(t, true, loadTodoEnforcement(t, `option todo-hard-gate on`)["hard_gate"])
+
+	path := filepath.Join(t.TempDir(), "crushrc")
+	_, err := LoadShellConfig(t.Context(), path, []byte(`option todo-hard-gate maybe`))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "todo-hard-gate")
+}
+
+func TestOption_TodoKillAfterNudges(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, float64(3), loadTodoEnforcement(t, `option todo-kill-after-nudges 3`)["kill_after_nudges"])
+	require.Equal(t, float64(0), loadTodoEnforcement(t, `option todo-kill-after-nudges off`)["kill_after_nudges"])
+	require.Equal(t, float64(0), loadTodoEnforcement(t, `option todo-kill-after-nudges 0`)["kill_after_nudges"])
+
+	path := filepath.Join(t.TempDir(), "crushrc")
+	for _, script := range []string{
+		`option todo-kill-after-nudges -1`,
+		`option todo-kill-after-nudges soon`,
+	} {
+		_, err := LoadShellConfig(t.Context(), path, []byte(script))
+		require.Error(t, err, "script %q should fail", script)
+		require.Contains(t, err.Error(), "todo-kill-after-nudges", "script %q", script)
+	}
+}
+
+func TestOption_DispatchStall(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, float64(300), loadTodoEnforcement(t, `option dispatch-stall 5m`)["stall_window"])
+	require.Equal(t, float64(300), loadTodoEnforcement(t, `option dispatch-stall 300`)["stall_window"])
+	require.Equal(t, float64(0), loadTodoEnforcement(t, `option dispatch-stall off`)["stall_window"])
+
+	path := filepath.Join(t.TempDir(), "crushrc")
+	for _, script := range []string{
+		`option dispatch-stall soon`,
+		`option dispatch-stall -5m`,
+		`option dispatch-stall -300`,
+	} {
+		_, err := LoadShellConfig(t.Context(), path, []byte(script))
+		require.Error(t, err, "script %q should fail", script)
+		require.Contains(t, err.Error(), "dispatch-stall", "script %q", script)
+	}
+}
+
+func TestOption_DispatchTimeout(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, float64(3600), loadTodoEnforcement(t, `option dispatch-timeout 1h`)["hard_timeout"])
+	require.Equal(t, float64(1800), loadTodoEnforcement(t, `option dispatch-timeout 1800`)["hard_timeout"])
+	require.Equal(t, float64(0), loadTodoEnforcement(t, `option dispatch-timeout off`)["hard_timeout"])
+
+	path := filepath.Join(t.TempDir(), "crushrc")
+	_, err := LoadShellConfig(t.Context(), path, []byte(`option dispatch-timeout -5m`))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "dispatch-timeout")
+}
+
+func TestOption_TodoDispatchUnknownKey(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "crushrc")
+	_, err := LoadShellConfig(t.Context(), path, []byte(`option dispatch-bogus 5m`))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown key")
+}
