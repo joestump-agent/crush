@@ -101,6 +101,15 @@ type SessionAgentCall struct {
 	FrequencyPenalty *float64
 	PresencePenalty  *float64
 	NonInteractive   bool
+	// systemDelivery marks a dispatch-result delivery turn (#388): a
+	// queue partition keeps it where it would drop a user prompt
+	// (ClearQueue, Cancel, the cancel-covered handoffs), and the
+	// queued-prompt surfaces the UI reads (QueuedPrompts,
+	// QueuedPromptsList) skip it, so Esc-clears-queue never drops a
+	// delivery and the queue pill never counts one. It is set from the
+	// WithSystemDelivery context marker on the delivery path and is
+	// unexported so external callers cannot forge it.
+	systemDelivery bool
 	// OnComplete, when non-nil, replaces the default RunComplete
 	// publish path: the inner Run hands the terminal payload to this
 	// callback instead of emitting it on the RunComplete broker. The
@@ -510,6 +519,13 @@ func (a *sessionAgent) drainQueueForStep(sessionID string) (fold, canceledWithRu
 	queuedCalls, _ := a.messageQueue.Get(sessionID)
 	var keep []SessionAgentCall
 	for _, queued := range queuedCalls {
+		if queued.systemDelivery {
+			// Dispatch-result delivery (#388): never folded into the
+			// active turn and never covered by a pending cancel — it
+			// waits for its own turn.
+			keep = append(keep, queued)
+			continue
+		}
 		if a.canceledBySeq(sessionID, queued.acceptSeq) {
 			if queued.RunID != "" {
 				canceledWithRunID = append(canceledWithRunID, queued)
@@ -570,11 +586,25 @@ func (a *sessionAgent) publishCanceledQueueDrops(drops []SessionAgentCall) {
 // hanging when their queued prompt is discarded without running.
 func (a *sessionAgent) clearQueueAndNotify(sessionID string) {
 	queued, ok := a.messageQueue.Get(sessionID)
-	a.messageQueue.Del(sessionID)
 	if !ok {
 		return
 	}
-	a.publishCanceledQueueDrops(queued)
+	// System deliveries (#388) are exempt: a dispatch result the parent
+	// has not consumed yet survives the clear and still runs.
+	var drops, keep []SessionAgentCall
+	for _, call := range queued {
+		if call.systemDelivery {
+			keep = append(keep, call)
+			continue
+		}
+		drops = append(drops, call)
+	}
+	if len(keep) > 0 {
+		a.messageQueue.Set(sessionID, keep)
+	} else {
+		a.messageQueue.Del(sessionID)
+	}
+	a.publishCanceledQueueDrops(drops)
 }
 
 // clearPendingCancel removes any pending-cancel mark for sessionID. It
@@ -1419,6 +1449,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		var kept []SessionAgentCall
 		var canceledRunIDDrops []SessionAgentCall
 		for _, q := range queuedMessages {
+			if q.systemDelivery {
+				// Dispatch-result delivery (#388): the cancel covers
+				// user prompts, never an undelivered dispatch result.
+				kept = append(kept, q)
+				continue
+			}
 			if q.acceptSeq == 0 || q.acceptSeq <= mark {
 				if q.RunID != "" {
 					canceledRunIDDrops = append(canceledRunIDDrops, q)
@@ -2273,7 +2309,16 @@ func (a *sessionAgent) QueuedPrompts(sessionID string) int {
 	if !ok {
 		return 0
 	}
-	return len(l)
+	n := 0
+	for _, call := range l {
+		if call.systemDelivery {
+			// Dispatch-result deliveries (#388) are invisible to the
+			// queue surfaces: the pill counts prompts, not system turns.
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 func (a *sessionAgent) QueuedPromptsList(sessionID string) []string {
@@ -2281,9 +2326,12 @@ func (a *sessionAgent) QueuedPromptsList(sessionID string) []string {
 	if !ok {
 		return nil
 	}
-	prompts := make([]string, len(l))
-	for i, call := range l {
-		prompts[i] = call.Prompt
+	var prompts []string
+	for _, call := range l {
+		if call.systemDelivery {
+			continue
+		}
+		prompts = append(prompts, call.Prompt)
 	}
 	return prompts
 }

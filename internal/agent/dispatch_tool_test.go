@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,6 +52,11 @@ func (f *dispatchTestAgent) Run(_ context.Context, call SessionAgentCall) (*fant
 func (f *dispatchTestAgent) Model() Model { return f.model }
 
 func (f *dispatchTestAgent) WaitReady() error { return nil }
+
+// IsSessionBusy always reports idle: the delivery flush (#388) consults
+// it before touching pending results, and these fakes never park a
+// session mid-turn.
+func (f *dispatchTestAgent) IsSessionBusy(string) bool { return false }
 
 func dispatchTestModel() Model {
 	return Model{
@@ -742,16 +748,32 @@ type fakeMainAgent struct {
 	model Model
 	mu    sync.Mutex
 	runs  []SessionAgentCall
+	// busy reports the session busy so a delivery flush parks in the
+	// pending set instead of starting a turn.
+	busy atomic.Bool
+	// failures makes the next N Run calls fail, driving the retry path.
+	failures atomic.Int64
+	cancels  atomic.Int64
+	clears   atomic.Int64
 }
 
 func (f *fakeMainAgent) Run(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
 	f.mu.Lock()
 	f.runs = append(f.runs, call)
 	f.mu.Unlock()
+	if f.failures.Add(-1) >= 0 {
+		return nil, errors.New("delivery boom")
+	}
 	return &fantasy.AgentResult{
 		Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "reviewed"}}},
 	}, nil
 }
+
+func (f *fakeMainAgent) IsSessionBusy(sessionID string) bool { return f.busy.Load() }
+
+func (f *fakeMainAgent) Cancel(sessionID string) { f.cancels.Add(1) }
+
+func (f *fakeMainAgent) ClearQueue(sessionID string) { f.clears.Add(1) }
 
 func (f *fakeMainAgent) runCount() int {
 	f.mu.Lock()
@@ -763,6 +785,12 @@ func (f *fakeMainAgent) lastRun() SessionAgentCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.runs[len(f.runs)-1]
+}
+
+func (f *fakeMainAgent) runsSnapshot() []SessionAgentCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]SessionAgentCall(nil), f.runs...)
 }
 
 func (f *fakeMainAgent) Model() Model                   { return f.model }
@@ -822,11 +850,11 @@ func TestAssembleDispatchResult(t *testing.T) {
 	require.Contains(t, noTurn.Error, "did not start a turn")
 }
 
-// The terminal payload is delivered to the parent session as a hidden
-// follow-up turn on the main agent (#66): the main agent receives the
-// DispatchResult JSON as its prompt, marked hidden so it does not render
-// as a user message.
-func TestDeliverDispatchResultToParentSession(t *testing.T) {
+// newDeliveryEnv builds the coordinator, fake main agent, and parent
+// session the delivery tests share: config with a provider so c.run's
+// model resolution succeeds, and a coordinator whose main agent is the
+// recording fake.
+func newDeliveryEnv(t *testing.T) (*coordinator, *fakeMainAgent, string) {
 	env := testEnv(t)
 	initGitRepo(t, env.workingDir)
 
@@ -870,6 +898,17 @@ func TestDeliverDispatchResultToParentSession(t *testing.T) {
 
 	parent, err := env.sessions.Create(t.Context(), "parent")
 	require.NoError(t, err)
+	return c, main, parent.ID
+}
+
+// The terminal payload is delivered to the parent session as a hidden
+// follow-up turn on the main agent (#66): the main agent receives the
+// DispatchResult JSON as its prompt, marked hidden so it does not render
+// as a user message. The delivery's RunID is stripped, so the terminal
+// RunComplete it may carry is never mistaken for the dispatch tool
+// call's own (#388).
+func TestDeliverDispatchResultToParentSession(t *testing.T) {
+	c, main, parentID := newDeliveryEnv(t)
 
 	terminal := dispatch.DispatchResult{
 		DispatchID:  "d-deliver",
@@ -879,28 +918,202 @@ func TestDeliverDispatchResultToParentSession(t *testing.T) {
 		KeyFindings: "fixed the bug",
 		DiffSummary: "a.go | +2 -1",
 	}
-	c.deliverDispatchResult(t.Context(), parent.ID, terminal)
+	c.deliverDispatchResult(t.Context(), parentID, terminal)
 
 	require.Eventually(t, func() bool {
 		return main.runCount() == 1
 	}, 10*time.Second, 50*time.Millisecond)
 	run := main.lastRun()
-	require.Equal(t, parent.ID, run.SessionID)
+	require.Equal(t, parentID, run.SessionID)
 	require.True(t, run.HiddenUserMessage)
+	require.Empty(t, run.RunID)
 	require.Contains(t, run.Prompt, `"dispatch_id": "d-deliver"`)
 	require.Contains(t, run.Prompt, `"key_findings": "fixed the bug"`)
 	require.Contains(t, run.Prompt, "Review the diff and decide whether to merge or dismiss")
 }
 
 // Delivery is dropped, not panicked on, when the parent session is gone
-// (deleted, or a `crush run` process that already exited).
+// (deleted, or a `crush run` process that already exited). The main
+// agent is real so the flush reaches the session lookup that drops.
 func TestDeliverDispatchResultDroppedForMissingParent(t *testing.T) {
 	agent := &dispatchTestAgent{model: dispatchTestModel()}
 	c, _ := newDispatchToolEnv(t, agent)
+	c.mainAgent = agent
 	c.deliverDispatchResult(t.Context(), "no-such-parent-session", dispatch.DispatchResult{
 		DispatchID: "d-gone",
 		Status:     dispatch.StatusCompleted,
 	})
+	// The result stays pended only while the parent might come back; a
+	// missing parent must not retry forever.
+	c.dispatchMu.Lock()
+	pended := c.pendingResults["no-such-parent-session"]
+	c.dispatchMu.Unlock()
+	require.Empty(t, pended)
+}
+
+// A result that lands while the parent is busy waits in the pending set,
+// outside the queue the user's Esc tears through (#388): a ClearQueue on
+// the busy parent leaves it intact, and the next idle delivers it.
+func TestDeliverDispatchResultSurvivesClearQueue(t *testing.T) {
+	c, main, parentID := newDeliveryEnv(t)
+	main.busy.Store(true)
+
+	c.deliverDispatchResult(t.Context(), parentID, dispatch.DispatchResult{
+		DispatchID:  "d-clear",
+		Branch:      "crush-dispatch-d-clear",
+		SessionID:   "s-clear",
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "survived the clear",
+	})
+	require.Equal(t, int64(0), main.clears.Load(), "pending must not itself clear anything")
+	c.ClearQueue(parentID)
+	require.Equal(t, int64(1), main.clears.Load())
+
+	main.busy.Store(false)
+	go c.flushPendingResults(parentID)
+
+	require.Eventually(t, func() bool {
+		return main.runCount() == 1
+	}, 10*time.Second, 50*time.Millisecond)
+	run := main.lastRun()
+	require.Equal(t, parentID, run.SessionID)
+	require.True(t, run.HiddenUserMessage)
+	require.Empty(t, run.RunID)
+	require.Contains(t, run.Prompt, `"dispatch_id": "d-clear"`)
+	require.Contains(t, run.Prompt, "Review the diff and decide whether to merge or dismiss")
+
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, 1, main.runCount(), "exactly one delivery turn must run")
+}
+
+// A pending cancel (Cancel on the busy parent) covers queued prompts, not
+// the pending set (#388): the delivery survives and runs on the next idle.
+func TestDeliverDispatchResultSurvivesCancel(t *testing.T) {
+	c, main, parentID := newDeliveryEnv(t)
+	main.busy.Store(true)
+
+	c.deliverDispatchResult(t.Context(), parentID, dispatch.DispatchResult{
+		DispatchID:  "d-cancel",
+		Branch:      "crush-dispatch-d-cancel",
+		SessionID:   "s-cancel",
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "survived the cancel",
+	})
+	require.Equal(t, int64(0), main.cancels.Load(), "pending must not itself cancel anything")
+	c.Cancel(parentID)
+	require.Equal(t, int64(1), main.cancels.Load())
+
+	main.busy.Store(false)
+	go c.flushPendingResults(parentID)
+
+	require.Eventually(t, func() bool {
+		return main.runCount() == 1
+	}, 10*time.Second, 50*time.Millisecond)
+	run := main.lastRun()
+	require.True(t, run.HiddenUserMessage)
+	require.Empty(t, run.RunID)
+	require.Contains(t, run.Prompt, `"dispatch_id": "d-cancel"`)
+
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, 1, main.runCount(), "exactly one delivery turn must run")
+}
+
+// A delivery turn that errors goes back into the pending set and retries
+// (#388): exactly one extra attempt, and the successful one carries the
+// payload.
+func TestDeliverDispatchResultRetriesOnError(t *testing.T) {
+	c, main, parentID := newDeliveryEnv(t)
+	main.failures.Store(1)
+
+	c.deliverDispatchResult(t.Context(), parentID, dispatch.DispatchResult{
+		DispatchID:  "d-retry",
+		Branch:      "crush-dispatch-d-retry",
+		SessionID:   "s-retry",
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "second time lucky",
+	})
+
+	require.Eventually(t, func() bool {
+		return main.runCount() == 2
+	}, 10*time.Second, 50*time.Millisecond)
+	for _, call := range main.runsSnapshot() {
+		require.Empty(t, call.RunID, "every delivery attempt strips the tool call's RunID")
+	}
+	require.Contains(t, main.lastRun().Prompt, `"dispatch_id": "d-retry"`)
+
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, 2, main.runCount(), "the failed attempt must retry exactly once")
+}
+
+// Results that stack up while the parent is busy deliver in one turn,
+// each payload's terminal message in order (#388).
+func TestDeliverDispatchResultBatchesWhileBusy(t *testing.T) {
+	c, main, parentID := newDeliveryEnv(t)
+	main.busy.Store(true)
+
+	c.deliverDispatchResult(t.Context(), parentID, dispatch.DispatchResult{
+		DispatchID: "d-batch-1",
+		Branch:     "crush-dispatch-d-batch-1",
+		SessionID:  "s-batch-1",
+		Status:     dispatch.StatusCompleted,
+	})
+	c.deliverDispatchResult(t.Context(), parentID, dispatch.DispatchResult{
+		DispatchID: "d-batch-2",
+		Branch:     "crush-dispatch-d-batch-2",
+		SessionID:  "s-batch-2",
+		Status:     dispatch.StatusCompleted,
+	})
+	require.Equal(t, 0, main.runCount())
+
+	main.busy.Store(false)
+	go c.flushPendingResults(parentID)
+
+	require.Eventually(t, func() bool {
+		return main.runCount() == 1
+	}, 10*time.Second, 50*time.Millisecond)
+	run := main.lastRun()
+	require.Empty(t, run.RunID)
+	require.Contains(t, run.Prompt, `"dispatch_id": "d-batch-1"`)
+	require.Contains(t, run.Prompt, `"dispatch_id": "d-batch-2"`)
+
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, 1, main.runCount(), "both results must share one delivery turn")
+}
+
+// The queue surfaces never see a queued dispatch delivery (#388): the
+// prompt pill counts only user prompts, Esc's clear and cancel leave the
+// delivery queued, and the step drain neither folds it into the active
+// turn nor drops it under a pending cancel.
+func TestQueueKeepsSystemDeliveriesAcrossClearAndCancel(t *testing.T) {
+	env := testEnv(t)
+	sa := newInjectionSessionAgent(env, &twoStepEchoModel{}, nil)
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+	sa.messageQueue.Set(sess.ID, []SessionAgentCall{
+		{SessionID: sess.ID, Prompt: "user prompt"},
+		{SessionID: sess.ID, Prompt: "dispatch payload", systemDelivery: true},
+	})
+
+	require.Equal(t, 1, sa.QueuedPrompts(sess.ID), "the pill counts prompts, not deliveries")
+	require.Equal(t, []string{"user prompt"}, sa.QueuedPromptsList(sess.ID))
+
+	sa.ClearQueue(sess.ID)
+	kept, _ := sa.messageQueue.Get(sess.ID)
+	require.Len(t, kept, 1, "ClearQueue must keep the delivery")
+	require.True(t, kept[0].systemDelivery)
+
+	sa.Cancel(sess.ID)
+	kept, _ = sa.messageQueue.Get(sess.ID)
+	require.Len(t, kept, 1, "Cancel must keep the delivery")
+
+	sa.cancelMark.Set(sess.ID, 100)
+	fold, canceled := sa.drainQueueForStep(sess.ID)
+	require.Empty(t, fold, "the delivery must never fold into the active turn")
+	require.Empty(t, canceled)
+	kept, _ = sa.messageQueue.Get(sess.ID)
+	require.Len(t, kept, 1, "the delivery must survive a pending cancel in the drain")
+	require.True(t, kept[0].systemDelivery)
 }
 
 // agentSink is a dispatch.TodoSink that records snapshots as history,
