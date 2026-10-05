@@ -559,7 +559,7 @@ func (w *ClientWorkspace) DispatchByHandle(sessionID, handle string) (dispatch.T
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (w *ClientWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+func (w *ClientWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	return errors.New("dispatch steering is not available in client/server mode")
 }
 

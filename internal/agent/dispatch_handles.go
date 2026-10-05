@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/message"
 )
 
 // DispatchLive returns the snapshots of every non-terminal dispatch
@@ -67,14 +68,16 @@ func inScope(entry dispatch.Entry, sessionID string) bool {
 
 // DeliverAgentMessageByHandle delivers a message to the dispatched agent
 // carrying handle (#313): the editor's leading @handle routing front
-// door over the #312 injection seam. A finished handle refuses cleanly —
-// dispatch a new agent instead — matching the seam's session-keyed
-// contract. A handle dispatched from another session refuses exactly
-// like an unknown one (#399); the caller's sessionID scopes the
-// delivery, so session B cannot address — or even learn about — session
-// A's agent. Delivery never provisions the workspace: before the first
-// dispatch every handle is unknown (#370).
-func (c *coordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+// door over the #312 injection seam. The message's attachments (#414)
+// ride with it: the editor's pasted images, files and long pastes.
+// A finished handle refuses cleanly — dispatch a new agent instead —
+// matching the seam's session-keyed contract. A handle dispatched from
+// another session refuses exactly like an unknown one (#399); the
+// caller's sessionID scopes the delivery, so session B cannot address —
+// or even learn about — session A's agent. Delivery never provisions
+// the workspace: before the first dispatch every handle is unknown
+// (#370).
+func (c *coordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	// Tolerate the addressed form ("@Tester") as well as the bare slug:
 	// both the editor and the tool may pass either.
 	handle = dispatch.HandleSlug(handle)
@@ -88,5 +91,5 @@ func (c *coordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID
 	if entry.Status.IsTerminal() {
 		return fmt.Errorf("agent @%s finished (%s); task sessions are never continuable — dispatch a new agent instead", handle, entry.Status)
 	}
-	return c.DeliverAgentMessage(ctx, AgentMessage{SessionID: entry.SessionID, FromSessionID: sessionID, Text: text})
+	return c.DeliverAgentMessage(ctx, AgentMessage{SessionID: entry.SessionID, FromSessionID: sessionID, Text: text, Attachments: attachments})
 }

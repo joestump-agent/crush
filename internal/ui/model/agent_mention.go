@@ -175,35 +175,40 @@ func (m *UI) agentMentionAttachments(prompt string) []message.Attachment {
 // (#313): the message routes directly to that agent's injection queue
 // (#312) instead of starting a parent turn. handled reports whether the
 // prompt was consumed — routed, refused, or invalid — and the caller must
-// not also send it to the parent session. An unresolvable leading token
-// (a file path, an unknown name) falls back to the normal prompt path.
-func (m *UI) routeLeadingAgentHandle(prompt string) (cmd tea.Cmd, handled bool) {
+// not also send it to the parent session. delivered reports whether the
+// message actually reached the agent's queue; a consumed prompt that was
+// refused or failed to deliver is handled but not delivered, and the
+// caller restores the editor's pre-submit state for it (#414).
+// attachments are the editor's captured chips, delivered with the steer.
+// An unresolvable leading token (a file path, an unknown name) falls
+// back to the normal prompt path.
+func (m *UI) routeLeadingAgentHandle(prompt string, attachments []message.Attachment) (cmd tea.Cmd, handled, delivered bool) {
 	handle, rest, ok := splitLeadingHandle(prompt)
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
 	// Handles are stored slugged; resolve through the slug so the user's
 	// casing never matters, exactly like the message_agent tool path.
 	handle = dispatch.HandleSlug(handle)
 	if rest == "" {
-		return util.ReportWarn("Nothing to send @handle — write the message after the handle, e.g. \"@" + handle + " stop writing Rust\"."), true
+		return util.ReportWarn("Nothing to send @handle — write the message after the handle, e.g. \"@" + handle + " stop writing Rust\"."), true, false
 	}
 	snap, found := m.com.Workspace.DispatchByHandle(m.currentSessionID(), handle)
 	if !found {
 		// Not a dispatch handle: most likely a file mention or a typo.
 		// The normal prompt path owns it.
-		return nil, false
+		return nil, false, false
 	}
 	if snap.Entry.Status.IsTerminal() {
-		return util.ReportError(fmt.Errorf("agent @%s finished (%s); task sessions are never continuable — dispatch a new agent instead", handle, snap.Entry.Status)), true
+		return util.ReportError(fmt.Errorf("agent @%s finished (%s); task sessions are never continuable — dispatch a new agent instead", handle, snap.Entry.Status)), true, false
 	}
-	if err := m.com.Workspace.DeliverAgentMessageByHandle(context.Background(), m.currentSessionID(), handle, rest); err != nil {
-		return util.ReportError(err), true
+	if err := m.com.Workspace.DeliverAgentMessageByHandle(context.Background(), m.currentSessionID(), handle, rest, attachments); err != nil {
+		return util.ReportError(err), true, false
 	}
 	// The steer and the agent's response appear on its dispatch block in
 	// the chat (the child session's message events); nothing lands in the
 	// parent session.
-	return nil, true
+	return nil, true, true
 }
 
 // agentCompletionValues composes the live-agents source for the @

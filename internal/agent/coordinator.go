@@ -174,11 +174,12 @@ type Coordinator interface {
 	// finished handle means. A handle dispatched from another session
 	// does not resolve (#399).
 	DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool)
-	// DeliverAgentMessageByHandle delivers a message to the running
-	// dispatched agent carrying handle (#313) — the editor's leading
-	// @handle routing. A finished, unknown, or foreign-session handle
-	// refuses cleanly (#399).
-	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error
+	// DeliverAgentMessageByHandle delivers a message and its
+	// attachments (#414) to the running dispatched agent carrying
+	// handle (#313) — the editor's leading @handle routing. A
+	// finished, unknown, or foreign-session handle refuses cleanly
+	// (#399).
+	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error
 	// CancelDispatch stops one dispatched agent on demand (#373): the
 	// ref resolves through the registry as a dispatch ID, an @handle, or
 	// the dispatched agent's child session ID. The dispatch ends killed

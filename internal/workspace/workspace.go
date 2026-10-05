@@ -236,11 +236,12 @@ type Workspace interface {
 	// in client/server mode.
 	DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool)
 	// DeliverAgentMessageByHandle routes the editor's leading @handle
-	// message to the running dispatched agent's injection queue (#312 /
-	// #313). A finished, unknown, or foreign-session handle returns a
-	// refusal error (#399); in client/server mode it reports that
-	// dispatch steering needs a local process.
-	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error
+	// message and its attachments (#414) to the running dispatched
+	// agent's injection queue (#312 / #313). A finished, unknown, or
+	// foreign-session handle returns a refusal error (#399); in
+	// client/server mode it reports that dispatch steering needs a
+	// local process.
+	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error
 	// CancelDispatch stops one dispatched agent on demand (#373): the
 	// ref resolves through the dispatch registry as a dispatch ID, an
 	// @handle, or the dispatched agent's child session ID — the ID a

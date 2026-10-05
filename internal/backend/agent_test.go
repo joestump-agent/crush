@@ -245,6 +245,6 @@ func (c *blockingCoordinator) DispatchByHandle(sessionID, handle string) (dispat
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (c *blockingCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+func (c *blockingCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	return errors.New("not implemented")
 }

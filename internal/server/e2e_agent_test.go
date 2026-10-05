@@ -767,6 +767,6 @@ func (c *scriptedCoordinator) DispatchByHandle(sessionID, handle string) (dispat
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (c *scriptedCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+func (c *scriptedCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	return errors.New("not implemented")
 }
