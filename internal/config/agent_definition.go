@@ -854,6 +854,6 @@ func warnUnhonoredFields(id string, def AgentDefinition) {
 		if _, loaded := warnedDefinitionFields.LoadOrStore(key, struct{}{}); loaded {
 			continue
 		}
-		slog.Warn("agent definition field is parsed but not honored yet", "agent", id, "field", field.name)
+		slog.Warn("Agent definition field is parsed but not honored yet", "agent", id, "field", field.name)
 	}
 }

@@ -15,8 +15,10 @@ this fork.
 There are three sets of knobs today: the `options.todo_enforcement` block, the
 tool deny list, and permissions. Everything else about
 [dispatched agents](/agents/overview) is hard-coded, including their tool set,
-model choice, prompt and worktree location. Agents you can define yourself are
-[planned](#planned-agent-definitions).
+model choice, prompt and worktree location. The `agents` block that lets you
+define your own is specified in
+[agent definitions](#agent-definitions), and the runtime honors it from
+[#432](https://github.com/joestump-agent/crush/issues/432) on.
 
 ## What you can set today
 
