@@ -97,10 +97,12 @@ model.
    current branch, else `HEAD`. Uncommitted changes in your checkout are
    not included. The base and its resolved SHA are recorded on the
    registry entry.
-2. **Toolchain.** It loads a config scoped to the worktree and builds the
-   tools against the worktree path: the task agent's read-only set plus
-   `bash`, `edit`, `multiedit`, `write` and `todos`. It also builds a scoped
-   LSP manager and a scoped permission service bridged to the parent's.
+2. **Toolchain.** It reuses the parent's config viewed from the worktree
+   path and builds the tools against it: the task agent's read-only set plus
+   `bash`, `edit`, `multiedit`, `write` and `todos`. Nothing the base
+   revision's config files declare is read or executed. It also builds a
+   scoped LSP manager and a scoped permission service bridged to the
+   parent's.
 3. **Agent.** It renders the system prompt from `dispatch.md.tpl` and
    builds a `SessionAgent` on the chosen model, using the global
    `todo_enforcement` settings.
@@ -110,9 +112,7 @@ model.
    else `role`, else `agent`, suffixed `-2`, `-3` on collision.
 
 :::warning[Known issue]
-The scoped config is loaded from the worktree itself, so a `.crushrc` on
-the base revision runs with your environment and its permission settings
-are adopted ([#374](https://github.com/joestump-agent/crush/issues/374)). The model-supplied `branch` is not validated with
+The model-supplied `branch` is not validated with
 `--end-of-options` ([#375](https://github.com/joestump-agent/crush/issues/375)). Parallel provisions race inside git
 ([#381](https://github.com/joestump-agent/crush/issues/381)).
 :::
