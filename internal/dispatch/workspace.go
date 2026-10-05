@@ -208,6 +208,11 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 			return Entry{}, err
 		}
 	}
+	// Defence in depth: a base starting with "-" would be read as a git
+	// option further down the line, so refuse it before git sees it.
+	if strings.HasPrefix(base, "-") {
+		return Entry{}, fmt.Errorf("invalid base %q: must not start with \"-\"", base)
+	}
 	baseSHA, err := revisionSHA(ctx, w.repoRoot, base)
 	if err != nil {
 		return Entry{}, fmt.Errorf("resolve base %q: %w", base, err)
@@ -217,7 +222,9 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 	branch := BranchPrefix + id
 	path := filepath.Join(w.worktreesDir, branch)
 
-	if err := runGit(ctx, w.repoRoot, nil, "worktree", "add", "-b", branch, path, base); err != nil {
+	// The resolved SHA is what worktree add gets, never the raw base
+	// string, and "--" ends option parsing before the positionals.
+	if err := runGit(ctx, w.repoRoot, nil, "worktree", "add", "-b", branch, "--", path, baseSHA); err != nil {
 		return Entry{}, fmt.Errorf("create worktree: %w", err)
 	}
 
@@ -710,11 +717,13 @@ func currentRevision(ctx context.Context, repoRoot string) (string, error) {
 	return rev, nil
 }
 
-// revisionSHA resolves a revision to its commit SHA.
+// revisionSHA resolves a revision to its commit SHA. --end-of-options
+// stops a rev that starts with "-" from being parsed as an option, and
+// every failure, including empty output, is an unknown-revision error.
 func revisionSHA(ctx context.Context, repoRoot, rev string) (string, error) {
-	out, err := gitOutput(ctx, repoRoot, nil, "rev-parse", rev+"^{commit}")
-	if err != nil {
-		return "", err
+	out, err := gitOutput(ctx, repoRoot, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", rev+"^{commit}")
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return "", fmt.Errorf("unknown revision %q", rev)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
