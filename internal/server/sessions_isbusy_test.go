@@ -42,7 +42,10 @@ func (s *stubCoordinator) BeginAccepted(sessionID string) *agent.AcceptedRun {
 }
 func (s *stubCoordinator) Cancel(string) {}
 func (s *stubCoordinator) CancelAll()    {}
-func (s *stubCoordinator) IsBusy() bool  { return false }
+func (s *stubCoordinator) CancelDispatch(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *stubCoordinator) IsBusy() bool { return false }
 func (s *stubCoordinator) IsSessionBusy(id string) bool {
 	return s.busy[id]
 }

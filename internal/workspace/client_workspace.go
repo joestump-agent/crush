@@ -544,12 +544,13 @@ func (w *ClientWorkspace) DispatchStatus(sessionID string) (dispatch.TodoSnapsho
 	return dispatch.TodoSnapshot{}, false
 }
 
-// DispatchLive, DispatchByHandle, and DeliverAgentMessageByHandle share
-// DispatchStatus's client/server limitation (#313): the dispatch registry
-// and the injection queue live in the server process, and no wire
-// surface carries them yet. The @ completions show no live agents, an
-// @handle resolves to nothing, and steering a dispatched agent reports
-// that it needs a local process rather than failing silently.
+// DispatchLive, DispatchByHandle, DeliverAgentMessageByHandle, and
+// CancelDispatch share DispatchStatus's client/server limitation (#313):
+// the dispatch registry and the injection queue live in the server
+// process, and no wire surface carries them yet. The @ completions show
+// no live agents, an @handle resolves to nothing, and steering or
+// canceling a dispatched agent reports that it needs a local process
+// rather than failing silently.
 func (w *ClientWorkspace) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	return nil
 }
@@ -560,6 +561,10 @@ func (w *ClientWorkspace) DispatchByHandle(sessionID, handle string) (dispatch.T
 
 func (w *ClientWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
 	return errors.New("dispatch steering is not available in client/server mode")
+}
+
+func (w *ClientWorkspace) CancelDispatch(ctx context.Context, ref string) error {
+	return errors.New("canceling a dispatched agent is not available in client/server mode")
 }
 
 // -- LSP --
@@ -1457,7 +1462,7 @@ func protoToMessage(m proto.Message) message.Message {
 	for _, p := range m.Parts {
 		switch v := p.(type) {
 		case proto.TextContent:
-			msg.Parts = append(msg.Parts, message.TextContent{Text: v.Text, Hidden: v.Hidden})
+			msg.Parts = append(msg.Parts, message.TextContent{Text: v.Text, Hidden: v.Hidden, Steer: v.Steer})
 		case proto.ReasoningContent:
 			msg.Parts = append(msg.Parts, message.ReasoningContent{
 				Thinking:   v.Thinking,

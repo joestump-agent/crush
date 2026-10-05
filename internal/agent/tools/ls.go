@@ -83,6 +83,12 @@ func NewLsTool(permissions permission.Service, workingDir string, lsConfig confi
 
 			searchPath = filepathext.SmartJoin(workingDir, searchPath)
 
+			contained, err := ContainPath(ctx, searchPath)
+			if err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
+			searchPath = contained
+
 			// Check if directory is outside working directory and request permission if needed
 			absWorkingDir, err := filepath.Abs(workingDir)
 			if err != nil {

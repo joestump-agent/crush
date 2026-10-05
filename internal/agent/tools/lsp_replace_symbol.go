@@ -60,6 +60,12 @@ func NewReplaceSymbolTool(
 				return fantasy.NewTextErrorResponse("file_path is required"), nil
 			}
 
+			contained, err := ContainPath(ctx, params.FilePath)
+			if err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
+			params.FilePath = contained
+
 			action := params.Action
 			if action == "" {
 				action = "replace"

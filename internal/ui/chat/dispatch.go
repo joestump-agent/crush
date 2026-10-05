@@ -248,25 +248,43 @@ func (d *DispatchToolMessageItem) UpdateSteerAnswer(messageID, text string) bool
 	return true
 }
 
-// IsInitialDispatchPrompt reports whether a child-session user message is
-// the dispatch's own initial prompt rather than an injected steer: before
-// any steer exists, the only user message that can equal the prompt text
-// is the prompt itself. A steer whose text happens to be identical is
-// indistinguishable and treated as the prompt — cosmetic, never a
-// delivery concern.
-func (d *DispatchToolMessageItem) IsInitialDispatchPrompt(text string) bool {
-	if len(d.steers) > 0 || text == "" {
-		return false
-	}
-	var params agent.DispatchAgentParams
-	_ = json.Unmarshal([]byte(d.ToolCall().Input), &params)
-	return params.Prompt == text
-}
-
 // Steers returns the recorded steers — the injected messages and the
 // agent's answers so far.
 func (d *DispatchToolMessageItem) Steers() []dispatchSteer {
 	return d.steers
+}
+
+// RebuildSteers rebuilds the steer log from the child session's
+// persisted messages (#410), replacing whatever was recorded live:
+// every Steer-marked user message becomes a steer, and each assistant
+// message's text becomes the latest steer's answer — the same pairing
+// the live path produces, where only the most recent steer's answer
+// advances. The dispatch's initial prompt and todo nudges are not
+// Steer-marked, so a rebuild can never mistake either for a steer.
+func (d *DispatchToolMessageItem) RebuildSteers(msgs []message.Message) {
+	steers := make([]dispatchSteer, 0, len(d.steers))
+	latest := -1
+	for _, msg := range msgs {
+		switch msg.Role {
+		case message.User:
+			content := msg.Content()
+			if !content.Steer || content.Text == "" {
+				continue
+			}
+			steers = append(steers, dispatchSteer{Text: content.Text})
+			latest = len(steers) - 1
+		case message.Assistant:
+			text := msg.Content().Text
+			if text == "" || latest < 0 {
+				continue
+			}
+			steers[latest].ResponseMessageID = msg.ID
+			steers[latest].Response = text
+		}
+	}
+	d.steers = steers
+	d.clearCache()
+	d.Bump()
 }
 
 // elapsed returns the dispatch's run time: FinishedAt - StartedAt once
@@ -286,11 +304,22 @@ func (d *DispatchToolMessageItem) elapsed() (time.Duration, bool) {
 	return end.Sub(start), true
 }
 
-// parseDispatchResult extracts the dispatch handle from a tool result,
-// which is the DispatchResult JSON the tool returns (running handle or,
-// for runs from an earlier process, whatever was persisted).
+// parseDispatchResult extracts the dispatch state from a tool result.
+// A terminal DispatchResult in Metadata — stamped by the run on
+// completion (#410) — wins over the running handle in Content, so a
+// restarted or client/server card renders the durable record instead of
+// a stale "working".
 func parseDispatchResult(result *message.ToolResult) *dispatch.DispatchResult {
-	if result == nil || result.Content == "" {
+	if result == nil {
+		return nil
+	}
+	if result.Metadata != "" {
+		var terminal dispatch.DispatchResult
+		if err := json.Unmarshal([]byte(result.Metadata), &terminal); err == nil && isTerminalDispatchStatus(terminal.Status) {
+			return &terminal
+		}
+	}
+	if result.Content == "" {
 		return nil
 	}
 	var handle dispatch.DispatchResult
@@ -312,9 +341,9 @@ func isTerminalDispatchStatus(status dispatch.Status) bool {
 
 // dispatchStateLabel maps a registry status to its card label. The
 // card's vocabulary is the interaction model's (queued / working /
-// complete / failed / killed); "killed" is reserved for wander kill
-// (#316) and unreachable for now.
-func dispatchStateLabel(status dispatch.Status) string {
+// complete / failed / killed / canceled); "canceled" marks a killed run
+// whose reason is the user cancel (#373), "killed" the other kills.
+func dispatchStateLabel(status dispatch.Status, killedReason string) string {
 	switch status {
 	case dispatch.StatusProvisioned:
 		return "queued"
@@ -325,6 +354,9 @@ func dispatchStateLabel(status dispatch.Status) string {
 	case dispatch.StatusFailed:
 		return "failed"
 	case dispatch.StatusKilled:
+		if killedReason == dispatch.ReasonCanceled {
+			return "canceled"
+		}
 		return "killed"
 	default:
 		return string(status)
@@ -474,7 +506,11 @@ func (d *DispatchToolMessageItem) statusParams() []string {
 	if handle := d.handleLabel(); handle != "" {
 		parts = append(parts, handle)
 	}
-	parts = append(parts, dispatchStateLabel(status))
+	killedReason := ""
+	if terminal := d.terminalResult(); terminal != nil {
+		killedReason = terminal.KilledReason
+	}
+	parts = append(parts, dispatchStateLabel(status, killedReason))
 	if elapsed, ok := d.elapsed(); ok {
 		parts = append(parts, formatDispatchElapsed(elapsed))
 	}

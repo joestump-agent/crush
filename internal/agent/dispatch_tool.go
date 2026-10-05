@@ -33,6 +33,15 @@ const DispatchAgentToolName = "dispatch_agent"
 // deterministic failure would otherwise loop back-to-back.
 const dispatchRetryBackoff = 2 * time.Second
 
+// dispatchResultPersistWindow bounds how long the run waits for the
+// parent turn to persist the dispatch_agent tool result before stamping
+// the terminal result onto it (#410): the run is launched before the
+// tool returns, so a run that ends almost instantly can beat the write.
+const dispatchResultPersistWindow = 5 * time.Second
+
+// dispatchResultPersistPoll paces that wait.
+const dispatchResultPersistPoll = 200 * time.Millisecond
+
 // DispatchAgentParams are the DispatchAgent tool's arguments.
 type DispatchAgentParams struct {
 	Prompt string `json:"prompt" description:"Self-contained task instructions for the dispatched agent"`
@@ -680,6 +689,11 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	run.reg.SetResult(run.entry.ID, terminal)
 	run.reg.SetStatus(run.entry.ID, terminal.Status)
 
+	// Stamp the terminal result onto the parent's persisted dispatch_agent
+	// tool result (#410): the card's durable record after a restart or in
+	// client/server mode, where the in-memory registry is unreachable.
+	c.persistDispatchTerminalResult(ctx, run, terminal)
+
 	// Cost propagation is best-effort, mirroring runSubAgent: a failure
 	// here must not lose the run's outcome.
 	if err := c.updateParentSessionCost(ctx, run.sessionID, run.parentSessionID); err != nil {
@@ -687,6 +701,83 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	}
 
 	c.deliverDispatchResult(ctx, run.parentSessionID, terminal)
+}
+
+// persistDispatchTerminalResult records the terminal DispatchResult on
+// the parent session's persisted dispatch_agent tool result (#410):
+// the result lands in ToolResult.Metadata as JSON, Content stays the
+// running handle the model already saw, so the tool result the model
+// reads is byte-identical before and after completion. The card parses
+// Metadata in preference to Content, which is what makes a finished
+// dispatch render its terminal state after a restart and in
+// client/server mode, where the in-memory registry is unreachable.
+//
+// The parent turn persists the tool result after dispatchTool returns,
+// and the run is launched before that, so a run that ends almost
+// instantly can race the write. The wait is bounded: on giveup the
+// terminal record stays only in the registry and the delivery turn,
+// logged at Warn.
+func (c *coordinator) persistDispatchTerminalResult(ctx context.Context, run dispatchRun, terminal dispatch.DispatchResult) {
+	_, toolCallID, ok := c.sessions.ParseAgentToolSessionID(run.sessionID)
+	if !ok {
+		slog.Warn("Cannot persist dispatch terminal result: session is not an agent tool session", "session_id", run.sessionID, "dispatch_id", run.entry.ID)
+		return
+	}
+	b, err := json.Marshal(terminal)
+	if err != nil {
+		slog.Warn("Failed to encode dispatch terminal result", "dispatch_id", run.entry.ID, "error", err)
+		return
+	}
+	metadata := string(b)
+
+	deadline := time.Now().Add(dispatchResultPersistWindow)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		msgs, err := c.messages.List(ctx, run.parentSessionID)
+		if err != nil {
+			slog.Warn("Failed to list parent session for dispatch terminal result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "error", err)
+			return
+		}
+		for i, msg := range msgs {
+			if msg.Role != message.Tool {
+				continue
+			}
+			stamped := false
+			for j, part := range msg.Parts {
+				tr, ok := part.(message.ToolResult)
+				if !ok || tr.ToolCallID != toolCallID || tr.Metadata == metadata {
+					continue
+				}
+				tr.Metadata = metadata
+				msg.Parts[j] = tr
+				stamped = true
+			}
+			if !stamped {
+				continue
+			}
+			if err := c.messages.Update(ctx, msgs[i]); err != nil {
+				slog.Warn("Failed to persist dispatch terminal result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "error", err)
+				return
+			}
+			// The service may debounce updates; flush so any later read
+			// (a session reload, the client's event stream) sees it now.
+			if err := c.messages.Flush(ctx, msg.ID); err != nil {
+				slog.Debug("Failed to flush dispatch terminal result update", "message_id", msg.ID, "error", err)
+			}
+			return
+		}
+		if !time.Now().Before(deadline) {
+			slog.Warn("Gave up waiting for the parent's dispatch tool result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "tool_call_id", toolCallID, "waited", dispatchResultPersistWindow)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(dispatchResultPersistPoll):
+		}
+	}
 }
 
 // dispatchNaturalOutcome is the path-neutral natural outcome of one

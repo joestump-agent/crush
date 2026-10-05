@@ -56,16 +56,19 @@ func (c *blockingCoordinator) RunAccepted(ctx context.Context, accept *agent.Acc
 func (c *blockingCoordinator) BeginAccepted(sessionID string) *agent.AcceptedRun { return nil }
 func (c *blockingCoordinator) Cancel(string)                                     {}
 func (c *blockingCoordinator) CancelAll()                                        {}
-func (c *blockingCoordinator) IsBusy() bool                                      { return c.busy }
-func (c *blockingCoordinator) IsSessionBusy(string) bool                         { return false }
-func (c *blockingCoordinator) QueuedPrompts(string) int                          { return 0 }
-func (c *blockingCoordinator) QueuedPromptsList(string) []string                 { return nil }
-func (c *blockingCoordinator) ClearQueue(string)                                 {}
-func (c *blockingCoordinator) ListCronTasks(string) []scheduler.Task             { return nil }
-func (c *blockingCoordinator) Summarize(context.Context, string) error           { return nil }
-func (c *blockingCoordinator) Model() agent.Model                                { return agent.Model{} }
-func (c *blockingCoordinator) UpdateModels(context.Context) error                { return nil }
-func (c *blockingCoordinator) GenerateTitle(context.Context, string, string)     {}
+func (c *blockingCoordinator) CancelDispatch(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (c *blockingCoordinator) IsBusy() bool                                  { return c.busy }
+func (c *blockingCoordinator) IsSessionBusy(string) bool                     { return false }
+func (c *blockingCoordinator) QueuedPrompts(string) int                      { return 0 }
+func (c *blockingCoordinator) QueuedPromptsList(string) []string             { return nil }
+func (c *blockingCoordinator) ClearQueue(string)                             {}
+func (c *blockingCoordinator) ListCronTasks(string) []scheduler.Task         { return nil }
+func (c *blockingCoordinator) Summarize(context.Context, string) error       { return nil }
+func (c *blockingCoordinator) Model() agent.Model                            { return agent.Model{} }
+func (c *blockingCoordinator) UpdateModels(context.Context) error            { return nil }
+func (c *blockingCoordinator) GenerateTitle(context.Context, string, string) {}
 func (c *blockingCoordinator) SetMainAgent(agentName string) error {
 	c.lastMainAgentSet.Store(agentName)
 	return c.setMainAgentErr

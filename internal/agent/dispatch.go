@@ -25,12 +25,14 @@ var ErrNoWorkingDir = errors.New("dispatch toolchain requires a workspace direct
 //
 // Every path-rooted tool (bash, edit, multi-edit, write, view, glob, grep,
 // ls, fetch, download) is constructed against the workspace directory, and
-// the LSP manager and permission service are scoped to the same directory,
-// so a SessionAgent built from this toolchain (#64) can only address files
-// inside its workspace through its tools. The isolation boundary is the
-// toolset, not the call: SessionAgentCall is unchanged, and an agent built
-// the usual way — via buildTools against the workspace root — behaves
-// exactly as before.
+// the LSP manager and permission service are scoped to the same directory.
+// The file tools resolve every path against the workspace root and refuse
+// anything outside it (#379): each dispatched call carries the root on its
+// context. Bash is rooted at the workspace directory but its commands can
+// reach anywhere the process can, so staying inside is advised for bash,
+// not enforced. For the file tools the boundary is the toolset, not the
+// call: SessionAgentCall is unchanged, and an agent built the usual way
+// (via buildTools against the workspace root) behaves exactly as before.
 //
 // Deliberately absent, because each would reach back across the isolation
 // boundary:
@@ -333,7 +335,37 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 	if preToolHooks := c.cfg.Config().Hooks[hooks.EventPreToolUse]; len(preToolHooks) > 0 {
 		hookRunner = hooks.NewRunner(preToolHooks, c.cfg.WorkingDir(), c.cfg.WorkingDir())
 	}
+
+	// Every dispatched tool call carries the workspace root on its
+	// context (#379), so path-resolving tools refuse anything outside
+	// it even when the tool itself does not know the working directory.
+	for i, tool := range filtered {
+		filtered[i] = containedTool{inner: tool, workspace: dir}
+	}
 	return wrapToolsWithHooks(filtered, hookRunner, false)
+}
+
+// containedTool injects the dispatch workspace root into a tool
+// call's context before delegating to the inner tool.
+type containedTool struct {
+	inner     fantasy.AgentTool
+	workspace string
+}
+
+func (c containedTool) Info() fantasy.ToolInfo {
+	return c.inner.Info()
+}
+
+func (c containedTool) ProviderOptions() fantasy.ProviderOptions {
+	return c.inner.ProviderOptions()
+}
+
+func (c containedTool) SetProviderOptions(opts fantasy.ProviderOptions) {
+	c.inner.SetProviderOptions(opts)
+}
+
+func (c containedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	return c.inner.Run(tools.WithContainmentRoot(ctx, c.workspace), call)
 }
 
 // bridgePermissions forwards permission requests raised inside a dispatch

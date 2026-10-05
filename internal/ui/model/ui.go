@@ -384,16 +384,19 @@ type UI struct {
 	// parent chat state captured on entry and restored on exit.
 	// inspectRing enumerates the live agent blocks (in transcript order)
 	// at the moment inspect mode was entered; ctrl+] cycles it.
+	// inspectDispatchTargets marks which ring members are dispatch blocks
+	// (vs plain agent tools), so ctrl+x only offers a cancel for them.
 	// inspectSeq numbers inspect transitions so a child load that lands
 	// after a later one is dropped. inspectPending is a task session
 	// picked from the sessions dialog, waiting for its parent to load.
-	inspecting     *session.Session
-	inspectScroll  [2]int
-	inspectFollow  bool
-	inspectRing    []string
-	inspectRingPos int
-	inspectSeq     int
-	inspectPending *session.Session
+	inspecting             *session.Session
+	inspectScroll          [2]int
+	inspectFollow          bool
+	inspectRing            []string
+	inspectRingPos         int
+	inspectDispatchTargets map[string]bool
+	inspectSeq             int
+	inspectPending         *session.Session
 
 	// onboarding state
 	onboarding struct {
@@ -1890,6 +1893,14 @@ func (m *UI) loadNestedToolCalls(items []chat.MessageItem) {
 		}
 		nestedToolResultMap := chat.BuildToolResultMap(nestedMsgPtrs)
 
+		// A dispatch block rebuilds its steer log from the persisted
+		// child transcript (#410): Steer-marked user messages are steers,
+		// so the record survives reloads, session switches, and inspect
+		// round-trips.
+		if dispatchBlock, ok := nestedContainer.(*chat.DispatchToolMessageItem); ok {
+			dispatchBlock.RebuildSteers(nestedMsgs)
+		}
+
 		// Extract nested tool items.
 		var nestedTools []chat.ToolMessageItem
 		for _, nestedMsg := range nestedMsgPtrs {
@@ -2114,6 +2125,16 @@ func (m *UI) updateSessionMessage(msg message.Message) tea.Cmd {
 		}
 	}
 
+	// A Tool-role update can carry results the card has never seen —
+	// the dispatch terminal record stamped after the fact (#410) — so
+	// apply them like the created path does, or a client/server card
+	// would spin forever on a finished dispatch.
+	for _, tr := range msg.ToolResults() {
+		if toolItem, ok := m.chat.MessageItem(tr.ToolCallID).(chat.ToolMessageItem); ok && toolItem != nil {
+			toolItem.SetResult(&tr)
+		}
+	}
+
 	m.chat.AppendMessages(items...)
 	if m.chat.Follow() {
 		m.chat.ScrollToBottom()
@@ -2233,11 +2254,14 @@ func (m *UI) feedDispatchConversation(block *chat.DispatchToolMessageItem, event
 	msg := event.Payload
 	switch msg.Role {
 	case message.User:
-		text := msg.Content().Text
-		if text == "" || block.IsInitialDispatchPrompt(text) {
+		// Only Steer-marked messages are steers (#410): the dispatch's
+		// initial prompt and persisted todo nudges are plain user
+		// messages and must never appear on the card.
+		content := msg.Content()
+		if !content.Steer || content.Text == "" {
 			return
 		}
-		block.AddSteer(text)
+		block.AddSteer(content.Text)
 	case message.Assistant:
 		text := msg.Content().Text
 		if text == "" {
@@ -4353,6 +4377,12 @@ func (m *UI) FullHelp() [][]key.Binding {
 			if hasSession {
 				mainBinds = append(mainBinds, k.Chat.NewSession, k.Chat.EndFollow)
 			}
+		}
+		if sid := m.focusedLiveDispatchSessionID(); sid != "" {
+			// A live dispatch is targeted: advertise the cancel binding
+			// (#373). It rides the inspect handler, so unlike the rows
+			// above it also works while the sidebar is focused.
+			mainBinds = append(mainBinds, k.CancelAgent)
 		}
 
 		binds = append(binds, mainBinds)

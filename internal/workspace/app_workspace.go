@@ -353,6 +353,10 @@ func (w *AppWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionI
 	return w.app.DeliverAgentMessageByHandle(ctx, sessionID, handle, text)
 }
 
+func (w *AppWorkspace) CancelDispatch(ctx context.Context, ref string) error {
+	return w.app.CancelDispatch(ctx, ref)
+}
+
 // -- LSP --
 
 func (w *AppWorkspace) LSPStart(ctx context.Context, path string) {
