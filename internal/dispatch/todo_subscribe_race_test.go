@@ -15,7 +15,7 @@ import (
 // must not panic: emit's listener delivery and the unsubscribe goroutine's
 // channel close race unless both hold the collector mutex (#174).
 func TestTodoCollectorSubscribeUnsubscribeRace(t *testing.T) {
-	ws, err := NewWorkspace(newTestRepo(t))
+	ws, err := newWorkspace(t, newTestRepo(t))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 

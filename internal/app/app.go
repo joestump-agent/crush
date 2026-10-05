@@ -103,6 +103,10 @@ type App struct {
 	// herdrClient reports agent state to herdr when running inside
 	// a herdr-managed pane. Nil when not in a herdr environment.
 	herdrClient *herdr.Client
+
+	// newCoordinator is the seam used to build the agent coordinator,
+	// so tests can capture the lifetime context it receives.
+	newCoordinator func(context.Context, agent.CoordinatorOptions) (agent.Coordinator, error)
 }
 
 // New initializes a new application instance. skillsMgr carries the
@@ -142,6 +146,7 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 		agentNotifications: pubsub.NewBroker[notify.Notification](),
 		runCompletions:     pubsub.NewBroker[notify.RunComplete](),
 		dispatchTodos:      pubsub.NewBroker[dispatch.TodoSnapshot](),
+		newCoordinator:     agent.NewCoordinator,
 	}
 
 	app.setupEvents()
@@ -867,7 +872,11 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		}
 	}
 
-	app.AgentCoordinator, err = agent.NewCoordinator(ctx, coordinatorOpts)
+	buildCoordinator := app.newCoordinator
+	if buildCoordinator == nil {
+		buildCoordinator = agent.NewCoordinator
+	}
+	app.AgentCoordinator, err = buildCoordinator(app.globalCtx, coordinatorOpts)
 	if err != nil {
 		slog.Error("Failed to create coder agent", "err", err)
 		return err

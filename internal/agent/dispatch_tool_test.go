@@ -20,6 +20,7 @@ import (
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/scheduler"
 	"github.com/charmbracelet/crush/internal/session"
+	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/charmbracelet/crush/internal/skills"
 	"github.com/stretchr/testify/require"
 )
@@ -32,11 +33,18 @@ type dispatchTestAgent struct {
 	model  Model
 	result *fantasy.AgentResult
 	err    error
-	calls  []SessionAgentCall
+	// onRun, when set, runs before each turn returns — the seam the
+	// background-job tests use to start a job tagged with the dispatch
+	// session from inside the run (#385).
+	onRun func(call SessionAgentCall)
+	calls []SessionAgentCall
 }
 
 func (f *dispatchTestAgent) Run(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
 	f.calls = append(f.calls, call)
+	if f.onRun != nil {
+		f.onRun(call)
+	}
 	return f.result, f.err
 }
 
@@ -117,6 +125,88 @@ func decodeDispatchHandle(t *testing.T, resp fantasy.ToolResponse) dispatch.Disp
 	var handle dispatch.DispatchResult
 	require.NoError(t, json.Unmarshal([]byte(resp.Content), &handle))
 	return handle
+}
+
+// mustWorktreesDir returns the worktrees directory the coordinator
+// provisions into — the repo-keyed path under the data directory (#383).
+func mustWorktreesDir(t *testing.T, c *coordinator) string {
+	t.Helper()
+	dir, err := dispatch.WorktreesDir(c.cfg.Config().Options.DataDirectory, c.cfg.WorkingDir())
+	require.NoError(t, err)
+	return dir
+}
+
+// Dispatch worktrees live under the data directory, never beside the
+// working directory (#383): a coordinator started in a repo
+// subdirectory provisions into <dataDir>/worktrees/<repo-key>/ without
+// creating <cwd>/.crush, and the parent repo's git view stays clean —
+// nothing for git status to list, no gitlink for git add -A to stage.
+// Both data-directory placements are exercised: the default lookup
+// finding <repo>/.crush, and a custom data directory outside the repo.
+func TestDispatchWorktreesLiveUnderDataDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		dataDir func(*testing.T) string
+	}{
+		{"data directory inside the repo", func(*testing.T) string { return "" }},
+		{"custom data directory outside the repo", func(t *testing.T) string { return t.TempDir() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &dispatchTestAgent{
+				model:  dispatchTestModel(),
+				result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
+			}
+			env := testEnv(t)
+			repo := env.workingDir
+			initGitRepo(t, repo)
+			// A .crush at the repo root, as after any launch from the
+			// root: root.go gitignores it with a "*".
+			require.NoError(t, os.MkdirAll(filepath.Join(repo, ".crush"), 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(repo, ".crush", ".gitignore"), []byte("*\n"), 0o644))
+			sub := filepath.Join(repo, "sub")
+			require.NoError(t, os.MkdirAll(sub, 0o755))
+			env.workingDir = sub
+
+			c := newDispatchTestCoordinatorAt(t, env, sub, tc.dataDir(t))
+			c.dispatchAgentBuilder = func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error) {
+				return &dispatchedAgent{
+					agent:       agent,
+					model:       agent.model,
+					providerCfg: config.ProviderConfig{ID: "test-provider"},
+				}, nil
+			}
+			tool := c.dispatchTool()
+
+			resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work", Branch: "main"})
+			handle := decodeDispatchHandle(t, resp)
+
+			// Release the workspace lease before TempDir cleanup runs:
+			// the dispatch holds the lock file, and Windows refuses to
+			// remove a file another process has open. Cleanups run LIFO,
+			// so this lands ahead of testEnv's RemoveAll.
+			ws, werr := c.dispatchWorkspace()
+			require.NoError(t, werr)
+			t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+
+			// The workspace is <dataDir>/worktrees/<repo-key>/<branch>,
+			// under the resolved data directory — never beside the cwd.
+			wtDir := mustWorktreesDir(t, c)
+			require.True(t, strings.HasPrefix(
+				filepath.ToSlash(handle.WorkspacePath),
+				filepath.ToSlash(wtDir)+"/",
+			), "workspace %q is not under %q", handle.WorkspacePath, wtDir)
+			require.NoDirExists(t, filepath.Join(sub, ".crush"))
+
+			// The parent repo's git view is untouched by the dispatch.
+			out, err := exec.CommandContext(t.Context(), "git", "-C", repo, "status", "--porcelain").CombinedOutput()
+			require.NoError(t, err)
+			require.Empty(t, strings.TrimSpace(string(out)), "git status is not clean: %s", out)
+
+			out, err = exec.CommandContext(t.Context(), "git", "-C", repo, "add", "-A", "--dry-run").CombinedOutput()
+			require.NoError(t, err)
+			require.NotContains(t, string(out), "crush-dispatch-", "git add -A stages dispatch worktree paths: %s", out)
+		})
+	}
 }
 
 // The tool validates its arguments before touching git: a missing prompt
@@ -222,12 +312,14 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 	require.Equal(t, dispatch.StatusRunning, handle.Status)
 	require.NotEmpty(t, handle.DispatchID)
 	require.Equal(t, dispatch.BranchPrefix+handle.DispatchID, handle.Branch)
-	// Path-form-agnostic: the workspace is the worktrees dir + branch,
-	// under the repo root (which the Workspace absolutizes — on Windows
-	// the test env's /tmp prefix gains a drive letter).
+	// Path-form-agnostic: the workspace is the worktrees dir + branch
+	// under the data directory (which the Workspace absolutizes — on
+	// Windows the test env's /tmp prefix gains a drive letter).
+	wtDir, werr := dispatch.WorktreesDir(c.cfg.Config().Options.DataDirectory, c.cfg.WorkingDir())
+	require.NoError(t, werr)
 	require.True(t, strings.HasSuffix(
 		filepath.ToSlash(handle.WorkspacePath),
-		"/.crush/worktrees/"+handle.Branch,
+		filepath.ToSlash(wtDir)+"/"+handle.Branch,
 	), "workspace path %q is not the worktrees dir + branch", handle.WorkspacePath)
 	require.NotEmpty(t, handle.SessionID)
 	require.DirExists(t, handle.WorkspacePath)
@@ -239,7 +331,7 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 	require.Equal(t, handle.SessionID, entry.SessionID)
 	require.True(t, strings.HasSuffix(
 		filepath.ToSlash(entry.Path),
-		"/.crush/worktrees/"+entry.Branch,
+		filepath.ToSlash(wtDir)+"/"+entry.Branch,
 	))
 
 	// The background run completes and records the terminal status in
@@ -280,7 +372,7 @@ func TestDispatchAgentToolCleansUpFailedSetup(t *testing.T) {
 	out, err := exec.CommandContext(t.Context(), "git", "-C", env.workingDir, "branch", "--list", dispatch.BranchPrefix+"*").CombinedOutput()
 	require.NoError(t, err)
 	require.Empty(t, strings.TrimSpace(string(out)), "dispatch branch left behind")
-	entries, err := os.ReadDir(filepath.Join(env.workingDir, ".crush", "worktrees"))
+	entries, err := os.ReadDir(mustWorktreesDir(t, c))
 	require.NoError(t, err)
 	for _, e := range entries {
 		require.False(t, e.IsDir(), "worktree directory left behind: %s", e.Name())
@@ -351,6 +443,100 @@ func branchExists(t *testing.T, dir, branch string) bool {
 	out, err := exec.CommandContext(t.Context(), "git", "-C", dir, "branch", "--list", branch).CombinedOutput()
 	require.NoError(t, err, "git branch --list %s: %s", branch, out)
 	return strings.TrimSpace(string(out)) != ""
+}
+
+// A dispatched run's background jobs die with the run (#385): the fake
+// agent starts a job tagged with the dispatch session, and runDispatch
+// kills it before the terminal result is assembled, so the salvage diff
+// cannot race a job still writing the workspace.
+func TestRunDispatchKillsBackgroundJobsOnCompletion(t *testing.T) {
+	var env fakeEnv
+	jobID := ""
+	agent := &dispatchTestAgent{
+		model:  dispatchTestModel(),
+		result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
+		onRun: func(call SessionAgentCall) {
+			bgShell, err := shell.GetBackgroundShellManager().Start(context.Background(), call.SessionID, env.workingDir, nil, "sleep 30", "dispatch job")
+			require.NoError(t, err)
+			jobID = bgShell.ID
+		},
+	}
+	c, env := newDispatchToolEnv(t, agent)
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
+	require.NoError(t, err)
+	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
+	require.NoError(t, err)
+
+	c.runDispatch(t.Context(), dispatchRun{
+		workspace:       ws,
+		entry:           entry,
+		toolchain:       toolchain,
+		agent:           agent,
+		model:           agent.model,
+		providerCfg:     config.ProviderConfig{ID: "test-provider"},
+		prompt:          "do work",
+		sessionID:       "dispatch-child-session",
+		parentSessionID: "dispatch-parent-session",
+	})
+
+	got, ok := ws.Get(entry.ID)
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusCompleted, got.Status)
+
+	// The job started during the run is gone after it.
+	require.NotEmpty(t, jobID)
+	_, ok = shell.GetBackgroundShellManager().Get(jobID)
+	require.False(t, ok, "background job %s survived the run", jobID)
+}
+
+// The kill path kills the run's background jobs the same way: the run is
+// killed, its Run returns context.Canceled, and the job started under the
+// dispatch session is gone when runDispatch returns (#385).
+func TestRunDispatchKillsBackgroundJobsOnKill(t *testing.T) {
+	var env fakeEnv
+	jobID := ""
+	kill := &dispatchKill{}
+	agent := &dispatchTestAgent{
+		model: dispatchTestModel(),
+		err:   context.Canceled,
+		onRun: func(call SessionAgentCall) {
+			kill.kill("test kill")
+			bgShell, err := shell.GetBackgroundShellManager().Start(context.Background(), call.SessionID, env.workingDir, nil, "sleep 30", "dispatch job")
+			require.NoError(t, err)
+			jobID = bgShell.ID
+		},
+	}
+	c, env := newDispatchToolEnv(t, agent)
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
+	require.NoError(t, err)
+	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
+	require.NoError(t, err)
+
+	c.runDispatch(t.Context(), dispatchRun{
+		workspace:       ws,
+		entry:           entry,
+		toolchain:       toolchain,
+		agent:           agent,
+		model:           agent.model,
+		providerCfg:     config.ProviderConfig{ID: "test-provider"},
+		prompt:          "do work",
+		sessionID:       "dispatch-child-session",
+		parentSessionID: "dispatch-parent-session",
+		kill:            kill,
+	})
+
+	got, ok := ws.Get(entry.ID)
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusKilled, got.Status)
+
+	// The job started during the killed run is gone after it.
+	require.NotEmpty(t, jobID)
+	_, ok = shell.GetBackgroundShellManager().Get(jobID)
+	require.False(t, ok, "background job %s survived the killed run", jobID)
 }
 
 // ReleaseDispatches is the synchronous session-end cleanup (#367): a
