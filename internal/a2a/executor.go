@@ -163,10 +163,11 @@ var _ a2asrv.AgentExecutor = (*Executor)(nil)
 
 // Execute runs one dispatched agent turn. It announces the task submitted
 // (for a new task), emits Working, invokes the SessionAgent, then emits the
-// diff artifact (if any) and a terminal Completed status carrying the agent's
-// text output. A run error maps to a Failed status with the error surfaced;
-// per the AgentExecutor contract, failures after work has begun are reported
-// as events, not as a returned error.
+// chunked diff artifact (if any), the typed dispatch-result artifact, and a
+// terminal Completed status carrying the agent's text output. A run error
+// maps to a Failed status with the error surfaced; per the AgentExecutor
+// contract, failures after work has begun are reported as events, not as a
+// returned error.
 func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
 		// The backstop's terminal is the task's last word: drop the
@@ -242,10 +243,30 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		}
 
 		if e.diff != nil {
-			if diff, derr := e.diff(ctx); derr == nil && diff != "" {
-				if !yield(a2aspec.NewArtifactEvent(execCtx, a2aspec.NewTextPart(diff)), nil) {
-					return
+			diff, derr := e.diff(ctx)
+			if derr == nil && diff != "" {
+				// The diff streams as chunked text/x-diff parts of one
+				// named artifact (#361): no single SSE data line carries
+				// more than a 256 KiB piece, so a huge diff cannot trip
+				// the SDK's 10 MB line cap.
+				chunks := chunkDiff(diff)
+				for i := range chunks {
+					if !yield(diffArtifact(execCtx, chunks, i), nil) {
+						return
+					}
 				}
+			}
+			// The typed outcome rides alongside — and stands in for the
+			// diff when capture failed — so the error crosses the wire
+			// and the run still completes (#361).
+			outcome := DispatchOutcome{DiffBytes: len(diff)}
+			if derr != nil {
+				outcome.DiffError = derr.Error()
+			} else {
+				outcome.FilesChanged = countDiffFiles(diff)
+			}
+			if !yield(resultArtifact(execCtx, outcome), nil) {
+				return
 			}
 		}
 
