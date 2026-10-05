@@ -19,7 +19,7 @@ in the [log](/reference/logging) (`crush logs --tail 200`):
 
 | Log message | Meaning |
 | --- | --- |
-| `Dispatch A2A stream failed` | The transport gave up on a dispatch, usually at the 3-minute timeout |
+| `Dispatch A2A stream failed` | The transport gave up on a dispatch mid-stream |
 | `Dispatch A2A server failed to start` | The dispatch fell back to running in-process |
 | `Todo enforcement killed the run` | An agent was killed for ignoring nudges |
 | `Dispatch run killed by watchdog` | A dispatch hit `hard_timeout` (or `stall_window`) |
