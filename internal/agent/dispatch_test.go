@@ -13,6 +13,7 @@ import (
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/scheduler"
 	"github.com/stretchr/testify/require"
@@ -404,4 +405,147 @@ func extractBackgroundShellID(t *testing.T, content string) string {
 	matches := regexp.MustCompile(`Background shell (?:started with )?ID: (\S+)`).FindStringSubmatch(content)
 	require.NotEmpty(t, matches, "no background shell ID in %q", content)
 	return matches[1]
+}
+
+// setDispatchHook configures a single PreToolUse hook on the parent
+// store, the way a user's config would carry it.
+func setDispatchHook(t *testing.T, c *coordinator, hook config.HookConfig) {
+	t.Helper()
+	c.cfg.Config().Hooks = map[string][]config.HookConfig{
+		hooks.EventPreToolUse: {hook},
+	}
+	require.NoError(t, c.cfg.Config().ValidateHooks())
+}
+
+// toolsByName indexes a toolchain's tools by name.
+func toolsByName(tc *DispatchToolchain) map[string]fantasy.AgentTool {
+	byName := make(map[string]fantasy.AgentTool, len(tc.Tools()))
+	for _, tool := range tc.Tools() {
+		byName[tool.Info().Name] = tool
+	}
+	return byName
+}
+
+// A PreToolUse deny hook configured on the parent blocks a dispatched
+// agent's bash call: the hook fires before the inner tool runs, the
+// response carries the hook's reason, and the command never executes
+// (#377). A deny matters most for dispatch, whose agents hold bash and
+// the write tools even when the main agent's policy blocks them.
+func TestDispatchToolsPreToolUseDenyBlocksBash(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+	setDispatchHook(t, c, config.HookConfig{Matcher: "^bash$", Command: `echo "no pushes" >&2; exit 2`})
+
+	workspace := t.TempDir()
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	bash, ok := toolsByName(tc)[tools.BashToolName].(*hookedTool)
+	require.Truef(t, ok, "dispatched bash should be wrapped in a hookedTool")
+
+	resp := runTool(t, bash, tools.BashToolName, map[string]any{
+		"command":     "echo marker > marker.txt",
+		"description": "write a marker into the dispatch working directory",
+	})
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "Tool call blocked by hook")
+	require.Contains(t, resp.Content, "no pushes")
+	require.NoFileExists(t, filepath.Join(workspace, "marker.txt"))
+}
+
+// A hook's updated_input patch rewrites the dispatched call's input
+// before the inner tool runs: bash executes the rewritten command, not
+// the one the model sent (#377).
+func TestDispatchToolsPreToolUseUpdatedInputRewritesCall(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+	setDispatchHook(t, c, config.HookConfig{Matcher: "^bash$", Command: `echo '{"updated_input":{"command":"echo rewritten > rewritten.txt"}}'`})
+
+	workspace := t.TempDir()
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	bash, ok := toolsByName(tc)[tools.BashToolName].(*hookedTool)
+	require.Truef(t, ok, "dispatched bash should be wrapped in a hookedTool")
+
+	resp := runTool(t, bash, tools.BashToolName, map[string]any{
+		"command":     "echo marker > marker.txt",
+		"description": "write a marker into the dispatch working directory",
+	})
+	require.False(t, resp.IsError, resp.Content)
+	require.FileExists(t, filepath.Join(workspace, "rewritten.txt"))
+	require.NoFileExists(t, filepath.Join(workspace, "marker.txt"))
+}
+
+// A PreToolUse allow hook pre-approves the dispatched call's permission
+// request the same way it does for the main agent: the command runs and
+// the parent's (prompting) permission service sees no request through
+// the bridge (#377).
+func TestDispatchToolsPreToolUseAllowSkipsPermission(t *testing.T) {
+	env := testEnv(t)
+	// The parent prompts (skip off), so a bridged request would surface
+	// here; the allow hook must short-circuit before that.
+	env.permissions = permission.NewPermissionService(env.workingDir, false, []string{})
+	c := newDispatchTestCoordinator(t, env)
+	setDispatchHook(t, c, config.HookConfig{Matcher: "^bash$", Command: `echo '{"decision":"allow"}'`})
+
+	workspace := t.TempDir()
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	bash, ok := toolsByName(tc)[tools.BashToolName].(*hookedTool)
+	require.Truef(t, ok, "dispatched bash should be wrapped in a hookedTool")
+
+	events := env.permissions.Subscribe(t.Context())
+	resp := runTool(t, bash, tools.BashToolName, map[string]any{
+		"command":     "echo marker > marker.txt",
+		"description": "write a marker into the dispatch working directory",
+	})
+	require.NotContains(t, resp.Content, "User denied permission")
+	require.FileExists(t, filepath.Join(workspace, "marker.txt"))
+
+	select {
+	case ev := <-events:
+		t.Fatalf("parent saw a permission request: %+v", ev)
+	case <-time.After(250 * time.Millisecond):
+	}
+}
+
+// With no hooks configured, dispatched tools are returned unwrapped: the
+// hook runner is nil and the tool set is the plain filtered list (#377).
+func TestDispatchToolsUnwrappedWithoutHooks(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: t.TempDir()})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	require.NotEmpty(t, tc.Tools())
+	for _, tool := range tc.Tools() {
+		_, isHooked := tool.(*hookedTool)
+		require.Falsef(t, isHooked, "tool %s should not be wrapped", tool.Info().Name)
+	}
+}
+
+// The `agent` and `agentic_fetch` sub-agents stay unhooked even with
+// hooks configured: buildTools passes isSubAgent=true and the wrap is a
+// no-op for them (#377).
+func TestBuildToolsSubAgentUnwrappedWithHooks(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+	setDispatchHook(t, c, config.HookConfig{Matcher: "^bash$", Command: `exit 0`})
+
+	agentCfg := c.cfg.Config().Agents[config.AgentCoder]
+	agentCfg.AllowedTools = []string{tools.GlobToolName, tools.BashToolName}
+	built, err := c.buildTools(t.Context(), agentCfg, true)
+	require.NoError(t, err)
+	require.NotEmpty(t, built)
+	for _, tool := range built {
+		_, isHooked := tool.(*hookedTool)
+		require.Falsef(t, isHooked, "sub-agent tool %s should not be wrapped", tool.Info().Name)
+	}
 }
