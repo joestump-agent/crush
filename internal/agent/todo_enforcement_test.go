@@ -65,29 +65,39 @@ func (m *scriptedModel) StreamObject(ctx context.Context, call fantasy.ObjectCal
 // without consuming the script or polluting the recorded prompts.
 const titlePromptMarker = "You will generate a short title"
 
+// isTitleCall reports whether a model call is the GenerateTitle
+// goroutine's, by the same marker the scripted model serves canned
+// titles on.
+func isTitleCall(call fantasy.Call) bool {
+	for _, msg := range call.Prompt {
+		for _, part := range msg.Content {
+			if text, ok := part.(fantasy.TextPart); ok && strings.Contains(text.Text, titlePromptMarker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (m *scriptedModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
 	// A canceled context (the wander kill, mostly) must end the stream
 	// deterministically, not let the script run on.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	for _, msg := range call.Prompt {
-		for _, part := range msg.Content {
-			if text, ok := part.(fantasy.TextPart); ok && strings.Contains(text.Text, titlePromptMarker) {
-				return func(yield func(fantasy.StreamPart) bool) {
-					if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextStart, ID: "1"}) {
-						return
-					}
-					if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextDelta, ID: "1", Delta: "session"}) {
-						return
-					}
-					if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextEnd, ID: "1"}) {
-						return
-					}
-					yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeFinish, FinishReason: fantasy.FinishReasonStop})
-				}, nil
+	if isTitleCall(call) {
+		return func(yield func(fantasy.StreamPart) bool) {
+			if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextStart, ID: "1"}) {
+				return
 			}
-		}
+			if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextDelta, ID: "1", Delta: "session"}) {
+				return
+			}
+			if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextEnd, ID: "1"}) {
+				return
+			}
+			yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeFinish, FinishReason: fantasy.FinishReasonStop})
+		}, nil
 	}
 
 	m.mu.Lock()
