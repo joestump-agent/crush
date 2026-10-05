@@ -30,4 +30,19 @@
 //
 // The SDK's core type package is imported as a2aspec throughout to avoid
 // colliding with this package's own name.
+//
+// # Adding an extension
+//
+// Declared, statically typed metadata extensions (#359) are registered in
+// one place, [extension registry in ext.go]: define the payload type next to
+// [agent.DispatchTransportOutcome] in internal/agent (the a2a package
+// imports agent, not the other way around), then add an [Extension] entry
+// with mustRegister in ext.go's init, carrying the payload's Go type and
+// its JSON Schema. Registration advertises the extension — URI, description,
+// schema in the card params — on every built agent card automatically; the
+// server emits values with [Encode], the client activates the card-declared
+// extensions it has registered and decodes their metadata with
+// [Decode]/[DecodeValue] on each TaskStatusUpdateEvent, consuming decoded
+// payloads onto the transport outcome. Unknown or undeclared metadata keys
+// are logged and dropped, never fatal.
 package a2a
