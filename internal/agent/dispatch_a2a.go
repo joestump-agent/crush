@@ -89,6 +89,32 @@ type DispatchTransportParams struct {
 	Endpoint string
 	Card     any
 	Prompt   string
+	// OnTask, when set, receives the served task's ID once the stream's
+	// first event names it (#349): the task outlives a dropped stream,
+	// and with the ID the coordinator can stamp the registry entry so
+	// the run stays recoverable (tasks/resubscribe, tasks/get) and
+	// answerable after the fact. Called at most once. Nil-safe.
+	OnTask func(taskID string)
+}
+
+// GetDispatchTaskParams is one A2A task query (#349): the served
+// dispatch's endpoint and card, plus the task ID the transport reported
+// through DispatchTransportParams.OnTask. Card is the registry entry's
+// opaque AgentCard — the transport owns its concrete type.
+type GetDispatchTaskParams struct {
+	Endpoint string
+	Card     any
+	TaskID   string
+}
+
+// DispatchTaskStatus is the observed state of one dispatched task
+// (#349). Status is "working" while the task is still in flight and
+// otherwise the terminal outcome vocabulary — "completed", "failed",
+// "canceled", the same tokens DispatchTransportOutcome.Status carries.
+// Text is the task status' message when one arrived.
+type DispatchTaskStatus struct {
+	Status string
+	Text   string
 }
 
 // DispatchTransportOutcome is the terminal outcome of one A2A-driven
@@ -180,6 +206,12 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 		Endpoint: entry.Endpoint,
 		Card:     entry.AgentCard,
 		Prompt:   run.prompt,
+		// The served task outlives a dropped stream (#349): stamp the
+		// task ID the moment the stream names it, so the run stays
+		// recoverable and answerable through the registry.
+		OnTask: func(taskID string) {
+			run.reg.SetTaskID(run.entry.ID, taskID)
+		},
 	})
 	if err != nil {
 		slog.Error("Dispatch A2A stream failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)

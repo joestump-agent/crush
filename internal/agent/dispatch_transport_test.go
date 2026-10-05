@@ -87,6 +87,11 @@ type gatedServingTransport struct {
 	outcome DispatchTransportOutcome
 	err     error
 
+	// taskID, when set, is reported through the stream params' OnTask
+	// before the gate opens — the first-event stamp the coordinator
+	// records on the registry entry (#349).
+	taskID string
+
 	mu       sync.Mutex
 	streamed []DispatchTransportParams
 }
@@ -99,6 +104,9 @@ func (f *gatedServingTransport) StreamDispatch(ctx context.Context, p DispatchTr
 	f.mu.Lock()
 	f.streamed = append(f.streamed, p)
 	f.mu.Unlock()
+	if f.taskID != "" && p.OnTask != nil {
+		p.OnTask(f.taskID)
+	}
 	select {
 	case <-f.gate:
 	case <-ctx.Done():
@@ -194,6 +202,48 @@ func TestDispatchRunsOverTransportSeam(t *testing.T) {
 	// The server is torn down with the run.
 	require.Empty(t, e.Endpoint)
 	require.Nil(t, e.AgentCard)
+}
+
+// The served task's ID lands on the registry entry from the stream's
+// first event onward (#349): stamped mid-run, while the stream is
+// still open, and kept after the terminal teardown clears the endpoint
+// and card, so the run stays recoverable through tasks/resubscribe and
+// tasks/get.
+func TestDispatchStreamStampsRegistryTaskID(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, _ := newInjectionEnv(t, agent)
+	transport := newGatedServingTransport(DispatchTransportOutcome{
+		Status: transportStatusCompleted,
+		Text:   "done, all fixed",
+	})
+	transport.taskID = "task-123"
+	c.SetDispatchServerStarter(transport)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{
+		Prompt: "fix the bug",
+		Branch: "main",
+		Handle: "tester",
+	}))
+
+	require.Eventually(t, func() bool {
+		e, ok := c.dispatchRegistry().Get(handle.DispatchID)
+		return ok && e.TaskID == "task-123"
+	}, 10*time.Second, 20*time.Millisecond, "the task ID must stamp the entry mid-run")
+
+	close(transport.gate)
+	// Wait for terminal AND the teardown's endpoint clear — the status
+	// is stamped just before the run's defers tear the server down, so
+	// both together are the completion signal here.
+	require.Eventually(t, func() bool {
+		e, ok := c.dispatchRegistry().Get(handle.DispatchID)
+		return ok && e.Status.IsTerminal() && e.Endpoint == "" && e.AgentCard == nil
+	}, 10*time.Second, 50*time.Millisecond)
+
+	e, ok := c.dispatchRegistry().Get(handle.DispatchID)
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusCompleted, e.Status)
+	require.Equal(t, "task-123", e.TaskID, "the task ID survives the terminal teardown")
 }
 
 // A transport failure before any terminal state fails the dispatch with

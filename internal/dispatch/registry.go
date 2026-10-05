@@ -131,6 +131,11 @@ type Entry struct {
 	// AgentCard is the dispatched agent's A2A AgentCard (#70). Opaque to
 	// this package to keep it import-cycle-free of internal/a2a.
 	AgentCard any
+	// TaskID is the A2A task ID the served dispatch's first stream event
+	// named (#349); empty until then. It survives a dropped stream: with
+	// it, the run is recoverable through tasks/resubscribe and tasks/get
+	// and answerable through queries after the fact.
+	TaskID string
 	// StartedAt is when the dispatch's agent started running; zero
 	// until then. FinishedAt is when it reached a terminal state. The
 	// agent block (#65) renders elapsed time from the pair.
@@ -325,6 +330,12 @@ func (r *AgentRegistry) SetSession(id, sessionID string) bool {
 // against, so another session cannot address this dispatch.
 func (r *AgentRegistry) SetParentSessionID(id, parentSessionID string) bool {
 	return r.Update(id, func(e *Entry) { e.ParentSessionID = parentSessionID })
+}
+
+// SetTaskID records the A2A task ID serving the dispatched agent (#349),
+// reported by the transport from the stream's first event onward.
+func (r *AgentRegistry) SetTaskID(id, taskID string) bool {
+	return r.Update(id, func(e *Entry) { e.TaskID = taskID })
 }
 
 // SetHandle records the @handle the dispatched agent is addressable by.
