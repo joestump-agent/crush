@@ -149,6 +149,12 @@ type dispatchRun struct {
 	// enforcement ladder's hook and the watchdog; empty when the run is
 	// never killed.
 	kill *dispatchKill
+	// cancel ends the dispatch's root context (#371). The watchdog's
+	// kill fires it so a kill landing before the dispatched agent's Run
+	// registered the session still ends the run: agent.Cancel alone is
+	// a no-op for an unregistered session (#430). Nil where a run is
+	// driven without a root (tests that assemble or observe only).
+	cancel context.CancelFunc
 	// killSettings are the resolved wander-kill thresholds for this
 	// dispatch: nudges-before-kill, todos stall window, hard timeout.
 	killSettings config.TodoEnforcementSettings
@@ -355,6 +361,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				contentWidth:    tools.GetContentWidthFromContext(ctx),
 				kill:            kill,
 				killSettings:    killSettings,
+				cancel:          rootCancel,
 			}
 
 			// Stand up the dispatch's in-process A2A server (#70) and stamp
@@ -673,6 +680,15 @@ func (c *coordinator) startDispatchKillWatch(ctx context.Context, run dispatchRu
 	killFromWatch := func(reason string) {
 		run.kill.kill(reason)
 		slog.Warn("Dispatch run killed by watchdog", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "reason", reason)
+		// Cancel the dispatch's root first (#430): a kill landing before
+		// the dispatched agent's Run registered the session leaves
+		// agent.Cancel a no-op, and the run's context is detached from
+		// every parent cancel, so without this the agent keeps running
+		// with no bound. The registered-session cancel below still runs
+		// for the post-registration case and is a no-op otherwise.
+		if run.cancel != nil {
+			run.cancel()
+		}
 		run.agent.Cancel(run.sessionID)
 	}
 
