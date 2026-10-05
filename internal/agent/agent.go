@@ -85,7 +85,14 @@ type SessionAgentCall struct {
 	// ambiguous when concurrent turns share the same session.
 	RunID             string
 	HiddenUserMessage bool
-	Channel           string
+	// Steer marks the call as a mid-run injection into a running
+	// dispatched agent (#312): the persisted user message carries
+	// TextContent.Steer so a rebuilt transcript can tell steers apart
+	// from the dispatch's initial prompt and from todo nudges (#410).
+	// Only the injection paths set it; callers cannot forge it onto an
+	// ordinary prompt.
+	Steer   bool
+	Channel string
 	// ContentWidth is the UI's chat content width hint in cells (0 when
 	// the turn has no interactive UI). Tools rendering width-sensitive
 	// remote content (e.g. A2UI surfaces with pre-sized bar geometry)
@@ -1715,7 +1722,7 @@ func sessionHeaders(sessionID string) map[string]string {
 }
 
 func (a *sessionAgent) createUserMessage(ctx context.Context, call SessionAgentCall) (message.Message, error) {
-	parts := []message.ContentPart{message.TextContent{Text: call.Prompt, Hidden: call.HiddenUserMessage}}
+	parts := []message.ContentPart{message.TextContent{Text: call.Prompt, Hidden: call.HiddenUserMessage, Steer: call.Steer}}
 	var attachmentParts []message.ContentPart
 	for _, attachment := range call.Attachments {
 		attachmentParts = append(attachmentParts, message.BinaryContent{Path: attachment.FilePath, MIMEType: attachment.MimeType, Data: attachment.Content, Kind: attachment.Kind, PromptArgCount: attachment.PromptArgCount})

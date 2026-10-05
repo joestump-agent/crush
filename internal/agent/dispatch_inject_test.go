@@ -182,6 +182,9 @@ func TestDeliverAgentMessageMidRunThenRefusalAfterFinish(t *testing.T) {
 	require.Equal(t, 80, injected[0].ContentWidth)
 	require.True(t, injected[0].NonInteractive)
 	require.Empty(t, injected[0].RunID)
+	// The injection is a steer (#410): the mark is what separates it from
+	// the dispatch's initial prompt on a rebuilt card.
+	require.True(t, injected[0].Steer)
 
 	// Finish the run; the injection target is gone with it.
 	close(agent.gate)

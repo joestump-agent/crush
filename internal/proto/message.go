@@ -103,8 +103,12 @@ func (ReasoningContent) isPart() {}
 
 // TextContent represents a text part of a message.
 type TextContent struct {
-	Text   string `json:"text"`
-	Hidden bool   `json:"hidden,omitempty"`
+	Text string `json:"text"`
+	// Hidden marks generated user continuations that remain in model history.
+	Hidden bool `json:"hidden,omitempty"`
+	// Steer marks a message injected into a running dispatched agent;
+	// mirrored from message.TextContent (#410).
+	Steer bool `json:"steer,omitempty"`
 }
 
 // String returns the text content as a string.

@@ -175,15 +175,45 @@ func TestDispatchCardFailureShowsError(t *testing.T) {
 }
 
 // A reloaded session renders from the persisted running handle without
-// a live snapshot — and never spins, because nothing will advance the
-// card again.
-func TestDispatchCardStaleHandleIsStatic(t *testing.T) {
+// a live snapshot and without a terminal record (#410) — and never
+// spins, because nothing will advance the card again.
+func TestDispatchCardStaleHandleWithoutTerminalRecordIsStatic(t *testing.T) {
 	t.Parallel()
 
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
 	out := dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), false))
 
 	require.Contains(t, out, "working")
+	require.False(t, item.Spinning())
+	require.Equal(t, "msg$$call-dispatch-1", item.DispatchSessionID())
+}
+
+// A restarted or client/server card has only the persisted tool result:
+// Content still holds the running handle, but the run stamped the
+// terminal DispatchResult into Metadata (#410). The terminal record
+// wins, so the card shows the durable findings instead of "working".
+func TestDispatchCardPrefersTerminalMetadata(t *testing.T) {
+	t.Parallel()
+
+	terminal := dispatch.DispatchResult{
+		DispatchID:  "dispatch-1",
+		Branch:      "crush-dispatch-dispatch-1",
+		SessionID:   "msg$$call-dispatch-1",
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "Added validation and two tests.",
+	}
+	b, err := json.Marshal(terminal)
+	require.NoError(t, err)
+
+	result := runningHandle(t, dispatch.StatusRunning)
+	result.Metadata = string(b)
+
+	item := newDispatchItem(t, result)
+	out := dispatchTestRender(t, item, dispatchToolOpts(result, false))
+
+	require.Contains(t, out, "complete")
+	require.Contains(t, out, "Added validation and two tests.")
+	require.NotContains(t, out, "working")
 	require.False(t, item.Spinning())
 	require.Equal(t, "msg$$call-dispatch-1", item.DispatchSessionID())
 }
@@ -227,8 +257,7 @@ func TestDispatchCardNestedTools(t *testing.T) {
 }
 
 // Mid-run injection (#312): an injected message recorded on the block
-// renders as a steer with the agent's streaming answer beneath it, and
-// the initial dispatch prompt is never mistaken for a steer.
+// renders as a steer with the agent's streaming answer beneath it.
 func TestDispatchCardRendersSteerConversation(t *testing.T) {
 	t.Parallel()
 
@@ -240,11 +269,6 @@ func TestDispatchCardRendersSteerConversation(t *testing.T) {
 			Status:    dispatch.StatusRunning,
 		},
 	})
-
-	// The dispatch's own prompt is not a steer.
-	require.True(t, item.IsInitialDispatchPrompt("implement the login form with validation"))
-	// Any other text before the first steer is not the prompt either.
-	require.False(t, item.IsInitialDispatchPrompt("stop writing Rust"))
 
 	item.AddSteer("stop writing Rust and use Go")
 	item.UpdateSteerAnswer("assistant-1", "understood, switching to Go")
@@ -267,9 +291,63 @@ func TestDispatchCardRendersSteerConversation(t *testing.T) {
 	require.Contains(t, out, "done, go.mod updated")
 
 	require.Len(t, item.Steers(), 2)
-	// After the first steer, nothing is ever treated as the initial
-	// prompt again.
-	require.False(t, item.IsInitialDispatchPrompt("implement the login form with validation"))
+}
+
+// RebuildSteers rebuilds the steer log from the persisted child
+// transcript (#410): Steer-marked user messages become steers — plain
+// user messages (the dispatch's initial prompt, todo nudges) never do —
+// and each assistant message answers the latest steer so far.
+func TestDispatchCardRebuildSteers(t *testing.T) {
+	t.Parallel()
+
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	// Live-recorded state is replaced wholesale by the rebuild.
+	item.AddSteer("stale live steer")
+
+	msg := func(role message.MessageRole, id, text string, steer bool) message.Message {
+		part := message.TextContent{Text: text, Steer: steer}
+		return message.Message{ID: id, Role: role, Parts: []message.ContentPart{part}}
+	}
+
+	msgs := []message.Message{
+		msg(message.User, "child-prompt", "implement the login form with validation", false),
+		msg(message.Assistant, "child-a1", "on it", false),
+		msg(message.User, "nudge-1", "todo reminder", false),
+		msg(message.User, "steer-1", "stop writing Rust and use Go", true),
+		msg(message.Assistant, "child-a2", "switched to Go", false),
+		msg(message.User, "steer-2", "also run the linter", true),
+		msg(message.Assistant, "child-a3", "lint clean", false),
+		msg(message.Assistant, "child-a4", "linter passes everywhere", false),
+	}
+
+	item.RebuildSteers(msgs)
+
+	require.Len(t, item.Steers(), 2)
+	require.Equal(t, "stop writing Rust and use Go", item.Steers()[0].Text)
+	require.Equal(t, "switched to Go", item.Steers()[0].Response)
+	require.Equal(t, "child-a2", item.Steers()[0].ResponseMessageID)
+	// child-a3 and child-a4 both advance the latest steer; the last one
+	// wins, matching the live retarget-latest semantics.
+	require.Equal(t, "also run the linter", item.Steers()[1].Text)
+	require.Equal(t, "linter passes everywhere", item.Steers()[1].Response)
+	require.Equal(t, "child-a4", item.Steers()[1].ResponseMessageID)
+
+	out := dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), true))
+	require.Contains(t, out, "stop writing Rust and use Go")
+	require.Contains(t, out, "linter passes everywhere")
+	// The prompt still renders once, as the card's Task line — but the
+	// unmarked nudge never appears as a steer.
+	require.NotContains(t, out, "todo reminder")
+}
+
+// RebuildSteers with no Steer-marked messages yields an empty steer
+// log: an untouched dispatch rebuilds to a bare card.
+func TestDispatchCardRebuildSteersEmpty(t *testing.T) {
+	t.Parallel()
+
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	item.RebuildSteers([]message.Message{})
+	require.Empty(t, item.Steers())
 }
 
 // Steers survive into the terminal record view: the block keeps the
