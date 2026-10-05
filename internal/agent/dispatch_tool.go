@@ -228,6 +228,11 @@ type dispatchRun struct {
 	// a no-op for an unregistered session (#430). Nil where a run is
 	// driven without a root (tests that assemble or observe only).
 	cancel context.CancelFunc
+	// holdsSlot reports that the run holds the dispatch concurrency slot
+	// its tool call reserved (#390): the run's teardown releases it when
+	// the dispatch reaches a terminal state. Runs driven without a
+	// reservation (tests that call runDispatch directly) do not.
+	holdsSlot bool
 	// killSettings are the resolved wander-kill thresholds for this
 	// dispatch: nudges-before-kill, todos stall window, hard timeout.
 	killSettings config.TodoEnforcementSettings
@@ -347,6 +352,36 @@ waitLoop:
 	}
 }
 
+// reserveDispatchSlot checks the resolved dispatch.max_concurrent cap
+// (#390) against the dispatches currently holding a slot — live
+// dispatches plus setups still in flight — and reserves one more under
+// the same lock, so parallel tool calls within one step cannot overshoot
+// the cap. It reports whether the slot was reserved, and how many
+// dispatches hold slots when the cap refused.
+func (c *coordinator) reserveDispatchSlot() (bool, int) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	limit := c.cfg.Config().Options.GetDispatchMaxConcurrent()
+	if c.dispatchSlots >= limit {
+		return false, c.dispatchSlots
+	}
+	c.dispatchSlots++
+	return true, 0
+}
+
+// releaseDispatchSlot frees a dispatch slot held by a setup that failed
+// before its run took ownership, or by a run that reached a terminal
+// state (#390). Each reservation is released exactly once; the clamp
+// keeps a spurious release from drifting the counter negative and
+// silently raising the cap.
+func (c *coordinator) releaseDispatchSlot() {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	if c.dispatchSlots > 0 {
+		c.dispatchSlots--
+	}
+}
+
 // call builds the full SessionAgentCall a dispatch's turns run with:
 // the chosen model's shaping, the parent turn's content width, and the
 // non-interactive flag. Built per consumer — the server stamps its
@@ -430,6 +465,21 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			}
 			reg := c.dispatchRegistry()
 
+			// The concurrency cap (#390): count the slots in flight —
+			// live dispatches plus setups still provisioning — and
+			// reserve one more under the same lock, so parallel tool
+			// calls within one step cannot overshoot the cap. At the
+			// cap, refuse before provisioning anything. The slot is
+			// released by the setup-failure paths below, or by the run's
+			// teardown once the dispatch reaches a terminal state.
+			reserved, running := c.reserveDispatchSlot()
+			if !reserved {
+				limit := c.cfg.Config().Options.GetDispatchMaxConcurrent()
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"dispatch at capacity: %d agents are already running (dispatch.max_concurrent=%d); wait for one to finish or cancel one",
+					running, limit)), nil
+			}
+
 			// Provision, bootstrap, and build while the tool call is
 			// still open: every step is local and fast, and failures
 			// here are actionable tool errors rather than silent
@@ -439,6 +489,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			id := uuid.NewString()
 			placement, err := provider.Provision(ctx, id, dispatch.ProvisionOptions{Base: params.Branch})
 			if err != nil {
+				c.releaseDispatchSlot()
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("provision dispatch workspace: %s", err)), nil
 			}
 			entry := dispatch.Entry{
@@ -466,12 +517,14 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			toolchain, err := c.BuildDispatchToolchain(rootCtx, DispatchToolchainOptions{WorkingDir: entry.Path})
 			if err != nil {
 				rootCancel()
+				c.releaseDispatchSlot()
 				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("build dispatch toolchain: %s", err)), nil
 			}
 
 			if unknown := missingSkills(toolchain.Config(), params.Skills); len(unknown) > 0 {
 				rootCancel()
+				c.releaseDispatchSlot()
 				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("unknown skills: %s", strings.Join(unknown, ", "))), nil
 			}
@@ -505,6 +558,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			})
 			if err != nil {
 				rootCancel()
+				c.releaseDispatchSlot()
 				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("build dispatched agent: %s", err)), nil
 			}
@@ -515,6 +569,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			taskSession, err := c.sessions.CreateTaskSession(ctx, taskSessionID, sessionID, "Dispatched Agent")
 			if err != nil {
 				rootCancel()
+				c.releaseDispatchSlot()
 				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("create session: %s", err)), nil
 			}
@@ -529,6 +584,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			assignedHandle, ok := reg.AssignHandle(entry.ID, params.Handle, params.Role)
 			if !ok {
 				rootCancel()
+				c.releaseDispatchSlot()
 				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse("assign dispatch handle: registry entry vanished"), nil
 			}
@@ -549,6 +605,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				killSettings:    killSettings,
 				cancel:          rootCancel,
 				findings:        &dispatchFindings{},
+				holdsSlot:       true,
 			}
 
 			// Stand up the dispatch's in-process A2A server (#70) and stamp
@@ -697,6 +754,12 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		// live record keeps the registry holding exactly the running
 		// dispatches.
 		c.teardownLiveDispatch(run.entry.ID)
+		// The dispatch's concurrency slot (#390) is held from the tool
+		// call's reservation to here, when the dispatch has reached its
+		// terminal state.
+		if run.holdsSlot {
+			c.releaseDispatchSlot()
+		}
 	}()
 
 	watchStop := c.startDispatchKillWatch(ctx, run)

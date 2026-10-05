@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,6 +35,13 @@ type dispatchTestAgent struct {
 	model  Model
 	result *fantasy.AgentResult
 	err    error
+	// mu guards calls: the concurrency-cap tests run several dispatches
+	// against the same fake, whose turns then append from separate
+	// goroutines.
+	mu sync.Mutex
+	// gate, when non-nil, blocks each turn until it is closed — the
+	// seam the concurrency-cap tests use to hold a dispatch running.
+	gate chan struct{}
 	// onRun, when set, runs before each turn returns — the seam the
 	// background-job tests use to start a job tagged with the dispatch
 	// session from inside the run (#385).
@@ -42,11 +50,22 @@ type dispatchTestAgent struct {
 }
 
 func (f *dispatchTestAgent) Run(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+	f.mu.Lock()
 	f.calls = append(f.calls, call)
+	f.mu.Unlock()
+	if f.gate != nil {
+		<-f.gate
+	}
 	if f.onRun != nil {
 		f.onRun(call)
 	}
 	return f.result, f.err
+}
+
+func (f *dispatchTestAgent) lenCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
 }
 
 func (f *dispatchTestAgent) Model() Model { return f.model }
@@ -64,6 +83,8 @@ func dispatchTestModel() Model {
 		ModelCfg:   config.SelectedModel{Provider: "test-provider", Model: "test-model"},
 	}
 }
+
+func intPtr(v int) *int { return &v }
 
 // initGitRepo makes dir a git repository with one commit, so dispatch can
 // provision worktrees from it.
@@ -1277,4 +1298,188 @@ func TestDispatchAgentToolRefusedWhenAllWriteToolsDenied(t *testing.T) {
 
 	require.Empty(t, c.dispatchRegistry().List())
 	require.Empty(t, agent.calls)
+}
+
+// runDispatchToolCallAs is runDispatchToolCall with the tool call ID
+// parameterized: each dispatch keys its ephemeral task session off the
+// call ID, so tests that dispatch several times need distinct IDs.
+func runDispatchToolCallAs(t *testing.T, tool fantasy.AgentTool, params any, callID string) fantasy.ToolResponse {
+	t.Helper()
+	input, err := json.Marshal(params)
+	require.NoError(t, err)
+	ctx := context.WithValue(context.Background(), tools.SessionIDContextKey, "dispatch-parent-session")
+	ctx = context.WithValue(ctx, tools.MessageIDContextKey, "dispatch-parent-message")
+	ctx = context.WithValue(ctx, tools.ContentWidthContextKey, 80)
+	resp, err := tool.Run(ctx, fantasy.ToolCall{
+		ID:    callID,
+		Name:  DispatchAgentToolName,
+		Input: string(input),
+	})
+	require.NoError(t, err)
+	return resp
+}
+
+// dispatchBranchCount counts the dispatch branches the repository holds.
+func dispatchBranchCount(t *testing.T, workingDir string) int {
+	t.Helper()
+	out, err := exec.CommandContext(t.Context(), "git", "-C", workingDir,
+		"for-each-ref", "--format=%(refname:short)", "refs/heads/"+dispatch.BranchPrefix+"*",
+	).Output()
+	require.NoError(t, err)
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return 0
+	}
+	return len(strings.Split(trimmed, "\n"))
+}
+
+// The concurrency cap (#390) with a gated fake agent at the cap of 2:
+// the third concurrent call returns the at-capacity error and provisions
+// nothing, and once one of the held dispatches finishes the next call
+// succeeds.
+func TestDispatchAgentToolRefusesAtCapacity(t *testing.T) {
+	gate := make(chan struct{})
+	agent := &dispatchTestAgent{
+		model:  dispatchTestModel(),
+		result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
+		gate:   gate,
+	}
+	c, env := newDispatchToolEnv(t, agent)
+	c.cfg.Config().Options.Dispatch = &config.DispatchOptions{MaxConcurrent: intPtr(2)}
+	tool := c.dispatchTool()
+
+	handleA := decodeDispatchHandle(t, runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "work A", Branch: "main"}, "dispatch-tool-call-A"))
+	handleB := decodeDispatchHandle(t, runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "work B", Branch: "main"}, "dispatch-tool-call-B"))
+
+	// The third concurrent call hits the cap: an error, and nothing
+	// provisioned — no branch, and the worktrees directory still holds
+	// exactly the two running dispatches.
+	resp := runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "work C", Branch: "main"}, "dispatch-tool-call-C")
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "dispatch at capacity: 2 agents are already running (dispatch.max_concurrent=2)")
+	require.Equal(t, 2, dispatchBranchCount(t, env.workingDir))
+	wtDir := mustWorktreesDir(t, c)
+	entries, err := os.ReadDir(wtDir)
+	require.NoError(t, err)
+	var dispatchEntries int
+	for _, entry := range entries {
+		// Count worktree directories, not the per-dispatch .lock and
+		// .owner.json sidecar files beside each one.
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), dispatch.BranchPrefix) {
+			dispatchEntries++
+		}
+	}
+	require.Equal(t, 2, dispatchEntries)
+
+	// Both held dispatches finish, and the freed slot lets the next
+	// call through.
+	close(gate)
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		entryA, ok := ws.Get(handleA.DispatchID)
+		entryB, okB := ws.Get(handleB.DispatchID)
+		return ok && okB && entryA.Status != dispatch.StatusRunning && entryB.Status != dispatch.StatusRunning
+	}, 10*time.Second, 50*time.Millisecond)
+
+	handleD := decodeDispatchHandle(t, runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "work D", Branch: "main"}, "dispatch-tool-call-D"))
+	require.Equal(t, dispatch.StatusRunning, handleD.Status)
+	require.Equal(t, 3, dispatchBranchCount(t, env.workingDir))
+}
+
+// Parallel tool calls within one step never go over the cap (#390): six
+// parallel dispatches with the cap at 3, exactly three succeed and the
+// other three get the at-capacity error.
+func TestDispatchAgentToolParallelCallsNeverOvershootCap(t *testing.T) {
+	gate := make(chan struct{})
+	agent := &dispatchTestAgent{
+		model:  dispatchTestModel(),
+		result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
+		gate:   gate,
+	}
+	c, _ := newDispatchToolEnv(t, agent)
+	c.cfg.Config().Options.Dispatch = &config.DispatchOptions{MaxConcurrent: intPtr(3)}
+	tool := c.dispatchTool()
+
+	var wg sync.WaitGroup
+	responses := make([]fantasy.ToolResponse, 6)
+	errs := make([]error, 6)
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			input, err := json.Marshal(DispatchAgentParams{Prompt: fmt.Sprintf("work %d", i), Branch: "main"})
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			ctx := context.WithValue(context.Background(), tools.SessionIDContextKey, "dispatch-parent-session")
+			ctx = context.WithValue(ctx, tools.MessageIDContextKey, fmt.Sprintf("dispatch-parent-message-%d", i))
+			ctx = context.WithValue(ctx, tools.ContentWidthContextKey, 80)
+			responses[i], errs[i] = tool.Run(ctx, fantasy.ToolCall{
+				ID:    fmt.Sprintf("dispatch-tool-call-%d", i),
+				Name:  DispatchAgentToolName,
+				Input: string(input),
+			})
+		}(i)
+	}
+	wg.Wait()
+	close(gate)
+
+	var handles []dispatch.DispatchResult
+	for i := 0; i < 6; i++ {
+		require.NoError(t, errs[i], "parallel call %d", i)
+		if responses[i].IsError {
+			require.Contains(t, responses[i].Content, "dispatch at capacity: 3 agents are already running (dispatch.max_concurrent=3)")
+			continue
+		}
+		handles = append(handles, decodeDispatchHandle(t, responses[i]))
+	}
+	// Exactly the cap succeeds; the rest are refused, never queued or
+	// silently dropped.
+	require.Len(t, handles, 3)
+
+	// Every admitted run finishes and gives its slot back.
+	ws, err := c.dispatchWorkspace()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		for _, handle := range handles {
+			entry, ok := ws.Get(handle.DispatchID)
+			if !ok || entry.Status == dispatch.StatusRunning {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, 50*time.Millisecond)
+}
+
+// A dispatch that fails setup does not use up a slot (#390): with the
+// cap at 2, a running dispatch plus one that fails on an unknown skill
+// still leaves room for a third call.
+func TestDispatchAgentToolFailedSetupReleasesSlot(t *testing.T) {
+	gate := make(chan struct{})
+	agent := &dispatchTestAgent{
+		model:  dispatchTestModel(),
+		result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
+		gate:   gate,
+	}
+	c, _ := newDispatchToolEnv(t, agent)
+	c.cfg.Config().Options.Dispatch = &config.DispatchOptions{MaxConcurrent: intPtr(2)}
+	tool := c.dispatchTool()
+
+	handleA := decodeDispatchHandle(t, runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "work A", Branch: "main"}, "dispatch-tool-call-A"))
+
+	// The failed setup must not consume a slot: the unknown skill
+	// rejects the call and releases what it reserved.
+	resp := runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "work B", Branch: "main", Skills: []string{"no-such-skill"}}, "dispatch-tool-call-B")
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "unknown skills: no-such-skill")
+
+	// And the slot it held is free: the third call succeeds while the
+	// first dispatch is still running.
+	handleC := decodeDispatchHandle(t, runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "work C", Branch: "main"}, "dispatch-tool-call-C"))
+	require.Equal(t, dispatch.StatusRunning, handleC.Status)
+	require.NotEqual(t, handleA.DispatchID, handleC.DispatchID)
+
+	close(gate)
 }
