@@ -3,7 +3,10 @@ package a2a
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"strings"
+	"time"
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
@@ -47,7 +50,7 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 		return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch prompt is empty")
 	}
 
-	client, err := a2aclient.NewFromCard(ctx, card)
+	client, err := a2aclient.NewFromCard(ctx, card, a2aclient.WithJSONRPCTransport(f.dispatchHTTPClient()))
 	if err != nil {
 		return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: client from card: %w", err)
 	}
@@ -169,6 +172,27 @@ func artifactText(ev *a2aspec.TaskArtifactUpdateEvent) string {
 		}
 	}
 	return b.String()
+}
+
+// dispatchHTTPClient builds the HTTP client dispatch streams dial
+// through: its transport maps every dial onto the factory's unix socket,
+// ignoring the resolved address, so the card's http://crush-a2a endpoint
+// is a routing label rather than a dial target (#346). There is
+// deliberately no proxy (ProxyFromEnvironment would route an http:// URL
+// at an HTTP proxy, breaking the unix dial) and no overall timeout: the
+// SDK's own 3-minute total timeout is dropped, matching the per-phase
+// bounds the dispatch client carries.
+func (f *ServerFactory) dispatchHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialer := &net.Dialer{Timeout: 10 * time.Second}
+				return dialer.DialContext(ctx, "unix", f.socketPath())
+			},
+			ResponseHeaderTimeout: 30 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+		},
+	}
 }
 
 // Compile-time proof the factory also satisfies the transport seam.

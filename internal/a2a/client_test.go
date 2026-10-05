@@ -27,14 +27,17 @@ func (f *fakeTodoSource) SubscribeSessionTodos(ctx context.Context, sessionID st
 }
 
 // The client half of the protocol boundary (#71): StreamDispatch drives a
-// served dispatch over the loopback wire — prompt out, SSE events back —
-// and returns the terminal outcome with the agent's text, the artifact
-// diff, and the observed Working progress count.
+// served dispatch over the unix-socket wire — prompt out, SSE events
+// back — and returns the terminal outcome with the agent's text, the
+// artifact diff, and the observed Working progress count. The same
+// factory instance serves and dials (#346): the socket path lives on it.
 func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
+	factory := NewServerFactory(t.TempDir())
 	runner := &fakeRunner{result: textResult("done, two files changed")}
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    runner,
-		SessionID: "dispatch-session",
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return "--- a/x\n+++ b/x\n@@\n+changed", nil
 		},
@@ -45,9 +48,8 @@ func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
 		Call: agent.SessionAgentCall{NonInteractive: true, MaxOutputTokens: 512},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
-	factory := NewServerFactory()
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
@@ -69,14 +71,16 @@ func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
 // A failed run maps to the failed outcome with the failure text from the
 // terminal status message.
 func TestStreamDispatchFailedRun(t *testing.T) {
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    &fakeRunner{err: errors.New("provider exploded")},
-		SessionID: "dispatch-session",
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     &fakeRunner{err: errors.New("provider exploded")},
+		SessionID:  "dispatch-session",
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
-	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "fix the bug",
@@ -89,14 +93,16 @@ func TestStreamDispatchFailedRun(t *testing.T) {
 // A panic in the dispatched runner must surface as a failed outcome
 // across the wire, not crash the server process (#345).
 func TestStreamDispatchRunnerPanicFails(t *testing.T) {
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    &fakeRunner{panicValue: errors.New("adapter blew up")},
-		SessionID: "dispatch-session",
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     &fakeRunner{panicValue: errors.New("adapter blew up")},
+		SessionID:  "dispatch-session",
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
-	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "fix the bug",
@@ -111,16 +117,18 @@ func TestStreamDispatchRunnerPanicFails(t *testing.T) {
 // stream quickly with the canceled outcome and the kill reason, never at
 // the caller's deadline (#342).
 func TestStreamDispatchOutOfBandCancelEnds(t *testing.T) {
+	factory := NewServerFactory(t.TempDir())
 	runner := &blockingCancelRunner{started: make(chan struct{}), kill: make(chan struct{})}
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    runner,
-		SessionID: "dispatch-session",
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
 		CancelReason: func() string {
 			return "wander kill: hard timeout"
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	go func() {
 		<-runner.started
@@ -130,7 +138,7 @@ func TestStreamDispatchOutOfBandCancelEnds(t *testing.T) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	outcome, err := NewServerFactory().StreamDispatch(ctx, agent.DispatchTransportParams{
+	outcome, err := factory.StreamDispatch(ctx, agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "fix the bug",
@@ -144,7 +152,7 @@ func TestStreamDispatchOutOfBandCancelEnds(t *testing.T) {
 // An unreachable or bogus endpoint is a transport error before any
 // terminal state, never a silent success.
 func TestStreamDispatchTransportErrors(t *testing.T) {
-	factory := NewServerFactory()
+	factory := NewServerFactory(t.TempDir())
 
 	// No card to build a client from.
 	_, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
