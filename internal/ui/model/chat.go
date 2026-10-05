@@ -120,6 +120,13 @@ type Chat struct {
 	// bottom on new messages.
 	follow bool
 
+	// a2uiReadOnly renders every A2UI surface the chat holds in its
+	// read-only state (#407): while an inspected transcript is on screen,
+	// its surfaces must not take focus or keys. Items set or appended
+	// while it is on inherit it, so a live message landing mid-inspect is
+	// non-interactive from the start.
+	a2uiReadOnly bool
+
 	// drawCache memoizes the decoded form of the last list.Render output so
 	// repeat frames with byte-identical content skip the per-cell ANSI
 	// reparse that uv.StyledString.Draw performs every call. See F9
@@ -432,6 +439,7 @@ func (m *Chat) SetMessages(msgs ...chat.MessageItem) tea.Cmd {
 		}
 		items[i] = msg
 	}
+	m.stampA2UIReadOnly(msgs)
 	m.list.SetItems(items...)
 	m.ScrollToBottom()
 	return nil
@@ -451,7 +459,34 @@ func (m *Chat) AppendMessages(msgs ...chat.MessageItem) {
 		}
 		items[i] = msg
 	}
+	m.stampA2UIReadOnly(msgs)
 	m.list.AppendItems(items...)
+}
+
+// stampA2UIReadOnly applies the chat's read-only state to the given items
+// (#407), so items added while the chat is read-only start out
+// non-interactive instead of waiting for a flag sweep.
+func (m *Chat) stampA2UIReadOnly(msgs []chat.MessageItem) {
+	if !m.a2uiReadOnly {
+		return
+	}
+	for _, msg := range msgs {
+		if ro, ok := msg.(interface{ SetA2UIReadOnly(bool) }); ok {
+			ro.SetA2UIReadOnly(true)
+		}
+	}
+}
+
+// SetA2UIReadOnly toggles read-only rendering of every A2UI surface the
+// chat holds (#407): items currently in the list get the flag applied,
+// and items set or appended while it is on inherit it.
+func (m *Chat) SetA2UIReadOnly(readOnly bool) {
+	m.a2uiReadOnly = readOnly
+	for i := range m.list.Len() {
+		if item, ok := m.list.ItemAt(i).(interface{ SetA2UIReadOnly(bool) }); ok {
+			item.SetA2UIReadOnly(readOnly)
+		}
+	}
 }
 
 // UpdateNestedToolIDs updates the ID map for nested tools within a container.

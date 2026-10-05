@@ -782,14 +782,33 @@ func A2UIMessagesDeleteSurface(msgs []a2ui.ServerMessage) bool {
 	return false
 }
 
-// a2uiSurfaceRetired reports whether the surface at part-index i has been
-// retired after a submission (#45). Retired surfaces still render (showing
-// their final state) but no longer receive focus or keys.
+// a2uiSurfaceRetired reports whether the surface at part-index i is
+// inactive for interaction (#45, #407): retired after a submission, or
+// read-only because the message is part of an inspected transcript.
+// Inactive surfaces still render (showing their final state) but no
+// longer receive focus or keys.
 func (a *AssistantMessageItem) a2uiSurfaceRetired(i int) bool {
+	if a.a2uiReadOnly {
+		return true
+	}
 	if i < 0 || i >= len(a.a2uiSurfaceIDs) {
 		return false
 	}
 	return a.a2uiRetired[a.a2uiSurfaceIDs[i]]
+}
+
+// SetA2UIReadOnly toggles read-only rendering of the message's A2UI
+// surfaces (#407): read-only surfaces never receive focus or keys and
+// draw in their retired style, so a form in an inspected transcript
+// cannot act on the session being viewed. Toggling back re-grants focus
+// when the item is selected.
+func (a *AssistantMessageItem) SetA2UIReadOnly(readOnly bool) {
+	a.a2uiReadOnly = readOnly
+	if readOnly {
+		a.blurA2UISurfaces()
+	} else if a.isFocused() {
+		a.focusA2UISurfaces()
+	}
 }
 
 // HasLiveA2UISurface reports whether this assistant message holds a
