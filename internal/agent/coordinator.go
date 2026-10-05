@@ -1016,8 +1016,11 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 
 	// Worktree dispatch (#64) is a coder-level tool. Sub-agents never
 	// get it: dispatching from inside a dispatch would recurse across
-	// the isolation boundary the dispatch toolchain enforces.
-	if !isSubAgent && slices.Contains(agent.AllowedTools, DispatchAgentToolName) {
+	// the isolation boundary the dispatch toolchain enforces. It is also
+	// interactive-only (#387): a non-interactive `crush run` exits when
+	// the parent's turn ends, so a dispatch would die mid-run with its
+	// result undelivered.
+	if !isSubAgent && c.interactive && slices.Contains(agent.AllowedTools, DispatchAgentToolName) {
 		allTools = append(allTools, c.dispatchTool())
 	}
 
@@ -1025,8 +1028,10 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// the injection queue. Main agents only: a dispatched agent steering
 	// a sibling would cross the same isolation boundary the dispatch
 	// toolchain enforces, and worker-to-worker routing is deliberately
-	// deferred (A2A epic #67).
-	if !isSubAgent && slices.Contains(agent.AllowedTools, MessageAgentToolName) {
+	// deferred (A2A epic #67). Interactive-only for the same reason
+	// dispatch is (#387): a non-interactive run ends with the parent's
+	// turn, so there is no live run left to inject into.
+	if !isSubAgent && c.interactive && slices.Contains(agent.AllowedTools, MessageAgentToolName) {
 		allTools = append(allTools, c.messageAgentTool())
 	}
 
