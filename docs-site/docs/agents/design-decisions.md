@@ -75,7 +75,7 @@ timeout and steering cannot diverge. Process isolation
 ([#73](https://github.com/joestump-agent/crush/issues/73)) and third-party
 agents ([#74](https://github.com/joestump-agent/crush/issues/74)) become a
 choice of transport rather than a re-plumb.
-Tracking: [#347](https://github.com/joestump-agent/crush/issues/347), [#343](https://github.com/joestump-agent/crush/issues/343), [#344](https://github.com/joestump-agent/crush/issues/344), [#392](https://github.com/joestump-agent/crush/issues/392).
+Tracking: [#347](https://github.com/joestump-agent/crush/issues/347), [#343](https://github.com/joestump-agent/crush/issues/343), [#392](https://github.com/joestump-agent/crush/issues/392).
 
 ### One host per process, on a unix socket
 

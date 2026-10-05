@@ -183,6 +183,13 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 	})
 	if err != nil {
 		slog.Error("Dispatch A2A stream failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)
+		// The served task runs on a detached context (#344): a stream
+		// error before a terminal state leaves the agent running
+		// unsupervised with its result headed for the trash. Cancel it
+		// now, before the run's teardown closes the toolchain and the
+		// permission bridge, and wait — bounded — for the run to end so
+		// teardown never orphans a live agent.
+		c.cancelOrphanedDispatchRun(ctx, run)
 		outcome = DispatchTransportOutcome{
 			Status: transportStatusFailed,
 			Text:   err.Error(),
@@ -193,6 +200,34 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 	// the workspace (#385).
 	c.killDispatchSessionJobs(ctx, run)
 	return c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcomeFromTransport(outcome)), true
+}
+
+// cancelOrphanedDispatchRun cancels a dispatched agent whose transport
+// stream failed before a terminal state (#344) and waits, bounded at
+// ten seconds by polling IsSessionBusy, for the run to actually end:
+// the served task runs on context.WithoutCancel, so without the
+// explicit Cancel the agent keeps burning tokens after the stream is
+// gone and nothing would ever reap it.
+func (c *coordinator) cancelOrphanedDispatchRun(ctx context.Context, run dispatchRun) {
+	if run.agent == nil {
+		return
+	}
+	run.agent.Cancel(run.sessionID)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if !run.agent.IsSessionBusy(run.sessionID) {
+			return
+		}
+		if time.Now().After(deadline) {
+			slog.Warn("Dispatched agent still busy after stream-error cancel", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // SetDispatchServerStarter wires the A2A server factory (#70). Call once

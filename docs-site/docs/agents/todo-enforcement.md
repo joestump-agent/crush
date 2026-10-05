@@ -191,9 +191,6 @@ timeout, then shows **failed** with a stream error. It has no `killed_reason`
 and no salvaged diff, and a `tool loop` stop is reported as *completed*. Tracked
 in [#342](https://github.com/joestump-agent/crush/issues/342) and [#343](https://github.com/joestump-agent/crush/issues/343).
 
-Separately, every dispatch still running after 3 minutes is reported as
-failed ([#344](https://github.com/joestump-agent/crush/issues/344)), and the watchdogs stop at that point. In practice, a
-`hard_timeout` above `180` has no effect today.
 :::
 
 ## Examples

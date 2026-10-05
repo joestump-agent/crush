@@ -3,6 +3,7 @@ package a2a
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -231,4 +232,47 @@ func TestStreamDispatchDiffErrorStillCompletes(t *testing.T) {
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
 	require.Equal(t, "not a git repo", outcome.DiffError)
 	require.Empty(t, outcome.Diff)
+}
+
+// The production dispatch client carries no total Timeout (#344): the
+// SDK's default three-minute http.Client.Timeout bounds the whole
+// exchange including the SSE body, killing every served dispatch that
+// runs longer. The per-phase bounds stay, so a dead server still fails
+// fast.
+func TestDispatchClientHasNoTotalTimeout(t *testing.T) {
+	client := dispatchHTTPClient()
+	require.Zero(t, client.Timeout, "a total Timeout would re-create the three-minute kill")
+
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.Greater(t, transport.ResponseHeaderTimeout, time.Duration(0))
+	require.Greater(t, transport.TLSHandshakeTimeout, time.Duration(0))
+}
+
+// A served run outlives a short injected client deadline (#344): the
+// response headers arrive inside the deadline, the SSE body streams
+// past it, and the terminal outcome still lands.
+func TestStreamDispatchOutlivesShortClientDeadline(t *testing.T) {
+	runner := &fakeRunner{result: textResult("eventually done"), delay: time.Second}
+	server, err := StartServer(t.Context(), ServerParams{
+		Runner:    runner,
+		SessionID: "dispatch-session",
+		Todos:     &fakeTodoSource{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+
+	factory := NewServerFactory(WithHTTPClient(&http.Client{
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: 200 * time.Millisecond,
+		},
+	}))
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "fix the bug",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Equal(t, "eventually done", outcome.Text)
 }

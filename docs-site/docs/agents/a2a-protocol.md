@@ -230,10 +230,7 @@ arrived. `Working` events are counted, not re-published: the agent block
 renders from the in-process todo collector.
 
 :::warning[Known issue]
-The client uses the SDK's default HTTP client, whose 3-minute total
-timeout also bounds the SSE body. Every dispatch longer than 3 minutes
-ends as a stream error while the agent keeps running ([#344](https://github.com/joestump-agent/crush/issues/344)). A
-panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/crush/issues/345)).
+A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/crush/issues/345)).
 :::
 
 ## Not implemented

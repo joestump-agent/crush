@@ -99,14 +99,6 @@ Dispatched agents must keep a todo list. By default, one that ignores two
 nudges about it is killed. See [Todo enforcement](/agents/todo-enforcement).
 
 :::warning[Known issue]
-**Dispatches longer than 3 minutes are reported as failed**, with an
-`a2a: dispatch stream` error, because the A2A client inherits a 3-minute HTTP
-timeout. The agent may keep working in its worktree, but its result never
-arrives ([#344](https://github.com/joestump-agent/crush/issues/344)). Keep tasks small, and check the transcript and worktree of
-any dispatch that fails at that mark.
-:::
-
-:::warning[Known issue]
 The `killed` state doesn't appear today. A kill for nudges, stalled todos, or a
 hard timeout hangs the dispatch until the 3-minute limit reports it as failed;
 a tool loop reports as completed ([#342](https://github.com/joestump-agent/crush/issues/342), [#343](https://github.com/joestump-agent/crush/issues/343)).

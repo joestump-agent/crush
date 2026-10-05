@@ -60,33 +60,16 @@ uncommitted changes. Commit before you dispatch.
 
 ## Running agents
 
-### A dispatched agent shows failed after about 3 minutes
-
-The block flips to **failed** about three minutes after the dispatch started.
-The error starts with `a2a: dispatch stream:` and mentions `context deadline
-exceeded` or `Client.Timeout`.
-
-**Cause.** The A2A client that drives every dispatch uses the SDK's default
-3-minute timeout for the whole request ([#344](https://github.com/joestump-agent/crush/issues/344)). The agent is **not** stopped.
-It keeps running in its worktree with nobody supervising it: its permission
-requests are never shown, the watchdogs have stopped, and its result is
-thrown away.
-
-**Fix.** There is no setting for this. Keep dispatched tasks small enough to
-finish in under three minutes. When a dispatch fails this way, its result still
-names the `branch` and `workspace_path`. Wait for the agent to go quiet, then
-[review the worktree by hand](#recover-a-dispatch-by-hand) instead of letting
-the main agent dispatch the same task again.
-
 ### A dispatched agent stays at running and never progresses
 
 | Cause | How to tell | Fix |
 | --- | --- | --- |
 | It is waiting on a permission request that will never be shown ([#371](https://github.com/joestump-agent/crush/issues/371)) | You did not start Crush with `--yolo`, and the main agent's turn has already ended | Start Crush with `--yolo`, or auto-approve the tools it needs in a config the worktree reads. See [Permissions and yolo](/agents/configuration#permissions-and-yolo) |
-| It was killed, but the kill never reached the transport ([#342](https://github.com/joestump-agent/crush/issues/342)) | The log has `Todo enforcement killed the run` or `Dispatch run killed by watchdog` | Nothing to do: it shows **failed** at the 3-minute mark |
+| It was killed, but the kill never reached the transport ([#342](https://github.com/joestump-agent/crush/issues/342)) | The log has `Todo enforcement killed the run` or `Dispatch run killed by watchdog` | Nothing to do: the block flips to **failed** with the kill reason once the kill lands |
 | It is actually working | Focus the block and press <kbd>ctrl+]</kbd> to watch its transcript | Wait, or steer it with `@handle …` |
 
-In every case the block resolves to **failed** at the 3-minute mark ([#344](https://github.com/joestump-agent/crush/issues/344)).
+A killed or canceled run resolves to **failed** with its reason; there is no
+fixed deadline that ends a running dispatch.
 
 ### I can't stop a single dispatched agent
 

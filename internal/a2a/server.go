@@ -188,10 +188,34 @@ func (s *Server) Stop(ctx context.Context) error {
 // (#70) on the coordinator's behalf. It implements the agent package's
 // [agent.DispatchServerStarter] seam, which is how the dependency stays
 // one-way: a2a imports agent, never the reverse.
-type ServerFactory struct{}
+type ServerFactory struct {
+	// httpClient, when set, replaces the production dispatch HTTP
+	// client in StreamDispatch — the test injection seam (#344), used
+	// to bound phases of the wire protocol independently of the SDK's
+	// defaults.
+	httpClient *http.Client
+}
+
+// ServerFactoryOption customizes the server factory built by
+// NewServerFactory.
+type ServerFactoryOption func(*ServerFactory)
+
+// WithHTTPClient injects the HTTP client StreamDispatch dials with
+// (#344). Production leaves it unset and uses the no-total-timeout
+// dispatch client; tests use it to shorten a phase and prove the run
+// outlives the transport's own deadline.
+func WithHTTPClient(client *http.Client) ServerFactoryOption {
+	return func(f *ServerFactory) { f.httpClient = client }
+}
 
 // NewServerFactory returns the production server factory.
-func NewServerFactory() *ServerFactory { return &ServerFactory{} }
+func NewServerFactory(opts ...ServerFactoryOption) *ServerFactory {
+	f := &ServerFactory{}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
+}
 
 // StartDispatchServer implements [agent.DispatchServerStarter]: it
 // starts the loopback server and returns its endpoint, the AgentCard to

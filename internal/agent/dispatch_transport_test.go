@@ -222,6 +222,37 @@ func TestDispatchTransportStreamErrorFails(t *testing.T) {
 	require.False(t, agent.ranOnce())
 }
 
+// A stream error before a terminal state cancels the dispatched agent
+// before the run tears down (#344): the served task runs on a detached
+// context, so without the explicit Cancel the agent would keep running
+// unsupervised — watchdog stopped, permission bridge closed — while the
+// registry records failed with the transport error.
+func TestDispatchTransportStreamErrorCancelsRun(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, _ := newInjectionEnv(t, agent)
+	transport := newGatedServingTransport(DispatchTransportOutcome{})
+	transport.err = errors.New("SSE stream error: context deadline exceeded")
+	c.SetDispatchServerStarter(transport)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
+	transport.waitStreamed(t)
+	close(transport.gate)
+
+	ws, _ := c.dispatchWorkspace()
+	require.Eventually(t, func() bool {
+		entries := ws.List()
+		return len(entries) > 0 && entries[0].Status == dispatch.StatusFailed
+	}, 10*time.Second, 50*time.Millisecond)
+	entries := ws.List()
+	require.Contains(t, entries[0].Result.Error, "SSE stream error")
+	// The orphaned run was canceled with the dispatch's session id —
+	// before the failed outcome was recorded.
+	require.Equal(t, []string{handle.SessionID}, agent.cancels())
+	// The cancel did not double-run the prompt directly.
+	require.False(t, agent.ranOnce())
+}
+
 // A starter that is not a transport keeps the direct in-process path:
 // the server exists (endpoint stamped) but the coordinator drives the
 // agent itself, as before #71.
