@@ -188,6 +188,10 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 			Text:   err.Error(),
 		}
 	}
+	// Kill the run's background jobs before terminal assembly, so the
+	// in-process salvage-diff fallback cannot race a job still writing
+	// the workspace (#385).
+	c.killDispatchSessionJobs(ctx, run)
 	return c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcomeFromTransport(outcome)), true
 }
 

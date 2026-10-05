@@ -297,8 +297,10 @@ func NewBashTool(permissions permission.Service, workingDir, spillDir string, at
 				startTime := time.Now()
 				bgManager := shell.GetBackgroundShellManager()
 				bgManager.Cleanup()
-				// Use background context so it continues after tool returns
-				bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(allowedCommands, allowAllCommands), params.Command, params.Description)
+				// Use background context so it continues after tool returns;
+				// tag the job with the calling session so the session's
+				// teardown kills it (#385).
+				bgShell, err := bgManager.Start(context.Background(), sessionID, execWorkingDir, blockFuncs(allowedCommands, allowAllCommands), params.Command, params.Description)
 				if err != nil {
 					return fantasy.ToolResponse{}, fmt.Errorf("error starting background shell: %w", err)
 				}
@@ -350,10 +352,12 @@ func NewBashTool(permissions permission.Service, workingDir, spillDir string, at
 			// Start synchronous execution with auto-background support
 			startTime := time.Now()
 
-			// Start with detached context so it can survive if moved to background
+			// Start with detached context so it can survive if moved to
+			// background; tag the job with the calling session so the
+			// session's teardown kills it (#385).
 			bgManager := shell.GetBackgroundShellManager()
 			bgManager.Cleanup()
-			bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(allowedCommands, allowAllCommands), params.Command, params.Description)
+			bgShell, err := bgManager.Start(context.Background(), sessionID, execWorkingDir, blockFuncs(allowedCommands, allowAllCommands), params.Command, params.Description)
 			if err != nil {
 				return fantasy.ToolResponse{}, fmt.Errorf("error starting shell: %w", err)
 			}

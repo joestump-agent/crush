@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -256,7 +257,7 @@ func TestDispatchFromTransportOutcome(t *testing.T) {
 	t.Parallel()
 
 	repo := newTestRepoForTransport(t)
-	ws, err := dispatch.NewWorkspace(repo)
+	ws, err := dispatch.NewWorkspace(repo, filepath.Join(repo, "worktrees"))
 	require.NoError(t, err)
 	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
 	require.NoError(t, err)

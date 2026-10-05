@@ -84,6 +84,9 @@ type Service interface {
 	Save(ctx context.Context, session Session) (Session, error)
 	SetChannel(ctx context.Context, sessionID, channel string) (Session, error)
 	UpdateTitleAndUsage(ctx context.Context, sessionID, title string, promptTokens, completionTokens int64, cost float64) error
+	// AddCost atomically adds delta to the session's cost without writing
+	// any other column, so concurrent full-row saves cannot clobber it.
+	AddCost(ctx context.Context, sessionID string, delta float64) error
 	Rename(ctx context.Context, id string, title string) error
 	Delete(ctx context.Context, id string) error
 
@@ -262,6 +265,20 @@ func (s *service) UpdateTitleAndUsage(ctx context.Context, sessionID, title stri
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 		Cost:             cost,
+	}); err != nil {
+		return err
+	}
+	s.publishSessionUpdate(ctx, sessionID)
+	return nil
+}
+
+// AddCost atomically adds delta to the session's cost. Only the cost column
+// is written, so a parent's own full-row saves during its turn cannot
+// clobber the increment.
+func (s *service) AddCost(ctx context.Context, sessionID string, delta float64) error {
+	if err := s.q.AddSessionCost(ctx, db.AddSessionCostParams{
+		Cost: delta,
+		ID:   sessionID,
 	}); err != nil {
 		return err
 	}

@@ -11,6 +11,7 @@ import (
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/permission"
 )
@@ -82,8 +83,9 @@ func (t *DispatchToolchain) Permissions() permission.Service {
 	return t.permissions
 }
 
-// Tools returns the constructed tool set, filtered by the task agent's
-// allowed tools minus the parent's deny list.
+// Tools returns the constructed tool set, filtered to the task agent's
+// allowed tools, widened with the dispatch write and support tools and
+// narrowed by the parent's deny list.
 func (t *DispatchToolchain) Tools() []fantasy.AgentTool {
 	return t.tools
 }
@@ -207,15 +209,30 @@ var dispatchWriteTools = slices.Concat(dispatchCapabilityTools, []string{tools.T
 
 // dispatchAllowedTools is the allow-list a dispatched agent's tools are
 // filtered against: the task agent's allowed tools widened with
-// dispatchWriteTools (#64), minus everything in disabled (#376).
+// dispatchWriteTools (#64) and dispatchSupportTools (#384), minus
+// everything in disabled (#376).
 // disabled is the parent's options.disabled_tools (the list
 // permissions deny writes), never the dispatched workspace's own config,
 // which must not widen what the user denied at the top (#374).
 func dispatchAllowedTools(agentCfg config.Agent, disabled []string) []string {
-	allowed := slices.Concat(agentCfg.AllowedTools, dispatchWriteTools)
+	allowed := slices.Concat(agentCfg.AllowedTools, dispatchWriteTools, dispatchSupportTools)
 	return slices.DeleteFunc(allowed, func(name string) bool {
 		return slices.Contains(disabled, name)
 	})
+}
+
+// dispatchSupportTools are the observation tools a dispatched agent gets
+// on top of the task agent's AllowedTools (#384). bash auto-backgrounds
+// any command past DefaultAutoBackgroundAfter and tells the agent to read
+// the result back with job_output (or stop it with job_kill), and
+// lsp_diagnostics is how the agent checks what the LSP thinks of an edit
+// (constructed only while the LSP tools are registered). None of them
+// writes, but without them a dispatch loses the output of any command it
+// starts: the buffer lives only in this process.
+var dispatchSupportTools = []string{
+	tools.JobOutputToolName,
+	tools.JobKillToolName,
+	tools.DiagnosticsToolName,
 }
 
 // buildDispatchTools constructs the dispatched agent's tools against the
@@ -280,10 +297,10 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 		)
 	}
 
-	// The task agent's set widened with the dispatch write tools, minus
-	// the parent's deny list (#376): a dispatched agent must be able to
-	// edit, not just read (#64), but a tool the user denied stays
-	// denied.
+	// The task agent's set widened with the dispatch write tools and
+	// support tools, minus the parent's deny list (#376): a dispatched
+	// agent must be able to edit, not just read (#64), and observe what
+	// it ran and wrote (#384), but a tool the user denied stays denied.
 	allowed := dispatchAllowedTools(agentCfg, c.cfg.Config().Options.DisabledTools)
 
 	var filtered []fantasy.AgentTool
@@ -292,7 +309,20 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 			filtered = append(filtered, tool)
 		}
 	}
-	return filtered
+
+	// Dispatched agents fire the parent's PreToolUse hooks (#377): they
+	// carry bash, edit, multiedit, and write, so a hook that blocks a
+	// command must reach them too. Hooks come from the parent store —
+	// never the workspace's scoped config — and run with the parent's
+	// working directory as both cwd and projectDir, so hook commands
+	// resolve to the parent's trusted scripts, never a copy checked out
+	// at a model-chosen base. The payload carries the dispatched
+	// session's ID, which is what the hook sees.
+	var hookRunner *hooks.Runner
+	if preToolHooks := c.cfg.Config().Hooks[hooks.EventPreToolUse]; len(preToolHooks) > 0 {
+		hookRunner = hooks.NewRunner(preToolHooks, c.cfg.WorkingDir(), c.cfg.WorkingDir())
+	}
+	return wrapToolsWithHooks(filtered, hookRunner, false)
 }
 
 // bridgePermissions forwards permission requests raised inside a dispatch

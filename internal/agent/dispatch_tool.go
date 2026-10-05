@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/shell"
 )
 
 //go:embed templates/dispatch_tool.md
@@ -148,6 +149,12 @@ type dispatchRun struct {
 	// enforcement ladder's hook and the watchdog; empty when the run is
 	// never killed.
 	kill *dispatchKill
+	// cancel ends the dispatch's root context (#371). The watchdog's
+	// kill fires it so a kill landing before the dispatched agent's Run
+	// registered the session still ends the run: agent.Cancel alone is
+	// a no-op for an unregistered session (#430). Nil where a run is
+	// driven without a root (tests that assemble or observe only).
+	cancel context.CancelFunc
 	// killSettings are the resolved wander-kill thresholds for this
 	// dispatch: nudges-before-kill, todos stall window, hard timeout.
 	killSettings config.TodoEnforcementSettings
@@ -354,6 +361,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				contentWidth:    tools.GetContentWidthFromContext(ctx),
 				kill:            kill,
 				killSettings:    killSettings,
+				cancel:          rootCancel,
 			}
 
 			// Stand up the dispatch's in-process A2A server (#70) and stamp
@@ -471,6 +479,10 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 // deterministically when a kill threshold trips.
 func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	defer func() {
+		// Backstop for the kill after the run returns (#385): a run that
+		// ends before its terminal result is assembled still must not
+		// leave its background jobs running in the workspace.
+		c.killDispatchSessionJobs(ctx, run)
 		// The A2A server dies with the run (#70): teardown clears the
 		// registry's endpoint and card too, so discovery never hands out
 		// a dead endpoint. It stops before the toolchain closes, which
@@ -528,6 +540,11 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		} else if result == nil {
 			slog.Error("Dispatched agent ran no turn", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
 		}
+
+		// Kill the run's background jobs before terminal assembly, so the
+		// salvage diff cannot race a job still writing the workspace
+		// (#385).
+		c.killDispatchSessionJobs(ctx, run)
 
 		terminal = c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcome{
 			completed:     err == nil && result != nil,
@@ -623,6 +640,18 @@ func (c *coordinator) assembleTerminalDispatchResult(ctx context.Context, run di
 	return c.assembleDispatchResult(ctx, run, natural)
 }
 
+// killDispatchSessionJobs kills the run's background jobs — the ones its
+// bash calls tagged with the dispatch session's ID — and logs how many
+// it killed at Debug when non-zero. The main agent's jobs carry the main
+// session's ID, as do other dispatches', so only this run's jobs are
+// touched (#385).
+func (c *coordinator) killDispatchSessionJobs(ctx context.Context, run dispatchRun) {
+	killed := shell.GetBackgroundShellManager().KillSession(ctx, run.sessionID)
+	if killed > 0 {
+		slog.Debug("Killed dispatch background jobs", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "killed", killed)
+	}
+}
+
 // dispatchRunStoppedInLoop reports whether a finished run ended on the
 // loop-detection stop condition (#316's tool-loop kill reason): the same
 // signature check the StopWhen in Run uses, applied to the result's
@@ -651,6 +680,15 @@ func (c *coordinator) startDispatchKillWatch(ctx context.Context, run dispatchRu
 	killFromWatch := func(reason string) {
 		run.kill.kill(reason)
 		slog.Warn("Dispatch run killed by watchdog", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "reason", reason)
+		// Cancel the dispatch's root first (#430): a kill landing before
+		// the dispatched agent's Run registered the session leaves
+		// agent.Cancel a no-op, and the run's context is detached from
+		// every parent cancel, so without this the agent keeps running
+		// with no bound. The registered-session cancel below still runs
+		// for the post-registration case and is a no-op otherwise.
+		if run.cancel != nil {
+			run.cancel()
+		}
 		run.agent.Cancel(run.sessionID)
 	}
 
@@ -885,7 +923,16 @@ func (c *coordinator) dispatchWorkspace() (*dispatch.Workspace, error) {
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
 	if c.dispatchWS == nil && c.dispatchWSErr == nil {
-		c.dispatchWS, c.dispatchWSErr = dispatch.NewWorkspace(c.cfg.WorkingDir())
+		// Worktrees live under the data directory, never beside the
+		// working directory: a launch from a repo subdirectory must not
+		// create a new <cwd>/.crush that git picks up and that later
+		// launches treat as their data directory (#383).
+		worktreesDir, err := dispatch.WorktreesDir(c.cfg.Config().Options.DataDirectory, c.cfg.WorkingDir())
+		if err != nil {
+			c.dispatchWSErr = err
+		} else {
+			c.dispatchWS, c.dispatchWSErr = dispatch.NewWorkspace(c.cfg.WorkingDir(), worktreesDir)
+		}
 		if c.dispatchWS != nil {
 			c.dispatchCollector = dispatch.NewTodoCollector(c.dispatchWS, c.sessions, c.dispatchSinks...)
 			ctx := c.dispatchCtx
