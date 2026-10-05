@@ -172,6 +172,19 @@ type Coordinator interface {
 	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error
 }
 
+// liveDispatch is the coordinator's record of one running dispatch
+// (#371): the cancel for the dispatch's root context, the task session
+// and agent behind the run, the wander-kill state, and a done channel
+// closed when the run's teardown drops the record. #372 (cancel at
+// shutdown) and #373 (user-initiated cancel) build on it.
+type liveDispatch struct {
+	cancel    context.CancelFunc
+	sessionID string
+	agent     SessionAgent
+	kill      *dispatchKill
+	done      chan struct{}
+}
+
 type coordinator struct {
 	cfg         *config.ConfigStore
 	sessions    session.Service
@@ -215,6 +228,12 @@ type coordinator struct {
 	// as the background run, so handle lifetime is run lifetime and a
 	// finished dispatch refuses messages instead of running another turn.
 	dispatchRuns map[string]*runningDispatch
+	// liveDispatches maps each running dispatch's ID to its live record
+	// (#371): the per-dispatch root cancel, the task session and agent
+	// behind the run, the wander-kill, and a done channel closed at
+	// teardown. Guarded by dispatchMu; #372 (cancel at shutdown) and
+	// #373 (user-initiated cancel) build on it.
+	liveDispatches map[string]*liveDispatch
 	// dispatchCtx is the NewCoordinator context the collector's
 	// subscriptions run on; nil-safe (tests construct the coordinator
 	// struct directly) — dispatchWorkspace falls back to

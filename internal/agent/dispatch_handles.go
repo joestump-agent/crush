@@ -12,9 +12,13 @@ import (
 // handle, one-line role, status, current todo. Finished handles never
 // appear, so nothing the popup offers can be addressed into a
 // continuation. Only dispatches created from sessionID appear (#399):
-// one session's agents are invisible to another's surfaces.
+// one session's agents are invisible to another's surfaces. Reading
+// never provisions the workspace: before the first dispatch there is
+// no registry and nothing is live (#370).
 func (c *coordinator) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
-	collector := c.activeDispatchCollector()
+	c.dispatchMu.Lock()
+	collector := c.dispatchCollector
+	c.dispatchMu.Unlock()
 	if collector == nil {
 		return nil
 	}
@@ -25,9 +29,13 @@ func (c *coordinator) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 // finished dispatches resolve too — the caller decides what a finished
 // handle means (a read-only card for a mention, a routing refusal for a
 // direct address). A handle dispatched from another session does not
-// resolve (#399): ok=false, exactly like an unknown handle.
+// resolve (#399): ok=false, exactly like an unknown handle. Reading
+// never provisions the workspace: before the first dispatch every
+// handle is unknown (#370).
 func (c *coordinator) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
-	collector := c.activeDispatchCollector()
+	c.dispatchMu.Lock()
+	collector := c.dispatchCollector
+	c.dispatchMu.Unlock()
 	if collector == nil {
 		return dispatch.TodoSnapshot{}, false
 	}
@@ -57,21 +65,6 @@ func inScope(entry dispatch.Entry, sessionID string) bool {
 	return sessionID != "" && entry.ParentSessionID == sessionID
 }
 
-// activeDispatchCollector returns the todo collector, creating the
-// dispatch workspace (and with it the collector) on first use so the
-// handle surfaces work even before the first dispatch tool call. A
-// working directory with no git repository has no dispatches: the
-// creation error is cached by dispatchWorkspace and the collector stays
-// nil, so the live/handle surfaces report empty rather than failing.
-func (c *coordinator) activeDispatchCollector() *dispatch.TodoCollector {
-	if _, err := c.dispatchWorkspace(); err != nil {
-		return nil
-	}
-	c.dispatchMu.Lock()
-	defer c.dispatchMu.Unlock()
-	return c.dispatchCollector
-}
-
 // DeliverAgentMessageByHandle delivers a message to the dispatched agent
 // carrying handle (#313): the editor's leading @handle routing front
 // door over the #312 injection seam. A finished handle refuses cleanly —
@@ -79,16 +72,22 @@ func (c *coordinator) activeDispatchCollector() *dispatch.TodoCollector {
 // contract. A handle dispatched from another session refuses exactly
 // like an unknown one (#399); the caller's sessionID scopes the
 // delivery, so session B cannot address — or even learn about — session
-// A's agent.
+// A's agent. Delivery never provisions the workspace: before the first
+// dispatch every handle is unknown (#370).
 func (c *coordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
-	workspace, err := c.dispatchWorkspace()
-	if err != nil {
-		return err
-	}
 	// Tolerate the addressed form ("@Tester") as well as the bare slug:
 	// both the editor and the tool may pass either.
 	handle = dispatch.HandleSlug(handle)
-	entry, ok := workspace.ByHandle(handle)
+	c.dispatchMu.Lock()
+	workspace := c.dispatchWS
+	c.dispatchMu.Unlock()
+	var (
+		entry dispatch.Entry
+		ok    bool
+	)
+	if workspace != nil {
+		entry, ok = workspace.ByHandle(handle)
+	}
 	if !ok {
 		return fmt.Errorf("no agent with handle @%s is known; dispatch one first", handle)
 	}

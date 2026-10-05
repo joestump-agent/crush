@@ -363,6 +363,9 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 
 	ws.SetSession(entry.ID, task.ID)
 	ws.SetStatus(entry.ID, dispatch.StatusRunning)
+	if _, ok := ws.AssignHandle(entry.ID, "tester", "dispatch tester"); !ok {
+		t.Fatal("assign dispatch handle")
+	}
 
 	f.main = &fakeMainAgent{model: dispatchTestModel()}
 	c.mainAgent = f.main
@@ -377,10 +380,15 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 // dispatchAgentBuilder. extra feeds extra tools.
 func (f *wanderKillFixture) buildDispatched(t *testing.T, model fantasy.LanguageModel, settings config.TodoEnforcementSettings, extra []fantasy.AgentTool) {
 	t.Helper()
-	opts := []todoAgentOpt{withTodoKill(func(sessionID, reason string) {
-		f.killHookInvoked = true
-		f.kill.kill(reason)
-	})}
+	opts := []todoAgentOpt{
+		withTodoKill(func(sessionID, reason string) {
+			f.killHookInvoked = true
+			f.kill.kill(reason)
+		}),
+		withLoopStop(func(sessionID string) {
+			f.kill.kill(dispatch.ReasonToolLoop)
+		}),
+	}
 	dispatched := newTodoTestAgentOpts(t, f.env, model, settings, opts, extra...)
 	f.dispatched = dispatched
 	f.c.dispatchAgentBuilder = func(ctx context.Context, opts dispatchAgentOptions) (*dispatchedAgent, error) {
@@ -392,10 +400,10 @@ func (f *wanderKillFixture) buildDispatched(t *testing.T, model fantasy.Language
 	}
 }
 
-// runDispatchSync drives the fixture's dispatch to completion.
-func (f *wanderKillFixture) runDispatchSync(t *testing.T) {
-	t.Helper()
-	f.c.runDispatch(context.WithoutCancel(t.Context()), dispatchRun{
+// buildRun assembles the dispatchRun the fixture drives, so the
+// transport wiring can build the same served call the run carries.
+func (f *wanderKillFixture) buildRun() dispatchRun {
+	return dispatchRun{
 		workspace:       f.ws,
 		entry:           f.entry,
 		agent:           f.dispatched,
@@ -405,7 +413,33 @@ func (f *wanderKillFixture) runDispatchSync(t *testing.T) {
 		parentSessionID: f.parentSess.ID,
 		kill:            f.kill,
 		killSettings:    f.killSettings,
+	}
+}
+
+// runDispatchSync drives the fixture's dispatch to completion.
+func (f *wanderKillFixture) runDispatchSync(t *testing.T) {
+	t.Helper()
+	f.c.runDispatch(context.WithoutCancel(t.Context()), f.buildRun())
+}
+
+// wireTransport serves the fixture's dispatch through rt: the real
+// startDispatchServer path records the runner and call on the transport
+// and stamps the endpoint and card on the registry entry, so the run
+// takes the served transport path instead of the direct one.
+func (f *wanderKillFixture) wireTransport(t *testing.T, rt *runnerTransport) {
+	t.Helper()
+	run := f.buildRun()
+	f.c.SetDispatchServerStarter(rt)
+	stop := f.c.startDispatchServer(context.Background(), f.ws, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current)
+	t.Cleanup(func() {
+		if stop != nil {
+			stop()
+		}
+		f.c.stopDispatchServer(f.ws, f.entry.ID, nil)
 	})
+	entry, ok := f.ws.Get(f.entry.ID)
+	require.True(t, ok)
+	require.NotEmpty(t, entry.Endpoint, "the dispatch must be served for the transport to drive it")
 }
 
 // requireKilled asserts the registry-level kill record and the preserved
@@ -418,6 +452,7 @@ func (f *wanderKillFixture) requireKilled(t *testing.T, reason string) dispatch.
 	require.NotNil(t, entry.Result)
 	assert.Equal(t, reason, entry.Result.KilledReason)
 	assert.Equal(t, dispatch.StatusKilled, entry.Result.Status)
+	assert.Equal(t, "tester", entry.Result.Handle, "the killed payload carries the handle the parent re-dispatches against")
 	assert.False(t, entry.FinishedAt.IsZero())
 	require.DirExists(t, entry.Path, "a kill never auto-discards work-in-progress")
 	return entry
@@ -576,14 +611,21 @@ func TestWanderKill_CompletionWinsOverLateKill(t *testing.T) {
 	f := newWanderKillFixture(t, model, config.TodoEnforcementSettings{})
 	f.kill.kill(dispatch.ReasonHardTimeout)
 
-	terminal := f.c.assembleTerminalDispatchResult(t.Context(), dispatchRun{
+	run := dispatchRun{
 		workspace:    f.ws,
 		entry:        f.entry,
 		model:        Model{Model: f.runModel, CatwalkCfg: catwalkModelCfg()},
 		sessionID:    f.taskSess.ID,
 		kill:         f.kill,
 		killSettings: config.TodoEnforcementSettings{},
-	}, &fantasy.AgentResult{Steps: []fantasy.StepResult{{Response: fantasy.Response{FinishReason: fantasy.FinishReasonStop}}}}, nil)
+	}
+	terminal := f.c.assembleTerminalDispatchResult(t.Context(), run, dispatchNaturalOutcome{
+		completed: true,
+		findings:  "all done",
+		diff: func(ctx context.Context) (string, error) {
+			return run.workspace.Diff(ctx, run.entry.ID)
+		},
+	})
 
 	assert.Equal(t, dispatch.StatusCompleted, terminal.Status)
 	assert.Empty(t, terminal.KilledReason)

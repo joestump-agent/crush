@@ -3,6 +3,7 @@ package agent
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -106,49 +107,45 @@ type DispatchTransportOutcome struct {
 }
 
 // Transport status tokens (#71), spelled identically to the a2a
-// package's — the mapping in dispatchFromTransportOutcome keys on them.
+// package's — the mapping in dispatchNaturalOutcomeFromTransport keys on them.
 const (
 	transportStatusCompleted = "completed"
 	transportStatusFailed    = "failed"
 	transportStatusCanceled  = "canceled"
 )
 
-// dispatchFromTransportOutcome maps an A2A transport outcome onto the
-// terminal DispatchResult (#71), mirroring the direct path's semantics:
-// completed keeps its findings and diff, failed and canceled record the
-// transport's text as the error. A canceled dispatch stays failed —
-// parity with the direct path, where a canceled run records failed;
-// StatusKilled is reserved for wander kill (#316).
-func dispatchFromTransportOutcome(run dispatchRun, outcome DispatchTransportOutcome) dispatch.DispatchResult {
-	terminal := dispatch.DispatchResult{
-		DispatchID:    run.entry.ID,
-		Branch:        run.entry.Branch,
-		WorkspacePath: run.entry.Path,
-		SessionID:     run.sessionID,
+// dispatchNaturalOutcomeFromTransport maps an A2A transport outcome onto
+// the path-neutral natural outcome (#343), mirroring the direct path's
+// semantics: completed carries its findings and diff, failed and
+// canceled become a run error carrying the transport's text — parity
+// with the direct path, where a canceled run records failed; StatusKilled
+// is reserved for wander kill (#316). A loop stop arrives as the kill
+// state's tool-loop reason, recorded in-process by the served agent's
+// observer. A completed outcome with no diff on the wire falls back to
+// an in-process capture so a capture error surfaces as "(diff
+// unavailable: ...)" instead of "(no changes)" (#361 puts the error on
+// the wire and deletes this).
+func dispatchNaturalOutcomeFromTransport(run dispatchRun, outcome DispatchTransportOutcome) dispatchNaturalOutcome {
+	natural := dispatchNaturalOutcome{
+		diff: func(ctx context.Context) (string, error) {
+			return run.workspace.Diff(ctx, run.entry.ID)
+		},
 	}
-	// The handle was assigned after the dispatchRun's entry snapshot was
-	// taken, so read it back from the registry — same as the direct path.
-	if entry, ok := run.workspace.Get(run.entry.ID); ok {
-		terminal.Handle = entry.Handle
+	if outcome.Diff != "" {
+		natural.diff = func(context.Context) (string, error) {
+			return outcome.Diff, nil
+		}
 	}
 	switch outcome.Status {
 	case transportStatusCompleted:
-		terminal.Status = dispatch.StatusCompleted
-		terminal.KeyFindings = outcome.Text
-		switch outcome.Diff {
-		case "":
-			terminal.DiffSummary = "(no changes)"
-		default:
-			terminal.DiffSummary = dispatch.SummarizeDiff(outcome.Diff)
-		}
+		natural.completed = true
+		natural.findings = outcome.Text
 	case transportStatusCanceled:
-		terminal.Status = dispatch.StatusFailed
-		terminal.Error = fmt.Sprintf("dispatch canceled: %s", cmp.Or(outcome.Text, "no reason given"))
+		natural.runErr = fmt.Errorf("dispatch canceled: %s", cmp.Or(outcome.Text, "no reason given"))
 	default:
-		terminal.Status = dispatch.StatusFailed
-		terminal.Error = cmp.Or(outcome.Text, "dispatch failed without a reason")
+		natural.runErr = errors.New(cmp.Or(outcome.Text, "dispatch failed without a reason"))
 	}
-	return terminal
+	return natural
 }
 
 // runDispatchOverTransport drives one dispatch through the A2A client
@@ -157,6 +154,8 @@ func dispatchFromTransportOutcome(run dispatchRun, outcome DispatchTransportOutc
 // stream runs to its terminal state. Returns (nil, nil) when this
 // dispatch is not transport-driven — no endpoint, no card, or no wired
 // transport — so the caller falls back to the direct in-process run.
+// The outcome maps through the same terminal assembly as the direct
+// path (#343): the kill state decides killed-vs-natural on both.
 func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatchRun) (dispatch.DispatchResult, bool) {
 	transport, ok := c.dispatchServerStarter().(DispatchTransport)
 	if !ok || transport == nil {
@@ -173,12 +172,12 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 	})
 	if err != nil {
 		slog.Error("Dispatch A2A stream failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)
-		return dispatchFromTransportOutcome(run, DispatchTransportOutcome{
+		outcome = DispatchTransportOutcome{
 			Status: transportStatusFailed,
 			Text:   err.Error(),
-		}), true
+		}
 	}
-	return dispatchFromTransportOutcome(run, outcome), true
+	return c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcomeFromTransport(run, outcome)), true
 }
 
 // SetDispatchServerStarter wires the A2A server factory (#70). Call once

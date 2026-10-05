@@ -24,7 +24,10 @@ package dispatch
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +36,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/lock"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/google/uuid"
 )
@@ -104,8 +108,7 @@ type Entry struct {
 	// other revision as given at provision time.
 	Base string
 	// BaseSHA is the commit Base resolved to when the workspace was
-	// provisioned. Diff falls back to it when the base branch no longer
-	// exists.
+	// provisioned. Diff always diffs against it.
 	BaseSHA string
 	// SessionID is the ephemeral session backing the dispatched agent
 	// (#48/#50); empty until the dispatch starts running.
@@ -155,14 +158,31 @@ type Workspace struct {
 	// worktreesDir is the directory provisioned workspaces are created
 	// under, <repoRoot>/.crush/worktrees.
 	worktreesDir string
+	// commonDir is the repository's git common dir, resolved in
+	// NewWorkspace. It keys the per-repo provision lock, so two
+	// Workspaces on the same repository serialize their worktree adds.
+	commonDir string
 
 	// events re-publishes every registry mutation as an entry event, so
 	// the todo collector (#65) and later sinks observe lifecycle
 	// transitions without the mutation call sites knowing about them.
 	events *pubsub.Broker[Entry]
 
+	// provisionHook, when set, runs just before the locked worktree add
+	// with the branch and path about to be created. Tests use it to
+	// force a deterministic failure, such as a pre-created non-empty
+	// target directory.
+	provisionHook func(branch, path string)
+
+	// instanceID identifies this Workspace instance in the owner
+	// markers it writes, so humans can tell concurrent processes apart.
+	instanceID string
+
 	mu      sync.Mutex
 	entries map[string]Entry
+	// leases holds the release function for the ownership lease of
+	// every registered entry, keyed by entry ID.
+	leases map[string]func()
 }
 
 // NewWorkspace returns a Workspace managing isolated workspaces for the
@@ -175,6 +195,21 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 	}
 	if err := runGit(context.Background(), root, nil, "rev-parse", "--git-dir"); err != nil {
 		return nil, fmt.Errorf("%s is not a git repository: %w", repoRoot, err)
+	}
+
+	// The provision lock key: the git common dir, so every checkout of
+	// the same repository — this one or a worktree — shares a lock.
+	common, err := gitOutput(context.Background(), root, nil, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return nil, fmt.Errorf("resolve git common dir: %w", err)
+	}
+	commonDir := strings.TrimSpace(string(common))
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(root, commonDir)
+	}
+	commonDir, err = filepath.Abs(commonDir)
+	if err != nil {
+		return nil, err
 	}
 
 	dir := filepath.Join(root, ".crush", "worktrees")
@@ -191,9 +226,36 @@ func NewWorkspace(repoRoot string) (*Workspace, error) {
 	return &Workspace{
 		repoRoot:     root,
 		worktreesDir: dir,
+		commonDir:    commonDir,
 		events:       pubsub.NewBroker[Entry](),
 		entries:      make(map[string]Entry),
+		instanceID:   uuid.New().String(),
+		leases:       make(map[string]func()),
 	}, nil
+}
+
+// provisionLocks serializes the worktree add step per repository:
+// git's .git/config lock makes concurrent worktree add calls fail
+// ("could not lock config file") even when they create disjoint
+// branches, so the add and its failure cleanup run one at a time per
+// repo. Keying by git's common dir means two Workspaces on the same
+// repository in one process serialize on the same lock.
+var (
+	provisionLocksMu sync.Mutex
+	provisionLocks   = make(map[string]*sync.Mutex)
+)
+
+// provisionLock returns the lock guarding worktree add for the repo
+// whose git common dir is key, creating it on first use.
+func provisionLock(key string) *sync.Mutex {
+	provisionLocksMu.Lock()
+	defer provisionLocksMu.Unlock()
+	lock, ok := provisionLocks[key]
+	if !ok {
+		lock = &sync.Mutex{}
+		provisionLocks[key] = lock
+	}
+	return lock
 }
 
 // ProvisionOptions configures Provision.
@@ -216,6 +278,11 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 			return Entry{}, err
 		}
 	}
+	// Defence in depth: a base starting with "-" would be read as a git
+	// option further down the line, so refuse it before git sees it.
+	if strings.HasPrefix(base, "-") {
+		return Entry{}, fmt.Errorf("invalid base %q: must not start with \"-\"", base)
+	}
 	baseSHA, err := revisionSHA(ctx, w.repoRoot, base)
 	if err != nil {
 		return Entry{}, fmt.Errorf("resolve base %q: %w", base, err)
@@ -225,8 +292,34 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 	branch := BranchPrefix + id
 	path := filepath.Join(w.worktreesDir, branch)
 
-	if err := runGit(ctx, w.repoRoot, nil, "worktree", "add", "-b", branch, path, base); err != nil {
+	// The add and its failure cleanup run one at a time per
+	// repository, but nothing else in the provision is locked.
+	addLock := provisionLock(w.commonDir)
+	addLock.Lock()
+	if w.provisionHook != nil {
+		w.provisionHook(branch, path)
+	}
+	// The resolved SHA is what worktree add gets, never the raw base
+	// string, and "--" ends option parsing before the positionals.
+	err = runGit(ctx, w.repoRoot, nil, "worktree", "add", "--no-track", "-b", branch, "--", path, baseSHA)
+	if err != nil {
+		w.cleanupFailedProvision(ctx, branch, path)
+		addLock.Unlock()
 		return Entry{}, fmt.Errorf("create worktree: %w", err)
+	}
+	addLock.Unlock()
+
+	// The lease and marker live next to the worktree, never inside it,
+	// because Diff stages the whole workspace with git add -A.
+	release, err := lock.TryFile(w.leasePath(branch))
+	if err != nil {
+		w.removeEntry(ctx, Entry{Path: path, Branch: branch}, nil)
+		return Entry{}, fmt.Errorf("take ownership lease: %w", err)
+	}
+	if err := w.writeOwnerMarker(branch); err != nil {
+		release()
+		w.removeEntry(ctx, Entry{Path: path, Branch: branch}, nil)
+		return Entry{}, fmt.Errorf("write owner marker: %w", err)
 	}
 
 	entry := Entry{
@@ -240,8 +333,82 @@ func (w *Workspace) Provision(ctx context.Context, opts ProvisionOptions) (Entry
 
 	w.mu.Lock()
 	w.entries[id] = entry
+	w.leases[id] = release
 	w.mu.Unlock()
 	return entry, nil
+}
+
+// cleanupFailedProvision removes what a failed worktree add may have
+// left behind: the branch -b can create before the add fails, a
+// partially created directory, and stale worktree admin entries. It
+// runs under the repository's provision lock, and its own failures are
+// ignored: the caller returns the original error either way. The
+// directory is removed before the branch, and prune runs before
+// branch -D: while a worktree admin entry remains, git still regards
+// the branch as checked out and refuses to delete it.
+func (w *Workspace) cleanupFailedProvision(ctx context.Context, branch, path string) {
+	// False positive: branch is generated here from a UUID, so path
+	// always stays inside worktreesDir and RemoveAll cannot escape the
+	// worktrees directory; the repo root is the directory the client
+	// asked the server to open.
+	// codeql[go/path-injection]
+	_ = os.RemoveAll(path)
+	_ = runGit(ctx, w.repoRoot, nil, "worktree", "prune")
+	if _, err := gitOutput(ctx, w.repoRoot, nil, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
+		_ = runGit(ctx, w.repoRoot, nil, "branch", "-D", branch)
+	}
+}
+
+// leasePath is the flock file guarding branch's workspace. It lives
+// next to the worktree, never inside it, and the kernel releases the
+// lock when the owning process dies — no stale-lock recovery needed.
+func (w *Workspace) leasePath(branch string) string {
+	return filepath.Join(w.worktreesDir, branch+".lock")
+}
+
+// ownerPath is the human-readable owner marker for branch. It carries
+// no authority: the lock file is what ownership is proven with.
+func (w *Workspace) ownerPath(branch string) string {
+	return filepath.Join(w.worktreesDir, branch+".owner.json")
+}
+
+// ownerMarker records who holds a workspace's lease.
+type ownerMarker struct {
+	InstanceID string    `json:"instance_id"`
+	PID        int       `json:"pid"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// writeOwnerMarker atomically records this workspace instance as the
+// owner of branch.
+func (w *Workspace) writeOwnerMarker(branch string) error {
+	data, err := json.Marshal(ownerMarker{
+		InstanceID: w.instanceID,
+		PID:        os.Getpid(),
+		CreatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(w.worktreesDir, ".*.owner.json.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, w.ownerPath(branch)); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return nil
 }
 
 // Get returns a copy of the entry for id.
@@ -503,12 +670,16 @@ func (w *Workspace) Subscribe(ctx context.Context) <-chan pubsub.Event[Entry] {
 }
 
 // Diff returns the dispatched agent's work product as one unified diff:
-// base...HEAD plus the uncommitted state (staged, unstaged, and
-// untracked files), so committed work is never lost. The base is the
-// merge-base of the entry's Base and HEAD — falling back to the
-// recorded BaseSHA when the base branch no longer exists. Uncommitted
-// changes are staged into a throwaway temporary index, mirroring
-// a2a.GitDiff, so the workspace's real index is never touched.
+// the recorded base SHA...HEAD plus the uncommitted state (staged,
+// unstaged, and untracked files), so committed work is never lost. The
+// base is always entry.BaseSHA, the commit the dispatch branch was cut
+// from, resolved in the repository root at provision time. Never
+// re-resolve the base revision against the worktree: a "HEAD" or
+// "HEAD~1" base would resolve to the worktree's own tip and the
+// agent's commits would vanish from the diff (#380). An empty BaseSHA
+// is an error, not a fallback. Uncommitted changes are staged into a
+// throwaway temporary index, mirroring a2a.GitDiff, so the
+// workspace's real index is never touched.
 //
 // The contract is owned here and consumed twice: #66's DispatchResult
 // diff and the executor DiffFunc injected in #71.
@@ -520,10 +691,8 @@ func (w *Workspace) Diff(ctx context.Context, id string) (string, error) {
 	if _, err := os.Stat(entry.Path); err != nil {
 		return "", fmt.Errorf("workspace directory missing: %w", err)
 	}
-
-	base := entry.BaseSHA
-	if out, err := gitOutput(ctx, entry.Path, nil, "merge-base", entry.Base, "HEAD"); err == nil {
-		base = strings.TrimSpace(string(out))
+	if entry.BaseSHA == "" {
+		return "", fmt.Errorf("dispatch %q has no recorded base SHA", id)
 	}
 
 	tmp, err := os.CreateTemp("", "crush-dispatch-index-")
@@ -545,7 +714,7 @@ func (w *Workspace) Diff(ctx context.Context, id string) (string, error) {
 	if err := runGit(ctx, entry.Path, env, "add", "-A"); err != nil {
 		return "", fmt.Errorf("stage workspace: %w", err)
 	}
-	out, err := gitOutput(ctx, entry.Path, env, "diff", "--cached", base)
+	out, err := gitOutput(ctx, entry.Path, env, "diff", "--cached", entry.BaseSHA)
 	if err != nil {
 		return "", fmt.Errorf("diff against base: %w", err)
 	}
@@ -559,92 +728,174 @@ func (w *Workspace) Diff(ctx context.Context, id string) (string, error) {
 func (w *Workspace) Remove(ctx context.Context, id string) error {
 	w.mu.Lock()
 	entry, ok := w.entries[id]
+	release := w.leases[id]
 	delete(w.entries, id)
+	delete(w.leases, id)
 	w.mu.Unlock()
 	if !ok {
 		return nil
 	}
-	return w.removeEntry(ctx, entry)
+	return w.removeEntry(ctx, entry, release)
 }
 
-// Sweep removes every tracked workspace plus any orphaned
-// crush-dispatch-* directories under the worktrees directory (from a
-// crashed run whose registry was lost). It is the session-end backstop:
-// nothing dispatch created survives it, and no dangling branches or
-// .crush/worktrees/ entries are left behind.
+// Sweep removes every tracked workspace plus every orphaned
+// crush-dispatch-* directory whose ownership lease is free (from a
+// crashed run whose registry was lost). Orphans a live process still
+// holds — another Workspace on the same repository — and orphans with
+// no lease file at all, whose ownership cannot be proven, are left
+// alone (#369 is the explicit cleanup tool for those). It is the
+// session-end backstop: nothing dispatch created survives it, and no
+// dangling branches or .crush/worktrees/ entries are left behind. One
+// stubborn workspace does not stop the sweep: every entry and every
+// orphan is attempted, the errors are joined and returned, and a failed
+// entry stays registered so a later sweep or Remove can retry it.
 func (w *Workspace) Sweep(ctx context.Context) error {
 	w.mu.Lock()
-	entries := make([]Entry, 0, len(w.entries))
-	for _, e := range w.entries {
-		entries = append(entries, e)
+	type sweepEntry struct {
+		entry   Entry
+		release func()
+	}
+	items := make([]sweepEntry, 0, len(w.entries))
+	for id, e := range w.entries {
+		items = append(items, sweepEntry{e, w.leases[id]})
+		delete(w.leases, id)
 	}
 	w.entries = make(map[string]Entry)
 	w.mu.Unlock()
 
-	for _, entry := range entries {
-		if err := w.removeEntry(ctx, entry); err != nil {
-			return err
+	var errs []error
+	for _, item := range items {
+		if err := w.removeEntry(ctx, item.entry, item.release); err != nil {
+			errs = append(errs, err)
+			// The removal failed, so the entry and its lease stay
+			// registered for a later sweep or Remove to retry.
+			w.mu.Lock()
+			w.entries[item.entry.ID] = item.entry
+			if item.release != nil {
+				w.leases[item.entry.ID] = item.release
+			}
+			w.mu.Unlock()
 		}
 	}
 
-	// Orphaned directories: registered names are gone by now, so
-	// anything left under the worktrees dir with our prefix belongs to a
-	// run whose registry entry was lost. The directory name is the
+	// Orphaned directories: registered names — including entries this
+	// sweep just failed, whose removal a later sweep or Remove will
+	// retry — are not ours to take, so anything left under the
+	// worktrees dir with our prefix and an unregistered branch belongs
+	// to a run whose registry entry was lost. The directory name is the
 	// branch name, so the branch is recoverable from it.
+	w.mu.Lock()
+	registered := make(map[string]struct{}, len(w.entries))
+	for _, e := range w.entries {
+		registered[e.Branch] = struct{}{}
+	}
+	w.mu.Unlock()
+
 	dirs, err := os.ReadDir(w.worktreesDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+		if !os.IsNotExist(err) {
+			errs = append(errs, err)
 		}
-		return err
+	} else {
+		for _, d := range dirs {
+			if !d.IsDir() || !strings.HasPrefix(d.Name(), BranchPrefix) {
+				continue
+			}
+			if _, ok := registered[d.Name()]; ok {
+				continue
+			}
+			lockPath := w.leasePath(d.Name())
+			if _, err := os.Stat(lockPath); err != nil {
+				if os.IsNotExist(err) {
+					// Without a lease file ownership cannot be proven,
+					// so the directory is not ours to take.
+					slog.Debug("Skipping dispatch worktree without a lease file", "path", filepath.Join(w.worktreesDir, d.Name()))
+					continue
+				}
+				errs = append(errs, err)
+				continue
+			}
+			release, err := lock.TryFile(lockPath)
+			if err != nil {
+				if errors.Is(err, lock.ErrContended) {
+					// A live process — another Workspace on this
+					// repository — still owns this workspace.
+					slog.Debug("Skipping dispatch worktree with a held lease", "path", filepath.Join(w.worktreesDir, d.Name()))
+					continue
+				}
+				errs = append(errs, err)
+				continue
+			}
+			entry := Entry{
+				Path:   filepath.Join(w.worktreesDir, d.Name()),
+				Branch: d.Name(),
+			}
+			if err := w.removeEntry(ctx, entry, release); err != nil {
+				errs = append(errs, err)
+			}
+		}
 	}
-	for _, d := range dirs {
-		if !d.IsDir() || !strings.HasPrefix(d.Name(), BranchPrefix) {
-			continue
-		}
-		entry := Entry{
-			Path:   filepath.Join(w.worktreesDir, d.Name()),
-			Branch: d.Name(),
-		}
-		if err := w.removeEntry(ctx, entry); err != nil {
-			return err
-		}
+	if err := runGit(ctx, w.repoRoot, nil, "worktree", "prune"); err != nil {
+		errs = append(errs, err)
 	}
-	return runGit(ctx, w.repoRoot, nil, "worktree", "prune")
+	return errors.Join(errs...)
 }
 
 // removeEntry tears down one workspace on disk: the worktree (forced if
 // it is dirty), the branch, and the admin entry. Missing artifacts are
-// not errors.
-func (w *Workspace) removeEntry(ctx context.Context, entry Entry) error {
+// not errors. The lock file is never unlinked: flock is keyed by inode,
+// so removing it can let two processes lock different inodes at the
+// same path and both believe they own the workspace. When lease is not
+// nil the owner marker is removed — only a lease holder may touch
+// ownership artifacts — and the lease is released last, after
+// everything else is gone.
+func (w *Workspace) removeEntry(ctx context.Context, entry Entry, lease func()) error {
+	// Errors are prefixed with the entry so a joined sweep error says
+	// what failed. Orphan entries carry no ID; their branch is the name.
+	label := entry.ID
+	if label == "" {
+		label = entry.Branch
+	}
 	if entry.Path != "" {
 		if err := runGit(ctx, w.repoRoot, nil, "worktree", "remove", entry.Path); err != nil {
 			// A dirty workspace still removes with --force; a missing
 			// one is already gone and prune cleans the admin entry.
 			if err := runGit(ctx, w.repoRoot, nil, "worktree", "remove", "--force", entry.Path); err != nil {
 				if err := runGit(ctx, w.repoRoot, nil, "worktree", "prune"); err != nil {
-					return fmt.Errorf("remove worktree %s: %w", entry.Path, err)
+					return fmt.Errorf("dispatch %s: remove worktree %s: %w", label, entry.Path, err)
 				}
 			}
 		}
 	}
 	if entry.Branch != "" {
 		// -D because a dispatched branch may be unmerged — that is the
-		// point of an explicit review step — and a missing branch is
-		// already gone.
-		if err := runGit(ctx, w.repoRoot, nil, "branch", "-D", entry.Branch); err != nil {
-			if !isBranchMissing(err) {
-				return fmt.Errorf("delete branch %s: %w", entry.Branch, err)
+		// point of an explicit review step. Existence is checked by exit
+		// code, not by git's message text, so a deleted branch is
+		// tolerated under any locale.
+		if hasBranch(ctx, w.repoRoot, entry.Branch) {
+			if err := runGit(ctx, w.repoRoot, nil, "branch", "-D", entry.Branch); err != nil {
+				// A concurrent Remove may have deleted the branch
+				// between the existence check and -D; gone is gone, so
+				// only an error on a branch still there is real.
+				if hasBranch(ctx, w.repoRoot, entry.Branch) {
+					return fmt.Errorf("dispatch %s: delete branch %s: %w", label, entry.Branch, err)
+				}
 			}
 		}
+	}
+	if entry.Branch != "" && lease != nil {
+		os.Remove(w.ownerPath(entry.Branch))
+		lease()
 	}
 	return nil
 }
 
-// isBranchMissing reports whether a git branch error is just "no such
-// branch", which cleanup treats as success.
-func isBranchMissing(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "not found")
+// hasBranch reports whether the repository has the local branch, decided
+// by git's exit code so the check never reads localized message text.
+func hasBranch(ctx context.Context, dir, branch string) bool {
+	cmd := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	cmd.Dir = dir
+	return cmd.Run() == nil
 }
 
 // currentRevision returns the repository's current branch name, or HEAD
@@ -661,11 +912,13 @@ func currentRevision(ctx context.Context, repoRoot string) (string, error) {
 	return rev, nil
 }
 
-// revisionSHA resolves a revision to its commit SHA.
+// revisionSHA resolves a revision to its commit SHA. --end-of-options
+// stops a rev that starts with "-" from being parsed as an option, and
+// every failure, including empty output, is an unknown-revision error.
 func revisionSHA(ctx context.Context, repoRoot, rev string) (string, error) {
-	out, err := gitOutput(ctx, repoRoot, nil, "rev-parse", rev+"^{commit}")
-	if err != nil {
-		return "", err
+	out, err := gitOutput(ctx, repoRoot, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", rev+"^{commit}")
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return "", fmt.Errorf("unknown revision %q", rev)
 	}
 	return strings.TrimSpace(string(out)), nil
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -163,6 +165,7 @@ func TestDeliverByHandleRoutesAndToolAcceptsHandle(t *testing.T) {
 	close(agent.gate)
 }
 
+<<<<<<< HEAD
 // runToolAsSession is runTool over a caller-supplied session: the
 // message_agent tool scopes its delivery to the session it runs in
 // (#399), so tests must be able to pick it.
@@ -233,4 +236,44 @@ func TestDeliverScopedToCallerSession(t *testing.T) {
 	require.Len(t, agent.injected(), 2)
 
 	close(agent.gate)
+}
+
+// The @-completion and handle-routing surfaces read the dispatch
+// registry without provisioning it (#370): a single @ keystroke must
+// not run git or create <workingDir>/.crush in a repo where the user
+// has never dispatched an agent.
+func TestHandleSurfacesDoNotProvisionWorkspace(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, env := newInjectionEnv(t, agent)
+
+	require.Nil(t, c.DispatchLive(""))
+	_, ok := c.DispatchByHandle("", "ghost")
+	require.False(t, ok)
+	err := c.DeliverAgentMessageByHandle(t.Context(), "", "ghost", "hello")
+	require.ErrorContains(t, err, "no agent with handle @ghost")
+
+	_, err = os.Stat(filepath.Join(env.workingDir, ".crush"))
+	require.True(t, os.IsNotExist(err), "a handle read must not create .crush")
+	c.dispatchMu.Lock()
+	ws, collector := c.dispatchWS, c.dispatchCollector
+	c.dispatchMu.Unlock()
+	require.Nil(t, ws)
+	require.Nil(t, collector)
+}
+
+// The same holds in a directory with no git repository at all: the
+// live/handle surfaces report empty, and delivery refuses with the
+// unknown-handle error, without provisioning anything (#370).
+func TestHandleSurfacesInNonGitDirectory(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	require.Nil(t, c.DispatchLive(""))
+	_, ok := c.DispatchByHandle("", "ghost")
+	require.False(t, ok)
+	err := c.DeliverAgentMessageByHandle(t.Context(), "", "ghost", "hello")
+	require.ErrorContains(t, err, "no agent with handle @ghost")
+
+	_, err = os.Stat(filepath.Join(env.workingDir, ".crush"))
+	require.True(t, os.IsNotExist(err), "a handle read must not create .crush")
 }
