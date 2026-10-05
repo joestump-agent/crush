@@ -17,12 +17,12 @@
 //     (issue #69).
 //
 // On top of those foundations, #70 serves each dispatched agent as an
-// in-process A2A server: [StartServer] binds a loopback JSON-RPC endpoint,
-// wires the Executor behind a2asrv with the agent card at the well-known
-// path, and [Resolve] reads a dispatch's card and endpoint back from its
-// registry entry — in-memory discovery over the dispatch registry, no
-// network hop. The DispatchAgent A2A client + SSE progress (#71) build on
-// these: [ServerFactory.StreamDispatch] is the client half — prompt out
+// in-process A2A server and #71 drives it over the protocol:
+// [ServerFactory.StartServer] registers the dispatch on a process-wide
+// unix-socket host (#346), wires the Executor behind a2asrv, and
+// [Resolve] reads a dispatch's card and endpoint back from its registry
+// entry — in-memory discovery over the dispatch registry, no network
+// hop. [ServerFactory.StreamDispatch] is the client half — prompt out
 // as a streaming message, the SSE event stream back to its terminal
 // state, the artifact (diff) and the agent's final text assembled into
 // the transport outcome the coordinator maps onto its DispatchResult.
