@@ -306,8 +306,13 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 // the canceled context.
 func bridgePermissions(ctx context.Context, parent, scoped permission.Service) context.CancelFunc {
 	ctx, cancel := context.WithCancel(ctx)
+	// Subscribe before spawning the consumer: Broker delivery is lossy
+	// for events published before a subscriber registers, so subscribing
+	// inside the goroutine could strand a request that arrived first and
+	// leave its waiter blocked until the context is canceled.
+	events := scoped.Subscribe(ctx)
 	go func() {
-		for ev := range scoped.Subscribe(ctx) {
+		for ev := range events {
 			req := ev.Payload
 			allowed, err := parent.Request(ctx, permission.CreatePermissionRequest{
 				SessionID:   req.SessionID,

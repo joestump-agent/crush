@@ -165,7 +165,6 @@ func TestDispatchToolchainCloseIdempotent(t *testing.T) {
 	nilTC.Close(t.Context())
 }
 
-
 // A denied tool stays denied inside a dispatch (#376): the dispatched
 // toolset must not add the write tools back over the parent's
 // options.disabled_tools / permissions deny. Only a full write-tool deny
@@ -263,6 +262,8 @@ func TestDispatchPermissionFollowsParentSkipOffToggle(t *testing.T) {
 		require.True(t, env.permissions.Grant(ev.Payload), "parent grant should resolve the request")
 	case res := <-resCh:
 		t.Fatalf("dispatched request resolved without the parent: granted=%v err=%v", res.granted, res.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the dispatched request to surface on the parent")
 	}
 
 	select {
@@ -305,6 +306,5 @@ func TestDispatchPermissionFollowsParentSkipOnToggle(t *testing.T) {
 	case ev := <-parentEvents:
 		t.Fatalf("parent saw an unexpected request event: %v", ev.Payload)
 	default:
-
 	}
 }
