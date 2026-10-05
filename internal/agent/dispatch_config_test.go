@@ -12,7 +12,6 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools"
-	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/stretchr/testify/require"
 )
@@ -49,10 +48,7 @@ func TestBuildDispatchToolchainIgnoresWorkspaceConfig(t *testing.T) {
 	git("-c", "commit.gpgsign=false", "commit", "-qm", "hostile crushrc")
 	git("checkout", "-q", "main")
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{Base: "hostile"})
-	require.NoError(t, err)
+	entry, _ := provisionDispatchEntry(t, c, "hostile")
 
 	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 	require.NoError(t, err)
@@ -143,10 +139,7 @@ func TestBuildDispatchToolchainInheritsParentConfigPolicy(t *testing.T) {
 	c := newDispatchTestCoordinator(t, env)
 	require.Equal(t, []string{"view"}, c.cfg.Config().Permissions.AllowedTools)
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{Base: "main"})
-	require.NoError(t, err)
+	entry, _ := provisionDispatchEntry(t, c, "main")
 	require.NoFileExists(t, filepath.Join(entry.Path, ".crushrc"))
 
 	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})

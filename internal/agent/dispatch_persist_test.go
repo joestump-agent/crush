@@ -83,10 +83,8 @@ func TestRunDispatchStampsTerminalMetadataOnParentToolResult(t *testing.T) {
 
 	msgID := createParentToolResult(t, env, parent.ID, handleJSON)
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		entry, ok := ws.Get(decodeDispatchID(t, handleJSON))
+		entry, ok := c.dispatchRegistry().Get(decodeDispatchID(t, handleJSON))
 		return ok && entry.Status == dispatch.StatusCompleted
 	}, 10*time.Second, 50*time.Millisecond)
 
@@ -137,10 +135,8 @@ func TestRunDispatchTerminalMetadataWaitsForLateToolResult(t *testing.T) {
 	// close the gate, wait for the terminal registry status, and only
 	// then write the tool result the parent turn would have written.
 	close(gated.gate)
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		entry, ok := ws.Get(decodeDispatchID(t, handleJSON))
+		entry, ok := c.dispatchRegistry().Get(decodeDispatchID(t, handleJSON))
 		return ok && entry.Status == dispatch.StatusCompleted
 	}, 10*time.Second, 50*time.Millisecond)
 
@@ -167,10 +163,8 @@ func TestDispatchRunCallIsNotMarkedAsSteer(t *testing.T) {
 
 	// The run executes in the background; wait for it to finish before
 	// inspecting the recorded call.
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		entry, ok := ws.Get(handle.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status == dispatch.StatusCompleted
 	}, 10*time.Second, 50*time.Millisecond)
 

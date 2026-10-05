@@ -31,11 +31,7 @@ func waitTerminalDispatch(t *testing.T, c *coordinator, dispatchID string, want 
 	t.Helper()
 	var entry dispatch.Entry
 	require.Eventually(t, func() bool {
-		ws, err := c.dispatchWorkspace()
-		if err != nil {
-			return false
-		}
-		e, ok := ws.Get(dispatchID)
+		e, ok := c.dispatchRegistry().Get(dispatchID)
 		if !ok || e.Status != want {
 			return false
 		}

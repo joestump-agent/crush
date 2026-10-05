@@ -189,10 +189,8 @@ func TestShutdownCancelAllKillsLiveDispatches(t *testing.T) {
 
 	c.CancelAll()
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
 	for _, h := range handles {
-		entry, ok := ws.Get(h.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(h.DispatchID)
 		require.True(t, ok)
 		require.Equal(t, dispatch.StatusKilled, entry.Status)
 		require.NotNil(t, entry.Result)
@@ -230,9 +228,7 @@ func TestShutdownRootCancelFallbackEndsStubbornDispatch(t *testing.T) {
 	c.CancelAll()
 	require.Less(t, time.Since(start), 4*time.Second, "CancelAll must return within its bounds")
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, ok := ws.Get(handle.DispatchID)
+	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusKilled, entry.Status)
 	require.NotNil(t, entry.Result)
@@ -269,14 +265,12 @@ func TestShutdownBoundExpiresStillReturns(t *testing.T) {
 	// The wedged run is still going; unblock it so the test's goroutine
 	// finishes and records its (killed) terminal state.
 	close(agent.unblockCh)
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		c.dispatchMu.Lock()
 		defer c.dispatchMu.Unlock()
 		return len(c.liveDispatches) == 0
 	}, 10*time.Second, 10*time.Millisecond)
-	entry, ok := ws.Get(handle.DispatchID)
+	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusKilled, entry.Status)
 	require.NotNil(t, entry.Result)

@@ -172,7 +172,7 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 	if !ok || transport == nil {
 		return dispatch.DispatchResult{}, false
 	}
-	entry, ok := run.workspace.Get(run.entry.ID)
+	entry, ok := run.reg.Get(run.entry.ID)
 	if !ok || entry.Endpoint == "" || entry.AgentCard == nil {
 		return dispatch.DispatchResult{}, false
 	}
@@ -254,16 +254,22 @@ func (c *coordinator) dispatchServerStarter() DispatchServerStarter {
 // dispatch itself does not depend on being served, and Phase 1 has no
 // A2A client in the loop yet (#71 adds it); failing the dispatch over a
 // loopback server would trade working dispatches for protocol purity.
-func (c *coordinator) startDispatchServer(ctx context.Context, workspace *dispatch.Workspace, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string) (stop func()) {
+func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string) (stop func()) {
 	starter := c.dispatchServerStarter()
 	if starter == nil {
 		return nil
 	}
 
 	endpoint, card, stop, err := starter.StartDispatchServer(ctx, DispatchServerParams{
-		SessionID:         sessionID,
-		Runner:            runner,
-		Diff:              func(ctx context.Context) (string, error) { return workspace.Diff(ctx, entryID) },
+		SessionID: sessionID,
+		Runner:    runner,
+		Diff: func(ctx context.Context) (string, error) {
+			entry, ok := reg.Get(entryID)
+			if !ok {
+				return "", fmt.Errorf("unknown dispatch %q", entryID)
+			}
+			return provider.Diff(ctx, entry)
+		},
 		Todos:             c.dispatchCollector,
 		Name:              handle,
 		Description:       role,
@@ -276,7 +282,7 @@ func (c *coordinator) startDispatchServer(ctx context.Context, workspace *dispat
 		slog.Warn("Dispatch A2A server failed to start", "dispatch_id", entryID, "error", err)
 		return nil
 	}
-	workspace.SetEndpoint(entryID, endpoint, card)
+	reg.SetEndpoint(entryID, endpoint, card)
 	slog.Debug("Dispatch A2A server started", "dispatch_id", entryID, "endpoint", endpoint)
 	return stop
 }
@@ -305,9 +311,9 @@ func resolvedSkills(store *config.ConfigStore, requested []string) []*skills.Ski
 // registry entry's endpoint and card: a finished dispatch serves
 // nothing, and discovery must not hand out a dead endpoint (#70's
 // teardown half).
-func (c *coordinator) stopDispatchServer(workspace *dispatch.Workspace, entryID string, stop func()) {
+func (c *coordinator) stopDispatchServer(reg *dispatch.AgentRegistry, entryID string, stop func()) {
 	if stop != nil {
 		stop()
 	}
-	workspace.SetEndpoint(entryID, "", nil)
+	reg.SetEndpoint(entryID, "", nil)
 }

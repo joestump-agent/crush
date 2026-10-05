@@ -216,15 +216,18 @@ type coordinator struct {
 
 	cronStore *scheduler.Store
 
-	// Worktree dispatch (#61): the Workspace registry is created lazily
-	// on first dispatch because a non-git working directory must not
-	// fail coordinator construction, and the failure is cached so later
-	// dispatches report it instead of retrying. dispatchAgentBuilder is
-	// the dispatched-agent constructor the DispatchAgent tool uses; nil
-	// means the real one, and tests substitute a fake through it.
+	// Worktree dispatch (#61): the agent registry is created eagerly (it
+	// is pure in-memory state and never fails), while the git worktree
+	// provider is created lazily on first dispatch because a non-git
+	// working directory must not fail coordinator construction, and the
+	// failure is cached so later dispatches report it instead of
+	// retrying. dispatchAgentBuilder is the dispatched-agent constructor
+	// the DispatchAgent tool uses; nil means the real one, and tests
+	// substitute a fake through it.
 	dispatchMu           sync.Mutex
-	dispatchWS           *dispatch.Workspace
-	dispatchWSErr        error
+	dispatchReg          *dispatch.AgentRegistry
+	dispatchProvider     *dispatch.GitWorktreeProvider
+	dispatchProviderErr  error
 	dispatchAgentBuilder func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error)
 	// pendingResults holds each parent session's dispatch results whose
 	// delivery turn has not succeeded yet (#388): a result arrives while
@@ -235,7 +238,7 @@ type coordinator struct {
 	pendingResults map[string][]dispatch.DispatchResult
 	// dispatchCollector reduces dispatched-session state into
 	// per-dispatch snapshots for the configured sinks (#65); created
-	// with the registry and run on the coordinator's lifetime context.
+	// with the provider and run on the coordinator's lifetime context.
 	dispatchCollector *dispatch.TodoCollector
 	// dispatchRuns maps each running dispatch's task session to its
 	// injection target (#312): the injectable agent plus the call
@@ -263,7 +266,7 @@ type coordinator struct {
 	dispatchShutdownRootWait time.Duration
 	// dispatchCtx is the NewCoordinator context the collector's
 	// subscriptions run on; nil-safe (tests construct the coordinator
-	// struct directly) — dispatchWorkspace falls back to
+	// struct directly) — dispatchWorkspaceProvider falls back to
 	// context.Background.
 	dispatchCtx   context.Context
 	dispatchSinks []dispatch.TodoSink
@@ -363,6 +366,7 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		semanticStore:   opts.SemanticStore,
 		semanticClient:  opts.SemanticClient,
 		semanticSymbols: symbols.NewExtractor(),
+		dispatchReg:     dispatch.NewAgentRegistry(),
 		dispatchCtx:     ctx,
 		dispatchSinks:   opts.DispatchSinks,
 		dispatchServer:  opts.DispatchServer,

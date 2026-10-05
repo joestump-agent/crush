@@ -49,23 +49,18 @@ type CancelDispatchParams struct {
 // its workspace is preserved (#367).
 func (c *coordinator) CancelDispatch(ctx context.Context, ref string) error {
 	ref = strings.TrimSpace(ref)
-	c.dispatchMu.Lock()
-	workspace := c.dispatchWS
-	c.dispatchMu.Unlock()
-	if workspace == nil {
-		return fmt.Errorf("no dispatch %q is known; dispatch one first", ref)
-	}
+	reg := c.dispatchRegistry()
 
 	// Dispatch IDs and child session IDs are resolved verbatim — they
 	// carry characters the handle slug would mangle ($$, length caps) —
 	// and the fuzzy handle form goes last, slugged the way handles are
 	// stored so "@Team Lead" finds the "team-lead" entry.
-	entry, ok := workspace.Get(ref)
+	entry, ok := reg.Get(ref)
 	if !ok {
-		entry, ok = workspace.BySession(ref)
+		entry, ok = reg.BySession(ref)
 	}
 	if !ok {
-		entry, ok = workspace.ByHandle(dispatch.HandleSlug(ref))
+		entry, ok = reg.ByHandle(dispatch.HandleSlug(ref))
 	}
 	if !ok {
 		return fmt.Errorf("no dispatch %q is known; dispatch one first", ref)

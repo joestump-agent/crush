@@ -19,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/shell"
+	"github.com/google/uuid"
 )
 
 //go:embed templates/dispatch_tool.md
@@ -138,7 +139,8 @@ type dispatchedAgent struct {
 // dispatchRun carries one backgrounded dispatch from the tool call that
 // started it to the goroutine that runs it.
 type dispatchRun struct {
-	workspace   *dispatch.Workspace
+	reg         *dispatch.AgentRegistry
+	provider    *dispatch.GitWorktreeProvider
 	entry       dispatch.Entry
 	toolchain   *DispatchToolchain
 	agent       SessionAgent
@@ -354,19 +356,32 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse("dispatch unavailable: bash/edit/write are disabled by your configuration (disabled_tools / permissions deny)"), nil
 			}
 
-			workspace, err := c.dispatchWorkspace()
+			provider, err := c.dispatchWorkspaceProvider()
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("dispatch unavailable: %s", err)), nil
 			}
+			reg := c.dispatchRegistry()
 
 			// Provision, bootstrap, and build while the tool call is
 			// still open: every step is local and fast, and failures
 			// here are actionable tool errors rather than silent
-			// background failures.
-			entry, err := workspace.Provision(ctx, dispatch.ProvisionOptions{Base: params.Branch})
+			// background failures. The provider owns the directory; the
+			// registry owns the entry, registered here so every setup
+			// failure below tears both down.
+			id := uuid.NewString()
+			placement, err := provider.Provision(ctx, id, dispatch.ProvisionOptions{Base: params.Branch})
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("provision dispatch workspace: %s", err)), nil
 			}
+			entry := dispatch.Entry{
+				ID:      id,
+				Path:    placement.Path,
+				Branch:  placement.Branch,
+				Base:    placement.Base,
+				BaseSHA: placement.BaseSHA,
+				Status:  dispatch.StatusProvisioned,
+			}
+			reg.Register(entry)
 
 			// The dispatch outlives the turn that started it: its root
 			// context is detached from the tool call's, so the run and
@@ -383,13 +398,13 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			toolchain, err := c.BuildDispatchToolchain(rootCtx, DispatchToolchainOptions{WorkingDir: entry.Path})
 			if err != nil {
 				rootCancel()
-				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("build dispatch toolchain: %s", err)), nil
 			}
 
 			if unknown := missingSkills(toolchain.Config(), params.Skills); len(unknown) > 0 {
 				rootCancel()
-				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("unknown skills: %s", strings.Join(unknown, ", "))), nil
 			}
 
@@ -415,7 +430,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			})
 			if err != nil {
 				rootCancel()
-				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("build dispatched agent: %s", err)), nil
 			}
 
@@ -425,7 +440,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			taskSession, err := c.sessions.CreateTaskSession(ctx, taskSessionID, sessionID, "Dispatched Agent")
 			if err != nil {
 				rootCancel()
-				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("create session: %s", err)), nil
 			}
 
@@ -433,18 +448,19 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// and #313's handles read these entries. The handle is assigned
 			// after the session so the assignment event carries the complete
 			// entry — handle, role, session, running state.
-			workspace.SetSession(entry.ID, taskSession.ID)
-			workspace.SetParentSessionID(entry.ID, sessionID)
-			workspace.SetStatus(entry.ID, dispatch.StatusRunning)
-			assignedHandle, ok := workspace.AssignHandle(entry.ID, params.Handle, params.Role)
+			reg.SetSession(entry.ID, taskSession.ID)
+			reg.SetParentSessionID(entry.ID, sessionID)
+			reg.SetStatus(entry.ID, dispatch.StatusRunning)
+			assignedHandle, ok := reg.AssignHandle(entry.ID, params.Handle, params.Role)
 			if !ok {
 				rootCancel()
-				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse("assign dispatch handle: registry entry vanished"), nil
 			}
 
 			run := dispatchRun{
-				workspace:       workspace,
+				reg:             reg,
+				provider:        provider,
 				entry:           entry,
 				toolchain:       toolchain,
 				agent:           dispatched.agent,
@@ -468,7 +484,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// settings, and the kill's reason (#316) rides along (#342):
 			// an out-of-band kill surfaces on the A2A task as a Canceled
 			// status carrying it.
-			run.stopServer = c.startDispatchServer(ctx, workspace, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current)
+			run.stopServer = c.startDispatchServer(ctx, provider, reg, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current)
 
 			// The dispatch runs on its root context, detached from the
 			// tool call's (#371): the permission bridge bound to the root
@@ -583,7 +599,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		// a dead endpoint. It stops before the toolchain closes, which
 		// ends the shared process-wide resources underneath it.
 		if run.stopServer != nil {
-			c.stopDispatchServer(run.workspace, run.entry.ID, run.stopServer)
+			c.stopDispatchServer(run.reg, run.entry.ID, run.stopServer)
 		}
 		// The toolchain outlives the turn: Close stops the permission
 		// bridge and the scoped LSP clients once nothing runs in the
@@ -647,7 +663,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 			runErr:        err,
 			stoppedInLoop: dispatchRunStoppedInLoop(result),
 			diff: func(ctx context.Context) (string, error) {
-				return run.workspace.Diff(ctx, run.entry.ID)
+				return run.provider.Diff(ctx, run.entry)
 			},
 		})
 	}
@@ -670,8 +686,8 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// Record the terminal payload before the terminal status so the
 	// terminal entry event carries it: the completed agent block (#65)
 	// renders its durable record from the registry.
-	run.workspace.SetResult(run.entry.ID, terminal)
-	run.workspace.SetStatus(run.entry.ID, terminal.Status)
+	run.reg.SetResult(run.entry.ID, terminal)
+	run.reg.SetStatus(run.entry.ID, terminal.Status)
 
 	// Stamp the terminal result onto the parent's persisted dispatch_agent
 	// tool result (#410): the card's durable record after a restart or in
@@ -976,10 +992,10 @@ func (c *coordinator) assembleKilledDispatchResult(ctx context.Context, run disp
 	// The handle was assigned after the dispatchRun's entry snapshot was
 	// taken, so read it back from the registry like the natural result:
 	// the killed payload is what the parent re-dispatches against.
-	if entry, ok := run.workspace.Get(run.entry.ID); ok {
+	if entry, ok := run.reg.Get(run.entry.ID); ok {
 		terminal.Handle = entry.Handle
 	}
-	diff, diffErr := run.workspace.Diff(ctx, run.entry.ID)
+	diff, diffErr := run.provider.Diff(ctx, run.entry)
 	switch {
 	case diffErr != nil:
 		terminal.DiffSummary = fmt.Sprintf("(diff unavailable: %s)", diffErr)
@@ -1027,7 +1043,7 @@ func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRu
 	// The handle was assigned after the dispatchRun's entry snapshot was
 	// taken, so read it back from the registry: the terminal payload is
 	// the model's addressable record of the run (#313).
-	if entry, ok := run.workspace.Get(run.entry.ID); ok {
+	if entry, ok := run.reg.Get(run.entry.ID); ok {
 		terminal.Handle = entry.Handle
 	}
 	switch {
@@ -1184,31 +1200,53 @@ func (c *coordinator) flushPendingResults(parentSessionID string) {
 	}()
 }
 
-// dispatchWorkspace returns the coordinator's dispatch workspace
-// registry, creating it on first use. Creation can fail — the working
-// directory may not be a git repository — and the failure is cached so
-// every later dispatch reports it instead of retrying, while coordinator
-// construction stays git-agnostic. The first successful creation also
-// starts the todo collector (#65): one subscription to the session
-// event stream and the registry's own transitions, reduced once and
-// sunk to every configured sink (the agent block now, #174's A2A
-// bridge later).
-func (c *coordinator) dispatchWorkspace() (*dispatch.Workspace, error) {
+// dispatchRegistry returns the coordinator's dispatch registry,
+// creating it on first use. Unlike the workspace provider it never
+// fails: the registry is pure in-memory state, so callers can resolve
+// handles and sessions whether or not any git-backed dispatch ever
+// ran. NewCoordinator creates it eagerly; the nil branch covers tests
+// that construct the coordinator struct directly.
+func (c *coordinator) dispatchRegistry() *dispatch.AgentRegistry {
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
-	if c.dispatchWS == nil && c.dispatchWSErr == nil {
+	if c.dispatchReg == nil {
+		c.dispatchReg = dispatch.NewAgentRegistry()
+	}
+	return c.dispatchReg
+}
+
+// dispatchWorkspaceProvider returns the coordinator's git worktree
+// provider, creating it on first use. Creation can fail — the working
+// directory may not be a git repository — and the failure is cached so
+// every later dispatch reports it instead of retrying, while
+// coordinator construction stays git-agnostic. The first successful
+// creation also starts the todo collector (#65): one subscription to
+// the session event stream and the registry's own transitions, reduced
+// once and sunk to every configured sink (the agent block now, #174's
+// A2A bridge later).
+func (c *coordinator) dispatchWorkspaceProvider() (*dispatch.GitWorktreeProvider, error) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	if c.dispatchProvider == nil && c.dispatchProviderErr == nil {
 		// Worktrees live under the data directory, never beside the
 		// working directory: a launch from a repo subdirectory must not
 		// create a new <cwd>/.crush that git picks up and that later
 		// launches treat as their data directory (#383).
 		worktreesDir, err := dispatch.WorktreesDir(c.cfg.Config().Options.DataDirectory, c.cfg.WorkingDir())
 		if err != nil {
-			c.dispatchWSErr = err
+			c.dispatchProviderErr = err
 		} else {
-			c.dispatchWS, c.dispatchWSErr = dispatch.NewWorkspace(c.cfg.WorkingDir(), worktreesDir)
+			// The registry is created inline, not via dispatchRegistry():
+			// that accessor takes dispatchMu, and this method already
+			// holds it. NewCoordinator creates the registry eagerly; the
+			// nil branch covers tests that build the struct directly.
+			if c.dispatchReg == nil {
+				c.dispatchReg = dispatch.NewAgentRegistry()
+			}
+			c.dispatchProvider, c.dispatchProviderErr = dispatch.NewGitWorktreeProvider(c.cfg.WorkingDir(), worktreesDir, c.dispatchReg)
 		}
-		if c.dispatchWS != nil {
-			c.dispatchCollector = dispatch.NewTodoCollector(c.dispatchWS, c.sessions, c.dispatchSinks...)
+		if c.dispatchProvider != nil {
+			c.dispatchCollector = dispatch.NewTodoCollector(c.dispatchReg, c.sessions, c.dispatchSinks...)
 			ctx := c.dispatchCtx
 			if ctx == nil {
 				// Tests construct the coordinator struct directly; a nil
@@ -1221,7 +1259,7 @@ func (c *coordinator) dispatchWorkspace() (*dispatch.Workspace, error) {
 			c.dispatchCollector.Start(ctx)
 		}
 	}
-	return c.dispatchWS, c.dispatchWSErr
+	return c.dispatchProvider, c.dispatchProviderErr
 }
 
 // DispatchStatus returns the current progress snapshot for the
@@ -1249,18 +1287,18 @@ func (c *coordinator) sweepDispatchOnDone(ctx context.Context) {
 	c.sweepDispatch()
 }
 
-// sweepDispatch sweeps the dispatch workspace registry if one exists.
+// sweepDispatch sweeps the dispatch worktree provider if one exists.
 func (c *coordinator) sweepDispatch() {
 	c.dispatchMu.Lock()
-	workspace := c.dispatchWS
+	provider := c.dispatchProvider
 	c.dispatchMu.Unlock()
-	if workspace == nil {
+	if provider == nil {
 		return
 	}
 	// A fresh, bounded context: the coordinator's own is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), dispatchSweepTimeout)
 	defer cancel()
-	if err := workspace.Sweep(ctx); err != nil {
+	if err := provider.Sweep(ctx); err != nil {
 		slog.Error("Dispatch workspace sweep failed", "error", err)
 	}
 }
@@ -1268,12 +1306,13 @@ func (c *coordinator) sweepDispatch() {
 // removeDispatch tears down a dispatch that failed before its background
 // run started: the registry entry, the workspace, and the toolchain. Best
 // effort — the tool error being returned to the model matters more.
-func (c *coordinator) removeDispatch(ctx context.Context, workspace *dispatch.Workspace, id string, toolchain *DispatchToolchain) {
+func (c *coordinator) removeDispatch(ctx context.Context, reg *dispatch.AgentRegistry, provider *dispatch.GitWorktreeProvider, entry dispatch.Entry, toolchain *DispatchToolchain) {
 	if toolchain != nil {
 		toolchain.Close(ctx)
 	}
-	if err := workspace.Remove(ctx, id); err != nil {
-		slog.Warn("Failed to remove failed dispatch workspace", "dispatch_id", id, "error", err)
+	reg.Remove(entry.ID)
+	if err := provider.Release(ctx, entry); err != nil {
+		slog.Warn("Failed to remove failed dispatch workspace", "dispatch_id", entry.ID, "error", err)
 	}
 }
 

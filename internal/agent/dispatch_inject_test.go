@@ -189,8 +189,7 @@ func TestDeliverAgentMessageMidRunThenRefusalAfterFinish(t *testing.T) {
 	// Finish the run; the injection target is gone with it.
 	close(agent.gate)
 	require.Eventually(t, func() bool {
-		ws, _ := c.dispatchWorkspace()
-		entry, ok := ws.Get(handle.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status == dispatch.StatusCompleted
 	}, 10*time.Second, 50*time.Millisecond)
 
@@ -265,8 +264,7 @@ func TestDeliverAgentMessageRefusesOnceRegistryIsTerminal(t *testing.T) {
 		t.Fatal("dispatch never reached cost propagation")
 	}
 
-	ws, _ := c.dispatchWorkspace()
-	entry, ok := ws.Get(handle.DispatchID)
+	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusCompleted, entry.Status, "the dispatch is parked after its terminal status")
 
@@ -378,8 +376,7 @@ func TestMessageAgentToolDeliversAndRefuses(t *testing.T) {
 
 	close(agent.gate)
 	require.Eventually(t, func() bool {
-		ws, _ := c.dispatchWorkspace()
-		entry, ok := ws.Get(handle.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status == dispatch.StatusCompleted
 	}, 10*time.Second, 50*time.Millisecond)
 

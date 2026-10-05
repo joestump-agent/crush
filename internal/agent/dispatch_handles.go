@@ -78,16 +78,7 @@ func (c *coordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID
 	// Tolerate the addressed form ("@Tester") as well as the bare slug:
 	// both the editor and the tool may pass either.
 	handle = dispatch.HandleSlug(handle)
-	c.dispatchMu.Lock()
-	workspace := c.dispatchWS
-	c.dispatchMu.Unlock()
-	var (
-		entry dispatch.Entry
-		ok    bool
-	)
-	if workspace != nil {
-		entry, ok = workspace.ByHandle(handle)
-	}
+	entry, ok := c.dispatchRegistry().ByHandle(handle)
 	if !ok {
 		return fmt.Errorf("no agent with handle @%s is known; dispatch one first", handle)
 	}

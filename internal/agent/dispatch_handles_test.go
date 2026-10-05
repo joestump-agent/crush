@@ -105,8 +105,7 @@ func TestDispatchLiveExcludesFinished(t *testing.T) {
 	// resolves by handle (finished dispatches keep their handle).
 	close(agent.gate)
 	require.Eventually(t, func() bool {
-		ws, _ := c.dispatchWorkspace()
-		entry, ok := ws.Get(first.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(first.DispatchID)
 		return ok && entry.Status.IsTerminal()
 	}, 10*time.Second, 50*time.Millisecond)
 
@@ -254,9 +253,9 @@ func TestHandleSurfacesDoNotProvisionWorkspace(t *testing.T) {
 	_, err = os.Stat(filepath.Join(env.workingDir, ".crush"))
 	require.True(t, os.IsNotExist(err), "a handle read must not create .crush")
 	c.dispatchMu.Lock()
-	ws, collector := c.dispatchWS, c.dispatchCollector
+	provider, collector := c.dispatchProvider, c.dispatchCollector
 	c.dispatchMu.Unlock()
-	require.Nil(t, ws)
+	require.Nil(t, provider)
 	require.Nil(t, collector)
 }
 

@@ -114,7 +114,8 @@ func (t *DispatchToolchain) Close(ctx context.Context) {
 // DispatchToolchainOptions configures BuildDispatchToolchain.
 type DispatchToolchainOptions struct {
 	// WorkingDir is the isolated workspace directory the toolchain is
-	// rooted at — the path Workspace (#63) provisions. Required.
+	// rooted at — the path the git worktree provider (#63) provisions.
+	// Required.
 	WorkingDir string
 }
 

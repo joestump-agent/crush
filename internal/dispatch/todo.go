@@ -61,7 +61,7 @@ type TodoSink interface {
 // subscription and reduction are written once and sunk twice — the
 // agent block is the first sink, #174's A2A event bridge the second.
 type TodoCollector struct {
-	ws       *Workspace
+	reg      *AgentRegistry
 	sessions pubsub.Subscriber[session.Session]
 	sinks    []TodoSink
 
@@ -77,11 +77,11 @@ type TodoCollector struct {
 }
 
 // NewTodoCollector returns a collector reducing progress for the
-// workspaces in ws, reading session state from sessions, and delivering
-// snapshots to sinks. Call [TodoCollector.Start] to run it.
-func NewTodoCollector(ws *Workspace, sessions pubsub.Subscriber[session.Session], sinks ...TodoSink) *TodoCollector {
+// dispatches in reg, reading session state from sessions, and
+// delivering snapshots to sinks. Call [TodoCollector.Start] to run it.
+func NewTodoCollector(reg *AgentRegistry, sessions pubsub.Subscriber[session.Session], sinks ...TodoSink) *TodoCollector {
 	return &TodoCollector{
-		ws:               ws,
+		reg:              reg,
 		sessions:         sessions,
 		sinks:            sinks,
 		latest:           make(map[string]TodoSnapshot),
@@ -98,7 +98,7 @@ func NewTodoCollector(ws *Workspace, sessions pubsub.Subscriber[session.Session]
 // without a replay log.
 func (c *TodoCollector) Start(ctx context.Context) {
 	sessionCh := c.sessions.Subscribe(ctx)
-	entryCh := c.ws.Subscribe(ctx)
+	entryCh := c.reg.Subscribe(ctx)
 	go c.loop(ctx, sessionCh, entryCh)
 }
 
@@ -161,7 +161,7 @@ func (c *TodoCollector) SubscribeSessionTodos(ctx context.Context, sessionID str
 // session reloaded mid-dispatch picks up live state immediately
 // (#65's seed path).
 func (c *TodoCollector) Snapshot(sessionID string) (TodoSnapshot, bool) {
-	entry, ok := c.ws.BySession(sessionID)
+	entry, ok := c.reg.BySession(sessionID)
 	if !ok {
 		return TodoSnapshot{}, false
 	}
@@ -174,7 +174,7 @@ func (c *TodoCollector) Snapshot(sessionID string) (TodoSnapshot, bool) {
 // dispatches too — the caller decides what a finished handle means (a
 // read-only card, a routing refusal).
 func (c *TodoCollector) SnapshotByHandle(handle string) (TodoSnapshot, bool) {
-	entry, ok := c.ws.ByHandle(handle)
+	entry, ok := c.reg.ByHandle(handle)
 	if !ok {
 		return TodoSnapshot{}, false
 	}
@@ -186,7 +186,7 @@ func (c *TodoCollector) SnapshotByHandle(handle string) (TodoSnapshot, bool) {
 // event yet still appear, seeded from their registry entry, so a freshly
 // provisioned dispatch is never invisible to the live-agents surfaces.
 func (c *TodoCollector) Snapshots() []TodoSnapshot {
-	return c.mergeAll(c.ws.List())
+	return c.mergeAll(c.reg.List())
 }
 
 // LiveSnapshots returns the snapshots of every non-terminal dispatch —
@@ -194,7 +194,7 @@ func (c *TodoCollector) Snapshots() []TodoSnapshot {
 // never appear, which keeps the not-continuable rule honest: nothing in
 // the popup can be addressed into a continuation.
 func (c *TodoCollector) LiveSnapshots() []TodoSnapshot {
-	all := c.mergeAll(c.ws.List())
+	all := c.mergeAll(c.reg.List())
 	live := make([]TodoSnapshot, 0, len(all))
 	for _, snap := range all {
 		if !snap.Entry.Status.IsTerminal() {
@@ -224,7 +224,7 @@ func (c *TodoCollector) mergeAll(entries []Entry) []TodoSnapshot {
 // processSessionEvent reduces one session event when it belongs to a
 // dispatched session.
 func (c *TodoCollector) processSessionEvent(ev pubsub.Event[session.Session]) {
-	entry, ok := c.ws.BySession(ev.Payload.ID)
+	entry, ok := c.reg.BySession(ev.Payload.ID)
 	if !ok {
 		return
 	}
