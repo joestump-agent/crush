@@ -211,15 +211,16 @@ permissions deny dispatch_agent message_agent
 
 Sub-agents and dispatched agents never get these tools in any case.
 
-## Planned: agent definitions
+## Agent definitions
 
-:::info[Planned]
-None of this section works yet. Today an `agents` block is silently dropped.
-The design is decided. Built-in agents become overridable defaults
-([#333](https://github.com/joestump-agent/crush/issues/333)), configured in `crushrc` first ([#431](https://github.com/joestump-agent/crush/issues/431)). Per-agent model, prompt,
-tools and MCP access are honored at runtime ([#432](https://github.com/joestump-agent/crush/issues/432)), and `dispatch_agent`
-takes an `agent` parameter ([#433](https://github.com/joestump-agent/crush/issues/433)). Key names may still change before it
-ships.
+:::info[Partially shipped]
+The data model works: an `agents` block in `crush.json` loads, validates, and
+resolves, and the error paths described below are live
+([#333](https://github.com/joestump-agent/crush/issues/333)). What is still
+planned: a `crushrc` builtin ([#431](https://github.com/joestump-agent/crush/issues/431)), honoring per-agent model, prompt,
+tools and MCP access at runtime ([#432](https://github.com/joestump-agent/crush/issues/432)), and the `agent`
+parameter on `dispatch_agent` ([#433](https://github.com/joestump-agent/crush/issues/433)). Fields the runtime does not
+honor yet load with a one-time warning.
 :::
 
 The built-ins stay: `coder`, `plan`, `task`, and a new `worker` that replaces

@@ -114,6 +114,7 @@ builtin yet: `allowed_commands`, `allow_all_commands` (see
 These `crush.json` keys do not exist upstream: `options.allowed_commands`,
 `options.allow_all_commands`, `options.disable_a2ui`,
 `options.todo_enforcement` ([multi-agent](/agents/todo-enforcement)), the
+top-level `agents` block ([multi-agent](/agents/configuration)), the
 top-level `embeddings` block ([semantic search](/features/semantic-search)),
 and the per-server `channel_enabled` ([channels](/features/channels)). See
 [What this fork adds](/fork#configuration).
@@ -137,6 +138,60 @@ authentication — the AWS SDK credential chain, for instance — without wrappi
 
 Values support the same `$VAR` and `$(command)` expansion as other config
 fields.
+
+## The `agents` block
+
+The top-level `agents` object customizes the built-in agents and defines new
+ones ([multi-agent](/agents/configuration)). Every field is optional: a null or
+omitted field inherits from the built-in with the same id, lists replace
+rather than append, and `0` or `"off"` disables the knob it configures.
+
+The built-ins are `coder`, `plan`, and `task`, plus `worker`, the dispatch
+agent definition the multi-agent runtime uses. Their roles (`main`,
+`subagent`, `dispatch`) cannot be changed, and `coder` cannot be disabled.
+
+```json
+{
+  "$schema": "https://charm.land/crush.json",
+  "agents": {
+    "$defaults": { "todos": { "hard_gate": true } },
+    "coder": {
+      "description": "Ship it.",
+      "tools": { "deny": ["sourcegraph"] },
+      "mcp": { "allow": ["github"] }
+    },
+    "worker": {
+      "model": { "provider": "deepseek", "model": "deepseek-chat" },
+      "kill": { "after_ignored_nudges": 3, "stall": "5m", "timeout": "30m" }
+    }
+  }
+}
+```
+
+Field guide:
+
+| Field | Values |
+| --- | --- |
+| `role` | `main`, `subagent`, or `dispatch`. A new agent must be `dispatch`. |
+| `runtime` | `builtin` (in process) or `a2a` (an external [Agent Card](https://a2a-protocol.org)). |
+| `model` | `"large"`, `"small"`, or `{ "provider": "...", "model": "..." }`. |
+| `tools` | `allow` and `deny` lists; entries are tool names, `@read`, `@write`, or `*`. Effective tools are allow minus deny minus `options.disabled_tools`, so a definition can narrow but never widen your tool policy. |
+| `mcp` | `allow` list; entries are `*`, a server id from `mcp`, or `server:tool`. |
+| `todos` | `nudge`, `nudge_after_tool_calls`, `hard_gate` (see [Todo enforcement](/agents/todo-enforcement)). |
+| `kill` | `after_ignored_nudges`, `stall`, `timeout`. Dispatch agents only. |
+| `context_paths` | Context files for the agent, overriding `options.context_paths`. |
+| `$defaults` | Only `todos` and `kill`: the knobs every agent inherits. |
+
+An `a2a` agent is defined by its external card, so it may only set `role`,
+`name`, `description`, `disabled`, `card`, `auth`, `workspace` (must be
+`none`), `transport`, and `kill` (only `timeout`).
+
+Fields the runtime parses but does not act on yet (`model` pins, `prompt`,
+`skills`, `workspace`, and the `a2a` machinery) load with a one-time warning.
+They are carried for the multi-agent epic: #432 wires agents to these
+definitions, #433 adds the agent parameter, and #434 fetches external cards.
+There is no `crushrc` builtin for `agents` yet; that is
+[#431](https://github.com/joestump-agent/crush/issues/431).
 
 ## Full example
 

@@ -162,11 +162,13 @@ A2A becomes the runtime contract: one execution path through the A2A client
 TCP plus TLS as an opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)), and later the other agents too ([#392](https://github.com/joestump-agent/crush/issues/392)).
 :::
 
-:::info[Planned]
+:::info[Partially shipped]
 Agent definitions: the built-in `coder`, `plan`, `task`, and a new `worker`
-agent for dispatch become overridable defaults you can extend, configured from
-`crushrc` first ([#333](https://github.com/joestump-agent/crush/issues/333), [#431](https://github.com/joestump-agent/crush/issues/431)). `dispatch_agent` gains an `agent`
-parameter to choose one ([#433](https://github.com/joestump-agent/crush/issues/433)).
+agent for dispatch become overridable defaults you can extend. The
+`crush.json` data model and its validation are live
+([#333](https://github.com/joestump-agent/crush/issues/333)); still planned:
+the `crushrc` builtin ([#431](https://github.com/joestump-agent/crush/issues/431)) and an `agent`
+parameter on `dispatch_agent` to choose one ([#433](https://github.com/joestump-agent/crush/issues/433)).
 :::
 
 ## Turning it off
