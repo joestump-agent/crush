@@ -19,13 +19,15 @@ import (
 // 11 MB diff streams without tripping bufio.Scanner: token too long;
 // maxReassembledDiffBytes bounds what the client will reassemble.
 const (
-	DiffArtifactID   a2aspec.ArtifactID = "diff"
-	DiffArtifactName                    = "diff"
-	DiffFilename                        = "dispatch.diff"
-	DiffMediaType                       = "text/x-diff"
+	DiffArtifactID a2aspec.ArtifactID = "diff"
 
-	ResultArtifactID   a2aspec.ArtifactID = "dispatch-result"
-	ResultArtifactName                    = "dispatch-result"
+	ResultArtifactID a2aspec.ArtifactID = "dispatch-result"
+
+	DiffArtifactName = "diff"
+	DiffFilename     = "dispatch.diff"
+	DiffMediaType    = "text/x-diff"
+
+	ResultArtifactName = "dispatch-result"
 
 	diffChunkSize           = 256 * 1024
 	maxReassembledDiffBytes = 32 << 20
