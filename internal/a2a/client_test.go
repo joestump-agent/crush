@@ -45,8 +45,10 @@ func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
 			return "--- a/x\n+++ b/x\n@@\n+changed", nil
 		},
 		Todos: &fakeTodoSource{snapshot: dispatch.TodoSnapshot{
-			CurrentTodo: "wiring form validation",
-			Todos:       []session.Todo{{Content: "wiring form validation", Status: session.TodoStatusInProgress}},
+			CurrentTodo:   "wiring form validation",
+			TodoCompleted: 0,
+			TodoTotal:     1,
+			Todos:         []session.Todo{{Content: "wiring form validation", Status: session.TodoStatusInProgress}},
 		}},
 		Call: agent.SessionAgentCall{NonInteractive: true, MaxOutputTokens: 512},
 	})
@@ -70,6 +72,66 @@ func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
 	require.Equal(t, "done, two files changed", outcome.Text)
 	require.Contains(t, outcome.Diff, "+++ b/x")
 	require.Greater(t, outcome.WorkingEvents, 0, "the SSE stream carried Working progress events")
+
+	// The typed todo progress (#359) rode the wire under the declared
+	// todos/v1 extension and decoded onto the outcome.
+	require.NotNil(t, outcome.TodoProgress)
+	require.Equal(t, "wiring form validation", outcome.TodoProgress.Current)
+	require.Equal(t, 1, outcome.TodoProgress.Total)
+	require.Len(t, outcome.TodoProgress.Todos, 1)
+	require.Equal(t, "wiring form validation", outcome.TodoProgress.Todos[0].Content)
+}
+
+// The stream-side metadata decoder (#359): registered and declared keys
+// decode; unknown keys, and declared keys whose value does not fit the
+// extension's type, are logged and dropped without failing the stream.
+func TestMetadataDecoderDropsUndecodable(t *testing.T) {
+	t.Parallel()
+
+	card := BuildAgentCard(CardParams{
+		Agent:    config.Agent{Name: "worker"},
+		Endpoint: "http://127.0.0.1:9000",
+	})
+	decoder := newMetadataDecoder(card)
+
+	outcome := agent.DispatchTransportOutcome{}
+	// An unknown metadata key (the pre-extension "todos" shape) is dropped.
+	decoder.apply(&outcome, &a2aspec.TaskStatusUpdateEvent{
+		Status:   a2aspec.TaskStatus{State: a2aspec.TaskStateWorking},
+		Metadata: map[string]any{"todos": []any{map[string]any{"content": "old shape"}}},
+	})
+	// A declared key with a malformed value is dropped.
+	decoder.apply(&outcome, &a2aspec.TaskStatusUpdateEvent{
+		Status:   a2aspec.TaskStatus{State: a2aspec.TaskStateWorking},
+		Metadata: map[string]any{TodoExtensionURI: []any{"garbage"}},
+	})
+	require.Nil(t, outcome.TodoProgress)
+
+	// A well-formed value decodes onto the outcome.
+	encoded, err := Encode(TodoExt, agent.TodoProgress{Current: "wiring", Total: 1})
+	require.NoError(t, err)
+	decoder.apply(&outcome, &a2aspec.TaskStatusUpdateEvent{
+		Status:   a2aspec.TaskStatus{State: a2aspec.TaskStateWorking},
+		Metadata: map[string]any{TodoExtensionURI: encoded},
+	})
+	require.NotNil(t, outcome.TodoProgress)
+	require.Equal(t, "wiring", outcome.TodoProgress.Current)
+}
+
+// The activation request covers exactly the card-declared extensions this
+// process has registered.
+func TestMetadataDecoderActivatedURIs(t *testing.T) {
+	t.Parallel()
+
+	decoder := newMetadataDecoder(&a2aspec.AgentCard{
+		Capabilities: a2aspec.AgentCapabilities{
+			Extensions: []a2aspec.AgentExtension{
+				{URI: TodoExtensionURI},
+				{URI: "https://crush.charm.land/ext/unknown-to-us/v1"},
+			},
+		},
+	})
+	require.Equal(t, []string{TodoExtensionURI}, decoder.activatedURIs())
 }
 
 // A failed run maps to the failed outcome with the failure text from the
