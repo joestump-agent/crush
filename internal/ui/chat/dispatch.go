@@ -312,9 +312,9 @@ func isTerminalDispatchStatus(status dispatch.Status) bool {
 
 // dispatchStateLabel maps a registry status to its card label. The
 // card's vocabulary is the interaction model's (queued / working /
-// complete / failed / killed); "killed" is reserved for wander kill
-// (#316) and unreachable for now.
-func dispatchStateLabel(status dispatch.Status) string {
+// complete / failed / killed / canceled); "canceled" marks a killed run
+// whose reason is the user cancel (#373), "killed" the other kills.
+func dispatchStateLabel(status dispatch.Status, killedReason string) string {
 	switch status {
 	case dispatch.StatusProvisioned:
 		return "queued"
@@ -325,6 +325,9 @@ func dispatchStateLabel(status dispatch.Status) string {
 	case dispatch.StatusFailed:
 		return "failed"
 	case dispatch.StatusKilled:
+		if killedReason == dispatch.ReasonCanceled {
+			return "canceled"
+		}
 		return "killed"
 	default:
 		return string(status)
@@ -474,7 +477,11 @@ func (d *DispatchToolMessageItem) statusParams() []string {
 	if handle := d.handleLabel(); handle != "" {
 		parts = append(parts, handle)
 	}
-	parts = append(parts, dispatchStateLabel(status))
+	killedReason := ""
+	if terminal := d.terminalResult(); terminal != nil {
+		killedReason = terminal.KilledReason
+	}
+	parts = append(parts, dispatchStateLabel(status, killedReason))
 	if elapsed, ok := d.elapsed(); ok {
 		parts = append(parts, formatDispatchElapsed(elapsed))
 	}

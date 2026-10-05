@@ -384,16 +384,19 @@ type UI struct {
 	// parent chat state captured on entry and restored on exit.
 	// inspectRing enumerates the live agent blocks (in transcript order)
 	// at the moment inspect mode was entered; ctrl+] cycles it.
+	// inspectDispatchTargets marks which ring members are dispatch blocks
+	// (vs plain agent tools), so ctrl+x only offers a cancel for them.
 	// inspectSeq numbers inspect transitions so a child load that lands
 	// after a later one is dropped. inspectPending is a task session
 	// picked from the sessions dialog, waiting for its parent to load.
-	inspecting     *session.Session
-	inspectScroll  [2]int
-	inspectFollow  bool
-	inspectRing    []string
-	inspectRingPos int
-	inspectSeq     int
-	inspectPending *session.Session
+	inspecting             *session.Session
+	inspectScroll          [2]int
+	inspectFollow          bool
+	inspectRing            []string
+	inspectRingPos         int
+	inspectDispatchTargets map[string]bool
+	inspectSeq             int
+	inspectPending         *session.Session
 
 	// onboarding state
 	onboarding struct {
@@ -4353,6 +4356,12 @@ func (m *UI) FullHelp() [][]key.Binding {
 			if hasSession {
 				mainBinds = append(mainBinds, k.Chat.NewSession, k.Chat.EndFollow)
 			}
+		}
+		if sid := m.focusedLiveDispatchSessionID(); sid != "" {
+			// A live dispatch is targeted: advertise the cancel binding
+			// (#373). It rides the inspect handler, so unlike the rows
+			// above it also works while the sidebar is focused.
+			mainBinds = append(mainBinds, k.CancelAgent)
 		}
 
 		binds = append(binds, mainBinds)

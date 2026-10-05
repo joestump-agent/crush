@@ -71,12 +71,17 @@ uncommitted changes. Commit before you dispatch.
 A killed or canceled run resolves to **failed** with its reason; there is no
 fixed deadline that ends a running dispatch.
 
-### I can't stop a single dispatched agent
+### Stopping a single dispatched agent
 
-There is no per-dispatch cancel ([#373](https://github.com/joestump-agent/crush/issues/373)). Pressing <kbd>esc</kbd> twice
-cancels only the main agent's turn, and dispatched agents keep going. You can
-ask an agent to stop with `@handle stop and report`, but that is a message it
-may ignore. Quitting Crush ends every dispatched run; read
+Select the agent's block in the chat — or drill into it with
+<kbd>ctrl+]</kbd> — and press <kbd>ctrl+x</kbd>
+([#373](https://github.com/joestump-agent/crush/issues/373)). Asking the main
+agent to "cancel @tester" works too: it calls `cancel_dispatch`. The run ends
+killed with reason "canceled by user", the card shows **canceled**, and the
+workspace and branch remain so you can review the work or dispatch a fresh
+agent against it. A steer (`@handle stop and report`) is still the gentler
+lever — the agent can wrap up on its own. <kbd>esc</kbd> twice cancels only
+the main agent's turn, and quitting Crush ends every dispatched run; read
 [Worktrees disappeared](#worktrees-disappeared-after-quitting) first.
 
 ### Dispatched tests never report back
