@@ -25,9 +25,8 @@ func (w *sessionMouseWorkspace) ListSessions(context.Context) ([]session.Session
 	return w.sessions, nil
 }
 
-func (w *sessionMouseWorkspace) ListChildSessions(context.Context, string) ([]session.Session, error) {
-	return nil, nil
-}
+// The sub-agent tree loads asynchronously (#409); these mouse tests
+// never install one, so every row stays a plain childless session.
 
 func (w *sessionMouseWorkspace) ParseAgentToolSessionID(string) (string, string, bool) {
 	return "", "", false

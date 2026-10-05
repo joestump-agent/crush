@@ -42,8 +42,11 @@ type Session struct {
 	sessions           []session.Session
 	// children maps a parent session ID to its inspectable sub-agent
 	// task sessions (#314). They nest under their parent through the
-	// same sub-menu pattern the commands dialog uses.
-	children map[string][]session.Session
+	// same sub-menu pattern the commands dialog uses. They load
+	// asynchronously after the dialog opens (#409): childrenLoaded
+	// distinguishes "not known yet" from "no sub-agents".
+	children       map[string][]session.Session
+	childrenLoaded bool
 
 	// menuStack / breadcrumb implement the sub-menu: one level per
 	// entered parent, mirroring dialog/commands.go.
@@ -90,22 +93,12 @@ func NewSessions(com *common.Common, selectedSessionID string) (*Session, error)
 		return nil, err
 	}
 
-	// Fetch the inspectable sub-agent children of every session (#314)
-	// so parents can offer a nested sub-menu. Only agent-tool task
-	// sessions qualify: their IDs carry the "messageID$$toolCallID"
-	// shape, which excludes the title-generation helper sessions.
+	// The inspectable sub-agent tree loads asynchronously (#409): the
+	// dialog opens without it and SetChildren installs the bulk fetch
+	// once it lands. Only agent-tool task sessions qualify: their IDs
+	// carry the "messageID$$toolCallID" shape, which excludes the
+	// title-generation helper sessions.
 	s.children = make(map[string][]session.Session)
-	for _, sess := range sessions {
-		kids, err := com.Workspace.ListChildSessions(context.TODO(), sess.ID)
-		if err != nil {
-			continue
-		}
-		for _, kid := range kids {
-			if _, _, ok := com.Workspace.ParseAgentToolSessionID(kid.ID); ok {
-				s.children[sess.ID] = append(s.children[sess.ID], kid)
-			}
-		}
-	}
 
 	s.sessions = sessions
 	for i, sess := range sessions {
@@ -260,6 +253,9 @@ func (s *Session) HandleMsg(msg tea.Msg) Action {
 				// task sessions are one chord away (#314).
 				if item := s.list.SelectedItem(); item != nil {
 					sessionItem := item.(*SessionItem)
+					if !s.childrenLoaded {
+						return ActionCmd{util.ReportInfo("Loading sub-agent sessions…")}
+					}
 					if len(s.children[sessionItem.Session.ID]) == 0 {
 						return ActionCmd{util.ReportInfo("No sub-agent sessions to inspect")}
 					}
@@ -328,6 +324,24 @@ func (s *Session) resetMouseClick() {
 // mode, re-deriving each row's sub-agent count.
 func (s *Session) rebuildItems() {
 	s.list.SetItems(sessionItems(s.com.Styles, s.sessionsMode, s.childCount, s.sessions...)...)
+}
+
+// SetChildren installs the sub-agent tree the async loader fetched
+// (#409): one bulk batch of child sessions, grouped here by their
+// parent, agent-tool task sessions only — the same filter the old
+// synchronous loader applied. The rows refresh in place, so the filter
+// text, the selection and the scroll position survive the children
+// landing. A failed load installs an empty tree, so ctrl+] reports
+// "no sub-agent sessions" instead of "loading" forever.
+func (s *Session) SetChildren(all []session.Session) {
+	s.children = make(map[string][]session.Session, len(all))
+	for _, kid := range all {
+		if _, _, ok := s.com.Workspace.ParseAgentToolSessionID(kid.ID); ok {
+			s.children[kid.ParentSessionID] = append(s.children[kid.ParentSessionID], kid)
+		}
+	}
+	s.childrenLoaded = true
+	s.rebuildItems()
 }
 
 // childCount returns the number of inspectable sub-agent sessions nested

@@ -484,8 +484,12 @@ type UI struct {
 	// in-flight fetch captures it at dispatch and its result is discarded
 	// if the generation has moved on (see workspace_cache.go).
 	promptQueueGen uint64
-	sidebarScroll  int
-	pillsView      string
+	// sessionsTreeGen is bumped every time the sessions dialog opens;
+	// the async sub-agent tree load captures it at dispatch and its
+	// result is dropped once the dialog closed or was reopened (#409).
+	sessionsTreeGen uint64
+	sidebarScroll   int
+	pillsView       string
 
 	// cronTasks holds the scheduled tasks for the current session,
 	// refreshed on session load and after cron tool results.
@@ -1671,6 +1675,20 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// switched to (or was reopened in) skill mode.
 		if m.completionsOpen && m.completionsTrigger == completions.TriggerFile {
 			m.completions.SetItems(msg.Files, msg.Resources, m.agentCompletionValues())
+		}
+	case sessionChildrenLoadedMsg:
+		// A load for a dialog that closed or was reopened since the fetch
+		// started is dropped by generation (#409). A failed load still
+		// installs an empty tree, so ctrl+] reports "no sub-agent
+		// sessions" instead of "loading" forever, and warns once.
+		if msg.gen != m.sessionsTreeGen {
+			break
+		}
+		if sd, ok := m.dialog.Dialog(dialog.SessionsID).(*dialog.Session); ok {
+			sd.SetChildren(msg.children)
+		}
+		if msg.err != nil {
+			cmds = append(cmds, util.ReportWarn(fmt.Sprintf("Couldn't load sub-agent sessions: %v", msg.err)))
 		}
 	case uv.KittyGraphicsEvent:
 		if !bytes.HasPrefix(msg.Payload, []byte("OK")) {
@@ -6760,9 +6778,24 @@ func (m *UI) openSkillsDialog() {
 	m.dialog.OpenDialog(skillsDialog)
 }
 
+// sessionChildrenLoadedMsg carries the sessions picker's bulk sub-agent
+// tree (#409). Update drops loads whose generation has been superseded
+// by a close or reopen.
+type sessionChildrenLoadedMsg struct {
+	gen      uint64
+	children []session.Session
+	err      error
+}
+
+// sessionsTreeLoadTimeout bounds the picker's single bulk child-session
+// fetch: the load runs off the Update loop, but a wedged server must not
+// leave the sub-agent tree "loading" forever.
+const sessionsTreeLoadTimeout = 30 * time.Second
+
 // openSessionsDialog opens the sessions dialog. If the dialog is already open,
 // it brings it to the front. Otherwise, it will list all the sessions and open
-// the dialog.
+// the dialog. The sessions themselves load synchronously (pre-fork behavior);
+// the sub-agent tree loads off the Update loop (#409).
 func (m *UI) openSessionsDialog() tea.Cmd {
 	if m.dialog.ContainsDialog(dialog.SessionsID) {
 		// Bring to front
@@ -6781,7 +6814,19 @@ func (m *UI) openSessionsDialog() tea.Cmd {
 	}
 
 	m.dialog.OpenDialog(dialog)
-	return nil
+
+	// One bulk fetch replaces the picker's old per-parent child loads
+	// (N table scans locally, N HTTP round trips in client/server mode,
+	// all inside the key handler).
+	m.sessionsTreeGen++
+	gen := m.sessionsTreeGen
+	ws := m.com.Workspace
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), sessionsTreeLoadTimeout)
+		defer cancel()
+		children, err := ws.ListAllChildSessions(ctx)
+		return sessionChildrenLoadedMsg{gen: gen, children: children, err: err}
+	}
 }
 
 // openFilesDialog opens the file picker dialog.
