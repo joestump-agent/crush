@@ -65,7 +65,7 @@ func TestTodoEnforcementCrushrcMatchesJson(t *testing.T) {
 option todo-nudge-threshold 3
 option todo-hard-gate on
 option todo-kill-after-nudges 5
-option dispatch-stall 5m
+option dispatch-stall 500ms
 option dispatch-timeout 1h`)
 	json := loadSettings("crush.json", `{
 	"options": {
@@ -74,7 +74,7 @@ option dispatch-timeout 1h`)
 			"nudge_threshold": 3,
 			"hard_gate": true,
 			"kill_after_nudges": 5,
-			"stall_window": 300,
+			"stall_window": "500ms",
 			"hard_timeout": 3600
 		}
 	}

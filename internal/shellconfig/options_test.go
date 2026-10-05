@@ -367,6 +367,8 @@ func TestOption_DispatchStall(t *testing.T) {
 	require.Equal(t, float64(300), loadTodoEnforcement(t, `option dispatch-stall 5m`)["stall_window"])
 	require.Equal(t, float64(300), loadTodoEnforcement(t, `option dispatch-stall 300`)["stall_window"])
 	require.Equal(t, float64(0), loadTodoEnforcement(t, `option dispatch-stall off`)["stall_window"])
+	require.Equal(t, "500ms", loadTodoEnforcement(t, `option dispatch-stall 500ms`)["stall_window"],
+		"sub-second durations keep their precision, the way a crush.json string does")
 
 	path := filepath.Join(t.TempDir(), "crushrc")
 	for _, script := range []string{

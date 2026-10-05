@@ -372,12 +372,12 @@ func handleTodoDispatchOption(key, val string, options map[string]any, stderr io
 		if val == "" {
 			return usage(stderr, fmt.Sprintf("option: %s requires a value", key))
 		}
-		seconds, err := parseSecondsOrOff(val)
+		duration, err := parseSecondsOrOff(val)
 		if err != nil {
 			return usage(stderr, fmt.Sprintf("option: %s: %v", key, err))
 		}
-		target[spec.jsonKey] = seconds
-		slog.Info("Option set in shell config", "key", key, "value", seconds)
+		target[spec.jsonKey] = durationJSONValue(duration)
+		slog.Info("Option set in shell config", "key", key, "value", duration.String())
 		return nil
 	}
 }
@@ -398,11 +398,26 @@ func parseCountOrOff(val string) (int, error) {
 	return n, nil
 }
 
+// durationJSONValue renders a parsed duration the way the config's
+// Duration knob round-trips a JSON value: whole seconds as the bare
+// legacy number, anything finer as a Go duration string, which loses
+// nothing. Storing the same form a crush.json value takes keeps a
+// crushrc option and its JSON equivalent decoding identically, down to
+// sub-second values, which would otherwise truncate to zero and
+// silently disable the knob.
+func durationJSONValue(d time.Duration) any {
+	if d == 0 {
+		return 0
+	}
+	if d%time.Second == 0 {
+		return int(d / time.Second)
+	}
+	return d.String()
+}
+
 // parseSecondsOrOff parses a duration option value: the string "off" is
 // zero, a bare integer is seconds, anything else is a Go duration string.
-// The result is whole seconds, the form the config's Duration field
-// accepts.
-func parseSecondsOrOff(val string) (int, error) {
+func parseSecondsOrOff(val string) (time.Duration, error) {
 	if strings.EqualFold(val, "off") {
 		return 0, nil
 	}
@@ -410,7 +425,7 @@ func parseSecondsOrOff(val string) (int, error) {
 		if n < 0 {
 			return 0, fmt.Errorf("expects a non-negative number of seconds or off, got %d", n)
 		}
-		return n, nil
+		return time.Duration(n) * time.Second, nil
 	}
 	d, err := time.ParseDuration(val)
 	if err != nil {
@@ -419,7 +434,7 @@ func parseSecondsOrOff(val string) (int, error) {
 	if d < 0 {
 		return 0, fmt.Errorf("expects a non-negative duration, got %q", val)
 	}
-	return int(d / time.Second), nil
+	return d, nil
 }
 
 func parseBool(s string) (bool, error) {
