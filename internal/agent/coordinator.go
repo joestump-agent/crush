@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
@@ -241,6 +242,18 @@ type coordinator struct {
 	// teardown. Guarded by dispatchMu; #372 (cancel at shutdown) and
 	// #373 (user-initiated cancel) build on it.
 	liveDispatches map[string]*liveDispatch
+	// shuttingDown is set when CancelAll's dispatch phase begins (#372):
+	// while it is set, a finishing dispatch still records its terminal
+	// result and status in the registry, but deliverDispatchResult
+	// starts no parent turn.
+	shuttingDown atomic.Bool
+	// dispatchShutdownWait bounds the shared wait CancelAll gives the
+	// live dispatches' graceful agent.Cancel to finish each run (#372);
+	// dispatchShutdownRootWait is the extra shared bound the root-cancel
+	// fallback gets. Zero keeps the defaults, 5s and 1s, matching
+	// sessionAgent.CancelAll's own bound; tests shorten them.
+	dispatchShutdownWait     time.Duration
+	dispatchShutdownRootWait time.Duration
 	// dispatchCtx is the NewCoordinator context the collector's
 	// subscriptions run on; nil-safe (tests construct the coordinator
 	// struct directly) — dispatchWorkspace falls back to
@@ -1635,6 +1648,9 @@ func (c *coordinator) Cancel(sessionID string) {
 
 func (c *coordinator) CancelAll() {
 	c.currentAgent().CancelAll()
+	// Quitting stops dispatched agents too (#372): they run on detached
+	// contexts, so the agent cancel above never reaches them.
+	c.cancelDispatchesForShutdown()
 }
 
 func (c *coordinator) ClearQueue(sessionID string) {

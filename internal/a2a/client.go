@@ -3,7 +3,10 @@ package a2a
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"strings"
+	"time"
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
@@ -23,6 +26,40 @@ const (
 	// DispatchStatusCanceled maps TaskStateCanceled.
 	DispatchStatusCanceled = "canceled"
 )
+
+// dispatchHTTPClient returns the HTTP client the dispatch transport
+// dials with (#344). It carries no total Timeout: the SDK's default
+// three-minute http.Client.Timeout bounds the whole exchange including
+// the SSE body, killing every served dispatch that runs longer than
+// three minutes and throwing its result away. The per-phase bounds —
+// dial, TLS handshake, response headers — still fail fast when the
+// server never answers; bounding a live run is the caller's context
+// and the wander-kill watchdog's job, not the transport's.
+func dispatchHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+		},
+	}
+}
+
+// newDispatchClient builds the A2A client for one dispatch: in-memory
+// discovery from the dispatch's registered card, with the JSON-RPC
+// transport wired to httpClient — the factory's injected client in
+// tests, the no-total-timeout production client otherwise (#344).
+func newDispatchClient(ctx context.Context, card *a2aspec.AgentCard, httpClient *http.Client) (*a2aclient.Client, error) {
+	if httpClient == nil {
+		httpClient = dispatchHTTPClient()
+	}
+	client, err := a2aclient.NewFromCard(ctx, card, a2aclient.WithJSONRPCTransport(httpClient))
+	if err != nil {
+		return nil, fmt.Errorf("a2a: client from card: %w", err)
+	}
+	return client, nil
+}
 
 // StreamDispatch drives one dispatch's initial task over the A2A
 // protocol (#71): it builds a client from the dispatch's registered
@@ -47,9 +84,9 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 		return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch prompt is empty")
 	}
 
-	client, err := a2aclient.NewFromCard(ctx, card)
+	client, err := newDispatchClient(ctx, card, f.httpClient)
 	if err != nil {
-		return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: client from card: %w", err)
+		return agent.DispatchTransportOutcome{}, err
 	}
 
 	req := &a2aspec.SendMessageRequest{

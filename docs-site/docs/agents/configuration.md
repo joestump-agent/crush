@@ -75,9 +75,8 @@ Some values are not read the way they look:
   the nudges and the kill on.
 
 :::warning[Known issue]
-These semantics are surprising and are tracked in [#401](https://github.com/joestump-agent/crush/issues/401). Two more caveats on
-current main: `stall_window` never fires ([#396](https://github.com/joestump-agent/crush/issues/396)), and every dispatch dies
-after 3 minutes regardless of `hard_timeout` ([#344](https://github.com/joestump-agent/crush/issues/344)).
+These semantics are surprising and are tracked in [#401](https://github.com/joestump-agent/crush/issues/401). One more caveat on
+current main: `stall_window` never fires ([#396](https://github.com/joestump-agent/crush/issues/396)).
 :::
 
 :::warning[Known issue]
@@ -155,26 +154,18 @@ though those include `bash` and `write` ([#377](https://github.com/joestump-agen
 
 ## Config the dispatched agent reads
 
-A dispatched agent loads config fresh from its worktree, which is a checkout of
-a **committed** revision. It reads:
+A dispatched agent runs with your session's config, viewed from inside its
+worktree. It never loads config from the worktree itself: nothing committed
+on the base revision, a revision the main agent chooses, is read or executed
+([#374](https://github.com/joestump-agent/crush/issues/374)).
 
-- your global config (`~/.config/crush/…`);
-- the project `crushrc`, `crush.json` or `.crush.json` **as committed** on the
-  base revision;
-- context files (`AGENTS.md`, `CRUSH.md`, …) and skills paths, resolved inside
+- Policy (permissions, command allow-lists, LSP servers, skills, MCP) is your
+  session's config: global plus the launch directory's project config,
+  whether committed or not.
+- Context files (`AGENTS.md`, `CRUSH.md`, …) and skills paths, resolved inside
   the worktree.
-
-It does not see gitignored or uncommitted config, local skills or context
-files, so a `.crushrc` you keep out of git does not apply. The data directory
-is shared with your session, so logs and the database stay in one place.
-
-:::warning[Known issue]
-Loading that config **runs** the worktree's `crushrc` as Bash, with your
-environment, before any permission prompt. The main agent chooses the base
-revision, so a `crushrc` on any branch it picks executes on your machine. Its
-`permissions allow` list and command allow-lists also take effect. Only
-dispatch from repositories whose branches you trust. Tracked in [#374](https://github.com/joestump-agent/crush/issues/374).
-:::
+- The data directory is shared with your session, so logs and the database
+  stay in one place.
 
 ## Hard-coded today
 
@@ -188,7 +179,7 @@ dispatch from repositories whose branches you trust. Tracked in [#374](https://g
 | Nudges per run | 2 |
 | Tool-loop detection | More than 5 identical tool calls and results in the last 10 steps |
 | A2A server | One per dispatch, `127.0.0.1` on a random port, JSON-RPC, no authentication |
-| A2A client timeout | 3 minutes total, the SDK default ([#344](https://github.com/joestump-agent/crush/issues/344)) |
+| A2A client timeout | No total timeout; per-phase bounds only: 10 s dial, 10 s TLS handshake, 30 s response headers ([#344](https://github.com/joestump-agent/crush/issues/344)) |
 | A2A server shutdown | 5 seconds |
 | Cleanup when Crush exits | A sweep that force-removes every `crush-dispatch-*` worktree and branch, with a 30-second timeout. Whether it finishes depends on how Crush exits; see [troubleshooting](/agents/troubleshooting) |
 | Inspect keys | <kbd>ctrl+]</kbd> and <kbd>ctrl+[</kbd> |

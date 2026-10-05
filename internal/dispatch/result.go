@@ -41,6 +41,9 @@ const (
 	ReasonToolLoop = "tool loop"
 	// ReasonHardTimeout: the run outlived the configured hard timeout.
 	ReasonHardTimeout = "hard timeout"
+	// ReasonShutdown: the run was canceled because the application is
+	// shutting down (#372).
+	ReasonShutdown = "crush exited"
 )
 
 // DispatchResult is the model-facing result of a dispatch: the running

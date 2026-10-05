@@ -97,10 +97,12 @@ model.
    current branch, else `HEAD`. Uncommitted changes in your checkout are
    not included. The base and its resolved SHA are recorded on the
    registry entry.
-2. **Toolchain.** It loads a config scoped to the worktree and builds the
-   tools against the worktree path: the task agent's read-only set plus
-   `bash`, `edit`, `multiedit`, `write` and `todos`. It also builds a scoped
-   LSP manager and a scoped permission service bridged to the parent's.
+2. **Toolchain.** It reuses the parent's config viewed from the worktree
+   path and builds the tools against it: the task agent's read-only set plus
+   `bash`, `edit`, `multiedit`, `write` and `todos`. Nothing the base
+   revision's config files declare is read or executed. It also builds a
+   scoped LSP manager and a scoped permission service bridged to the
+   parent's.
 3. **Agent.** It renders the system prompt from `dispatch.md.tpl` and
    builds a `SessionAgent` on the chosen model, using the global
    `todo_enforcement` settings.
@@ -110,9 +112,7 @@ model.
    else `role`, else `agent`, suffixed `-2`, `-3` on collision.
 
 :::warning[Known issue]
-The scoped config is loaded from the worktree itself, so a `.crushrc` on
-the base revision runs with your environment and its permission settings
-are adopted ([#374](https://github.com/joestump-agent/crush/issues/374)). The model-supplied `branch` is not validated with
+The model-supplied `branch` is not validated with
 `--end-of-options` ([#375](https://github.com/joestump-agent/crush/issues/375)). Parallel provisions race inside git
 ([#381](https://github.com/joestump-agent/crush/issues/381)).
 :::
@@ -213,10 +213,7 @@ Then, in this order, the coordinator:
 On the transport path — the production path — kills are lost. A kill
 cancels the agent behind the executor's back, the executor emits no
 terminal event, and the stream hangs ([#342](https://github.com/joestump-agent/crush/issues/342)). The transport result also
-ignores kill reasons, loop detection and diff errors ([#343](https://github.com/joestump-agent/crush/issues/343)). The SDK
-client's default 3-minute total timeout ends the hang, but it also fails
-every dispatch that runs longer than 3 minutes, while the agent keeps
-working ([#344](https://github.com/joestump-agent/crush/issues/344)).
+ignores kill reasons, loop detection and diff errors ([#343](https://github.com/joestump-agent/crush/issues/343)).
 :::
 
 ### 6. Deliver
@@ -251,12 +248,16 @@ registry entry. It then removes every `crush-dispatch-*` directory left
 under `.crush/worktrees`, and deletes each branch with `git branch -D`.
 Completed and killed work goes too.
 
+Shutdown itself runs before that sweep: every live dispatch is canceled
+with the "crush exited" kill reason, and the exit waits (bounded) for
+each dispatched run to record its terminal state, so agents stop before
+messages flush and the database closes.
+
 :::warning[Known issue]
 The exit sweep discards unreviewed and killed work, contradicting the
 "workspace is preserved" message the main agent receives ([#367](https://github.com/joestump-agent/crush/issues/367)). It also
 removes worktrees that belong to another Crush instance in the same
-repository ([#365](https://github.com/joestump-agent/crush/issues/365)). Shutdown does not cancel running dispatches first
-([#372](https://github.com/joestump-agent/crush/issues/372)).
+repository ([#365](https://github.com/joestump-agent/crush/issues/365)).
 :::
 
 ## Where this is going
