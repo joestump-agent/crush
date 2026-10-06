@@ -139,8 +139,14 @@ func (m *UI) agentBlocks() []agentBlockRef {
 				continue
 			}
 			sid := m.com.Workspace.CreateAgentToolSessionID(block.MessageID(), block.ToolCall().ID)
-			live := block.Status() == chat.ToolStatusRunning ||
-				block.Status() == chat.ToolStatusAwaitingPermission
+			// Live only while the result has not arrived: the status
+			// field stays Running after the result lands (the result path
+			// never calls SetStatus), so a finished agent would ride the
+			// ring and the "(n/N)" counter forever. A canceled block is
+			// never live (#405).
+			live := !block.HasResult() &&
+				(block.Status() == chat.ToolStatusRunning ||
+					block.Status() == chat.ToolStatusAwaitingPermission)
 			refs = append(refs, agentBlockRef{sessionID: sid, index: i, live: live})
 		}
 	}
