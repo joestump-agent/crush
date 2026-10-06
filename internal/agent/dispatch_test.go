@@ -133,6 +133,18 @@ func provisionProviderEntry(t *testing.T, provider *dispatch.GitWorktreeProvider
 		Status:  dispatch.StatusProvisioned,
 	}
 	reg.Register(entry)
+	// Release the workspace at test end: a provisioned workspace
+	// outlives everything the test does with it, and its
+	// ownership-lease file stays open until something releases it.
+	// t.TempDir()'s cleanup fails the test on Windows when it cannot
+	// delete an open file, so the lease must close before that removal
+	// (#422). Release is idempotent, so tests that drive Release or
+	// Sweep themselves are unaffected.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = provider.Release(ctx, entry)
+	})
 	return entry
 }
 
