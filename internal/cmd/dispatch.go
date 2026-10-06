@@ -99,9 +99,10 @@ var dispatchPruneCmd = &cobra.Command{
 
 A workspace whose owning process is alive is never removed, whatever
 the flags. By default only dead-owner workspaces whose disposition is
-applied or dismissed go; --all-dead widens that to every dead owner,
-skipping workspaces that hold changes unless --force is also given.
---dry-run prints the plan and deletes nothing.`,
+applied or dismissed go; pass --dismissed=false to keep dismissed
+ones. --all-dead widens that to every dead owner, skipping workspaces
+that hold changes unless --force is also given. --dry-run prints the
+plan and deletes nothing.`,
 	Example: `
 # Remove dead-owner workspaces that were applied or dismissed
 crush dispatch prune
@@ -168,7 +169,12 @@ func pruneDecision(w dispatch.WorkspaceInfo, allDead, dismissed, force bool) (bo
 		return false, "no owner marker (use --all-dead to remove unmarked entries)"
 	}
 	switch w.Disposition {
-	case dispatch.DispositionApplied, dispatch.DispositionDismissed:
+	case dispatch.DispositionApplied:
+		return true, ""
+	case dispatch.DispositionDismissed:
+		if !dismissed {
+			return false, "dismissed work kept (--dismissed=false)"
+		}
 		return true, ""
 	default:
 		return false, "work not yet applied or dismissed (use --all-dead to remove regardless)"

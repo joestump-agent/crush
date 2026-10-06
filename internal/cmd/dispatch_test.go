@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,53 @@ import (
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/lock"
 )
+
+// leaseHelperEnv marks a test binary re-executed as a lease holder,
+// and leaseHelperPathEnv names the lock file it holds.
+const (
+	leaseHelperEnv     = "GO_DISPATCH_LEASE_HELPER"
+	leaseHelperPathEnv = "GO_DISPATCH_LEASE_PATH"
+)
+
+// TestLeaseHelperProcess is the re-executed child of holdLeaseElsewhere:
+// it takes the lease named in the environment and holds it until the
+// parent kills it.
+func TestLeaseHelperProcess(t *testing.T) {
+	if os.Getenv(leaseHelperEnv) != "1" {
+		t.Skip("lease-holder child of holdLeaseElsewhere")
+	}
+	release, err := lock.TryFile(os.Getenv(leaseHelperPathEnv))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lease holder child: %v\n", err)
+		os.Exit(3)
+	}
+	defer release()
+	fmt.Println("locked")
+	time.Sleep(10 * time.Minute)
+}
+
+// holdLeaseElsewhere holds the lease on path from a child process for
+// the duration of the test, killing it at cleanup. A lease held in
+// this process does not do: on darwin, flock is per-process, so a
+// probe from the same process takes the lock without contention and
+// reports the owner dead.
+func holdLeaseElsewhere(t *testing.T, path string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLeaseHelperProcess$")
+	cmd.Env = append(os.Environ(), leaseHelperEnv+"=1", leaseHelperPathEnv+"="+path)
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	require.NoError(t, err, "lease holder child did not start: %q", line)
+	require.Equal(t, "locked", strings.TrimSpace(line))
+
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+}
 
 // newDispatchCLIRepo builds a git repository with one commit, hermetic
 // identity, for dispatch command tests.
@@ -95,7 +144,7 @@ func runDispatchList(t *testing.T, repo, dataDir string, json bool) string {
 }
 
 // runDispatchPrune runs `crush dispatch prune` with the given flags.
-func runDispatchPrune(t *testing.T, repo, dataDir string, allDead, force, dryRun bool) string {
+func runDispatchPrune(t *testing.T, repo, dataDir string, allDead, force, dryRun, dismissed bool) string {
 	t.Helper()
 	dispatchPruneCmd.SetContext(context.Background())
 	set := func(name string, v bool) {
@@ -104,11 +153,13 @@ func runDispatchPrune(t *testing.T, repo, dataDir string, allDead, force, dryRun
 	set("all-dead", allDead)
 	set("force", force)
 	set("dry-run", dryRun)
+	set("dismissed", dismissed)
 	require.NoError(t, dispatchPruneCmd.ParseFlags([]string{"--cwd", repo, "--data-dir", dataDir}))
 	t.Cleanup(func() {
 		set("all-dead", false)
 		set("force", false)
 		set("dry-run", false)
+		set("dismissed", true)
 		_ = dispatchPruneCmd.ParseFlags([]string{"--cwd", "", "--data-dir", ""})
 	})
 
@@ -136,9 +187,7 @@ func TestDispatchListCommand(t *testing.T) {
 	deadBranch := addDispatchFixture(t, repo, wtDir, "dead", "", "")
 
 	// The live owner holds its lease; the dead one's is free.
-	held, err := lock.TryFile(filepath.Join(wtDir, aliveBranch+".lock"))
-	require.NoError(t, err)
-	t.Cleanup(held)
+	holdLeaseElsewhere(t, filepath.Join(wtDir, aliveBranch+".lock"))
 
 	out := runDispatchList(t, repo, dataDir, false)
 	for _, want := range []string{"alive", "dead", "tester", aliveBranch, deadBranch, "yes", "no"} {
@@ -174,11 +223,9 @@ func TestDispatchPruneDefault(t *testing.T) {
 	undecided := addDispatchFixture(t, repo, wtDir, "undecided", "", "d3")
 	live := addDispatchFixture(t, repo, wtDir, "live", dispatch.DispositionDismissed, "d4")
 
-	held, err := lock.TryFile(filepath.Join(wtDir, live+".lock"))
-	require.NoError(t, err)
-	t.Cleanup(held)
+	holdLeaseElsewhere(t, filepath.Join(wtDir, live+".lock"))
 
-	out := runDispatchPrune(t, repo, dataDir, false, false, false)
+	out := runDispatchPrune(t, repo, dataDir, false, false, false, true)
 	require.Contains(t, out, "removed "+dismissed)
 	require.Contains(t, out, "removed "+applied)
 	require.Contains(t, out, "skipped "+undecided)
@@ -197,6 +244,28 @@ func TestDispatchPruneDefault(t *testing.T) {
 	require.True(t, branchExistsCLI(t, repo, live))
 }
 
+// --dismissed=false keeps dismissed workspaces: only applied ones go
+// in default mode (#369).
+func TestDispatchPruneAppliedOnly(t *testing.T) {
+	repo := newDispatchCLIRepo(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	wtDir, err := dispatch.WorktreesDir(dataDir, repo)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(wtDir, 0o755))
+
+	dismissed := addDispatchFixture(t, repo, wtDir, "dismissed", dispatch.DispositionDismissed, "d1")
+	applied := addDispatchFixture(t, repo, wtDir, "applied", dispatch.DispositionApplied, "d2")
+
+	out := runDispatchPrune(t, repo, dataDir, false, false, false, false)
+	require.Contains(t, out, "removed "+applied)
+	require.Contains(t, out, "skipped "+dismissed)
+
+	_, err = os.Stat(filepath.Join(wtDir, dismissed))
+	require.NoError(t, err, "--dismissed=false keeps dismissed workspaces")
+	_, err = os.Stat(filepath.Join(wtDir, applied))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
 // --all-dead takes every dead owner but skips ones holding changes;
 // --force lifts that too (#369).
 func TestDispatchPruneAllDead(t *testing.T) {
@@ -212,7 +281,7 @@ func TestDispatchPruneAllDead(t *testing.T) {
 	// changed holds uncommitted work.
 	require.NoError(t, os.WriteFile(filepath.Join(wtDir, changed, "wip.txt"), []byte("half"), 0o644))
 
-	out := runDispatchPrune(t, repo, dataDir, true, false, false)
+	out := runDispatchPrune(t, repo, dataDir, true, false, false, true)
 	require.Contains(t, out, "removed "+clean)
 	require.Contains(t, out, "skipped "+changed)
 	require.Contains(t, out, "has unapplied changes")
@@ -220,7 +289,7 @@ func TestDispatchPruneAllDead(t *testing.T) {
 	_, err = os.Stat(filepath.Join(wtDir, changed))
 	require.NoError(t, err, "changes keep a dead workspace without --force")
 
-	out = runDispatchPrune(t, repo, dataDir, true, true, false)
+	out = runDispatchPrune(t, repo, dataDir, true, true, false, true)
 	require.Contains(t, out, "removed "+changed)
 	_, err = os.Stat(filepath.Join(wtDir, changed))
 	require.ErrorIs(t, err, os.ErrNotExist)
@@ -236,7 +305,7 @@ func TestDispatchPruneDryRun(t *testing.T) {
 
 	branch := addDispatchFixture(t, repo, wtDir, "gone", dispatch.DispositionDismissed, "d1")
 
-	out := runDispatchPrune(t, repo, dataDir, false, false, true)
+	out := runDispatchPrune(t, repo, dataDir, false, false, true, true)
 	require.Contains(t, out, "would remove "+branch)
 
 	_, err = os.Stat(filepath.Join(wtDir, branch))
@@ -251,7 +320,7 @@ func TestDispatchCommandsNoWorktrees(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "data")
 
 	require.Empty(t, runDispatchList(t, repo, dataDir, false))
-	require.Empty(t, runDispatchPrune(t, repo, dataDir, false, false, false))
+	require.Empty(t, runDispatchPrune(t, repo, dataDir, false, false, false, true))
 }
 
 // Outside a git repository, both commands fail with a clear error
