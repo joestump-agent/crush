@@ -25,7 +25,7 @@ const MessageAgentToolName = "message_agent"
 type MessageAgentParams struct {
 	// SessionID is the dispatched agent's task session — the "session_id"
 	// field of the running handle the dispatch_agent tool returned.
-	SessionID string `json:"session_id" description:"Session ID of the running dispatched agent (the \"session_id\" from its dispatch handle)"`
+	SessionID string `json:"session_id,omitempty" description:"Session ID of the running dispatched agent (the \"session_id\" from its dispatch handle)"`
 	// Handle is the dispatched agent's @handle (#313) — the "handle"
 	// field of the dispatch handle, or the handle the user addressed.
 	Handle string `json:"handle,omitempty" description:"@handle of the running dispatched agent (the \"handle\" from its dispatch handle)"`
@@ -190,18 +190,37 @@ func (c *coordinator) messageAgentTool() fantasy.AgentTool {
 		MessageAgentToolName,
 		messageAgentToolDescription,
 		func(ctx context.Context, params MessageAgentParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			from := tools.GetSessionFromContext(ctx)
 			var err error
 			switch {
+			case params.SessionID != "" && params.Handle != "":
+				// Both set: accept only when the handle names the same
+				// session — a contradictory address is refused rather
+				// than silently preferred one way (#400).
+				handle := dispatch.HandleSlug(params.Handle)
+				snap, ok := c.DispatchByHandle(from, handle)
+				switch {
+				case !ok:
+					err = fmt.Errorf("no agent with handle @%s in this session; dispatch one first", handle)
+				case snap.Entry.SessionID != params.SessionID:
+					err = fmt.Errorf("handle @%s and session_id %s name different agents; provide exactly one of handle or session_id", handle, params.SessionID)
+				default:
+					err = c.DeliverAgentMessage(ctx, AgentMessage{
+						SessionID:     params.SessionID,
+						FromSessionID: from,
+						Text:          params.Message,
+					})
+				}
 			case params.SessionID != "":
 				err = c.DeliverAgentMessage(ctx, AgentMessage{
 					SessionID:     params.SessionID,
-					FromSessionID: tools.GetSessionFromContext(ctx),
+					FromSessionID: from,
 					Text:          params.Message,
 				})
 			case params.Handle != "":
-				err = c.DeliverAgentMessageByHandle(ctx, tools.GetSessionFromContext(ctx), dispatch.HandleSlug(params.Handle), params.Message, nil)
+				err = c.DeliverAgentMessageByHandle(ctx, from, dispatch.HandleSlug(params.Handle), params.Message, nil)
 			default:
-				err = errors.New("session id or handle is required")
+				err = errors.New("provide exactly one of handle or session_id")
 			}
 			if err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
