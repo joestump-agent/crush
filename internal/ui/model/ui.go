@@ -6198,10 +6198,20 @@ func (m *UI) sendMessageInternal(content string, hidden bool, attachments ...mes
 // prompt path a typed message uses (sendMessage → AgentRun, which enqueues
 // behind a running turn).
 //
+// While a sub-agent transcript is being inspected (#407) the click is
+// refused outright: the parent never asked the question, so the surface is
+// left live and nothing is sent anywhere.
+//
 // The retire lookup may miss — e.g. the message content was rescanned and
 // the surface rebuilt without an ID — in which case the submission still
 // goes out with just the button identity rather than being dropped.
 func (m *UI) handleA2UIButtonClicked(clicked a2uievent.ButtonClicked) tea.Cmd {
+	// A surface in an inspected transcript is read-only (#407): the click
+	// must not retire the surface, start a parent turn, or round-trip to
+	// an MCP server.
+	if m.isInspecting() {
+		return util.ReportInfo("This form belongs to a sub-agent transcript and is read-only")
+	}
 	// A cancel/dismiss button only ever dismisses the surface locally —
 	// it never starts an agent turn nor round-trips to an MCP server.
 	// Checked first, before any provenance branch.

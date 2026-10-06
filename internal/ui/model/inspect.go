@@ -76,17 +76,20 @@ func (m *UI) inspectingSessionID() string {
 	return m.inspecting.ID
 }
 
-// clearInspectState drops the inspect state without touching the chat.
-// Called whenever the active session changes underneath inspect mode
-// (session switch, new session) so the view never claims to inspect a
-// session it is not showing. Bumping inspectSeq drops any child load
-// still in flight.
+// clearInspectState drops the inspect state. Called whenever the active
+// session changes underneath inspect mode (session switch, new session)
+// or the view leaves, so it never claims to inspect a session it is not
+// showing. Bumping inspectSeq drops any child load still in flight. The
+// chat's read-only flag goes off with it (#407): every transcript rebuilt
+// after a clear is the parent's — or the landing screen's — and must be
+// interactive again.
 func (m *UI) clearInspectState() {
 	m.inspecting = nil
 	m.inspectRing = nil
 	m.inspectRingPos = 0
 	m.inspectDispatchTargets = nil
 	m.inspectSeq++
+	m.chat.SetA2UIReadOnly(false)
 }
 
 // agentBlocks enumerates the drill-in targets in the chat transcript in
@@ -318,6 +321,10 @@ func (m *UI) handleInspectLoaded(msg inspectSessionLoadedMsg) tea.Cmd {
 	live := slices.Contains(m.inspectRing, msg.sess.ID)
 
 	cmd := m.setSessionMessages(msg.messages)
+	// The viewed transcript is read-only (#407): a form it carries must
+	// not take focus or start a turn on the parent. Applied after
+	// setSessionMessages so any surface the rebuild focused is blurred.
+	m.chat.SetA2UIReadOnly(true)
 	if live {
 		// A running child keeps its spinners going; setSessionMessages
 		// gates the animation clock on the parent's busy state.

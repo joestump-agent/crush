@@ -1020,6 +1020,40 @@ func TestRetireA2UISurfaceUnknownID(t *testing.T) {
 	require.GreaterOrEqual(t, item.focusedA2UISurfaceIndex(), 0)
 }
 
+func TestReadOnlyA2UISurfaceNeverGainsFocus(t *testing.T) {
+	t.Parallel()
+
+	// Read-only from the start: focusing the item grants no surface focus,
+	// and keys do not reach the surface.
+	item := newA2UIFormItem(t)
+	_ = item.RawRender(80)
+	item.SetA2UIReadOnly(true)
+	item.SetFocused(true)
+	require.Equal(t, -1, item.focusedA2UISurfaceIndex(),
+		"a read-only surface must never gain focus")
+	handled, _ := item.HandleKeyEvent(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.False(t, handled, "a read-only surface must not consume enter")
+
+	// A surface focused while interactive loses it when read-only turns on,
+	// and re-selecting the item does not hand it back.
+	item2 := newA2UIFormItem(t)
+	_ = item2.RawRender(80)
+	item2.SetFocused(true)
+	require.GreaterOrEqual(t, item2.focusedA2UISurfaceIndex(), 0)
+	item2.SetA2UIReadOnly(true)
+	require.Equal(t, -1, item2.focusedA2UISurfaceIndex(),
+		"switching to read-only must blur the surface")
+	item2.SetFocused(false)
+	item2.SetFocused(true)
+	require.Equal(t, -1, item2.focusedA2UISurfaceIndex(),
+		"re-selecting must not re-focus a read-only surface")
+
+	// Back to interactive: a selected item focuses its surface again.
+	item2.SetA2UIReadOnly(false)
+	require.GreaterOrEqual(t, item2.focusedA2UISurfaceIndex(), 0,
+		"an interactive surface must be focusable again")
+}
+
 // --- Single-border + width regression ---
 //
 // A Card surface renders inside exactly one box: a2tea's own CardBorder,
