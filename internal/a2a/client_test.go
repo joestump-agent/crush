@@ -50,7 +50,7 @@ func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
 			return "--- a/x\n+++ b/x\n@@\n+changed", nil
 		},
 		Todos: source,
-		Call: agent.SessionAgentCall{NonInteractive: true, MaxOutputTokens: 512},
+		Call:  agent.SessionAgentCall{NonInteractive: true, MaxOutputTokens: 512},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = server.Stop(context.Background()) })
