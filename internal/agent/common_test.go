@@ -2,9 +2,13 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,7 +66,43 @@ func hyperBuilder(model string) builderFunc {
 }
 
 func testEnv(t *testing.T) fakeEnv {
-	return testEnvAtDir(t, t.TempDir())
+	dir := t.TempDir()
+	t.Cleanup(func() { flakeDiagRemove(t, dir) })
+	return testEnvAtDir(t, dir)
+}
+
+// flakeDiagRemove is a throwaway diagnostic: it removes dir just before
+// t.TempDir's own cleanup would, and on failure reports what was left
+// under it and which processes still hold it.
+func flakeDiagRemove(t *testing.T, dir string) {
+	// Any git still running against dir at cleanup is the race, whether
+	// or not this RemoveAll happens to lose it.
+	if ps, _ := exec.Command("sh", "-c", "ps -axo pid,ppid,etime,command | grep -F '"+dir+"' | grep -v grep").Output(); len(ps) > 0 {
+		buf := make([]byte, 1<<22)
+		n := runtime.Stack(buf, true)
+		var stacks []string
+		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+			if strings.Contains(g, "os/exec.(*Cmd)") {
+				stacks = append(stacks, g)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "FLAKEDIAG-LINGER %s:\nps:\n%s\ngoroutines in exec:\n%s\n", t.Name(), ps, strings.Join(stacks, "\n\n"))
+	}
+	err := os.RemoveAll(dir)
+	if err == nil {
+		return
+	}
+	var left []string
+	_ = filepath.Walk(dir, func(p string, info os.FileInfo, _ error) error {
+		if info != nil {
+			left = append(left, fmt.Sprintf("%s %s", strings.TrimPrefix(p, dir), info.ModTime().Format("15:04:05.000000")))
+		}
+		return nil
+	})
+	ps, _ := exec.Command("sh", "-c", "ps -axo pid,ppid,etime,command | grep -E 'git|crush|agent.test' | grep -v grep").Output()
+	lsof, _ := exec.Command("lsof", "+D", dir).Output()
+	fmt.Fprintf(os.Stderr, "FLAKEDIAG %s at %s: %v\nleft:\n  %s\nps:\n%s\nlsof:\n%s\n",
+		t.Name(), time.Now().Format("15:04:05.000000"), err, strings.Join(left, "\n  "), ps, lsof)
 }
 
 // testEnvFixedDir is testEnv rooted at the pre-#422 fixed directory. The
