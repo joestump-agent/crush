@@ -22,6 +22,10 @@ type Querier interface {
 	DeleteSession(ctx context.Context, id string) error
 	DeleteSessionFiles(ctx context.Context, sessionID string) error
 	DeleteSessionMessages(ctx context.Context, sessionID string) error
+	FailA2ADispatch(ctx context.Context, arg FailA2ADispatchParams) (int64, error)
+	FinishA2ADispatch(ctx context.Context, arg FinishA2ADispatchParams) (int64, error)
+	GetA2ADispatch(ctx context.Context, dispatchID string) (A2aDispatch, error)
+	GetA2ADispatchBySession(ctx context.Context, sessionID string) (A2aDispatch, error)
 	GetA2ATask(ctx context.Context, id string) (A2aTask, error)
 	GetAverageResponseTime(ctx context.Context) (int64, error)
 	GetFile(ctx context.Context, id string) (File, error)
@@ -54,18 +58,24 @@ type Querier interface {
 	// summary can come back too; the caller slices from the summary by ID.
 	ListMessagesBySessionFromSummary(ctx context.Context, arg ListMessagesBySessionFromSummaryParams) ([]Message, error)
 	ListNewFiles(ctx context.Context) ([]File, error)
+	ListNonTerminalA2ADispatches(ctx context.Context) ([]A2aDispatch, error)
+	ListNonTerminalA2ATasks(ctx context.Context) ([]A2aTask, error)
 	ListSessionReadFiles(ctx context.Context, sessionID string) ([]ReadFile, error)
 	ListSessions(ctx context.Context) ([]Session, error)
+	ListUndeliveredA2ADispatches(ctx context.Context) ([]A2aDispatch, error)
 	// Backs prompt history, which steps back one entry at a time.
 	ListUserMessagesBySession(ctx context.Context, sessionID string) ([]Message, error)
+	MarkA2ADispatchDelivered(ctx context.Context, arg MarkA2ADispatchDeliveredParams) error
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
 	RenameSession(ctx context.Context, arg RenameSessionParams) error
+	SetA2ADispatchTask(ctx context.Context, arg SetA2ADispatchTaskParams) error
 	SetSessionChannel(ctx context.Context, arg SetSessionChannelParams) (Session, error)
 	UpdateA2ATask(ctx context.Context, arg UpdateA2ATaskParams) (int64, error)
 	UpdateA2ATaskIfVersion(ctx context.Context, arg UpdateA2ATaskIfVersionParams) (int64, error)
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
 	UpdateSession(ctx context.Context, arg UpdateSessionParams) (Session, error)
 	UpdateSessionTitleAndUsage(ctx context.Context, arg UpdateSessionTitleAndUsageParams) error
+	UpsertA2ADispatch(ctx context.Context, arg UpsertA2ADispatchParams) error
 }
 
 var _ Querier = (*Queries)(nil)

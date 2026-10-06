@@ -8,6 +8,21 @@ import (
 	"database/sql"
 )
 
+type A2aDispatch struct {
+	DispatchID      string `json:"dispatch_id"`
+	TaskID          string `json:"task_id"`
+	SessionID       string `json:"session_id"`
+	ParentSessionID string `json:"parent_session_id"`
+	Handle          string `json:"handle"`
+	Branch          string `json:"branch"`
+	WorkspacePath   string `json:"workspace_path"`
+	Status          string `json:"status"`
+	ResultJson      string `json:"result_json"`
+	DeliveredAt     int64  `json:"delivered_at"`
+	HostID          string `json:"host_id"`
+	UpdatedAt       int64  `json:"updated_at"`
+}
+
 type A2aTask struct {
 	ID        string `json:"id"`
 	ContextID string `json:"context_id"`
