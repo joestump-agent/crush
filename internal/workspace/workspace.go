@@ -122,7 +122,7 @@ type Workspace interface {
 	GetSession(ctx context.Context, sessionID string) (session.Session, error)
 	ListSessions(ctx context.Context) ([]session.Session, error)
 	// ListChildSessions returns the child sessions of the given
-	// session, oldest update first (#314): the task sessions the
+	// session, oldest first (creation order) (#314): the task sessions the
 	// sessions picker nests under their parent. Includes every child
 	// kind; callers filter.
 	ListChildSessions(ctx context.Context, parentSessionID string) ([]session.Session, error)

@@ -72,7 +72,7 @@ type Service interface {
 	GetLast(ctx context.Context) (Session, error)
 	List(ctx context.Context) ([]Session, error)
 	// ListChildren returns the sessions whose ParentSessionID is the
-	// given session, oldest update first — the inverse of List's
+	// given session, oldest first (creation order) — the inverse of List's
 	// parent-only filter (#314). Includes every child kind (task
 	// sessions and title sessions); callers filter by kind.
 	ListChildren(ctx context.Context, parentID string) ([]Session, error)
