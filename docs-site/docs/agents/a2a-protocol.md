@@ -152,7 +152,7 @@ streams:
 | --- | --- | --- | --- |
 | 1 | `task` | `TASK_STATE_SUBMITTED` | The new task, with its IDs. |
 | 2 | `statusUpdate` | `TASK_STATE_WORKING` | No message. The run has started. |
-| 3 | `statusUpdate` × 0..n | `TASK_STATE_WORKING` | One per todo-list change: the current todo as message text, and the list in `metadata.todos`. |
+| 3 | `statusUpdate` × 0..n | `TASK_STATE_WORKING` | One per todo-list change: the current todo as message text, and the typed progress under the declared `todos/v1` extension's metadata key. |
 | 4 | `artifactUpdate` × 1..n | — | The work product: the diff as chunked `text/x-diff` parts (artifact `diff`), then the typed outcome as a data part (artifact `dispatch-result`). |
 | 5 | `statusUpdate` | `TASK_STATE_COMPLETED` | The agent's final text as an agent message. |
 
@@ -173,10 +173,15 @@ A progress event looks like this:
       }
     },
     "metadata": {
-      "todos": [
-        { "content": "Read pkg/x", "status": "completed", "active_form": "Reading pkg/x" },
-        { "content": "Write tests", "status": "in_progress", "active_form": "Writing table-driven tests" }
-      ]
+      "https://crush.charm.land/ext/todos/v1": {
+        "current": "Writing table-driven tests",
+        "completed": 1,
+        "total": 2,
+        "todos": [
+          { "content": "Read pkg/x", "status": "completed", "active_form": "Reading pkg/x" },
+          { "content": "Write tests", "status": "in_progress", "active_form": "Writing table-driven tests" }
+        ]
+      }
     }
   }
 }
@@ -184,9 +189,13 @@ A progress event looks like this:
 
 - **Message text.** The first `in_progress` todo's `active_form`, else its
   `content`. With nothing in progress, the text is `N/M completed`.
-- **`metadata.todos`.** Every todo, with `status` set to `pending`,
-  `in_progress` or `completed`. The key is undeclared: the card lists no
-  extension for it.
+- **The `todos/v1` extension value.** A `TodoProgress` object: `current`
+  (the in-progress todo's active form or content, empty when none),
+  `completed` and `total` counts, and `todos` — every todo with `status`
+  set to `pending`, `in_progress` or `completed`. The card declares the
+  extension under `capabilities.extensions`, with its JSON Schema in the
+  extension's params. Metadata keys that are not declared extensions are
+  dropped by the client, never fatal.
 - **When an event is sent.** Only when the list actually changed and is
   not empty. Saves that change only usage stay silent.
 - **Loss.** Delivery is lossy under back-pressure, through a 16-slot
@@ -297,7 +306,7 @@ A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/c
 - **`input-required` and `auth-required`.** Dispatched agents have no
   question tool, and permission prompts use an in-process bridge
   ([#352](https://github.com/joestump-agent/crush/issues/352), [#353](https://github.com/joestump-agent/crush/issues/353)).
-- **Declared extensions, usage and trace metadata** ([#359](https://github.com/joestump-agent/crush/issues/359), [#364](https://github.com/joestump-agent/crush/issues/364)).
+- **Usage and trace metadata** ([#364](https://github.com/joestump-agent/crush/issues/364)); declared extension metadata already ships for todo progress ([#359](https://github.com/joestump-agent/crush/issues/359)).
 - **Durable task state.** A restart loses every task ([#354](https://github.com/joestump-agent/crush/issues/354)).
 - **Authentication** of any kind ([#357](https://github.com/joestump-agent/crush/issues/357)).
 

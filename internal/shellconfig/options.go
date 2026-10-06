@@ -110,6 +110,21 @@ func handleOption(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		return nil
 	}
 
+	if key == "dispatch-max-concurrent" {
+		if val == "" {
+			return usage(stderr, "option: dispatch-max-concurrent requires a value")
+		}
+		n, err := strconv.Atoi(val)
+		if err != nil || n < 1 {
+			return usage(stderr, fmt.Sprintf("option: dispatch-max-concurrent expects a positive integer, got %q", val))
+		}
+		// Nested-section pattern (like option ui): the value lands under
+		// options.dispatch, not beside the other flat option keys.
+		childMap(o, "dispatch")["max_concurrent"] = n
+		slog.Info("Option set in shell config", "key", key, "value", n)
+		return nil
+	}
+
 	// The todo-*/dispatch-* keys write into the nested
 	// options.todo_enforcement block, so they are a special case like
 	// attribution-*, not entries in optionSpecs.

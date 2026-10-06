@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
+	"github.com/a2aproject/a2a-go/v2/a2aext"
 
 	"github.com/charmbracelet/crush/internal/agent"
 )
@@ -41,8 +43,10 @@ var dispatchResumeBackoff = []time.Duration{250 * time.Millisecond, time.Second,
 // discovery from the dispatch's registered card, with the JSON-RPC
 // transport wired to httpClient — the factory's injected client in
 // tests, the factory's unix-socket client in production (#346).
-func newDispatchClient(ctx context.Context, card *a2aspec.AgentCard, httpClient *http.Client) (*a2aclient.Client, error) {
-	client, err := a2aclient.NewFromCard(ctx, card, a2aclient.WithJSONRPCTransport(httpClient))
+// Extra options (the extension-activation interceptor) ride along.
+func newDispatchClient(ctx context.Context, card *a2aspec.AgentCard, httpClient *http.Client, opts ...a2aclient.FactoryOption) (*a2aclient.Client, error) {
+	opts = append([]a2aclient.FactoryOption{a2aclient.WithJSONRPCTransport(httpClient)}, opts...)
+	client, err := a2aclient.NewFromCard(ctx, card, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("a2a: client from card: %w", err)
 	}
@@ -75,7 +79,11 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 	if httpClient == nil {
 		httpClient = f.dispatchHTTPClient()
 	}
-	client, err := newDispatchClient(ctx, card, httpClient)
+	// Activate the extensions the remote agent's card declares and this
+	// process registered (#359), and decode the metadata they carry off
+	// the stream's status updates.
+	decoder := newMetadataDecoder(card)
+	client, err := newDispatchClient(ctx, card, httpClient, a2aclient.WithCallInterceptors(a2aext.NewActivator(decoder.activatedURIs()...)))
 	if err != nil {
 		return agent.DispatchTransportOutcome{}, err
 	}
@@ -119,6 +127,7 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 		switch e := ev.(type) {
 		case *a2aspec.TaskStatusUpdateEvent:
 			applyStatusUpdate(&outcome, e)
+			decoder.apply(&outcome, e)
 		case *a2aspec.TaskArtifactUpdateEvent:
 			applyArtifactUpdate(&outcome, e)
 		case *a2aspec.Task:
@@ -216,6 +225,65 @@ func foldEvent(outcome *agent.DispatchTransportOutcome, ev a2aspec.Event) {
 		applyArtifactUpdate(outcome, e)
 	case *a2aspec.Task:
 		foldTaskSnapshot(outcome, e)
+	}
+}
+
+// metadataDecoder decodes declared A2A extension metadata off one stream's
+// TaskStatusUpdateEvents (#359): only keys a registered extension owns and
+// the remote agent's card declared are decoded — anything else is logged and
+// dropped, so unknown or undeclared metadata never fails a dispatch stream.
+type metadataDecoder struct {
+	// declared is the set of extension URIs on the card's capabilities.
+	declared map[string]struct{}
+}
+
+// newMetadataDecoder builds the decoder for one dispatch from its card.
+func newMetadataDecoder(card *a2aspec.AgentCard) *metadataDecoder {
+	declared := make(map[string]struct{}, len(card.Capabilities.Extensions))
+	for _, ext := range card.Capabilities.Extensions {
+		declared[ext.URI] = struct{}{}
+	}
+	return &metadataDecoder{declared: declared}
+}
+
+// activatedURIs returns the card-declared URIs this process has registered,
+// for the extension-activation request the client interceptor sends.
+func (d *metadataDecoder) activatedURIs() []string {
+	uris := make([]string, 0, len(d.declared))
+	for _, ext := range Registered() {
+		if _, ok := d.declared[ext.URI]; ok {
+			uris = append(uris, ext.URI)
+		}
+	}
+	return uris
+}
+
+// apply decodes one status update's extension metadata into the outcome.
+// The last decoded value wins per key, mirroring the server's latest-snapshot
+// emission order. TodoProgress is the only typed payload consumed today.
+func (d *metadataDecoder) apply(outcome *agent.DispatchTransportOutcome, ev *a2aspec.TaskStatusUpdateEvent) {
+	meta := ev.Meta()
+	if len(meta) == 0 {
+		return
+	}
+	for uri, raw := range meta {
+		ext, registered := Lookup(uri)
+		if !registered {
+			slog.Debug("A2A metadata key is not a registered extension; dropped", "uri", uri)
+			continue
+		}
+		if _, ok := d.declared[uri]; !ok {
+			slog.Debug("A2A extension metadata was not declared on the agent card; dropped", "uri", uri)
+			continue
+		}
+		decoded, err := DecodeValue(ext, raw)
+		if err != nil {
+			slog.Warn("A2A extension metadata failed to decode; dropped", "uri", uri, "err", err)
+			continue
+		}
+		if progress, ok := decoded.(*agent.TodoProgress); ok {
+			outcome.TodoProgress = progress
+		}
 	}
 }
 

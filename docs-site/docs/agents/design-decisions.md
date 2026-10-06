@@ -50,7 +50,7 @@ current behaviour. What ships today is on
 | 2026-10-04 | **A2A is the runtime contract.** One path through the A2A client, and no direct-run fallback. | Both | Planned: [#347](https://github.com/joestump-agent/crush/issues/347) |
 | 2026-10-04 | **Transport.** One host per Crush process on a 0600 unix socket. TCP is opt-in and requires TLS and auth. | A2A PRD | Shipped ([#346](https://github.com/joestump-agent/crush/issues/346)); TCP planned: [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357) |
 | 2026-10-04 | **Agent definitions.** Built-ins stay backwards compatible but can be overridden, extended, or replaced by an external card. crushrc first. | Both | Planned: [#333](https://github.com/joestump-agent/crush/issues/333), [#431](https://github.com/joestump-agent/crush/issues/431), [#434](https://github.com/joestump-agent/crush/issues/434) |
-| 2026-10-04 | **Extensions.** Metadata is allowed but must be declared on the card and statically typed. | A2A PRD | Planned: [#359](https://github.com/joestump-agent/crush/issues/359) |
+| 2026-10-04 | **Extensions.** Metadata is allowed but must be declared on the card and statically typed. | A2A PRD | Shipped ([#359](https://github.com/joestump-agent/crush/issues/359)) |
 | 2026-10-04 | **Kill is `tasks/cancel` with a reason.** Exactly one terminal event per task. | A2A PRD | Planned: [#342](https://github.com/joestump-agent/crush/issues/342), [#348](https://github.com/joestump-agent/crush/issues/348) |
 | 2026-10-04 | **Kill scope.** Nudges apply to agents that have the todos tool. Kill applies only to dispatched agents. | Both | Planned: [#393](https://github.com/joestump-agent/crush/issues/393), [#394](https://github.com/joestump-agent/crush/issues/394) |
 | 2026-10-04 | **Per-agent thresholds** live on the definition, with global options as defaults. | Both | Planned: [#402](https://github.com/joestump-agent/crush/issues/402) |
@@ -59,7 +59,7 @@ current behaviour. What ships today is on
 | 2026-10-04 | **Not continuable, for now.** Delegation depth is one level. | Both | Current behaviour; [#413](https://github.com/joestump-agent/crush/issues/413) closes gaps |
 | 2026-10-04 | **Navigation.** `ctrl+]` enters and cycles. Esc and `ctrl+[` always leave inspect mode, and Esc never cancels from it. | Interaction | Planned: [#404](https://github.com/joestump-agent/crush/issues/404) |
 | 2026-10-04 | **Durable task state** in a SQLite task store. | A2A PRD | Planned: [#354](https://github.com/joestump-agent/crush/issues/354), [#355](https://github.com/joestump-agent/crush/issues/355) |
-| 2026-10-04 | **Steering, kill and progress are A2A operations.** | Interaction | Planned: [#351](https://github.com/joestump-agent/crush/issues/351), [#348](https://github.com/joestump-agent/crush/issues/348), [#359](https://github.com/joestump-agent/crush/issues/359) |
+| 2026-10-04 | **Steering, kill and progress are A2A operations.** | Interaction | Partly shipped ([#359](https://github.com/joestump-agent/crush/issues/359) typed progress metadata). Planned: [#351](https://github.com/joestump-agent/crush/issues/351), [#348](https://github.com/joestump-agent/crush/issues/348) |
 
 ## The 2026-10-04 decisions
 
@@ -106,18 +106,19 @@ Tracking: [#333](https://github.com/joestump-agent/crush/issues/333), [#431](htt
 ### Extensions are declared and statically typed
 
 The A2A epic originally ruled out custom extensions, yet todo progress
-already travels in an undeclared metadata key. Instead of pretending
+already traveled in an undeclared metadata key. Instead of pretending
 otherwise, each kind of Crush metadata gets an extension URI, a Go type and
 a JSON schema. Cards list what they emit and accept, and undeclared keys
-are rejected. Planned extensions:
+are dropped. The `todos/v1` extension carries dispatch todo progress and
+ships today ([#359](https://github.com/joestump-agent/crush/issues/359)).
+Planned extensions:
 
-- `todos/v1`;
 - `delegation/v1`, carrying origin, chain, depth and budget; it subsumes
   [#332](https://github.com/joestump-agent/crush/issues/332) and
   [#336](https://github.com/joestump-agent/crush/issues/336);
 - `usage/v1`.
 
-Tracking: [#359](https://github.com/joestump-agent/crush/issues/359), [#364](https://github.com/joestump-agent/crush/issues/364).
+Tracking: [#364](https://github.com/joestump-agent/crush/issues/364).
 
 ### Kill is `tasks/cancel` with a reason
 
@@ -206,7 +207,7 @@ collector. None of those can cross a process boundary. As A2A operations
 they become a message on the running context, `tasks/cancel` and typed
 `Working` events. The same code then serves a local worker, an isolated
 process and a remote agent, and the TUI becomes one more A2A client.
-Tracking: [#351](https://github.com/joestump-agent/crush/issues/351), [#348](https://github.com/joestump-agent/crush/issues/348), [#359](https://github.com/joestump-agent/crush/issues/359), [#421](https://github.com/joestump-agent/crush/issues/421).
+Tracking: [#351](https://github.com/joestump-agent/crush/issues/351), [#348](https://github.com/joestump-agent/crush/issues/348), [#421](https://github.com/joestump-agent/crush/issues/421). The typed progress half — statically typed todo metadata under a declared extension — shipped in [#359](https://github.com/joestump-agent/crush/issues/359).
 
 ## Standing implementation choices
 

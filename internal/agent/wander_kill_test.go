@@ -731,65 +731,70 @@ func TestWanderKill_NoTodosNeverStallKilled(t *testing.T) {
 // TestWanderKill_TodosUpdatedWithinWindowNotKilled pins the reset half of
 // the stall window (#396): a run that keeps refreshing its todo list
 // within each window is never stall-killed, even though it stays open
-// far past a single window.
+// far past a single window. It runs under synctest: on a real clock a
+// 200ms refresh against a 400ms window was stall-killed whenever a loaded
+// runner delayed one refresh past the window, while the bubble's clock
+// only advances once every goroutine is idle, so a refresh can't be late.
 func TestWanderKill_TodosUpdatedWithinWindowNotKilled(t *testing.T) {
 	t.Parallel()
-	model := &scriptedModel{steps: []scriptedStep{
-		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
-		{text: "done"},
-	}}
-	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
-	settings := config.TodoEnforcementSettings{
-		Enabled:     false,
-		StallWindow: 400 * time.Millisecond,
-	}
-	f := newWanderKillFixture(t, model, settings)
-	f.runModel = blocked
-	f.buildDispatched(t, blocked, settings, nil)
-	f.armRunRoot()
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		f.runDispatchSync(t)
-	}()
-
-	// Keep the todo list fresh until the run ends: the first write arms
-	// the window, and every update within it resets the timer.
-	updated := make(chan struct{})
-	go func() {
-		defer close(updated)
-		step := 0
-		for {
-			select {
-			case <-done:
-				return
-			case <-time.After(200 * time.Millisecond):
-			}
-			step++
-			sess, err := f.env.sessions.Get(t.Context(), f.taskSess.ID)
-			if err != nil {
-				t.Errorf("Get task session: %v", err)
-				return
-			}
-			sess.Todos = []session.Todo{{Content: fmt.Sprintf("progress %d", step), Status: session.TodoStatusInProgress, ActiveForm: "Working"}}
-			if _, err := f.env.sessions.Save(t.Context(), sess); err != nil {
-				t.Errorf("Save refreshed todos: %v", err)
-				return
-			}
+	synctest.Test(t, func(t *testing.T) {
+		model := &scriptedModel{steps: []scriptedStep{
+			{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+			{text: "done"},
+		}}
+		blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+		settings := config.TodoEnforcementSettings{
+			Enabled:     false,
+			StallWindow: 10 * time.Minute,
 		}
-	}()
+		f := newWanderKillFixture(t, model, settings)
+		f.runModel = blocked
+		f.buildDispatched(t, blocked, settings, nil)
+		f.armRunRoot()
 
-	time.Sleep(3 * settings.StallWindow)
-	close(blocked.hold)
-	<-done
-	<-updated
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			f.runDispatchSync(t)
+		}()
 
-	entry, ok := f.reg.Get(f.entry.ID)
-	require.True(t, ok)
-	require.Equal(t, dispatch.StatusCompleted, entry.Status, "a run that refreshes its todos within each window must not be stall-killed")
-	require.NotNil(t, entry.Result)
-	assert.Empty(t, entry.Result.KilledReason)
+		// Keep the todo list fresh until the run ends: the first write
+		// arms the window, and every update within it resets the timer.
+		updated := make(chan struct{})
+		go func() {
+			defer close(updated)
+			step := 0
+			for {
+				select {
+				case <-done:
+					return
+				case <-time.After(settings.StallWindow / 2):
+				}
+				step++
+				sess, err := f.env.sessions.Get(t.Context(), f.taskSess.ID)
+				if err != nil {
+					t.Errorf("Get task session: %v", err)
+					return
+				}
+				sess.Todos = []session.Todo{{Content: fmt.Sprintf("progress %d", step), Status: session.TodoStatusInProgress, ActiveForm: "Working"}}
+				if _, err := f.env.sessions.Save(t.Context(), sess); err != nil {
+					t.Errorf("Save refreshed todos: %v", err)
+					return
+				}
+			}
+		}()
+
+		time.Sleep(3 * settings.StallWindow)
+		close(blocked.hold)
+		<-done
+		<-updated
+
+		entry, ok := f.reg.Get(f.entry.ID)
+		require.True(t, ok)
+		require.Equal(t, dispatch.StatusCompleted, entry.Status, "a run that refreshes its todos within each window must not be stall-killed")
+		require.NotNil(t, entry.Result)
+		assert.Empty(t, entry.Result.KilledReason)
+	})
 }
 
 // lateStartAgent delays every Run past a fixed duration: the real agent
