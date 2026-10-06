@@ -385,12 +385,17 @@ func TestA2ATasksMigrationDown(t *testing.T) {
 	_, err = store.Create(t.Context(), testTask("task-1", "ctx-1", a2aspec.TaskStateSubmitted))
 	require.NoError(t, err, "the table must exist after migrations run")
 
-	require.NoError(t, goose.Down(database, "migrations"))
+	// Down all of it — the latest migration is no longer the a2a_tasks
+	// one (#355's dispatches table sits on top of it) — and require both
+	// tables gone.
+	require.NoError(t, goose.DownTo(database, "migrations", 0))
 
-	var count int
-	err = database.QueryRowContext(t.Context(), "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='a2a_tasks'").Scan(&count)
-	require.NoError(t, err)
-	require.Zero(t, count, "Down must drop a2a_tasks")
+	for _, table := range []string{"a2a_tasks", "a2a_dispatches"} {
+		var count int
+		err = database.QueryRowContext(t.Context(), "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&count)
+		require.NoError(t, err)
+		require.Zero(t, count, "Down must drop "+table)
+	}
 }
 
 // The full served path: a message/send through StartServer with a

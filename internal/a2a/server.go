@@ -199,6 +199,14 @@ type ServerFactory struct {
 	// side's [a2aclient.AuthInterceptor] (#357).
 	creds *a2aclient.InMemoryCredentialsStore
 
+	// taskStore is the process-wide default served tasks persist to
+	// (#355): the durable SQLite store rooted at the session database,
+	// wired once by the app so the agent package never touches the
+	// taskstore types. A ServerParams.TaskStore set per dispatch wins
+	// over it (tests); when both are unset, served tasks keep the SDK's
+	// in-process default and do not survive a restart.
+	taskStore taskstore.Store
+
 	// httpClient, when set, replaces the factory's unix-socket dispatch
 	// client in StreamDispatch — the test injection seam (#344), used
 	// to bound phases of the wire protocol independently of the
@@ -322,8 +330,12 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	if p.InactivityTimeout > 0 {
 		handlerOpts = append(handlerOpts, a2asrv.WithAgentInactivityTimeout(p.InactivityTimeout+time.Minute))
 	}
-	if p.TaskStore != nil {
-		handlerOpts = append(handlerOpts, a2asrv.WithTaskStore(p.TaskStore))
+	store := p.TaskStore
+	if store == nil {
+		store = f.taskStore
+	}
+	if store != nil {
+		handlerOpts = append(handlerOpts, a2asrv.WithTaskStore(store))
 	}
 	// The traceparent propagator (#364): the W3C traceparent the parent's
 	// client interceptor sent moves into the request context, where the
@@ -402,6 +414,16 @@ type ServerFactoryOption func(*ServerFactory)
 // the transport's own deadline.
 func WithHTTPClient(client *http.Client) ServerFactoryOption {
 	return func(f *ServerFactory) { f.httpClient = client }
+}
+
+// WithTaskStore sets the store every served dispatch's tasks persist
+// to by default (#355). The app passes the SQLite store over the
+// session database, stamped with this process's HostID, so a crash no
+// longer ends a dispatch's task history; the startup reconcile fails
+// what the dead process left running. A per-dispatch ServerParams
+// TaskStore still wins, which is the seam tests use.
+func WithTaskStore(store taskstore.Store) ServerFactoryOption {
+	return func(f *ServerFactory) { f.taskStore = store }
 }
 
 // StartDispatchServer implements [agent.DispatchHost]: it
