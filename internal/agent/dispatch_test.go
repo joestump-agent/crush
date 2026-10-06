@@ -41,7 +41,7 @@ func newDispatchTestCoordinatorAt(t *testing.T, env fakeEnv, workingDir, dataDir
 	require.NoError(t, err)
 	cfg.SetupAgents()
 
-	return &coordinator{
+	c := &coordinator{
 		cfg:         cfg,
 		sessions:    env.sessions,
 		messages:    env.messages,
@@ -54,6 +54,18 @@ func newDispatchTestCoordinatorAt(t *testing.T, env fakeEnv, workingDir, dataDir
 		// test instead of leaking a Background subscription.
 		dispatchCtx: t.Context(),
 	}
+	// The session-end backstop (#63's Sweep), run as a cleanup: a
+	// dispatch's workspace outlives its background run — runDispatch
+	// never releases it — so the worktree provider's ownership-lease
+	// file stays open until something sweeps. t.TempDir()'s cleanup
+	// fails the test on Windows when it cannot delete an open file, so
+	// the sweep must run before that removal. Registered after testEnv's
+	// cleanups and before reapDispatchRuns' registration, it runs after
+	// the reaper has waited out every run (LIFO) and before the
+	// directory goes away (#422). Sweep is idempotent, so a test that
+	// swept or released explicitly is unaffected.
+	t.Cleanup(c.sweepDispatch)
+	return c
 }
 
 // reapDispatchRuns installs the spawn seam (#422): every runDispatch the
