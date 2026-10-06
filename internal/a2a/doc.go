@@ -34,7 +34,7 @@
 // # Adding an extension
 //
 // Declared, statically typed metadata extensions (#359) are registered in
-// one place, [extension registry in ext.go]: define the payload type next to
+// one place, ext.go's registry ([Register]): define the payload type next to
 // [agent.DispatchTransportOutcome] in internal/agent (the a2a package
 // imports agent, not the other way around), then add an [Extension] entry
 // with mustRegister in ext.go's init, carrying the payload's Go type and
