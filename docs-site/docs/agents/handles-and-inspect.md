@@ -200,7 +200,6 @@ terminal, and <kbd>esc</kbd> will never cancel the main agent from inspect mode
   ([#416](https://github.com/joestump-agent/crush/issues/416)).
 - A2UI forms in an inspected transcript stay live; submitting one starts a turn
   on the main agent ([#407](https://github.com/joestump-agent/crush/issues/407)).
-- The inspect keys are missing from <kbd>ctrl+g</kbd> help ([#412](https://github.com/joestump-agent/crush/issues/412)).
 :::
 
 ## Sessions tree
