@@ -27,6 +27,32 @@ func (q *Queries) AddSessionCost(ctx context.Context, arg AddSessionCostParams) 
 	return err
 }
 
+const addSessionUsage = `-- name: AddSessionUsage :exec
+UPDATE sessions
+SET
+    prompt_tokens = prompt_tokens + ?,
+    completion_tokens = completion_tokens + ?,
+    cost = cost + ?
+WHERE id = ?
+`
+
+type AddSessionUsageParams struct {
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	Cost             float64 `json:"cost"`
+	ID               string  `json:"id"`
+}
+
+func (q *Queries) AddSessionUsage(ctx context.Context, arg AddSessionUsageParams) error {
+	_, err := q.exec(ctx, q.addSessionUsageStmt, addSessionUsage,
+		arg.PromptTokens,
+		arg.CompletionTokens,
+		arg.Cost,
+		arg.ID,
+	)
+	return err
+}
+
 const createSession = `-- name: CreateSession :one
 INSERT INTO sessions (
     id,

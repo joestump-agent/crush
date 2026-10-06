@@ -43,9 +43,16 @@ var dispatchResumeBackoff = []time.Duration{250 * time.Millisecond, time.Second,
 // discovery from the dispatch's registered card, with the JSON-RPC
 // transport wired to httpClient — the factory's injected client in
 // tests, the factory's unix-socket client in production (#346).
-// Extra options (the extension-activation interceptor) ride along.
+// Every client carries the traceparent interceptor (#364): calls whose
+// context holds a W3C traceparent send it as a request header, and calls
+// whose context does not (cancels from kill paths, task queries) go out
+// without one. Extra options (the extension-activation interceptor) ride
+// along.
 func newDispatchClient(ctx context.Context, card *a2aspec.AgentCard, httpClient *http.Client, opts ...a2aclient.FactoryOption) (*a2aclient.Client, error) {
-	opts = append([]a2aclient.FactoryOption{a2aclient.WithJSONRPCTransport(httpClient)}, opts...)
+	opts = append([]a2aclient.FactoryOption{
+		a2aclient.WithJSONRPCTransport(httpClient),
+		a2aclient.WithCallInterceptors(&traceparentInterceptor{}),
+	}, opts...)
 	client, err := a2aclient.NewFromCard(ctx, card, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("a2a: client from card: %w", err)
@@ -81,7 +88,8 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 	}
 	// Activate the extensions the remote agent's card declares and this
 	// process registered (#359), and decode the metadata they carry off
-	// the stream's status updates.
+	// the stream's status updates. The traceparent interceptor rides on
+	// every client this package builds (#364).
 	decoder := newMetadataDecoder(card)
 	client, err := newDispatchClient(ctx, card, httpClient, a2aclient.WithCallInterceptors(a2aext.NewActivator(decoder.activatedURIs()...)))
 	if err != nil {
@@ -284,7 +292,29 @@ func (d *metadataDecoder) apply(outcome *agent.DispatchTransportOutcome, ev *a2a
 		if progress, ok := decoded.(*agent.TodoProgress); ok {
 			outcome.TodoProgress = progress
 		}
+		if usage, ok := decoded.(*agent.Usage); ok {
+			outcome.Usage = usage
+		}
 	}
+}
+
+// traceparentInterceptor sends the parent turn's W3C traceparent as the
+// traceparent request header on every A2A call (#364). The value rides
+// the request's context — the dispatch turn generates one when the caller
+// supplied none — and the server propagator lifts the header back out on
+// the other side, so parent call, server logs, and the usage payload's
+// trace_id share one trace. A call whose context carries no traceparent
+// (resumes, cancels from kill paths) goes out without one.
+type traceparentInterceptor struct {
+	a2aclient.PassthroughInterceptor
+}
+
+// Before implements [a2aclient.CallInterceptor].
+func (i *traceparentInterceptor) Before(ctx context.Context, req *a2aclient.Request) (context.Context, any, error) {
+	if tp := agent.TraceparentFromContext(ctx); tp != "" {
+		req.ServiceParams.Append(traceparentHeader, tp)
+	}
+	return ctx, nil, nil
 }
 
 // applyStatusUpdate folds one status update into the outcome: Working

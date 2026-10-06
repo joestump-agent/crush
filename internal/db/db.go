@@ -27,6 +27,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.addSessionCostStmt, err = db.PrepareContext(ctx, addSessionCost); err != nil {
 		return nil, fmt.Errorf("error preparing query AddSessionCost: %w", err)
 	}
+	if q.addSessionUsageStmt, err = db.PrepareContext(ctx, addSessionUsage); err != nil {
+		return nil, fmt.Errorf("error preparing query AddSessionUsage: %w", err)
+	}
 	if q.countA2ATasksStmt, err = db.PrepareContext(ctx, countA2ATasks); err != nil {
 		return nil, fmt.Errorf("error preparing query CountA2ATasks: %w", err)
 	}
@@ -179,6 +182,11 @@ func (q *Queries) Close() error {
 	if q.addSessionCostStmt != nil {
 		if cerr := q.addSessionCostStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing addSessionCostStmt: %w", cerr)
+		}
+	}
+	if q.addSessionUsageStmt != nil {
+		if cerr := q.addSessionUsageStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing addSessionUsageStmt: %w", cerr)
 		}
 	}
 	if q.countA2ATasksStmt != nil {
@@ -461,6 +469,7 @@ type Queries struct {
 	db                                   DBTX
 	tx                                   *sql.Tx
 	addSessionCostStmt                   *sql.Stmt
+	addSessionUsageStmt                  *sql.Stmt
 	countA2ATasksStmt                    *sql.Stmt
 	createA2ATaskStmt                    *sql.Stmt
 	createFileStmt                       *sql.Stmt
@@ -516,6 +525,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		db:                                   tx,
 		tx:                                   tx,
 		addSessionCostStmt:                   q.addSessionCostStmt,
+		addSessionUsageStmt:                  q.addSessionUsageStmt,
 		countA2ATasksStmt:                    q.countA2ATasksStmt,
 		createA2ATaskStmt:                    q.createA2ATaskStmt,
 		createFileStmt:                       q.createFileStmt,
