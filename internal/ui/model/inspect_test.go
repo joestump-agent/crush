@@ -11,12 +11,14 @@ package model
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 
@@ -54,10 +56,12 @@ type inspectWorkspace struct {
 	sessions map[string]session.Session
 	messages map[string][]message.Message
 
-	getSessions  []string
-	listMessages []string
-	agentRuns    []string
-	listFailures map[string]bool
+	getSessions      []string
+	listMessages     []string
+	agentRuns        []string
+	agentCancels     []string
+	agentClearQueues []string
+	listFailures     map[string]bool
 }
 
 func newInspectWorkspace() *inspectWorkspace {
@@ -106,6 +110,14 @@ func (w *inspectWorkspace) SetCurrentSession(context.Context, string) error { re
 func (w *inspectWorkspace) AgentRun(_ context.Context, sessionID, _ string, _ ...message.Attachment) error {
 	w.agentRuns = append(w.agentRuns, sessionID)
 	return nil
+}
+
+func (w *inspectWorkspace) AgentCancel(sessionID string) {
+	w.agentCancels = append(w.agentCancels, sessionID)
+}
+
+func (w *inspectWorkspace) AgentClearQueue(sessionID string) {
+	w.agentClearQueues = append(w.agentClearQueues, sessionID)
 }
 
 func (w *inspectWorkspace) AgentIsReady() bool                               { return true }
@@ -496,8 +508,8 @@ func TestSessionSwitchClearsInspect(t *testing.T) {
 	require.Equal(t, next.ID, m.session.ID)
 }
 
-// TestInspectKeyBindings pins the binding surface: ctrl+] and ctrl+[ are
-// bound, and Esc is not part of inspect mode's bindings.
+// TestInspectKeyBindings pins the binding surface: ctrl+] drills in,
+// esc and ctrl+[ go back, and esc is not part of the drill-in binding.
 func TestInspectKeyBindings(t *testing.T) {
 	km := DefaultKeyMap()
 	require.True(t, matchesCtrl(km.InspectDrill, ']'))
@@ -505,8 +517,9 @@ func TestInspectKeyBindings(t *testing.T) {
 	require.False(t, matchesCtrl(km.InspectDrill, '['))
 	require.False(t, matchesCtrl(km.InspectBack, ']'))
 	require.False(t, key.Matches(tea.KeyPressMsg{Code: tea.KeyEscape}, km.InspectDrill),
-		"esc must stay out of inspect mode's bindings")
-	require.False(t, key.Matches(tea.KeyPressMsg{Code: tea.KeyEscape}, km.InspectBack))
+		"esc must stay out of inspect mode's drill-in binding")
+	require.True(t, key.Matches(tea.KeyPressMsg{Code: tea.KeyEscape}, km.InspectBack),
+		"esc is the back key on every terminal")
 }
 
 func matchesCtrl(b key.Binding, r rune) bool {
@@ -517,31 +530,161 @@ func parentMessageID(i int) string {
 	return "p" + strconv.Itoa(i)
 }
 
-// TestInspectEscIsBackOnLegacyTerminals pins ctrl+[ on terminals without
-// key disambiguation, which send it as the same byte as esc: while
-// inspecting, that esc must leave inspect mode instead of reaching the
-// cancel handler, where a second press cancels the parent's run. A
-// terminal that tells the two keys apart keeps esc's own meaning.
-func TestInspectEscIsBackOnLegacyTerminals(t *testing.T) {
+// TestInspectEscAlwaysLeaves pins the #404 decision: esc and ctrl+[
+// leave inspect mode on one press, on every terminal, whatever the
+// terminal reports for key disambiguation and whatever the parent's
+// queue holds, and the press that leaves never cancels or clears the
+// parent.
+func TestInspectEscAlwaysLeaves(t *testing.T) {
+	sequences := []struct {
+		name string
+		raw  string
+	}{
+		{"legacy esc", "\x1b"},
+		{"kitty esc", "\x1b[27u"},
+		{"kitty ctrl+[", "\x1b[91;5u"},
+		{"otherkeys ctrl+[", "\x1b[27;5;91~"},
+	}
+	keyMsg := func(t *testing.T, raw string) tea.KeyPressMsg {
+		t.Helper()
+		var decoder uv.EventDecoder
+		n, ev := decoder.Decode([]byte(raw))
+		require.Equal(t, len(raw), n, "decoding %q", raw)
+		kpe, ok := ev.(uv.KeyPressEvent)
+		require.True(t, ok, "decoding %q must yield a key press", raw)
+		return tea.KeyPressMsg(kpe)
+	}
+	setup := func(t *testing.T, flags, promptQueue int) (*UI, *inspectWorkspace) {
+		t.Helper()
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		m.keyenh = tea.KeyboardEnhancementsMsg{Flags: flags}
+		m.agentReady = true
+		m.agentBusyCache.val = true
+		m.promptQueue = promptQueue
+		addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+		runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+		require.True(t, m.isInspecting())
+		return m, ws
+	}
+
+	for _, flags := range []int{0, 1} {
+		for _, promptQueue := range []int{0, 2} {
+			for _, seq := range sequences {
+				t.Run(fmt.Sprintf("flags=%d queue=%d %s", flags, promptQueue, seq.name), func(t *testing.T) {
+					m, ws := setup(t, flags, promptQueue)
+
+					_, cmd := m.Update(keyMsg(t, seq.raw))
+					runInspectCmds(m, cmd)
+					require.False(t, m.isInspecting(),
+						"one press of %s must leave inspect mode", seq.name)
+					require.Empty(t, ws.agentCancels, "a back press must never cancel the parent")
+					require.Empty(t, ws.agentClearQueues, "a back press must never clear the parent's queue")
+					require.False(t, m.isCanceling, "a back press must not arm the parent's cancel")
+				})
+			}
+		}
+	}
+
+	t.Run("alt+esc never cancels the parent from inspect mode", func(t *testing.T) {
+		m, ws := setup(t, 0, 2)
+
+		for i := 0; i < 3; i++ {
+			_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape, Mod: tea.ModAlt})
+			runInspectCmds(m, cmd)
+		}
+		require.True(t, m.isInspecting(), "alt+esc is not the back key")
+		require.Empty(t, ws.agentCancels, "alt+esc must never cancel the parent")
+		require.Empty(t, ws.agentClearQueues, "alt+esc must never clear the parent's queue")
+		require.False(t, m.isCanceling, "alt+esc must not arm the parent's cancel")
+	})
+
+	t.Run("outside inspect mode esc still arms the cancel", func(t *testing.T) {
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		m.agentReady = true
+		m.agentBusyCache.val = true
+
+		_, cmd := m.Update(keyMsg(t, "\x1b"))
+		runInspectCmds(m, cmd)
+		require.False(t, m.isInspecting())
+		require.True(t, m.isCanceling, "outside inspect mode the first esc must arm the cancel")
+		require.Empty(t, ws.agentCancels, "arming is not canceling")
+	})
+}
+
+// escCloseDialog is the minimal dialog that closes on esc, for pinning
+// key routing order.
+type escCloseDialog struct{ closed bool }
+
+func (d *escCloseDialog) ID() string { return "test-esc-close" }
+
+func (d *escCloseDialog) HandleMsg(msg tea.Msg) dialog.Action {
+	if msg, ok := msg.(tea.KeyPressMsg); ok && key.Matches(msg, dialog.CloseKey) {
+		d.closed = true
+		return dialog.ActionClose{}
+	}
+	return nil
+}
+
+func (d *escCloseDialog) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor { return nil }
+
+// TestDialogKeepsEscOverInspect pins the routing order (#404): an open
+// dialog receives esc before inspect mode does, so closing the dialog
+// leaves the inspect view in place.
+func TestDialogKeepsEscOverInspect(t *testing.T) {
 	ws := newInspectWorkspace()
 	m := newInspectUI(t, ws)
 	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
-
 	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
 	require.True(t, m.isInspecting())
+
+	d := &escCloseDialog{}
+	m.dialog.OpenDialog(d)
+	require.True(t, m.dialog.HasDialogs())
 
 	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	runInspectCmds(m, cmd)
-	require.False(t, m.isInspecting(),
-		"ctrl+[ arrives as esc on a legacy terminal and must leave inspect mode")
-	require.False(t, m.isCanceling, "the back press must not arm the parent's cancel")
+	require.True(t, d.closed, "the open dialog must take esc first")
+	require.False(t, m.dialog.HasDialogs())
+	require.True(t, m.isInspecting(), "closing the dialog must not leave inspect mode")
+	require.False(t, m.isCanceling)
+}
 
-	m.keyenh = tea.KeyboardEnhancementsMsg{Flags: 1}
+// TestInspectHidesEscCancelHelp pins the help bar (#404): while
+// inspecting, the esc cancel/clear-queue entry is hidden even when the
+// parent is busy, and it comes back once inspect mode is left.
+func TestInspectHidesEscCancelHelp(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	m.agentReady = true
+	m.agentBusyCache.val = true
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
 	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
 	require.True(t, m.isInspecting())
-	handled, _ := m.handleInspectKeys(tea.KeyPressMsg{Code: tea.KeyEscape})
-	require.False(t, handled, "with key disambiguation esc is not ctrl+[")
-	require.True(t, m.isInspecting())
+
+	require.NotContains(t, m.ShortHelp(), m.keyMap.Chat.Cancel,
+		"the esc cancel entry must be hidden while inspecting")
+	require.False(t, fullHelpHasBinding(m, m.keyMap.Chat.Cancel),
+		"the esc cancel entry must be hidden from the full help while inspecting")
+
+	runInspectCmds(m, m.exitInspect())
+	require.False(t, m.isInspecting())
+	require.Contains(t, m.ShortHelp(), m.keyMap.Chat.Cancel,
+		"the esc cancel entry returns once inspect mode is left")
+	require.True(t, fullHelpHasBinding(m, m.keyMap.Chat.Cancel),
+		"the esc cancel entry returns to the full help once inspect mode is left")
+}
+
+func fullHelpHasBinding(m *UI, b key.Binding) bool {
+	for _, row := range m.FullHelp() {
+		for _, got := range row {
+			if reflect.DeepEqual(got, b) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestInspectStaleLoadsAreDropped pins the async ordering of inspect
@@ -680,7 +823,7 @@ func TestPickerTaskSessionOpensUnderItsParent(t *testing.T) {
 }
 
 // TestInspectPlaceholderKeepsTheWayBack pins the editor hint: a long
-// child title is what gets truncated, never the ctrl+[ hint.
+// child title is what gets truncated, never the esc hint.
 func TestInspectPlaceholderKeepsTheWayBack(t *testing.T) {
 	ws := newInspectWorkspace()
 	m := newInspectUI(t, ws)
@@ -690,7 +833,7 @@ func TestInspectPlaceholderKeepsTheWayBack(t *testing.T) {
 
 	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
 	placeholder := m.inspectPlaceholder()
-	require.Contains(t, placeholder, "ctrl+[ returns")
+	require.Contains(t, placeholder, "esc returns")
 	require.LessOrEqual(t, ansi.StringWidth(placeholder), m.textarea.Width())
 }
 
