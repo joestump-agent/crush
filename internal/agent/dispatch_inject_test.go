@@ -210,12 +210,12 @@ func TestDeliverAgentMessageMidRunThenRefusalAfterFinish(t *testing.T) {
 	require.ErrorContains(t, err, "dispatch a new agent")
 }
 
-// parkedSessions parks the first Get of one session ID until released.
-// runDispatch's first read of the dispatched session is its cost
-// propagation, which runs after the registry entry turns terminal, so
-// parking it holds the dispatch inside the window between "the registry
-// says finished" and runDispatch returning — where its deferred cleanup
-// has not run yet.
+// parkedSessions parks the first AddSessionUsage for one session ID
+// until released. runDispatch's cost propagation (#364) applies the
+// served dispatch's usage to the parent after the registry entry turns
+// terminal, so parking it holds the dispatch inside the window between
+// "the registry says finished" and runDispatch returning — where its
+// deferred cleanup has not run yet.
 type parkedSessions struct {
 	session.Service
 
@@ -236,7 +236,7 @@ func (s *parkedSessions) park(id string) {
 	s.id = id
 }
 
-func (s *parkedSessions) Get(ctx context.Context, id string) (session.Session, error) {
+func (s *parkedSessions) AddSessionUsage(ctx context.Context, id string, promptTokens, completionTokens int64, cost float64) error {
 	s.mu.Lock()
 	park := s.id != "" && id == s.id
 	s.mu.Unlock()
@@ -246,7 +246,7 @@ func (s *parkedSessions) Get(ctx context.Context, id string) (session.Session, e
 			<-s.release
 		})
 	}
-	return s.Service.Get(ctx, id)
+	return s.Service.AddSessionUsage(ctx, id, promptTokens, completionTokens, cost)
 }
 
 // A delivery that observes the registry entry as terminal must be
@@ -268,7 +268,9 @@ func TestDeliverAgentMessageRefusesOnceRegistryIsTerminal(t *testing.T) {
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
 	agent.waitRunning(t)
 
-	sessions.park(handle.SessionID)
+	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
+	require.True(t, ok)
+	sessions.park(entry.ParentSessionID)
 	agent.release()
 	select {
 	case <-sessions.parked:
@@ -276,7 +278,7 @@ func TestDeliverAgentMessageRefusesOnceRegistryIsTerminal(t *testing.T) {
 		t.Fatal("dispatch never reached cost propagation")
 	}
 
-	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
+	entry, ok = c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusCompleted, entry.Status, "the dispatch is parked after its terminal status")
 

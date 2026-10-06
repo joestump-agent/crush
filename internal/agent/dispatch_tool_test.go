@@ -506,7 +506,7 @@ func TestRunDispatchRecordsTerminalStatus(t *testing.T) {
 			toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 			require.NoError(t, err)
 
-			c.runDispatch(t.Context(), dispatchRun{
+			run := dispatchRun{
 				reg:             c.dispatchRegistry(),
 				provider:        provider,
 				entry:           entry,
@@ -517,7 +517,9 @@ func TestRunDispatchRecordsTerminalStatus(t *testing.T) {
 				prompt:          "do work",
 				sessionID:       "dispatch-child-session",
 				parentSessionID: "dispatch-parent-session",
-			})
+			}
+			serveDispatchRun(t, c, run)
+			c.runDispatch(t.Context(), run)
 
 			got, ok := c.dispatchRegistry().Get(entry.ID)
 			require.True(t, ok)
@@ -555,7 +557,7 @@ func TestRunDispatchKillsBackgroundJobsOnCompletion(t *testing.T) {
 	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 	require.NoError(t, err)
 
-	c.runDispatch(t.Context(), dispatchRun{
+	run := dispatchRun{
 		reg:             c.dispatchRegistry(),
 		provider:        provider,
 		entry:           entry,
@@ -566,7 +568,9 @@ func TestRunDispatchKillsBackgroundJobsOnCompletion(t *testing.T) {
 		prompt:          "do work",
 		sessionID:       "dispatch-child-session",
 		parentSessionID: "dispatch-parent-session",
-	})
+	}
+	serveDispatchRun(t, c, run)
+	c.runDispatch(t.Context(), run)
 
 	got, ok := c.dispatchRegistry().Get(entry.ID)
 	require.True(t, ok)
@@ -600,7 +604,7 @@ func TestRunDispatchKillsBackgroundJobsOnKill(t *testing.T) {
 	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 	require.NoError(t, err)
 
-	c.runDispatch(t.Context(), dispatchRun{
+	run := dispatchRun{
 		reg:             c.dispatchRegistry(),
 		provider:        provider,
 		entry:           entry,
@@ -612,7 +616,9 @@ func TestRunDispatchKillsBackgroundJobsOnKill(t *testing.T) {
 		sessionID:       "dispatch-child-session",
 		parentSessionID: "dispatch-parent-session",
 		kill:            kill,
-	})
+	}
+	serveDispatchRun(t, c, run)
+	c.runDispatch(t.Context(), run)
 
 	got, ok := c.dispatchRegistry().Get(entry.ID)
 	require.True(t, ok)

@@ -11,23 +11,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeServerStarter records the A2A servers the coordinator asks it to
+// fakeDispatchHost records the A2A servers the coordinator asks it to
 // start (#70) and hands back a canned endpoint/card pair with a counting
-// stop.
-type fakeServerStarter struct {
+// stop. The embedded runnerTransport supplies StreamDispatch, driving
+// the recorded runner the way the executor does, so a dispatch served by
+// this host runs to completion.
+type fakeDispatchHost struct {
+	runnerTransport
+
 	mu      sync.Mutex
 	fail    bool
 	started []DispatchServerParams
 	stopped int
 }
 
-func (f *fakeServerStarter) StartDispatchServer(ctx context.Context, params DispatchServerParams) (string, any, func(), error) {
+func (f *fakeDispatchHost) StartDispatchServer(ctx context.Context, params DispatchServerParams) (string, any, func(), error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail {
 		return "", nil, nil, errors.New("no free port")
 	}
 	f.started = append(f.started, params)
+	// The embedded transport's StreamDispatch drives the last served
+	// params, so the server half records them too.
+	f.serve(params)
 	stop := func() {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -36,13 +43,13 @@ func (f *fakeServerStarter) StartDispatchServer(ctx context.Context, params Disp
 	return "http://127.0.0.1:19999", "fake-card", stop, nil
 }
 
-func (f *fakeServerStarter) snapshot() (int, int) {
+func (f *fakeDispatchHost) snapshot() (int, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.started), f.stopped
 }
 
-func (f *fakeServerStarter) lastParams() DispatchServerParams {
+func (f *fakeDispatchHost) lastParams() DispatchServerParams {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.started) == 0 {
@@ -58,8 +65,8 @@ func (f *fakeServerStarter) lastParams() DispatchServerParams {
 func TestDispatchStartsAndStopsA2AServer(t *testing.T) {
 	agent := newGatedDispatchAgent()
 	c, _ := newInjectionEnv(t, agent)
-	starter := &fakeServerStarter{}
-	c.SetDispatchServerStarter(starter)
+	host := &fakeDispatchHost{}
+	c.SetDispatchHost(host)
 	tool := c.dispatchTool()
 
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{
@@ -81,7 +88,7 @@ func TestDispatchStartsAndStopsA2AServer(t *testing.T) {
 	// The server was told the dispatch's identity and wiring: the
 	// assigned handle as the card name, the role as the description, the
 	// task session, the dispatched agent, and the todo collector.
-	params := starter.lastParams()
+	params := host.lastParams()
 	require.Equal(t, handle.SessionID, params.SessionID)
 	require.Equal(t, "tester", params.Name)
 	require.Equal(t, "writes tests", params.Description)
@@ -96,7 +103,7 @@ func TestDispatchStartsAndStopsA2AServer(t *testing.T) {
 		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status.IsTerminal() && entry.Endpoint == "" && entry.AgentCard == nil
 	}, 10*time.Second, 50*time.Millisecond)
-	started, stopped := starter.snapshot()
+	started, stopped := host.snapshot()
 	require.Equal(t, 1, started)
 	require.Equal(t, 1, stopped)
 
@@ -116,41 +123,38 @@ func entryEndpoint(entry dispatch.Entry) (string, any, bool) {
 	return entry.Endpoint, entry.AgentCard, true
 }
 
-// A failed server start never fails the dispatch (#70): Phase 1 has no
-// A2A client in the loop, so the dispatch runs unserved and the failure
-// is only logged.
-func TestDispatchServerStartFailureIsNonFatal(t *testing.T) {
+// A failed server start is a dispatch failure (#347): the tool reports
+// the error, the registry entry and workspace are removed, and the
+// agent never runs — nothing runs unserved.
+func TestDispatchServerStartFailureFailsDispatch(t *testing.T) {
 	agent := newGatedDispatchAgent()
 	c, _ := newInjectionEnv(t, agent)
-	c.SetDispatchServerStarter(&fakeServerStarter{fail: true})
+	c.SetDispatchHost(&fakeDispatchHost{fail: true})
 	tool := c.dispatchTool()
 
-	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
-	require.Equal(t, dispatch.StatusRunning, handle.Status)
+	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"})
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "start A2A server: no free port")
 
-	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
-	require.True(t, ok)
-	require.Empty(t, entry.Endpoint)
-	require.Nil(t, entry.AgentCard)
-
-	agent.release()
+	require.Empty(t, c.dispatchRegistry().List())
+	require.False(t, agent.ranOnce())
 }
 
-// Without a wired starter (the default for direct-struct tests and any
-// caller that does not opt in), dispatches simply run unserved.
-func TestDispatchWithoutStarterRunsUnserved(t *testing.T) {
+// A coordinator with no A2A host refuses dispatches at the tool (#347):
+// there is no execution path behind it, so nothing is provisioned and
+// nothing runs.
+func TestDispatchWithoutHostIsRefused(t *testing.T) {
 	agent := newGatedDispatchAgent()
 	c, _ := newInjectionEnv(t, agent)
-	require.Nil(t, c.dispatchServerStarter())
+	c.SetDispatchHost(nil)
 	tool := c.dispatchTool()
 
-	decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
-	agent.waitRunning(t)
+	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"})
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "dispatch unavailable: no A2A host")
 
-	for _, entry := range c.dispatchRegistry().List() {
-		require.Empty(t, entry.Endpoint)
-	}
-	agent.release()
+	require.Empty(t, c.dispatchRegistry().List())
+	require.False(t, agent.ranOnce())
 }
 
 // resolvedSkills loads every discovered skill when nothing was requested
