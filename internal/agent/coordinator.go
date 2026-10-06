@@ -289,6 +289,12 @@ type coordinator struct {
 	// pending question at a time. Made on first use under dispatchMu.
 	dispatchQuestions chan struct{}
 
+	// dispatchRecords is the durable a2a_dispatches store (#355); nil
+	// until the app wires it, and nil means dispatches leave no restart
+	// record — every record write and the startup reconcile delivery
+	// are nil-safe no-ops.
+	dispatchRecords dispatch.DispatchRecords
+
 	// semanticStore and semanticClient back the semantic_search and
 	// semantic_index tools. Both are nil unless an embedding provider is
 	// configured and the store initialised, in which case neither tool
@@ -340,6 +346,12 @@ type CoordinatorOptions struct {
 	// dispatches are refused at the tool — there is no unserved run
 	// (#347).
 	DispatchHost DispatchHost
+
+	// DispatchRecords persists the durable dispatch records (#355); the
+	// app passes dispatch.NewSQLiteRecordStore. Nil (tests, or any
+	// caller without the database wired) means dispatches keep no
+	// restart record, which is exactly the pre-#355 behavior.
+	DispatchRecords dispatch.DispatchRecords
 }
 
 func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, error) {
@@ -385,6 +397,7 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		dispatchCtx:     ctx,
 		dispatchSinks:   opts.DispatchSinks,
 		dispatchHost:    opts.DispatchHost,
+		dispatchRecords: opts.DispatchRecords,
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]

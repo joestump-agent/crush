@@ -819,8 +819,11 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				done:      make(chan struct{}),
 			}
 			c.registerLiveDispatch(entry.ID, live)
-			c.startDispatchRun(func() { c.runDispatch(rootCtx, run) })
 
+			// The running handle is the start of the durable record
+			// (#355): the row exists before the run starts, so a crash
+			// at any later point leaves something to reconcile.
+			// Best-effort — a failed write never breaks a live dispatch.
 			handle := dispatch.DispatchResult{
 				DispatchID:    entry.ID,
 				Handle:        assignedHandle,
@@ -830,6 +833,13 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				SessionID:     taskSession.ID,
 				Status:        dispatch.StatusRunning,
 			}
+			if c.dispatchRecords != nil {
+				if err := c.dispatchRecords.RecordStarted(handle, sessionID); err != nil {
+					slog.Warn("Failed to record dispatch start", "dispatch_id", entry.ID, "error", err)
+				}
+			}
+			c.startDispatchRun(func() { c.runDispatch(rootCtx, run) })
+
 			return fantasy.NewTextResponse(handle.Render()), nil
 		},
 	)
@@ -1010,6 +1020,15 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// renders its durable record from the registry.
 	run.reg.SetResult(run.entry.ID, terminal)
 	run.reg.SetStatus(run.entry.ID, terminal.Status)
+	// The durable record (#355): the terminal payload lands in SQLite so
+	// a restart can re-deliver it if the parent's delivery turn never
+	// runs. A row reconcile already failed keeps that outcome; the write
+	// is best-effort.
+	if c.dispatchRecords != nil {
+		if err := c.dispatchRecords.RecordTerminal(terminal); err != nil {
+			slog.Warn("Failed to record dispatch terminal result", "dispatch_id", terminal.DispatchID, "error", err)
+		}
+	}
 
 	// Stamp the terminal result onto the parent's persisted dispatch_agent
 	// tool result (#410): the card's durable record after a restart or in
@@ -1512,7 +1531,15 @@ func (c *coordinator) flushPendingResults(parentSessionID string) {
 		result, err := c.run(runCtx, nil, parentSessionID, prompt.String())
 		switch {
 		case err == nil && result != nil:
-			// Delivered.
+			// Delivered: stamp the durable records (#355) so a restart
+			// never re-delivers a payload the parent has already seen.
+			if c.dispatchRecords != nil {
+				for _, terminal := range pending {
+					if err := c.dispatchRecords.RecordDelivered(terminal.DispatchID); err != nil {
+						slog.Warn("Failed to stamp dispatch result delivered", "dispatch_id", terminal.DispatchID, "error", err)
+					}
+				}
+			}
 		case err == nil && result == nil:
 			// The turn was queued behind a busy session; the queued
 			// system-delivery call owns the delivery now.
@@ -1606,14 +1633,76 @@ func (c *coordinator) dispatchWorkspaceProvider() (*dispatch.GitWorktreeProvider
 // seed-on-load path: a reloaded session's persisted dispatch_agent
 // result is the running handle, and this is how the block learns the
 // dispatch's real state without waiting for the next event.
+//
+// When the collector has no snapshot — a restart emptied the in-memory
+// registry — the durable record (#355) answers instead, so a block
+// whose run reached a terminal state renders that state instead of a
+// forever-working stale handle.
 func (c *coordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
 	c.dispatchMu.Lock()
 	collector := c.dispatchCollector
+	records := c.dispatchRecords
 	c.dispatchMu.Unlock()
-	if collector == nil {
+	if collector != nil {
+		if snapshot, ok := collector.Snapshot(sessionID); ok {
+			return snapshot, true
+		}
+	}
+	if records == nil {
 		return dispatch.TodoSnapshot{}, false
 	}
-	return collector.Snapshot(sessionID)
+	result, status, ok := records.SnapshotRecord(sessionID)
+	if !ok {
+		return dispatch.TodoSnapshot{}, false
+	}
+	entry := dispatch.Entry{
+		ID:        result.DispatchID,
+		Path:      result.WorkspacePath,
+		Branch:    result.Branch,
+		SessionID: sessionID,
+		Handle:    result.Handle,
+		Status:    status,
+	}
+	if status.IsTerminal() {
+		result.Status = status
+		entry.Result = &result
+	}
+	return dispatch.TodoSnapshot{Entry: entry}, true
+}
+
+// ReconcileDispatchDeliveries re-delivers the terminal dispatch
+// payloads a previous process finished but never delivered (#355).
+// Every terminal record without a delivered stamp whose parent session
+// still exists goes through deliverDispatchResult — #388's
+// pending-delivery machinery, so the delivered stamp lands only when
+// the delivery turn succeeds. A parent session that no longer exists
+// drops the payload permanently: nobody can ever receive it, and the
+// row's terminal state still seeds the UI. Called from the app at
+// startup, after a2a.ReconcileOrphanedTasks and before the UI loads
+// sessions.
+func (c *coordinator) ReconcileDispatchDeliveries(ctx context.Context) {
+	c.dispatchMu.Lock()
+	records := c.dispatchRecords
+	c.dispatchMu.Unlock()
+	if records == nil {
+		return
+	}
+	undelivered, err := records.UndeliveredTerminal()
+	if err != nil {
+		slog.Warn("Dispatch delivery reconcile could not list undelivered results", "error", err)
+		return
+	}
+	for _, u := range undelivered {
+		if _, err := c.sessions.Get(ctx, u.ParentSessionID); err != nil {
+			slog.Debug("Undelivered dispatch result dropped: parent session is gone", "parent_session", u.ParentSessionID, "dispatch_id", u.Result.DispatchID)
+			if err := records.RecordDelivered(u.Result.DispatchID); err != nil {
+				slog.Warn("Failed to close undelivered dispatch record", "dispatch_id", u.Result.DispatchID, "error", err)
+			}
+			continue
+		}
+		slog.Info("Re-delivering dispatch result left undelivered by a restart", "parent_session", u.ParentSessionID, "dispatch_id", u.Result.DispatchID)
+		c.deliverDispatchResult(ctx, u.ParentSessionID, u.Result)
+	}
 }
 
 // ReleaseDispatches is the synchronous session-end cleanup (#367): it

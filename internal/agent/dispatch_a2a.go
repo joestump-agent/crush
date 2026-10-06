@@ -555,6 +555,17 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 		OnTask: func(taskID string) {
 			run.reg.SetTaskID(run.entry.ID, taskID)
 			slog.Debug("Dispatch A2A task started", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "context_id", run.sessionID, "task_id", taskID, "trace_id", traceID)
+			// Stamp the durable record too (#355): with the task ID
+			// persisted, a restarted process can answer queries about
+			// the run through the same task.
+			c.dispatchMu.Lock()
+			records := c.dispatchRecords
+			c.dispatchMu.Unlock()
+			if records != nil {
+				if err := records.RecordTask(run.entry.ID, taskID); err != nil {
+					slog.Warn("Failed to record dispatch task id", "dispatch_id", run.entry.ID, "error", err)
+				}
+			}
 		},
 		// A question the served agent parked on (#352) reaches the
 		// parent's user, labeled with the dispatch's handle.
