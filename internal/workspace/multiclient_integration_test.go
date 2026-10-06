@@ -18,13 +18,18 @@ import (
 )
 
 // xdgIsolate redirects HOME and XDG_* to fresh temp dirs so config
-// loading does not touch the host's real config.
+// loading does not touch the host's real config. The CRUSH_* overrides
+// win over the XDG paths in config resolution, so they must be cleared
+// too, or a host that sets them leaks its real config into the test.
 func xdgIsolate(t *testing.T) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	t.Setenv("CRUSH_GLOBAL_CONFIG", "")
+	t.Setenv("CRUSH_GLOBAL_DATA", "")
+	t.Setenv("CRUSH_CACHE_DIR", "")
 }
 
 // runtimeServer wires the production server handler around an
