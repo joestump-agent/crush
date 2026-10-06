@@ -163,8 +163,10 @@ A2A becomes the runtime contract: one execution path through the A2A client
 Agent definitions: the built-in `coder`, `plan`, `task`, and a new `worker`
 agent for dispatch become overridable defaults you can extend. The
 `crush.json` data model and its validation are live
-([#333](https://github.com/joestump-agent/crush/issues/333)); still planned:
-the `crushrc` builtin ([#431](https://github.com/joestump-agent/crush/issues/431)) and an `agent`
+([#333](https://github.com/joestump-agent/crush/issues/333)), the `agent`
+builtin defines them from `crushrc`
+([#431](https://github.com/joestump-agent/crush/issues/431)); still planned:
+an `agent`
 parameter on `dispatch_agent` to choose one ([#433](https://github.com/joestump-agent/crush/issues/433)).
 :::
 

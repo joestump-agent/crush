@@ -190,8 +190,8 @@ Fields the runtime parses but does not act on yet (`model` pins, `prompt`,
 `skills`, `workspace`, and the `a2a` machinery) load with a one-time warning.
 They are carried for the multi-agent epic: #432 wires agents to these
 definitions, #433 adds the agent parameter, and #434 fetches external cards.
-There is no `crushrc` builtin for `agents` yet; that is
-[#431](https://github.com/joestump-agent/crush/issues/431).
+The `agent` builtin defines the same block from `crushrc`
+([#431](https://github.com/joestump-agent/crush/issues/431)).
 
 ## Full example
 
