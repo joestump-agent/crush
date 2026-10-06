@@ -82,10 +82,11 @@ type dispatchAgentOptions struct {
 	// Skills restricts the rendered available-skills set; empty means
 	// every skill discovered in the workspace.
 	Skills []string
-	// TodoKill observes the wander-kill escalation (#316): invoked when
-	// the dispatched run ignores its nudges past the kill threshold, so
-	// the coordinator can record the reason against this dispatch. The
-	// run's cancellation is intrinsic; this only observes.
+	// TodoKill is the wander-kill escalation's supervisor hook (#316):
+	// invoked when the dispatched run ignores its nudges past the kill
+	// threshold. The observer owns the kill (#348): it records the
+	// reason against this dispatch and routes the kill through the
+	// served run's tasks/cancel, with the direct cancel as the fallback.
 	TodoKill func(sessionID string, reason string)
 	// LoopStop observes the loop-detection stop (#343): invoked when the
 	// dispatched run's step loop ends on the loop-detection stop
@@ -421,8 +422,15 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				Toolchain: toolchain,
 				ModelType: modelType,
 				Skills:    params.Skills,
+				// The ladder's kill rung (#316) reports here; the
+				// supervisor owns the kill (#348): the reason rides a
+				// tasks/cancel to the served dispatch, with the direct
+				// cancel as the fallback while the task ID is still
+				// unknown. The dispatched agent's ladder closure no
+				// longer cancels itself.
 				TodoKill: func(sessionID string, reason string) {
 					kill.kill(reason)
+					c.killDispatch(reg, entry.ID, reason, nil)
 				},
 				LoopStop: func(sessionID string) {
 					kill.kill(dispatch.ReasonToolLoop)
@@ -818,6 +826,13 @@ type dispatchNaturalOutcome struct {
 	// unavailable: ...)" instead of "(no changes)" (#361 puts the error
 	// on the wire and deletes this).
 	diff func(ctx context.Context) (string, error)
+	// killReason is a kill reason the transport outcome carried (#348):
+	// a terminal Canceled whose status message is one of the kill
+	// reasons. The in-process kill state is the first witness and wins;
+	// this is the mapping for a kill this process never recorded — an
+	// out-of-process supervisor (#72/#73) that killed the served task
+	// directly. Empty unless the wire said killed.
+	killReason string
 }
 
 // assembleTerminalDispatchResult maps a finished dispatched run onto its
@@ -836,6 +851,11 @@ func (c *coordinator) assembleTerminalDispatchResult(ctx context.Context, run di
 		if natural.runErr != nil || reason == dispatch.ReasonToolLoop || natural.stoppedInLoop {
 			return c.assembleKilledDispatchResult(ctx, run, reason)
 		}
+	} else if natural.killReason != "" {
+		// A kill this process never recorded, reported by the wire
+		// (#348): the served task's Canceled status message is a kill
+		// reason, so the parent reads killed with it.
+		return c.assembleKilledDispatchResult(ctx, run, natural.killReason)
 	} else if natural.stoppedInLoop {
 		// Loop detection's StopWhen ended the run in-process with no kill
 		// recorded; the block records it as the tool-loop kill reason.
@@ -884,16 +904,19 @@ func (c *coordinator) startDispatchKillWatch(ctx context.Context, run dispatchRu
 	killFromWatch := func(reason string) {
 		run.kill.kill(reason)
 		slog.Warn("Dispatch run killed by watchdog", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "reason", reason)
-		// Cancel the dispatch's root first (#430): a kill landing before
-		// the dispatched agent's Run registered the session leaves
-		// agent.Cancel a no-op, and the run's context is detached from
-		// every parent cancel, so without this the agent keeps running
-		// with no bound. The registered-session cancel below still runs
-		// for the post-registration case and is a no-op otherwise.
-		if run.cancel != nil {
-			run.cancel()
-		}
-		run.agent.Cancel(run.sessionID)
+		// The kill travels the protocol (#348): a tasks/cancel carrying
+		// the reason ends the served task, so the terminal Canceled
+		// status says why the run stopped. The fallback keeps #430's
+		// guarantee for a kill landing before the dispatched agent's Run
+		// registered the session — or before the stream named the task —
+		// where agent.Cancel alone is a no-op: it also cancels the run's
+		// detached root.
+		c.killDispatch(run.reg, run.entry.ID, reason, func() {
+			if run.cancel != nil {
+				run.cancel()
+			}
+			run.agent.Cancel(run.sessionID)
+		})
 	}
 
 	if settings.HardTimeout > 0 {

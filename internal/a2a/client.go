@@ -411,5 +411,80 @@ func (f *ServerFactory) GetDispatchTask(ctx context.Context, p agent.GetDispatch
 	}, nil
 }
 
-// Compile-time proof the factory also satisfies the transport seam.
-var _ agent.DispatchTransport = (*ServerFactory)(nil)
+// CancelReasonMetadataKey is the metadata key a tasks/cancel request
+// carries its reason under (#348). It rides CancelTaskRequest.Metadata,
+// which the server copies onto the cancel's ExecutorContext, and the
+// executor puts the decoded reason on the terminal Canceled status
+// message. Declared as a single, crush-owned extension key; #359's
+// declared, statically typed metadata will adopt it.
+const CancelReasonMetadataKey = "crush.dispatch.cancel_reason"
+
+// CancelReason is the typed metadata payload a tasks/cancel request
+// carries its kill reason under (#348), keyed by
+// CancelReasonMetadataKey.
+type CancelReason struct {
+	Reason string `json:"reason"`
+}
+
+// cancelReasonFromMetadata decodes the kill reason a cancel request
+// carried (#348). The wire round-trips the typed payload through JSON,
+// so a served executor sees it as a nested map; accept the round-tripped
+// form, a direct payload from an in-process caller, and a bare string.
+func cancelReasonFromMetadata(md map[string]any) string {
+	if md == nil {
+		return ""
+	}
+	switch v := md[CancelReasonMetadataKey].(type) {
+	case string:
+		return v
+	case CancelReason:
+		return v.Reason
+	case *CancelReason:
+		if v != nil {
+			return v.Reason
+		}
+	case map[string]any:
+		if s, ok := v["reason"].(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// CancelDispatch sends one tasks/cancel for a served dispatch (#348):
+// the protocol-native kill the direct SessionAgent cancel can never be
+// for an out-of-process agent (#72/#73). The reason rides the request as
+// declared metadata and lands on the terminal Canceled status message
+// the dispatch's stream, or any tasks/get reader, reports. An error here
+// means the cancel did not land — the caller falls back to the direct
+// cancel.
+func (f *ServerFactory) CancelDispatch(ctx context.Context, p agent.DispatchCancelParams) error {
+	card, ok := p.Card.(*a2aspec.AgentCard)
+	if !ok || card == nil {
+		return fmt.Errorf("a2a: dispatch %s has no resolvable agent card", p.Endpoint)
+	}
+	if p.TaskID == "" {
+		return fmt.Errorf("a2a: dispatch %s has no task id", p.Endpoint)
+	}
+	client, err := newDispatchClient(ctx, card, f.httpClient)
+	if err != nil {
+		return err
+	}
+	req := &a2aspec.CancelTaskRequest{
+		ID: a2aspec.TaskID(p.TaskID),
+		Metadata: map[string]any{
+			CancelReasonMetadataKey: CancelReason{Reason: p.Reason},
+		},
+	}
+	if _, err := client.CancelTask(ctx, req); err != nil {
+		return fmt.Errorf("a2a: cancel task %s: %w", p.TaskID, err)
+	}
+	return nil
+}
+
+// Compile-time proof the factory also satisfies the transport and
+// cancel seams.
+var (
+	_ agent.DispatchTransport = (*ServerFactory)(nil)
+	_ agent.DispatchCanceler  = (*ServerFactory)(nil)
+)

@@ -83,11 +83,78 @@ func (c *coordinator) CancelDispatch(ctx context.Context, ref string) error {
 	// The watchdog's order (#316): the kill reason lands before the
 	// cancel, so the terminal result is assembled as killed with it. The
 	// root context is deliberately left alone — runDispatch assembles the
-	// salvage diff on it after the run returns.
+	// salvage diff on it after the run returns. The kill travels the
+	// protocol (#348): a tasks/cancel carrying the reason ends the served
+	// task; the direct agent cancel is the fallback (an unserved
+	// dispatch, or a task ID the stream never reported). The send is
+	// asynchronous: the SDK resolves a tasks/cancel only when the run
+	// ends, and this call returns to the tool loop immediately.
 	live.kill.kill(dispatch.ReasonCanceled)
-	live.agent.Cancel(live.sessionID)
+	c.killDispatch(reg, entry.ID, dispatch.ReasonCanceled, func() {
+		live.agent.Cancel(live.sessionID)
+	})
 	slog.Debug("Dispatch canceled on demand", "dispatch_id", entry.ID, "session_id", live.sessionID)
 	return nil
+}
+
+// killDispatch routes one dispatched run's kill through the served
+// dispatch's tasks/cancel (#348). The caller has already recorded the
+// reason on the run's kill state; this sends the protocol cancel that
+// carries it, so the terminal Canceled status — on the wire and in the
+// task store — says why the run stopped, and an out-of-process agent
+// (#72/#73) is killable at all. The fallback covers the paths no
+// tasks/cancel can serve: an unserved dispatch, a task ID the stream has
+// not reported yet (a kill before the first event), or a cancel that
+// errors. The send runs on a detached context — the kill must land even
+// if the dispatch's root is torn down under it — and a refused or
+// already-terminal task falls back harmlessly. reg is the registry the
+// kill's caller reads — the one its run was started against, passed in
+// because the kill site owns it — not necessarily the coordinator's
+// current one.
+func (c *coordinator) killDispatch(reg *dispatch.AgentRegistry, entryID, reason string, fallback func()) {
+	if fallback == nil {
+		fallback = func() { c.cancelDispatchRun(entryID) }
+	}
+	canceler, ok := c.dispatchServerStarter().(DispatchCanceler)
+	if !ok || canceler == nil {
+		fallback()
+		return
+	}
+	entry, ok := reg.Get(entryID)
+	if !ok || entry.Endpoint == "" || entry.AgentCard == nil || entry.TaskID == "" {
+		fallback()
+		return
+	}
+	go func() {
+		err := canceler.CancelDispatch(context.WithoutCancel(context.Background()), DispatchCancelParams{
+			Endpoint: entry.Endpoint,
+			Card:     entry.AgentCard,
+			TaskID:   entry.TaskID,
+			Reason:   reason,
+		})
+		if err != nil {
+			slog.Warn("Dispatch kill via tasks/cancel failed; using the direct cancel", "dispatch_id", entryID, "reason", reason, "error", err)
+			fallback()
+		}
+	}()
+}
+
+// cancelDispatchRun is the direct in-process kill (#430): the
+// dispatch's root cancel ends a run whose session the agent never
+// registered — agent.Cancel alone is a no-op there — and the agent
+// cancel ends the rest. No-op when there is no live run (the dispatch
+// never started, or its teardown already ran).
+func (c *coordinator) cancelDispatchRun(entryID string) {
+	c.dispatchMu.Lock()
+	live := c.liveDispatches[entryID]
+	c.dispatchMu.Unlock()
+	if live == nil {
+		return
+	}
+	if live.cancel != nil {
+		live.cancel()
+	}
+	live.agent.Cancel(live.sessionID)
 }
 
 // cancelDispatchTool builds the CancelDispatch tool (#373): the model's
