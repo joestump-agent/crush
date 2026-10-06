@@ -56,6 +56,10 @@ func TestAgentDefinitionsCrushrcMatchesJson(t *testing.T) {
 	// both variants reference the same absolute path.
 	promptPath := filepath.Join(t.TempDir(), "worker.md")
 	require.NoError(t, os.WriteFile(promptPath, []byte("Be brief."), 0o644))
+	// Forward slashes survive both substitution targets: the bash
+	// interpreter eats backslash escapes in crushrc, and JSON rejects
+	// them as invalid escapes. Windows accepts slashed paths.
+	refPath := filepath.ToSlash(promptPath)
 
 	load := func(useCrushrc bool) map[string]config.Agent {
 		t.Helper()
@@ -67,13 +71,13 @@ func TestAgentDefinitionsCrushrcMatchesJson(t *testing.T) {
 		"github": {"type": "stdio", "command": "glow"},`)
 		globalName := "crush.json"
 		if !useCrushrc {
-			agentsJSON := replaceAll(agentCrushrcJSON, "PROMPT_PATH", promptPath)
+			agentsJSON := replaceAll(agentCrushrcJSON, "PROMPT_PATH", refPath)
 			body = replaceAll(body, `"providers": {`, `"agents": `+agentsJSON+`,"providers": {`)
 		}
 		require.NoError(t, os.WriteFile(filepath.Join(globalDir, globalName), []byte(body), 0o600))
 
 		if useCrushrc {
-			rc := replaceAll(agentCrushrc, "PROMPT_PATH", promptPath)
+			rc := replaceAll(agentCrushrc, "PROMPT_PATH", refPath)
 			require.NoError(t, os.WriteFile(filepath.Join(workDir, "crushrc"), []byte(rc), 0o644))
 		}
 
