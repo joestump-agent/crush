@@ -11,6 +11,7 @@ import (
 
 type Querier interface {
 	AddSessionCost(ctx context.Context, arg AddSessionCostParams) error
+	AddSessionUsage(ctx context.Context, arg AddSessionUsageParams) error
 	CountA2ATasks(ctx context.Context, arg CountA2ATasksParams) (int64, error)
 	CreateA2ATask(ctx context.Context, arg CreateA2ATaskParams) error
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)

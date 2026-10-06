@@ -67,8 +67,9 @@ type DispatchAgentParams struct {
 	Role string `json:"role,omitempty" description:"One-line role label for the dispatched agent (e.g. \"tester\", \"docs writer\"), shown in the @ completions and used to derive its handle"`
 }
 
-// dispatchSweepTimeout bounds the session-end sweep: it runs git commands
-// against every workspace, and a wedged worktree must not hang shutdown.
+// dispatchSweepTimeout bounds the session-end ReleaseDispatches: it runs
+// git commands against every workspace, and a wedged worktree must not
+// hang shutdown.
 const dispatchSweepTimeout = 30 * time.Second
 
 // dispatchAgentOptions configures the dispatched-agent constructor.
@@ -616,8 +617,24 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// (#360) is armed with the dispatch's resolved enforcement
 			// settings, and the kill's reason (#316) rides along (#342):
 			// an out-of-band kill surfaces on the A2A task as a Canceled
-			// status carrying it.
-			run.stopServer = c.startDispatchServer(ctx, provider, reg, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current)
+			// status carrying it. The usage closure (#364) reads the
+			// dispatched session's final totals once the run ends, so the
+			// terminal status carries them and the parent can account for
+			// the run without sharing a database row.
+			usage := func(ctx context.Context) (Usage, error) {
+				sess, err := c.sessions.Get(ctx, taskSession.ID)
+				if err != nil {
+					return Usage{}, fmt.Errorf("get dispatch session: %w", err)
+				}
+				return Usage{
+					Model:            dispatched.model.ModelCfg.Model,
+					Provider:         dispatched.model.ModelCfg.Provider,
+					PromptTokens:     sess.PromptTokens,
+					CompletionTokens: sess.CompletionTokens,
+					Cost:             sess.Cost,
+				}, nil
+			}
+			run.stopServer = c.startDispatchServer(ctx, provider, reg, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current, usage)
 
 			// The dispatch runs on its root context, detached from the
 			// tool call's (#371): the permission bridge bound to the root
@@ -784,8 +801,11 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// injection target above is the same: the agent behind the session
 	// is one and the same object on both paths.
 	var terminal dispatch.DispatchResult
-	if transported, ok := c.runDispatchOverTransport(ctx, run); ok {
+	var servedUsage *Usage
+	transported, usage, ok := c.runDispatchOverTransport(ctx, run)
+	if ok {
 		terminal = transported
+		servedUsage = usage
 	} else {
 		result, err := run.agent.Run(ctx, call)
 		watchStop()
@@ -844,10 +864,25 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// client/server mode, where the in-memory registry is unreachable.
 	c.persistDispatchTerminalResult(ctx, run, terminal)
 
-	// Cost propagation is best-effort, mirroring runSubAgent: a failure
-	// here must not lose the run's outcome.
-	if err := c.updateParentSessionCost(ctx, run.sessionID, run.parentSessionID); err != nil {
-		slog.Warn("Failed to update parent session cost", "child_session", run.sessionID, "parent_session", run.parentSessionID, "error", err)
+	// Cost propagation (#364): a served dispatch reports its usage on
+	// the wire, and the parent applies it with one atomic UPDATE — no
+	// child-row copy, which is what lets an out-of-process or remote
+	// dispatched agent (#72/#73) report cost at all. A dispatch whose
+	// usage is missing or undecodable leaves the parent's cost
+	// untouched. The direct in-process path keeps the row-copy mirror.
+	// Both are best-effort, mirroring runSubAgent: a failure here must
+	// not lose the run's outcome.
+	switch {
+	case servedUsage != nil:
+		if err := c.sessions.AddSessionUsage(ctx, run.parentSessionID, servedUsage.PromptTokens, servedUsage.CompletionTokens, servedUsage.Cost); err != nil {
+			slog.Warn("Failed to add dispatched usage to parent session", "child_session", run.sessionID, "parent_session", run.parentSessionID, "error", err)
+		}
+	case ok:
+		slog.Warn("Served dispatch carried no usage; parent cost unchanged", "child_session", run.sessionID, "parent_session", run.parentSessionID)
+	default:
+		if err := c.updateParentSessionCost(ctx, run.sessionID, run.parentSessionID); err != nil {
+			slog.Warn("Failed to update parent session cost", "child_session", run.sessionID, "parent_session", run.parentSessionID, "error", err)
+		}
 	}
 
 	c.deliverDispatchResult(ctx, run.parentSessionID, terminal)
@@ -1455,17 +1490,39 @@ func (c *coordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, b
 	return collector.Snapshot(sessionID)
 }
 
-// sweepDispatchOnDone is the session-end backstop (#63's Sweep): when the
-// coordinator's context ends — app shutdown — every workspace dispatch
-// created is torn down, in-flight runs included (their runs fail against
-// a removed workspace; wander kill in #316 owns deterministic
-// cancellation of live runs).
+// ReleaseDispatches is the synchronous session-end cleanup (#367): it
+// releases this session's dispatch workspaces that are safe to remove —
+// the ones that never produced work — and leaves completed or killed
+// work with commits or uncommitted changes on disk for salvage. It is
+// called from App.Shutdown on the live coordinator context, bounded by
+// dispatchSweepTimeout so a wedged worktree cannot hang shutdown.
+func (c *coordinator) ReleaseDispatches(ctx context.Context) {
+	c.dispatchMu.Lock()
+	provider := c.dispatchProvider
+	c.dispatchMu.Unlock()
+	if provider == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, dispatchSweepTimeout)
+	defer cancel()
+	if err := provider.ReleaseUnworked(ctx); err != nil {
+		slog.Error("Dispatch workspace release failed", "error", err)
+	}
+}
+
+// sweepDispatchOnDone is the session-end backstop for the synchronous
+// ReleaseDispatches App.Shutdown runs: when the coordinator's context
+// ends without it — a crash path — the same selective release still
+// runs. A workspace with salvageable work stays on disk; only workless
+// ones are removed. In-flight runs fail against a removed workspace;
+// wander kill in #316 owns deterministic cancellation of live runs.
 func (c *coordinator) sweepDispatchOnDone(ctx context.Context) {
 	<-ctx.Done()
 	c.sweepDispatch()
 }
 
-// sweepDispatch sweeps the dispatch worktree provider if one exists.
+// sweepDispatch runs the session-end release on a fresh, bounded
+// context: the coordinator's own is already done.
 func (c *coordinator) sweepDispatch() {
 	c.dispatchMu.Lock()
 	provider := c.dispatchProvider
@@ -1473,11 +1530,10 @@ func (c *coordinator) sweepDispatch() {
 	if provider == nil {
 		return
 	}
-	// A fresh, bounded context: the coordinator's own is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), dispatchSweepTimeout)
 	defer cancel()
-	if err := provider.Sweep(ctx); err != nil {
-		slog.Error("Dispatch workspace sweep failed", "error", err)
+	if err := provider.ReleaseUnworked(ctx); err != nil {
+		slog.Error("Dispatch workspace release failed", "error", err)
 	}
 }
 

@@ -48,13 +48,13 @@ current behaviour. What ships today is on
 | 2026-10-02 | Mid-run message injection, handles and send-down ship in v1. | Interaction | Shipped ([#312](https://github.com/joestump-agent/crush/issues/312)) |
 | 2026-10-02 | Wander kill is deterministic and configurable, and workspace state is preserved for salvage. | Interaction | Shipped ([#316](https://github.com/joestump-agent/crush/issues/316)); scope revised 2026-10-04 |
 | 2026-10-04 | **A2A is the runtime contract.** One path through the A2A client, and no direct-run fallback. | Both | Planned: [#347](https://github.com/joestump-agent/crush/issues/347) |
-| 2026-10-04 | **Transport.** One host per Crush process on a 0600 unix socket. TCP is opt-in and requires TLS and auth. | A2A PRD | Planned: [#346](https://github.com/joestump-agent/crush/issues/346), [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357) |
+| 2026-10-04 | **Transport.** One host per Crush process on a 0600 unix socket. TCP is opt-in and requires TLS and auth. | A2A PRD | Shipped ([#346](https://github.com/joestump-agent/crush/issues/346)); TCP planned: [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357) |
 | 2026-10-04 | **Agent definitions.** Built-ins stay backwards compatible but can be overridden, extended, or replaced by an external card. crushrc first. | Both | Data model shipped in `crush.json`: [#333](https://github.com/joestump-agent/crush/issues/333). Planned: [#431](https://github.com/joestump-agent/crush/issues/431), [#434](https://github.com/joestump-agent/crush/issues/434) |
 | 2026-10-04 | **Extensions.** Metadata is allowed but must be declared on the card and statically typed. | A2A PRD | Shipped ([#359](https://github.com/joestump-agent/crush/issues/359)) |
 | 2026-10-04 | **Kill is `tasks/cancel` with a reason.** Exactly one terminal event per task. | A2A PRD | Planned: [#342](https://github.com/joestump-agent/crush/issues/342), [#348](https://github.com/joestump-agent/crush/issues/348) |
 | 2026-10-04 | **Kill scope.** Nudges apply to agents that have the todos tool. Kill applies only to dispatched agents. | Both | Planned: [#393](https://github.com/joestump-agent/crush/issues/393), [#394](https://github.com/joestump-agent/crush/issues/394) |
 | 2026-10-04 | **Per-agent thresholds** live on the definition, with global options as defaults. | Both | Planned: [#402](https://github.com/joestump-agent/crush/issues/402) |
-| 2026-10-04 | **Cleanup.** Work is preserved for salvage, with explicit apply and dismiss, ownership leases, and nothing discarded at exit. | Both | Planned: [#365](https://github.com/joestump-agent/crush/issues/365), [#367](https://github.com/joestump-agent/crush/issues/367), [#368](https://github.com/joestump-agent/crush/issues/368) |
+| 2026-10-04 | **Cleanup.** Work is preserved for salvage, with explicit apply and dismiss, ownership leases, and nothing discarded at exit. | Both | Shipped in part: leases and exit preservation ([#365](https://github.com/joestump-agent/crush/issues/365), [#367](https://github.com/joestump-agent/crush/issues/367)); apply and dismiss planned: [#368](https://github.com/joestump-agent/crush/issues/368) |
 | 2026-10-04 | **Handle lifetime is run lifetime.** Handles are scoped to the session tree. | Both | Planned: [#399](https://github.com/joestump-agent/crush/issues/399) |
 | 2026-10-04 | **Not continuable, for now.** Delegation depth is one level. | Both | Current behaviour; [#413](https://github.com/joestump-agent/crush/issues/413) closes gaps |
 | 2026-10-04 | **Navigation.** `ctrl+]` enters and cycles. Esc and `ctrl+[` always leave inspect mode, and Esc never cancels from it. | Interaction | Planned: [#404](https://github.com/joestump-agent/crush/issues/404) |
@@ -79,14 +79,17 @@ Tracking: [#347](https://github.com/joestump-agent/crush/issues/347), [#343](htt
 
 ### One host per process, on a unix socket
 
-Today each dispatch opens an unauthenticated JSON-RPC listener on
-`127.0.0.1`, which any local process, or a web page, can use to drive a
-write-capable agent. A 0600 unix socket puts access control in the
-operating system and opens no network listener at all. One host per
-process gives one place to route, authenticate and observe. TCP remains
-available for remote and third-party agents, but plain TCP is refused: it
-needs TLS, auth interceptors and `securitySchemes` on the card.
-Tracking: [#346](https://github.com/joestump-agent/crush/issues/346), [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357).
+Each dispatch used to open an unauthenticated JSON-RPC listener on
+`127.0.0.1`, which any local process, or a web page, could use to drive a
+write-capable agent. Now one host per process listens on a 0600 unix
+socket in a 0700 directory, so the operating system puts access control
+in place and no network listener opens at all, and middleware rejects
+cross-origin, non-JSON and wrong-`Host` requests before any dispatch
+work runs. One host per process gives one place to route, authenticate
+and observe. TCP remains available for remote and third-party agents,
+but plain TCP is refused: it needs TLS, auth interceptors and
+`securitySchemes` on the card.
+Tracking: shipped in [#346](https://github.com/joestump-agent/crush/issues/346); [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357) remain.
 
 ### Agents are definitions
 
@@ -109,14 +112,14 @@ The A2A epic originally ruled out custom extensions, yet todo progress
 already traveled in an undeclared metadata key. Instead of pretending
 otherwise, each kind of Crush metadata gets an extension URI, a Go type and
 a JSON schema. Cards list what they emit and accept, and undeclared keys
-are dropped. The `todos/v1` extension carries dispatch todo progress and
-ships today ([#359](https://github.com/joestump-agent/crush/issues/359)).
-Planned extensions:
-
-- `delegation/v1`, carrying origin, chain, depth and budget; it subsumes
-  [#332](https://github.com/joestump-agent/crush/issues/332) and
-  [#336](https://github.com/joestump-agent/crush/issues/336);
-- `usage/v1`.
+are dropped. Two extensions ship today: `todos/v1` carries dispatch todo
+progress ([#359](https://github.com/joestump-agent/crush/issues/359)), and
+`usage/v1` carries the child session's token totals, cost, model and trace
+id on every post-run terminal status
+([#364](https://github.com/joestump-agent/crush/issues/364)). The planned
+extension is `delegation/v1`, carrying origin, chain, depth and budget; it
+subsumes [#332](https://github.com/joestump-agent/crush/issues/332) and
+[#336](https://github.com/joestump-agent/crush/issues/336).
 
 Tracking: [#364](https://github.com/joestump-agent/crush/issues/364).
 
@@ -232,7 +235,7 @@ what the re-base changes.
 | **No pre-defined agent definitions.** Sub-agent prompts are rendered at dispatch time from nothing but the template. | 2026-10-02 | 2026-10-04: agents are definitions. Prompts are still rendered at dispatch time, from the definition's template. |
 | **Esc untouched.** Only `ctrl+[` leaves inspect mode. | 2026-10-02 | 2026-10-04: Esc and `ctrl+[` both leave inspect mode, and Esc never cancels from it ([#404](https://github.com/joestump-agent/crush/issues/404)). |
 | **Loopback TCP for Phase 1.** One `127.0.0.1` server per dispatch; gRPC and auth wait for remote workers. | 2026-07-13 | 2026-10-04: one host per process on a 0600 unix socket; TCP only with TLS and auth ([#346](https://github.com/joestump-agent/crush/issues/346), [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357)). |
-| **Session-end sweep.** Every dispatch worktree is removed on session end, even an abandoned one ([#63](https://github.com/joestump-agent/crush/issues/63)). | Original plan | 2026-10-04: never on exit. Preserve for salvage; explicit apply and dismiss; ownership leases ([#365](https://github.com/joestump-agent/crush/issues/365), [#367](https://github.com/joestump-agent/crush/issues/367), [#368](https://github.com/joestump-agent/crush/issues/368)). |
+| **Session-end sweep.** Every dispatch worktree is removed on session end, even an abandoned one ([#63](https://github.com/joestump-agent/crush/issues/63)). | Original plan | 2026-10-05: nothing is discarded at exit. Only decided and workless workspaces are released; work is kept for salvage; ownership leases, with explicit apply and dismiss ([#365](https://github.com/joestump-agent/crush/issues/365), [#367](https://github.com/joestump-agent/crush/issues/367), [#368](https://github.com/joestump-agent/crush/issues/368)). |
 | **No custom extensions.** Use the A2A spec as-is. | 2026-07-13 | 2026-10-04: declared, statically typed extensions ([#359](https://github.com/joestump-agent/crush/issues/359)). |
 | **Fallback over failure.** A server that fails to start is logged and the dispatch runs directly. | Phase 1 code | 2026-10-04: a host start failure is a dispatch failure ([#347](https://github.com/joestump-agent/crush/issues/347)). |
 | **Steering in a later phase.** Mid-run messages wait for the A2A transport. | 2026-07-13 | 2026-10-02: injection shipped in v1 as the seam A2A will use ([#312](https://github.com/joestump-agent/crush/issues/312)). |

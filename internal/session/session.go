@@ -87,6 +87,10 @@ type Service interface {
 	// AddCost atomically adds delta to the session's cost without writing
 	// any other column, so concurrent full-row saves cannot clobber it.
 	AddCost(ctx context.Context, sessionID string, delta float64) error
+	// AddSessionUsage atomically adds a dispatched agent's usage — token
+	// totals and cost — to the session without writing any other column,
+	// so concurrent full-row saves cannot clobber the increment (#364).
+	AddSessionUsage(ctx context.Context, sessionID string, promptTokens, completionTokens int64, cost float64) error
 	Rename(ctx context.Context, id string, title string) error
 	Delete(ctx context.Context, id string) error
 
@@ -340,6 +344,23 @@ func (s *service) AddCost(ctx context.Context, sessionID string, delta float64) 
 	if err := s.q.AddSessionCost(ctx, db.AddSessionCostParams{
 		Cost: delta,
 		ID:   sessionID,
+	}); err != nil {
+		return err
+	}
+	s.publishSessionUpdate(ctx, sessionID)
+	return nil
+}
+
+// AddSessionUsage atomically adds a dispatched agent's usage — token
+// totals and cost — to the session. Only the usage columns are written,
+// so a parent's own full-row saves during its turn cannot clobber the
+// increment (#364).
+func (s *service) AddSessionUsage(ctx context.Context, sessionID string, promptTokens, completionTokens int64, cost float64) error {
+	if err := s.q.AddSessionUsage(ctx, db.AddSessionUsageParams{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		Cost:             cost,
+		ID:               sessionID,
 	}); err != nil {
 		return err
 	}

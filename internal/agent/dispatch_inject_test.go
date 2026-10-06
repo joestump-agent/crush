@@ -402,7 +402,83 @@ func TestMessageAgentToolDeliversAndRefuses(t *testing.T) {
 
 	resp = runTool(t, messageTool, MessageAgentToolName, MessageAgentParams{Message: "no session"})
 	require.True(t, resp.IsError)
-	require.Contains(t, resp.Content, "session id or handle is required")
+	require.Contains(t, resp.Content, "provide exactly one of handle or session_id")
+}
+
+// The model sees exactly one required field on message_agent (#400):
+// providers that enforce required must not be pushed to invent a
+// session_id when the model knows only the @handle the user typed.
+func TestMessageAgentToolSchemaRequiresOnlyMessage(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, _ := newInjectionEnv(t, agent)
+
+	require.Equal(t, []string{"message"}, c.messageAgentTool().Info().Required)
+}
+
+// The four input shapes of the message_agent tool (#400) against a
+// coordinator with one running fake dispatch: exactly one of handle or
+// session_id delivers, neither is a tool error naming both fields, and a
+// pair that names different agents is refused — while a matching pair
+// names the same agent and delivers once.
+func TestMessageAgentToolInputShapes(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, _ := newInjectionEnv(t, agent)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main", Handle: "tester"}))
+	agent.waitRunning(t)
+	messageTool := c.messageAgentTool()
+
+	cases := []struct {
+		name     string
+		params   MessageAgentParams
+		wantErr  string
+		injected int
+	}{
+		{
+			name:     "handle only delivers",
+			params:   MessageAgentParams{Handle: "tester", Message: "by handle"},
+			injected: 1,
+		},
+		{
+			name:     "session id only delivers",
+			params:   MessageAgentParams{SessionID: handle.SessionID, Message: "by session"},
+			injected: 2,
+		},
+		{
+			name:     "neither is a tool error naming both fields",
+			params:   MessageAgentParams{Message: "by nothing"},
+			wantErr:  "provide exactly one of handle or session_id",
+			injected: 2,
+		},
+		{
+			name:     "both naming different agents is a tool error",
+			params:   MessageAgentParams{Handle: "tester", SessionID: "another-session", Message: "contradictory"},
+			wantErr:  "name different agents",
+			injected: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := runToolAsSession(t, messageTool, MessageAgentToolName, tc.params, "dispatch-parent-session")
+			if tc.wantErr != "" {
+				require.True(t, resp.IsError)
+				require.Contains(t, resp.Content, tc.wantErr)
+			} else {
+				require.False(t, resp.IsError, "unexpected tool error: %s", resp.Content)
+			}
+			require.Len(t, agent.injected(), tc.injected)
+		})
+	}
+
+	// A matching pair names the same agent and delivers once.
+	resp := runToolAsSession(t, messageTool, MessageAgentToolName, MessageAgentParams{
+		Handle:    "tester",
+		SessionID: handle.SessionID,
+		Message:   "same agent",
+	}, "dispatch-parent-session")
+	require.False(t, resp.IsError, "unexpected tool error: %s", resp.Content)
+	require.Len(t, agent.injected(), 3)
 }
 
 // refusingDispatchAgent is a fake dispatched agent that mirrors the real

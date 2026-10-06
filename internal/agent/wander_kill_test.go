@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -487,7 +488,7 @@ func (f *wanderKillFixture) wireTransport(t *testing.T, rt DispatchServerStarter
 	t.Helper()
 	run := f.buildRun()
 	f.c.SetDispatchServerStarter(rt)
-	stop := f.c.startDispatchServer(context.Background(), f.provider, f.reg, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current)
+	stop := f.c.startDispatchServer(context.Background(), f.provider, f.reg, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current, nil)
 	t.Cleanup(func() {
 		if stop != nil {
 			stop()
@@ -556,6 +557,16 @@ func TestWanderKill_IgnoredNudgesEndToEnd(t *testing.T) {
 	f.requireKilled(t, dispatch.ReasonIgnoredNudges)
 	assert.True(t, f.killHookInvoked, "the enforcement hook must have fired")
 	f.requireParentKilledDelivery(t)
+
+	// Session-end release keeps a killed workspace that holds work a
+	// human might want (#367): uncommitted changes count, so the
+	// directory and branch survive and the entry stays registered.
+	require.NoError(t, os.WriteFile(filepath.Join(f.entry.Path, "salvage.txt"), []byte("keep"), 0o644))
+	f.c.ReleaseDispatches(context.Background())
+	require.DirExists(t, f.entry.Path, "release must not discard a killed workspace's work")
+	require.True(t, branchExists(t, f.env.workingDir, f.entry.Branch))
+	_, ok := f.reg.Get(f.entry.ID)
+	require.True(t, ok, "the killed entry stays registered so it can still be removed")
 }
 
 // TestWanderKill_HardTimeout pins the watchdog's hard timeout: a run
@@ -1090,6 +1101,28 @@ func TestWanderKill_HardTimeoutOverServedHost(t *testing.T) {
 	require.NotNil(t, cancels[0].Card)
 }
 
+// cancelGatedModel serves a scripted run but holds its gateAt-th turn
+// (1-based) until the run's context is canceled, so a test of an
+// asynchronous kill can't lose the race to the run finishing first. A
+// kill that never lands releases the turn after a minute and the run
+// completes, which the test then reports, instead of hanging it.
+type cancelGatedModel struct {
+	*scriptedModel
+	gateAt int
+	calls  atomic.Int32
+}
+
+func (m *cancelGatedModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
+	if !isTitleCall(call) && int(m.calls.Add(1)) >= m.gateAt {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Minute):
+		}
+	}
+	return m.scriptedModel.Stream(ctx, call)
+}
+
 // TestWanderKill_IgnoredNudgesOverServedHost pins the ladder kill over
 // the protocol (#348): the enforcement ladder's kill rung routes through
 // the served dispatch's tasks/cancel with the ignored-nudges reason.
@@ -1107,6 +1140,13 @@ func TestWanderKill_IgnoredNudgesOverServedHost(t *testing.T) {
 		KillAfterNudges: 1,
 	}
 	f := newWanderKillFixture(t, model, settings)
+	// The kill rides an asynchronous tasks/cancel, and completion wins
+	// over a kill that lands late (TestWanderKill_CompletionWinsOverLateKill).
+	// An instant scripted model could finish before the cancel landed, so
+	// hold the final step until the cancel ends the run.
+	gated := &cancelGatedModel{scriptedModel: model, gateAt: len(model.steps)}
+	f.runModel = gated
+	f.buildDispatched(t, gated, settings, nil)
 
 	host := &cancelingTransport{reportTask: true}
 	f.wireTransport(t, host)

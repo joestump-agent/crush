@@ -34,8 +34,8 @@ type CardParams struct {
 	// A2A skill entry on the card. Optional.
 	Skills []*skills.Skill
 
-	// Endpoint is the base URL the agent serves A2A on (loopback in
-	// Phase 1). Required for a resolvable card.
+	// Endpoint is the base URL the agent serves A2A on (the process's
+	// unix-socket host in Phase 1, #346). Required for a resolvable card.
 	Endpoint string
 
 	// Transport is the protocol binding served at Endpoint. Defaults to

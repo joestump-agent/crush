@@ -3493,7 +3493,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 	}
 
 	// Handle cancel key when agent is busy.
-	if key.Matches(msg, m.keyMap.Chat.Cancel) {
+	if key.Matches(msg, m.keyMap.Chat.Cancel) && !m.isInspecting() {
 		if m.isAgentBusy() {
 			if cmd := m.cancelAgent(); cmd != nil {
 				cmds = append(cmds, cmd)
@@ -4326,7 +4326,7 @@ func (m *UI) ShortHelp() []key.Binding {
 		binds = append(binds, k.Quit)
 	case uiChat:
 		// Show cancel binding if agent is busy.
-		if m.isAgentBusy() {
+		if m.isAgentBusy() && !m.isInspecting() {
 			cancelBinding := k.Chat.Cancel
 			if m.isCanceling {
 				cancelBinding.SetHelp("esc", "press again to cancel")
@@ -4337,6 +4337,19 @@ func (m *UI) ShortHelp() []key.Binding {
 		}
 
 		isSidebar := m.focus == uiFocusSidebar
+
+		// Inspect mode (#412): while viewing a sub-agent, going back is
+		// the primary action, so lead with it; with more than one live
+		// agent in the entry ring, also advertise ctrl+] as "next agent".
+		// The sidebar help stays exactly as it was.
+		if m.isInspecting() && !isSidebar {
+			binds = append(binds, k.InspectBack)
+			if len(m.inspectRing) > 1 {
+				next := k.InspectDrill
+				next.SetHelp("ctrl+]", "next agent")
+				binds = append(binds, next)
+			}
+		}
 
 		commonBinds := []key.Binding{tab}
 		if !isSidebar {
@@ -4359,6 +4372,13 @@ func (m *UI) ShortHelp() []key.Binding {
 				k.Chat.PageDown,
 				k.Chat.Copy,
 			)
+			// Entry hint (#412): the selected transcript item is an agent
+			// block ctrl+] can drill into. Type check on the selected item
+			// only; agentBlocks() walks the whole transcript and help is
+			// rebuilt on every render.
+			if !m.isInspecting() && m.selectedAgentBlock() {
+				binds = append(binds, k.InspectDrill)
+			}
 		case uiFocusSidebar:
 			esc := k.Editor.Escape
 			esc.SetHelp("esc", "back to editor")
@@ -4439,7 +4459,7 @@ func (m *UI) FullHelp() [][]key.Binding {
 			})
 	case uiChat:
 		// Show cancel binding if agent is busy.
-		if m.isAgentBusy() {
+		if m.isAgentBusy() && !m.isInspecting() {
 			cancelBinding := k.Chat.Cancel
 			if m.isCanceling {
 				cancelBinding.SetHelp("esc", "press again to cancel")
@@ -4471,6 +4491,25 @@ func (m *UI) FullHelp() [][]key.Binding {
 		}
 
 		binds = append(binds, mainBinds)
+
+		// Inspect group (#412): drill-in and back, only while they
+		// apply. Back leads while inspecting, matching ShortHelp.
+		if !isSidebar {
+			var inspectBinds []key.Binding
+			if m.isInspecting() {
+				inspectBinds = append(inspectBinds, k.InspectBack)
+				if len(m.inspectRing) > 1 {
+					next := k.InspectDrill
+					next.SetHelp("ctrl+]", "next agent")
+					inspectBinds = append(inspectBinds, next)
+				}
+			} else if m.selectedAgentBlock() {
+				inspectBinds = append(inspectBinds, k.InspectDrill)
+			}
+			if len(inspectBinds) > 0 {
+				binds = append(binds, inspectBinds)
+			}
+		}
 
 		switch m.focus {
 		case uiFocusEditor:

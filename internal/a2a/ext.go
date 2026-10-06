@@ -165,10 +165,24 @@ var TodoExt = Extension{
 	Schema:      new(jsonschema.Reflector).Reflect(agent.TodoProgress{}),
 }
 
+// UsageExtensionURI is the URI of the usage/v1 extension: the dispatch's
+// usage, cost and trace context, carried in terminal TaskStatusUpdateEvent
+// metadata (#364).
+const UsageExtensionURI = extensionURIPrefix + "usage/v1"
+
+// UsageExt is the usage/v1 extension's registry entry.
+var UsageExt = Extension{
+	URI:         UsageExtensionURI,
+	Description: "Dispatch usage, cost and trace context in terminal TaskStatusUpdateEvent metadata.",
+	Type:        reflect.TypeFor[agent.Usage](),
+	Schema:      new(jsonschema.Reflector).Reflect(agent.Usage{}),
+}
+
 // The statically known extensions, registered at init so every card, stream,
 // and decode sees them.
 func init() {
 	mustRegister(TodoExt)
+	mustRegister(UsageExt)
 }
 
 // cardExtensions derives the agent card's advertised extension list from the

@@ -11,12 +11,14 @@ package model
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 
@@ -32,6 +34,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/dialog"
 	"github.com/charmbracelet/crush/internal/ui/textarea"
+	"github.com/charmbracelet/crush/internal/ui/util"
 	"github.com/charmbracelet/crush/internal/workspace"
 )
 
@@ -54,10 +57,12 @@ type inspectWorkspace struct {
 	sessions map[string]session.Session
 	messages map[string][]message.Message
 
-	getSessions  []string
-	listMessages []string
-	agentRuns    []string
-	listFailures map[string]bool
+	getSessions      []string
+	listMessages     []string
+	agentRuns        []string
+	agentCancels     []string
+	agentClearQueues []string
+	listFailures     map[string]bool
 }
 
 func newInspectWorkspace() *inspectWorkspace {
@@ -106,6 +111,14 @@ func (w *inspectWorkspace) SetCurrentSession(context.Context, string) error { re
 func (w *inspectWorkspace) AgentRun(_ context.Context, sessionID, _ string, _ ...message.Attachment) error {
 	w.agentRuns = append(w.agentRuns, sessionID)
 	return nil
+}
+
+func (w *inspectWorkspace) AgentCancel(sessionID string) {
+	w.agentCancels = append(w.agentCancels, sessionID)
+}
+
+func (w *inspectWorkspace) AgentClearQueue(sessionID string) {
+	w.agentClearQueues = append(w.agentClearQueues, sessionID)
 }
 
 func (w *inspectWorkspace) AgentIsReady() bool                               { return true }
@@ -220,6 +233,37 @@ func addAgentBlock(t *testing.T, m *UI, messageID, toolCallID string) {
 			},
 		},
 	})
+}
+
+// deliverAgentResult delivers the tool result for the named call the way
+// the live event path does: a Tool-role message created in the parent
+// session, which routes to SetResult on the existing block.
+func deliverAgentResult(t *testing.T, m *UI, toolCallID, content string) {
+	t.Helper()
+	m.Update(pubsub.Event[message.Message]{
+		Type: pubsub.CreatedEvent,
+		Payload: message.Message{
+			ID:        "toolresult-" + toolCallID,
+			SessionID: inspectParentID,
+			Role:      message.Tool,
+			Parts: []message.ContentPart{
+				message.ToolResult{ToolCallID: toolCallID, Name: agent.AgentToolName, Content: content},
+			},
+		},
+	})
+}
+
+// requireBlockLive asserts the inspect liveness recorded for the block
+// whose child session has the given ID.
+func requireBlockLive(t *testing.T, m *UI, sessionID string, live bool, msgAndArgs ...any) {
+	t.Helper()
+	for _, ref := range m.agentBlocks() {
+		if ref.sessionID == sessionID {
+			require.Equal(t, live, ref.live, append([]any{"block %s liveness", sessionID}, msgAndArgs...)...)
+			return
+		}
+	}
+	t.Fatalf("no agent block for session %q", sessionID)
 }
 
 // TestInspectSubmitGoesToActiveSession pins the split invariant (#314):
@@ -496,8 +540,8 @@ func TestSessionSwitchClearsInspect(t *testing.T) {
 	require.Equal(t, next.ID, m.session.ID)
 }
 
-// TestInspectKeyBindings pins the binding surface: ctrl+] and ctrl+[ are
-// bound, and Esc is not part of inspect mode's bindings.
+// TestInspectKeyBindings pins the binding surface: ctrl+] drills in,
+// esc and ctrl+[ go back, and esc is not part of the drill-in binding.
 func TestInspectKeyBindings(t *testing.T) {
 	km := DefaultKeyMap()
 	require.True(t, matchesCtrl(km.InspectDrill, ']'))
@@ -505,8 +549,9 @@ func TestInspectKeyBindings(t *testing.T) {
 	require.False(t, matchesCtrl(km.InspectDrill, '['))
 	require.False(t, matchesCtrl(km.InspectBack, ']'))
 	require.False(t, key.Matches(tea.KeyPressMsg{Code: tea.KeyEscape}, km.InspectDrill),
-		"esc must stay out of inspect mode's bindings")
-	require.False(t, key.Matches(tea.KeyPressMsg{Code: tea.KeyEscape}, km.InspectBack))
+		"esc must stay out of inspect mode's drill-in binding")
+	require.True(t, key.Matches(tea.KeyPressMsg{Code: tea.KeyEscape}, km.InspectBack),
+		"esc is the back key on every terminal")
 }
 
 func matchesCtrl(b key.Binding, r rune) bool {
@@ -517,31 +562,161 @@ func parentMessageID(i int) string {
 	return "p" + strconv.Itoa(i)
 }
 
-// TestInspectEscIsBackOnLegacyTerminals pins ctrl+[ on terminals without
-// key disambiguation, which send it as the same byte as esc: while
-// inspecting, that esc must leave inspect mode instead of reaching the
-// cancel handler, where a second press cancels the parent's run. A
-// terminal that tells the two keys apart keeps esc's own meaning.
-func TestInspectEscIsBackOnLegacyTerminals(t *testing.T) {
+// TestInspectEscAlwaysLeaves pins the #404 decision: esc and ctrl+[
+// leave inspect mode on one press, on every terminal, whatever the
+// terminal reports for key disambiguation and whatever the parent's
+// queue holds, and the press that leaves never cancels or clears the
+// parent.
+func TestInspectEscAlwaysLeaves(t *testing.T) {
+	sequences := []struct {
+		name string
+		raw  string
+	}{
+		{"legacy esc", "\x1b"},
+		{"kitty esc", "\x1b[27u"},
+		{"kitty ctrl+[", "\x1b[91;5u"},
+		{"otherkeys ctrl+[", "\x1b[27;5;91~"},
+	}
+	keyMsg := func(t *testing.T, raw string) tea.KeyPressMsg {
+		t.Helper()
+		var decoder uv.EventDecoder
+		n, ev := decoder.Decode([]byte(raw))
+		require.Equal(t, len(raw), n, "decoding %q", raw)
+		kpe, ok := ev.(uv.KeyPressEvent)
+		require.True(t, ok, "decoding %q must yield a key press", raw)
+		return tea.KeyPressMsg(kpe)
+	}
+	setup := func(t *testing.T, flags, promptQueue int) (*UI, *inspectWorkspace) {
+		t.Helper()
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		m.keyenh = tea.KeyboardEnhancementsMsg{Flags: flags}
+		m.agentReady = true
+		m.agentBusyCache.val = true
+		m.promptQueue = promptQueue
+		addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+		runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+		require.True(t, m.isInspecting())
+		return m, ws
+	}
+
+	for _, flags := range []int{0, 1} {
+		for _, promptQueue := range []int{0, 2} {
+			for _, seq := range sequences {
+				t.Run(fmt.Sprintf("flags=%d queue=%d %s", flags, promptQueue, seq.name), func(t *testing.T) {
+					m, ws := setup(t, flags, promptQueue)
+
+					_, cmd := m.Update(keyMsg(t, seq.raw))
+					runInspectCmds(m, cmd)
+					require.False(t, m.isInspecting(),
+						"one press of %s must leave inspect mode", seq.name)
+					require.Empty(t, ws.agentCancels, "a back press must never cancel the parent")
+					require.Empty(t, ws.agentClearQueues, "a back press must never clear the parent's queue")
+					require.False(t, m.isCanceling, "a back press must not arm the parent's cancel")
+				})
+			}
+		}
+	}
+
+	t.Run("alt+esc never cancels the parent from inspect mode", func(t *testing.T) {
+		m, ws := setup(t, 0, 2)
+
+		for i := 0; i < 3; i++ {
+			_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape, Mod: tea.ModAlt})
+			runInspectCmds(m, cmd)
+		}
+		require.True(t, m.isInspecting(), "alt+esc is not the back key")
+		require.Empty(t, ws.agentCancels, "alt+esc must never cancel the parent")
+		require.Empty(t, ws.agentClearQueues, "alt+esc must never clear the parent's queue")
+		require.False(t, m.isCanceling, "alt+esc must not arm the parent's cancel")
+	})
+
+	t.Run("outside inspect mode esc still arms the cancel", func(t *testing.T) {
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		m.agentReady = true
+		m.agentBusyCache.val = true
+
+		_, cmd := m.Update(keyMsg(t, "\x1b"))
+		runInspectCmds(m, cmd)
+		require.False(t, m.isInspecting())
+		require.True(t, m.isCanceling, "outside inspect mode the first esc must arm the cancel")
+		require.Empty(t, ws.agentCancels, "arming is not canceling")
+	})
+}
+
+// escCloseDialog is the minimal dialog that closes on esc, for pinning
+// key routing order.
+type escCloseDialog struct{ closed bool }
+
+func (d *escCloseDialog) ID() string { return "test-esc-close" }
+
+func (d *escCloseDialog) HandleMsg(msg tea.Msg) dialog.Action {
+	if msg, ok := msg.(tea.KeyPressMsg); ok && key.Matches(msg, dialog.CloseKey) {
+		d.closed = true
+		return dialog.ActionClose{}
+	}
+	return nil
+}
+
+func (d *escCloseDialog) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor { return nil }
+
+// TestDialogKeepsEscOverInspect pins the routing order (#404): an open
+// dialog receives esc before inspect mode does, so closing the dialog
+// leaves the inspect view in place.
+func TestDialogKeepsEscOverInspect(t *testing.T) {
 	ws := newInspectWorkspace()
 	m := newInspectUI(t, ws)
 	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
-
 	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
 	require.True(t, m.isInspecting())
+
+	d := &escCloseDialog{}
+	m.dialog.OpenDialog(d)
+	require.True(t, m.dialog.HasDialogs())
 
 	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	runInspectCmds(m, cmd)
-	require.False(t, m.isInspecting(),
-		"ctrl+[ arrives as esc on a legacy terminal and must leave inspect mode")
-	require.False(t, m.isCanceling, "the back press must not arm the parent's cancel")
+	require.True(t, d.closed, "the open dialog must take esc first")
+	require.False(t, m.dialog.HasDialogs())
+	require.True(t, m.isInspecting(), "closing the dialog must not leave inspect mode")
+	require.False(t, m.isCanceling)
+}
 
-	m.keyenh = tea.KeyboardEnhancementsMsg{Flags: 1}
+// TestInspectHidesEscCancelHelp pins the help bar (#404): while
+// inspecting, the esc cancel/clear-queue entry is hidden even when the
+// parent is busy, and it comes back once inspect mode is left.
+func TestInspectHidesEscCancelHelp(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	m.agentReady = true
+	m.agentBusyCache.val = true
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
 	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
 	require.True(t, m.isInspecting())
-	handled, _ := m.handleInspectKeys(tea.KeyPressMsg{Code: tea.KeyEscape})
-	require.False(t, handled, "with key disambiguation esc is not ctrl+[")
-	require.True(t, m.isInspecting())
+
+	require.NotContains(t, m.ShortHelp(), m.keyMap.Chat.Cancel,
+		"the esc cancel entry must be hidden while inspecting")
+	require.False(t, fullHelpHasBinding(m, m.keyMap.Chat.Cancel),
+		"the esc cancel entry must be hidden from the full help while inspecting")
+
+	runInspectCmds(m, m.exitInspect())
+	require.False(t, m.isInspecting())
+	require.Contains(t, m.ShortHelp(), m.keyMap.Chat.Cancel,
+		"the esc cancel entry returns once inspect mode is left")
+	require.True(t, fullHelpHasBinding(m, m.keyMap.Chat.Cancel),
+		"the esc cancel entry returns to the full help once inspect mode is left")
+}
+
+func fullHelpHasBinding(m *UI, b key.Binding) bool {
+	for _, row := range m.FullHelp() {
+		for _, got := range row {
+			if reflect.DeepEqual(got, b) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestInspectStaleLoadsAreDropped pins the async ordering of inspect
@@ -680,7 +855,7 @@ func TestPickerTaskSessionOpensUnderItsParent(t *testing.T) {
 }
 
 // TestInspectPlaceholderKeepsTheWayBack pins the editor hint: a long
-// child title is what gets truncated, never the ctrl+[ hint.
+// child title is what gets truncated, never the esc hint.
 func TestInspectPlaceholderKeepsTheWayBack(t *testing.T) {
 	ws := newInspectWorkspace()
 	m := newInspectUI(t, ws)
@@ -690,7 +865,7 @@ func TestInspectPlaceholderKeepsTheWayBack(t *testing.T) {
 
 	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
 	placeholder := m.inspectPlaceholder()
-	require.Contains(t, placeholder, "ctrl+[ returns")
+	require.Contains(t, placeholder, "esc returns")
 	require.LessOrEqual(t, ansi.StringWidth(placeholder), m.textarea.Width())
 }
 
@@ -745,6 +920,140 @@ func TestInitialTopLevelSessionLoadsActive(t *testing.T) {
 	require.Equal(t, otherID, m.session.ID, "a top-level session loads as active")
 	require.Equal(t, uiChat, m.state)
 	require.False(t, m.isInspecting())
+}
+
+// TestFinishedAgentBlockIsNotLive pins #405: an agent-tool block whose
+// result arrived is not live, on either path that can deliver a result:
+// the live event stream, or a transcript loaded from history.
+func TestFinishedAgentBlockIsNotLive(t *testing.T) {
+	t.Run("live result event", func(t *testing.T) {
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+		addAgentBlock(t, m, inspectMessageID, inspectCallID)
+		requireBlockLive(t, m, inspectChildID, true)
+
+		deliverAgentResult(t, m, inspectCallID, "done")
+
+		requireBlockLive(t, m, inspectChildID, false,
+			"a finished block must drop out of the live set")
+		require.Empty(t, m.liveAgentSessionIDs(),
+			"no live agents remain once the result lands")
+
+		// ctrl+] with nothing selected must now report instead of
+		// opening the oldest, long-finished block.
+		m.chat.SetSelected(-1)
+		cmd := m.handleInspectDrill()
+		require.NotNil(t, cmd)
+		info, ok := cmd().(util.InfoMsg)
+		require.True(t, ok, "the report is an info toast")
+		require.Equal(t, "No live sub-agents to inspect", info.Msg)
+	})
+
+	t.Run("history transcript", func(t *testing.T) {
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+		runInspectCmds(m, m.setSessionMessages([]message.Message{
+			{
+				ID:        inspectMessageID,
+				SessionID: inspectParentID,
+				Role:      message.Assistant,
+				Parts: []message.ContentPart{
+					message.ToolCall{
+						ID:    inspectCallID,
+						Name:  agent.AgentToolName,
+						Input: `{"prompt":"do things"}`,
+					},
+				},
+			},
+			{
+				ID:        "toolresult-" + inspectCallID,
+				SessionID: inspectParentID,
+				Role:      message.Tool,
+				Parts: []message.ContentPart{
+					message.ToolResult{ToolCallID: inspectCallID, Name: agent.AgentToolName, Content: "done"},
+				},
+			},
+		}))
+
+		requireBlockLive(t, m, inspectChildID, false,
+			"a block rebuilt from a loaded transcript is finished too")
+	})
+}
+
+// TestCanceledAgentBlockIsNotLive pins that a block from a canceled turn
+// is never live, whether or not a result ever arrived.
+func TestCanceledAgentBlockIsNotLive(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+	runInspectCmds(m, m.setSessionMessages([]message.Message{
+		{
+			ID:        inspectMessageID,
+			SessionID: inspectParentID,
+			Role:      message.Assistant,
+			Parts: []message.ContentPart{
+				message.ToolCall{
+					ID:    inspectCallID,
+					Name:  agent.AgentToolName,
+					Input: `{"prompt":"do things"}`,
+				},
+				message.Finish{Reason: message.FinishReasonCanceled},
+			},
+		},
+	}))
+
+	requireBlockLive(t, m, inspectChildID, false, "a canceled block is never live")
+}
+
+// TestCtrlDrillSkipsFinishedBlocks pins the selection path: with one
+// finished and one running agent block and nothing selected, ctrl+]
+// opens the running one and the ring holds only it.
+func TestCtrlDrillSkipsFinishedBlocks(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+	addChild(ws, inspectChild2ID, inspectParentID, "Agent B", inspectChildMessages()...)
+
+	addAgentBlock(t, m, inspectMessageID, inspectCallID)
+	addAgentBlock(t, m, inspectMessageID, inspectCall2ID)
+	deliverAgentResult(t, m, inspectCallID, "done")
+
+	m.chat.SetSelected(-1)
+	runInspectCmds(m, m.handleInspectDrill())
+
+	require.True(t, m.isInspecting())
+	require.Equal(t, inspectChild2ID, m.inspectingSessionID(),
+		"the running block must be the one inspected")
+	require.Equal(t, []string{inspectChild2ID}, m.inspectRing,
+		"the finished block must not ride the ring")
+}
+
+// TestFocusedFinishedBlockStillOpens pins that a finished block drops
+// out of the live ring, but focusing it and pressing ctrl+] still opens
+// its read-only transcript.
+func TestFocusedFinishedBlockStillOpens(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+	addAgentBlock(t, m, inspectMessageID, inspectCallID)
+	deliverAgentResult(t, m, inspectCallID, "done")
+
+	idx := -1
+	for _, ref := range m.agentBlocks() {
+		if ref.sessionID == inspectChildID {
+			idx = ref.index
+		}
+	}
+	require.NotEqual(t, -1, idx, "the finished block is still a drill-in target")
+	m.chat.SetSelected(idx)
+
+	runInspectCmds(m, m.handleInspectDrill())
+
+	require.True(t, m.isInspecting())
+	require.Equal(t, inspectChildID, m.inspectingSessionID(),
+		"focusing a finished block must still open its transcript")
 }
 
 // TestInspectExitBuffersLateParentCreate pins the exit half of the

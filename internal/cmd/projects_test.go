@@ -10,8 +10,11 @@ import (
 )
 
 func TestProjectsEmpty(t *testing.T) {
-	// Use a temp directory for projects.json
+	// Use a temp directory for projects.json. CRUSH_GLOBAL_DATA wins over
+	// XDG_DATA_HOME in config resolution, so it must be cleared too, or
+	// the test reads (and writes) the caller's real data directory.
 	tmpDir := t.TempDir()
+	t.Setenv("CRUSH_GLOBAL_DATA", "")
 	t.Setenv("XDG_DATA_HOME", tmpDir)
 
 	var b bytes.Buffer
@@ -25,6 +28,7 @@ func TestProjectsEmpty(t *testing.T) {
 
 func TestProjectsJSON(t *testing.T) {
 	tmpDir := t.TempDir()
+	t.Setenv("CRUSH_GLOBAL_DATA", "")
 	t.Setenv("XDG_DATA_HOME", tmpDir)
 
 	// Register a project

@@ -72,6 +72,10 @@ func (m *mockSessionService) AddCost(context.Context, string, float64) error {
 	return nil
 }
 
+func (m *mockSessionService) AddSessionUsage(context.Context, string, int64, int64, float64) error {
+	return nil
+}
+
 func (m *mockSessionService) Rename(context.Context, string, string) error {
 	return nil
 }

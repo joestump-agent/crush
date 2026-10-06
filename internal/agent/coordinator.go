@@ -442,9 +442,10 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 	cronScheduler := scheduler.NewScheduler(c.cronStore, c.fireScheduledTask)
 	go cronScheduler.Run(ctx)
 
-	// Dispatch session-end backstop: sweep every workspace dispatch
-	// created when the coordinator's context ends (#63's Sweep, wired
-	// here per #64).
+	// Dispatch session-end backstop: release the workspaces that are
+	// safe to remove when the coordinator's context ends (#63's Sweep,
+	// wired here per #64; #367 makes the pass selective, keeping work
+	// worth salvaging on disk).
 	go c.sweepDispatchOnDone(ctx)
 
 	c.mainAgent = agent

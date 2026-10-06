@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/agent"
@@ -33,35 +35,53 @@ func (f *fakeTodoSource) SubscribeSessionTodos(ctx context.Context, sessionID st
 }
 
 // The client half of the protocol boundary (#71): StreamDispatch drives a
-// served dispatch over the loopback wire — prompt out, SSE events back —
-// and returns the terminal outcome with the agent's text, the artifact
-// diff, and the observed Working progress count.
+// served dispatch over the unix-socket wire — prompt out, SSE events
+// back — and returns the terminal outcome with the agent's text, the
+// artifact diff, and the observed Working progress count. The same
+// factory instance serves and dials (#346): the socket path lives on it.
+// The paced runner holds the run open while exactly one todo snapshot
+// crosses the wire, so the count is the initial Working plus that one
+// todo event, and a bare Working status with the todo bridge broken
+// cannot pass (#425).
 func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
-	runner := &fakeRunner{result: textResult("done, two files changed")}
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    runner,
-		SessionID: "dispatch-session",
+	factory := NewServerFactory(t.TempDir())
+	runner := newPacedRunner("done, two files changed")
+	source := newPipeTodoSource()
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return "--- a/x\n+++ b/x\n@@\n+changed", nil
 		},
-		Todos: &fakeTodoSource{snapshot: dispatch.TodoSnapshot{
-			CurrentTodo:   "wiring form validation",
-			TodoCompleted: 0,
-			TodoTotal:     1,
-			Todos:         []session.Todo{{Content: "wiring form validation", Status: session.TodoStatusInProgress}},
-		}},
-		Call: agent.SessionAgentCall{NonInteractive: true, MaxOutputTokens: 512},
+		Todos: source,
+		Call:  agent.SessionAgentCall{NonInteractive: true, MaxOutputTokens: 512},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
-	factory := NewServerFactory()
-	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
-	})
-	require.NoError(t, err)
+	var outcome agent.DispatchTransportOutcome
+	streamErr := make(chan error, 1)
+	go func() {
+		var err error
+		outcome, err = factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+			Endpoint: server.Endpoint,
+			Card:     server.Card,
+			Prompt:   "fix the bug",
+		})
+		streamErr <- err
+	}()
+
+	// The subscription exists once the run has started, and the send is
+	// unbuffered: it returns only when the executor has taken the
+	// snapshot and yielded the todo Working event.
+	<-runner.started
+	source.ch <- todoSnapshot(runTodos(
+		session.Todo{Content: "wiring form validation", Status: session.TodoStatusInProgress, ActiveForm: "wiring form validation"},
+	))
+	close(runner.release)
+	require.NoError(t, <-streamErr)
+
 	// The call template flowed through the wire (#71): the served turn
 	// carries the dispatch's shaping, not a minimal test call.
 	require.True(t, runner.gotCall.NonInteractive)
@@ -71,10 +91,115 @@ func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
 	require.Equal(t, "done, two files changed", outcome.Text)
 	require.Contains(t, outcome.Diff, "+++ b/x")
-	require.Greater(t, outcome.WorkingEvents, 0, "the SSE stream carried Working progress events")
+	require.Equal(t, 2, outcome.WorkingEvents, "the SSE stream carried the initial Working plus exactly one todo progress event")
 
 	// The typed todo progress (#359) rode the wire under the declared
 	// todos/v1 extension and decoded onto the outcome.
+	require.NotNil(t, outcome.TodoProgress)
+	require.Equal(t, "wiring form validation", outcome.TodoProgress.Current)
+	require.Equal(t, 1, outcome.TodoProgress.Total)
+	require.Len(t, outcome.TodoProgress.Todos, 1)
+	require.Equal(t, "wiring form validation", outcome.TodoProgress.Todos[0].Content)
+}
+
+// A dispatch with no todo source carries exactly the executor's initial
+// Working status across the wire, nothing more: the control half of
+// #425's count.
+func TestStreamDispatchWithoutTodosSingleWorking(t *testing.T) {
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     &fakeRunner{result: textResult("done")},
+		SessionID:  "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "fix the bug",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Equal(t, 1, outcome.WorkingEvents, "only the initial Working status crosses the wire without a todo source")
+}
+
+// The todo progress event survives the wire as the client receives it
+// (#425): exactly one Working TaskStatusUpdateEvent carries the typed
+// progress under the declared todos/v1 extension's URI, its message is
+// the in-progress todo's active form, and the metadata decodes onto the
+// outcome.
+func TestStreamDispatchTodoEventOnWire(t *testing.T) {
+	runner := newPacedRunner("done")
+	source := newPipeTodoSource()
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+		Todos:      source,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	// The raw wire under the factory's unix transport (#346): the
+	// default transport cannot dial the per-process host's fake URL
+	// host, so the client dials exactly the way production does.
+	client, err := a2aclient.NewFromCard(t.Context(), server.Card,
+		a2aclient.WithJSONRPCTransport(factory.dispatchHTTPClient()))
+	require.NoError(t, err)
+
+	req := &a2aspec.SendMessageRequest{
+		Message: a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("fix the bug")),
+	}
+	evsCh := make(chan []a2aspec.Event, 1)
+	go func() {
+		var evs []a2aspec.Event
+		for ev, err := range client.SendStreamingMessage(t.Context(), req) {
+			require.NoError(t, err, "unexpected error from the dispatch stream")
+			evs = append(evs, ev)
+		}
+		evsCh <- evs
+	}()
+
+	// One snapshot while the run is in flight, then the terminal
+	// outcome: the same pacing as the StreamDispatch test.
+	<-runner.started
+	source.ch <- todoSnapshot(runTodos(
+		session.Todo{Content: "wiring form validation", Status: session.TodoStatusInProgress, ActiveForm: "wiring form validation"},
+	))
+	close(runner.release)
+
+	var evs []a2aspec.Event
+	select {
+	case evs = <-evsCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the stream to end")
+	}
+
+	var todoUpdates []*a2aspec.TaskStatusUpdateEvent
+	var terminal a2aspec.TaskState
+	for _, ev := range evs {
+		switch e := ev.(type) {
+		case *a2aspec.TaskStatusUpdateEvent:
+			terminal = e.Status.State
+			if e.Status.State == a2aspec.TaskStateWorking && e.Meta()[TodoExt.URI] != nil {
+				todoUpdates = append(todoUpdates, e)
+			}
+		case *a2aspec.Task:
+			terminal = e.Status.State
+		}
+	}
+	require.Equal(t, a2aspec.TaskStateCompleted, terminal)
+	require.Len(t, todoUpdates, 1, "exactly one Working event carries the typed todo progress")
+	todo := todoUpdates[0]
+	require.Equal(t, "wiring form validation", statusMessageText(t, todo))
+	// The typed payload decodes onto the outcome through the same path
+	// the client takes.
+	decoder := newMetadataDecoder(server.Card)
+	var outcome agent.DispatchTransportOutcome
+	decoder.apply(&outcome, todo)
 	require.NotNil(t, outcome.TodoProgress)
 	require.Equal(t, "wiring form validation", outcome.TodoProgress.Current)
 	require.Equal(t, 1, outcome.TodoProgress.Total)
@@ -137,14 +262,16 @@ func TestMetadataDecoderActivatedURIs(t *testing.T) {
 // A failed run maps to the failed outcome with the failure text from the
 // terminal status message.
 func TestStreamDispatchFailedRun(t *testing.T) {
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    &fakeRunner{err: errors.New("provider exploded")},
-		SessionID: "dispatch-session",
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     &fakeRunner{err: errors.New("provider exploded")},
+		SessionID:  "dispatch-session",
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
-	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "fix the bug",
@@ -157,14 +284,16 @@ func TestStreamDispatchFailedRun(t *testing.T) {
 // A panic in the dispatched runner must surface as a failed outcome
 // across the wire, not crash the server process (#345).
 func TestStreamDispatchRunnerPanicFails(t *testing.T) {
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    &fakeRunner{panicValue: errors.New("adapter blew up")},
-		SessionID: "dispatch-session",
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     &fakeRunner{panicValue: errors.New("adapter blew up")},
+		SessionID:  "dispatch-session",
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
-	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "fix the bug",
@@ -179,16 +308,18 @@ func TestStreamDispatchRunnerPanicFails(t *testing.T) {
 // stream quickly with the canceled outcome and the kill reason, never at
 // the caller's deadline (#342).
 func TestStreamDispatchOutOfBandCancelEnds(t *testing.T) {
+	factory := NewServerFactory(t.TempDir())
 	runner := &blockingCancelRunner{started: make(chan struct{}), kill: make(chan struct{})}
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    runner,
-		SessionID: "dispatch-session",
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
 		CancelReason: func() string {
 			return "wander kill: hard timeout"
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	go func() {
 		<-runner.started
@@ -198,7 +329,7 @@ func TestStreamDispatchOutOfBandCancelEnds(t *testing.T) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	outcome, err := NewServerFactory().StreamDispatch(ctx, agent.DispatchTransportParams{
+	outcome, err := factory.StreamDispatch(ctx, agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "fix the bug",
@@ -214,14 +345,14 @@ func TestStreamDispatchOutOfBandCancelEnds(t *testing.T) {
 // canceled carrying it, and exactly one cancel call is needed.
 func TestCancelDispatchEndsStream(t *testing.T) {
 	runner := &blockingCancelRunner{started: make(chan struct{}), kill: make(chan struct{})}
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    runner,
-		SessionID: "dispatch-session",
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-cancel",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
-
-	factory := NewServerFactory()
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
@@ -268,13 +399,13 @@ func TestCancelDispatchEndsStream(t *testing.T) {
 // CancelDispatch without a resolvable card or task ID is an error, not
 // a silent success — the caller's fallback depends on it.
 func TestCancelDispatchRejectsUnusableParams(t *testing.T) {
-	require.Error(t, NewServerFactory().CancelDispatch(t.Context(), agent.DispatchCancelParams{
+	require.Error(t, NewServerFactory(t.TempDir()).CancelDispatch(t.Context(), agent.DispatchCancelParams{
 		Endpoint: "http://127.0.0.1:1",
 		Card:     "not-a-card",
 		TaskID:   "task-1",
 		Reason:   "hard timeout",
 	}))
-	require.Error(t, NewServerFactory().CancelDispatch(t.Context(), agent.DispatchCancelParams{
+	require.Error(t, NewServerFactory(t.TempDir()).CancelDispatch(t.Context(), agent.DispatchCancelParams{
 		Endpoint: "http://127.0.0.1:1",
 		Card:     &a2aspec.AgentCard{},
 		TaskID:   "",
@@ -285,7 +416,7 @@ func TestCancelDispatchRejectsUnusableParams(t *testing.T) {
 // An unreachable or bogus endpoint is a transport error before any
 // terminal state, never a silent success.
 func TestStreamDispatchTransportErrors(t *testing.T) {
-	factory := NewServerFactory()
+	factory := NewServerFactory(t.TempDir())
 
 	// No card to build a client from.
 	_, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
@@ -324,17 +455,19 @@ func TestStreamDispatchLargeDiffRoundTrips(t *testing.T) {
 	diff := b.String()
 
 	runner := &fakeRunner{result: textResult("big change")}
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    runner,
-		SessionID: "dispatch-session",
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return diff, nil
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
-	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "change everything",
@@ -352,17 +485,19 @@ func TestStreamDispatchLargeDiffRoundTrips(t *testing.T) {
 // a diff (#361).
 func TestStreamDispatchDiffErrorStillCompletes(t *testing.T) {
 	runner := &fakeRunner{result: textResult("done, but the diff blew up")}
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    runner,
-		SessionID: "dispatch-session",
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return "", errors.New("not a git repo")
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
-	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "fix the bug",
@@ -379,7 +514,7 @@ func TestStreamDispatchDiffErrorStillCompletes(t *testing.T) {
 // runs longer. The per-phase bounds stay, so a dead server still fails
 // fast.
 func TestDispatchClientHasNoTotalTimeout(t *testing.T) {
-	client := dispatchHTTPClient()
+	client := NewServerFactory(t.TempDir()).dispatchHTTPClient()
 	require.Zero(t, client.Timeout, "a total Timeout would re-create the three-minute kill")
 
 	transport, ok := client.Transport.(*http.Transport)
@@ -393,19 +528,25 @@ func TestDispatchClientHasNoTotalTimeout(t *testing.T) {
 // past it, and the terminal outcome still lands.
 func TestStreamDispatchOutlivesShortClientDeadline(t *testing.T) {
 	runner := &fakeRunner{result: textResult("eventually done"), delay: time.Second}
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    runner,
-		SessionID: "dispatch-session",
-		Todos:     &fakeTodoSource{},
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+		Todos:      &fakeTodoSource{},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
-	factory := NewServerFactory(WithHTTPClient(&http.Client{
+	factory.httpClient = &http.Client{
 		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", factory.socketPath())
+			},
 			ResponseHeaderTimeout: 200 * time.Millisecond,
 		},
-	}))
+	}
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
@@ -550,8 +691,9 @@ func (b *cutAfterFirstEventBody) Read(p []byte) (int, error) {
 // with the connection.
 func resumeTestParams() ServerParams {
 	return ServerParams{
-		Runner:    &fakeRunner{result: textResult("resumed to the end"), delay: 2 * time.Second},
-		SessionID: "dispatch-session",
+		DispatchID: "resume-task",
+		Runner:     &fakeRunner{result: textResult("resumed to the end"), delay: 2 * time.Second},
+		SessionID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return "--- a/x\n+++ b/x\n@@\n+changed", nil
 		},
@@ -578,16 +720,18 @@ func resumeTestParams() ServerParams {
 // task ID reaches OnTask exactly once, and tasks/get answers that ID
 // with the stored task afterwards.
 func TestStreamDispatchResumesAfterDrop(t *testing.T) {
-	server, err := StartServer(t.Context(), resumeTestParams())
+	serverFactory := NewServerFactory(t.TempDir())
+	server, err := serverFactory.StartServer(t.Context(), resumeTestParams())
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
-	control, err := StartServer(t.Context(), resumeTestParams())
+	t.Cleanup(func() { _ = serverFactory.Close(context.Background()) })
+	controlFactory := NewServerFactory(t.TempDir())
+	control, err := controlFactory.StartServer(t.Context(), resumeTestParams())
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = control.Stop(context.Background()) })
+	t.Cleanup(func() { _ = controlFactory.Close(context.Background()) })
 
 	onTask := make(chan string, 2)
-	cutFactory := NewServerFactory(WithHTTPClient(&http.Client{
-		Transport: &cuttingTransport{base: http.DefaultTransport},
+	cutFactory := NewServerFactory(t.TempDir(), WithHTTPClient(&http.Client{
+		Transport: &cuttingTransport{base: unixDialClient(serverFactory).Transport},
 	}))
 	outcome, err := cutFactory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
@@ -604,7 +748,7 @@ func TestStreamDispatchResumesAfterDrop(t *testing.T) {
 	require.Equal(t, 2, outcome.WorkingEvents,
 		"the resumed run counts exactly the two post-cut todo Working events")
 
-	controlOutcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+	controlOutcome, err := controlFactory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: control.Endpoint,
 		Card:     control.Card,
 		Prompt:   "fix the bug",
@@ -637,19 +781,21 @@ func TestStreamDispatchResumesAfterDrop(t *testing.T) {
 // terminal status, the text, and the artifacts into the outcome.
 func TestStreamDispatchRecoversViaGetTask(t *testing.T) {
 	runner := &fakeRunner{result: textResult("finished while cut"), delay: 100 * time.Millisecond}
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    runner,
-		SessionID: "dispatch-session",
+	serverFactory := NewServerFactory(t.TempDir())
+	server, err := serverFactory.StartServer(t.Context(), ServerParams{
+		DispatchID: "gettask-task",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return "--- a/y\n+++ b/y\n@@\n+late", nil
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = serverFactory.Close(context.Background()) })
 
 	onTask := make(chan string, 2)
-	factory := NewServerFactory(WithHTTPClient(&http.Client{
-		Transport: &cuttingTransport{base: http.DefaultTransport},
+	factory := NewServerFactory(t.TempDir(), WithHTTPClient(&http.Client{
+		Transport: &cuttingTransport{base: unixDialClient(serverFactory).Transport},
 	}))
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
@@ -670,17 +816,19 @@ func TestStreamDispatchRecoversViaGetTask(t *testing.T) {
 // plus the exhaustion reason, after the full backoff ladder ran. The
 // coordinator's cancel-before-teardown (#344) reaps the run from there.
 func TestStreamDispatchGivesUpAfterRetries(t *testing.T) {
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    &fakeRunner{result: textResult("never seen"), delay: 2 * time.Second},
-		SessionID: "dispatch-session",
+	serverFactory := NewServerFactory(t.TempDir())
+	server, err := serverFactory.StartServer(t.Context(), ServerParams{
+		DispatchID: "retry-task",
+		Runner:     &fakeRunner{result: textResult("never seen"), delay: 2 * time.Second},
+		SessionID:  "dispatch-session",
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = serverFactory.Close(context.Background()) })
 
 	onTask := make(chan string, 2)
 	start := time.Now()
-	factory := NewServerFactory(WithHTTPClient(&http.Client{
-		Transport: &cuttingTransport{base: http.DefaultTransport, failAfterCut: true},
+	factory := NewServerFactory(t.TempDir(), WithHTTPClient(&http.Client{
+		Transport: &cuttingTransport{base: unixDialClient(serverFactory).Transport, failAfterCut: true},
 	}))
 	_, err = factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,

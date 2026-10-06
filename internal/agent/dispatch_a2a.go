@@ -3,10 +3,13 @@ package agent
 import (
 	"cmp"
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/config"
@@ -18,14 +21,15 @@ import (
 // dispatched agent (#70). It is the seam that keeps the dependency
 // direction one-way — internal/a2a imports internal/agent for the
 // Executor's runner, so the agent package only ever sees this
-// interface. The production implementation is a2a.ServerFactory; tests
-// substitute fakes through it, and a nil starter (the default until the
-// app wires the factory) simply serves nothing.
+// interface. The production implementation is a2a.ServerFactory, whose
+// process-wide host serves every dispatch on one per-process unix
+// socket (#346); tests substitute fakes through it, and a nil starter
+// (the default until the app wires the factory) simply serves nothing.
 type DispatchServerStarter interface {
-	// StartDispatchServer stands up the loopback A2A server for one
-	// dispatch and returns its endpoint, the AgentCard to stamp on the
-	// registry entry (opaque here), and the stop function the dispatch
-	// run defers.
+	// StartDispatchServer stands up the A2A server for one dispatch on
+	// the process host and returns its endpoint, the AgentCard to stamp
+	// on the registry entry (opaque here), and the stop function the
+	// dispatch run defers.
 	StartDispatchServer(ctx context.Context, params DispatchServerParams) (endpoint string, card any, stop func(), err error)
 }
 
@@ -35,6 +39,9 @@ type DispatchServerStarter interface {
 // import-clean of internal/a2a; the production value is the dispatch
 // registry's todo collector.
 type DispatchServerParams struct {
+	// DispatchID is the registry entry's id the served dispatch answers
+	// as (#346): the process host routes /agents/<DispatchID> to it.
+	DispatchID string
 	// SessionID is the ephemeral task session backing the dispatch.
 	SessionID string
 	// Runner is the dispatched agent itself.
@@ -68,6 +75,11 @@ type DispatchServerParams struct {
 	// the production value is the run's kill reason, and a nil func or
 	// an empty string falls back to "canceled".
 	CancelReason func() string
+	// Usage reads the dispatched session's final usage once its run has
+	// ended (#364): the totals the executor attaches to the terminal
+	// status under the usage/v1 extension. Nil-safe — a nil func simply
+	// emits no usage metadata.
+	Usage func(ctx context.Context) (Usage, error)
 }
 
 // DispatchTransport drives one dispatch's initial task over the A2A
@@ -173,6 +185,13 @@ type DispatchTransportOutcome struct {
 	// decode — a malformed extension value is logged and dropped, not a
 	// stream failure.
 	TodoProgress *TodoProgress
+	// Usage is the decoded usage, cost and trace context (#364) from
+	// the dispatch's terminal TaskStatusUpdateEvent metadata (extension
+	// https://crush.charm.land/ext/usage/v1). Nil when the remote agent
+	// did not declare the extension, never emitted it, or emitted a
+	// value that failed to decode — a dispatch whose usage is missing
+	// leaves the parent session's cost untouched.
+	Usage *Usage
 }
 
 // TodoItem is one entry of the todos/v1 extension's todo list, the
@@ -197,6 +216,84 @@ type TodoProgress struct {
 	Total     int `json:"total"`
 	// Todos is the full structured todo list.
 	Todos []TodoItem `json:"todos"`
+}
+
+// Usage is the statically typed payload the usage/v1 extension carries in
+// a dispatch's terminal TaskStatusUpdateEvent metadata (#364): the child
+// session's token totals and cost, the model that ran, and the W3C trace
+// ID of the parent turn that drove the dispatch, so a consumer — in
+// process today, remote with #72/#73 — can account for the run and
+// correlate its logs across hops.
+type Usage struct {
+	// Model is the model ID the dispatched agent ran on.
+	Model string `json:"model"`
+	// Provider is the provider ID the dispatched agent ran on.
+	Provider string `json:"provider"`
+	// PromptTokens and CompletionTokens are the child session's totals.
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	// Cost is the child session's total cost.
+	Cost float64 `json:"cost"`
+	// TraceID is the trace-id segment of the W3C traceparent the parent
+	// sent with the dispatch call. Empty when the call carried none.
+	TraceID string `json:"trace_id"`
+}
+
+// traceparentCtxKey is the context key the parent's dispatch turn stores
+// the W3C traceparent under; the A2A client's interceptor (in the a2a
+// package) reads it and sends the value as the traceparent request
+// header on every call (#364).
+type traceparentCtxKey struct{}
+
+// WithTraceparent returns a context carrying the W3C traceparent header
+// value the A2A client sends with every dispatch call (#364).
+func WithTraceparent(ctx context.Context, traceparent string) context.Context {
+	return context.WithValue(ctx, traceparentCtxKey{}, traceparent)
+}
+
+// TraceparentFromContext returns the W3C traceparent carried by ctx, or
+// the empty string when there is none.
+func TraceparentFromContext(ctx context.Context) string {
+	tp, _ := ctx.Value(traceparentCtxKey{}).(string)
+	return tp
+}
+
+// NewTraceparent generates a valid W3C traceparent — version 00, a
+// random trace ID and span ID, the sampled flag — for one parent turn's
+// dispatch call (#364).
+func NewTraceparent() (string, error) {
+	var traceID, spanID [16]byte
+	if _, err := cryptorand.Read(traceID[:]); err != nil {
+		return "", fmt.Errorf("generate trace id: %w", err)
+	}
+	if _, err := cryptorand.Read(spanID[:8]); err != nil {
+		return "", fmt.Errorf("generate span id: %w", err)
+	}
+	return fmt.Sprintf("00-%s-%s-01", hex.EncodeToString(traceID[:]), hex.EncodeToString(spanID[:8])), nil
+}
+
+// TraceIDFromTraceparent returns the trace-id segment of a W3C
+// traceparent, lowercased: the correlation key between a parent turn
+// and the dispatched run's server-side logs and usage (#364). The empty
+// string for anything that does not parse.
+func TraceIDFromTraceparent(traceparent string) string {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(traceparent)), "-")
+	if len(parts) != 4 || parts[0] != "00" || len(parts[1]) != 32 || len(parts[2]) != 16 {
+		return ""
+	}
+	if !isHex(parts[1]) || !isHex(parts[2]) {
+		return ""
+	}
+	return parts[1]
+}
+
+func isHex(s string) bool {
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // Transport status tokens (#71), spelled identically to the a2a
@@ -271,20 +368,39 @@ func isKillReason(text string) bool {
 // runDispatchOverTransport drives one dispatch through the A2A client
 // (#71): the served endpoint is read from the registry entry the server
 // stamped, the prompt goes out as a streaming message, and the SSE
-// stream runs to its terminal state. Returns (nil, nil) when this
+// stream runs to its terminal state. Returns (nil, nil, false) when this
 // dispatch is not transport-driven — no endpoint, no card, or no wired
 // transport — so the caller falls back to the direct in-process run.
 // The outcome maps through the same terminal assembly as the direct
 // path (#343): the kill state decides killed-vs-natural on both.
-func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatchRun) (dispatch.DispatchResult, bool) {
+//
+// The parent turn carries trace context (#364): a W3C traceparent is
+// generated when the caller supplied none, sent as the traceparent
+// request header on every A2A call, and echoed back in the terminal
+// status' usage metadata — the parent's client call and the dispatch's
+// server-side logs and usage share one trace ID. The decoded usage is
+// returned alongside the result; the caller applies it to the parent
+// session with one atomic UPDATE, replacing the row-copy the direct
+// path still uses.
+func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatchRun) (dispatch.DispatchResult, *Usage, bool) {
 	transport, ok := c.dispatchServerStarter().(DispatchTransport)
 	if !ok || transport == nil {
-		return dispatch.DispatchResult{}, false
+		return dispatch.DispatchResult{}, nil, false
 	}
 	entry, ok := run.reg.Get(run.entry.ID)
 	if !ok || entry.Endpoint == "" || entry.AgentCard == nil {
-		return dispatch.DispatchResult{}, false
+		return dispatch.DispatchResult{}, nil, false
 	}
+	if TraceparentFromContext(ctx) == "" {
+		tp, err := NewTraceparent()
+		if err != nil {
+			slog.Warn("Failed to generate dispatch traceparent; call carries no trace context", "dispatch_id", run.entry.ID, "error", err)
+		} else {
+			ctx = WithTraceparent(ctx, tp)
+		}
+	}
+	traceID := TraceIDFromTraceparent(TraceparentFromContext(ctx))
+	slog.Debug("Dispatch A2A stream starting", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "trace_id", traceID)
 	outcome, err := transport.StreamDispatch(ctx, DispatchTransportParams{
 		Endpoint: entry.Endpoint,
 		Card:     entry.AgentCard,
@@ -297,7 +413,7 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 		},
 	})
 	if err != nil {
-		slog.Error("Dispatch A2A stream failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)
+		slog.Error("Dispatch A2A stream failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "trace_id", traceID, "error", err)
 		// The served task runs on a detached context (#344): a stream
 		// error before a terminal state leaves the agent running
 		// unsupervised with its result headed for the trash. Cancel it
@@ -314,7 +430,7 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 	// in-process salvage-diff fallback cannot race a job still writing
 	// the workspace (#385).
 	c.killDispatchSessionJobs(ctx, run)
-	return c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcomeFromTransport(outcome)), true
+	return c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcomeFromTransport(outcome)), outcome.Usage, true
 }
 
 // cancelOrphanedDispatchRun cancels a dispatched agent whose transport
@@ -369,15 +485,16 @@ func (c *coordinator) dispatchServerStarter() DispatchServerStarter {
 // dispatch itself does not depend on being served, and Phase 1 has no
 // A2A client in the loop yet (#71 adds it); failing the dispatch over a
 // loopback server would trade working dispatches for protocol purity.
-func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string) (stop func()) {
+func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string, usage func(ctx context.Context) (Usage, error)) (stop func()) {
 	starter := c.dispatchServerStarter()
 	if starter == nil {
 		return nil
 	}
 
 	endpoint, card, stop, err := starter.StartDispatchServer(ctx, DispatchServerParams{
-		SessionID: sessionID,
-		Runner:    runner,
+		DispatchID: entryID,
+		SessionID:  sessionID,
+		Runner:     runner,
 		Diff: func(ctx context.Context) (string, error) {
 			entry, ok := reg.Get(entryID)
 			if !ok {
@@ -392,6 +509,7 @@ func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatc
 		Call:              call,
 		InactivityTimeout: inactivityTimeout,
 		CancelReason:      cancelReason,
+		Usage:             usage,
 	})
 	if err != nil {
 		slog.Warn("Dispatch A2A server failed to start", "dispatch_id", entryID, "error", err)

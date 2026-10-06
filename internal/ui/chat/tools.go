@@ -524,6 +524,14 @@ func (t *baseToolMessageItem) Status() ToolStatus {
 	return t.status
 }
 
+// HasResult reports whether a tool result has been recorded for this tool
+// call, either through the live event path or linked in from history.
+// The raw status cannot be used for this: the result path calls SetResult
+// and never SetStatus, so a finished tool stays Running here (#405).
+func (t *baseToolMessageItem) HasResult() bool {
+	return t.result != nil
+}
+
 // computeStatus computes the effective status considering the result.
 func (t *baseToolMessageItem) computeStatus() ToolStatus {
 	if t.result != nil {

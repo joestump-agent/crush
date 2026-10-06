@@ -89,6 +89,14 @@ SET
     cost = cost + ?
 WHERE id = ?;
 
+-- name: AddSessionUsage :exec
+UPDATE sessions
+SET
+    prompt_tokens = prompt_tokens + ?,
+    completion_tokens = completion_tokens + ?,
+    cost = cost + ?
+WHERE id = ?;
+
 -- name: RenameSession :exec
 UPDATE sessions
 SET

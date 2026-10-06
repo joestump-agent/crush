@@ -4,11 +4,12 @@ package model
 // transcript (reasoning, tool calls, results) in the normal chat window
 // while the parent stays the active session. ctrl+] enters from an agent
 // block (or opens the live-agents cycle when no block is focused) and
-// cycles live agents; ctrl+[ returns to the chat with the scroll position
-// preserved. Esc is untouched wherever the terminal can tell it apart from
-// ctrl+[ (see escIsInspectBack). Viewed ≠ active: nothing in this file ever
-// assigns m.session, so prompts typed while inspecting land in the parent
-// and a task session can never become the active/continuable session.
+// cycles live agents; esc or ctrl+[ returns to the chat with the scroll
+// position preserved, on every terminal (#404). Esc never cancels the
+// parent from inspect mode: leave inspect mode first to cancel. Viewed ≠
+// active: nothing in this file ever assigns m.session, so prompts typed
+// while inspecting land in the parent and a task session can never become
+// the active/continuable session.
 
 import (
 	"context"
@@ -138,8 +139,14 @@ func (m *UI) agentBlocks() []agentBlockRef {
 				continue
 			}
 			sid := m.com.Workspace.CreateAgentToolSessionID(block.MessageID(), block.ToolCall().ID)
-			live := block.Status() == chat.ToolStatusRunning ||
-				block.Status() == chat.ToolStatusAwaitingPermission
+			// Live only while the result has not arrived: the status
+			// field stays Running after the result lands (the result path
+			// never calls SetStatus), so a finished agent would ride the
+			// ring and the "(n/N)" counter forever. A canceled block is
+			// never live (#405).
+			live := !block.HasResult() &&
+				(block.Status() == chat.ToolStatusRunning ||
+					block.Status() == chat.ToolStatusAwaitingPermission)
 			refs = append(refs, agentBlockRef{sessionID: sid, index: i, live: live})
 		}
 	}
@@ -171,6 +178,19 @@ func (m *UI) liveDispatchSessionIDs() map[string]bool {
 		}
 	}
 	return ids
+}
+
+// selectedAgentBlock reports whether the chat's currently selected item
+// is a drill-in target: a dispatch block or a plain agent-tool block. It
+// type-checks only the selected item — the help views are rebuilt on
+// every render, so they must never walk the transcript (#412).
+func (m *UI) selectedAgentBlock() bool {
+	switch m.chat.ItemAt(m.chat.Selected()).(type) {
+	case *chat.DispatchToolMessageItem, *chat.AgentToolMessageItem:
+		return true
+	default:
+		return false
+	}
 }
 
 // agentBlockAt reports whether the chat item at the given index is a
@@ -218,20 +238,28 @@ func (m *UI) takeInspectPending(loadedID string) *session.Session {
 	return pending
 }
 
-// handleInspectKeys routes ctrl+], ctrl+[ and ctrl+x (#314, #373). It
-// runs after the dialog routing in handleKeyPressMsg, so open dialogs
-// keep their keys, and before every other handler, so the bindings work
-// from both editor and chat focus. ctrl+] drills in, ctrl+[ leaves
-// inspect mode, and ctrl+x cancels the dispatch being viewed (or the
-// selected live dispatch card in the chat). Esc and every other key
-// fall through untouched, except where Esc is ctrl+[ (escIsInspectBack).
+// handleInspectKeys routes ctrl+], esc/ctrl+[ and ctrl+x (#314, #373,
+// #404). It runs after the dialog routing in handleKeyPressMsg, so open
+// dialogs keep their keys, and before every other handler, so the
+// bindings work from both editor and chat focus. ctrl+] drills in, esc
+// or ctrl+[ leaves inspect mode on every terminal, and ctrl+x cancels
+// the dispatch being viewed (or the selected live dispatch card in the
+// chat). Esc means "back" only inside inspect mode; outside it falls
+// through untouched and keeps its chat-cancel meaning, as does every
+// other key.
 func (m *UI) handleInspectKeys(msg tea.KeyPressMsg) (handled bool, cmd tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keyMap.InspectDrill):
 		return true, m.handleInspectDrill()
-	case key.Matches(msg, m.keyMap.InspectBack), m.escIsInspectBack(msg):
+	case key.Matches(msg, m.keyMap.InspectBack):
 		if !m.isInspecting() {
 			return false, nil
+		}
+		// Leaving from the editor drops any @ completion popup open over
+		// the input: its own close key is esc, which this press no longer
+		// reaches.
+		if m.completionsOpen {
+			m.closeCompletions()
 		}
 		return true, m.exitInspect()
 	case key.Matches(msg, m.keyMap.CancelAgent):
@@ -241,16 +269,6 @@ func (m *UI) handleInspectKeys(msg tea.KeyPressMsg) (handled bool, cmd tea.Cmd) 
 		return false, nil
 	}
 	return false, nil
-}
-
-// escIsInspectBack reports whether an esc press is really ctrl+[. A
-// terminal without key disambiguation sends the same byte for both, so
-// there ctrl+[ only ever arrives as esc; read as esc it reaches the
-// cancel handler, and a second press would cancel the parent's run.
-// Terminals that tell the two apart keep esc's own meaning.
-func (m *UI) escIsInspectBack(msg tea.KeyPressMsg) bool {
-	return msg.Code == tea.KeyEscape && msg.Mod == 0 &&
-		!m.keyenh.SupportsKeyDisambiguation()
 }
 
 // handleInspectDrill implements ctrl+]: while inspecting, cycle to the
@@ -504,7 +522,7 @@ func (m *UI) inspectPlaceholder() string {
 		pos = fmt.Sprintf(" (%d/%d)", m.inspectRingPos+1, len(m.inspectRing))
 	}
 	const prefix = "Inspecting "
-	suffix := pos + " · ctrl+[ returns · prompts go to the parent"
+	suffix := pos + " · esc returns · prompts go to the parent"
 	width := m.textarea.Width() - 1
 	if width <= 0 {
 		width = inspectPlaceholderWidth
