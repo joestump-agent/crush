@@ -334,13 +334,24 @@ func (p *GitWorktreeProvider) cleanupFailedProvision(ctx context.Context, branch
 // next to the worktree, never inside it, and the kernel releases the
 // lock when the owning process dies — no stale-lock recovery needed.
 func (p *GitWorktreeProvider) leasePath(branch string) string {
-	return filepath.Join(p.worktreesDir, branch+".lock")
+	return leasePathFor(p.worktreesDir, branch)
+}
+
+// leasePathFor is leasePath at an arbitrary worktrees directory: the
+// same file name the scan and prune tooling (#369) must agree on.
+func leasePathFor(dir, branch string) string {
+	return filepath.Join(dir, branch+".lock")
 }
 
 // ownerPath is the human-readable owner marker for branch. It carries
 // no authority: the lock file is what ownership is proven with.
 func (p *GitWorktreeProvider) ownerPath(branch string) string {
-	return filepath.Join(p.worktreesDir, branch+ownerMarkerSuffix)
+	return ownerPathFor(p.worktreesDir, branch)
+}
+
+// ownerPathFor is ownerPath at an arbitrary worktrees directory.
+func ownerPathFor(dir, branch string) string {
+	return filepath.Join(dir, branch+ownerMarkerSuffix)
 }
 
 // ownerMarkerSuffix is the filename suffix of an owner marker next to
@@ -356,21 +367,82 @@ type ownerMarker struct {
 	// recorded so startup reconciliation can tell a workless leftover
 	// from salvageable work (#367).
 	BaseSHA string `json:"base_sha"`
+	// Handle and Role are the dispatch's addressable identity (#313),
+	// stamped by UpdateOwnerIdentity when the registry assigns the
+	// handle, so tooling outside a session can show it (#369).
+	Handle string `json:"handle,omitempty"`
+	Role   string `json:"role,omitempty"`
+	// Disposition is what became of the work (#368): applied or
+	// dismissed. Empty means nobody has judged it yet.
+	Disposition string `json:"disposition,omitempty"`
 }
 
 // writeOwnerMarker atomically records this provider instance as the
 // owner of branch, with the base SHA the workspace was cut from.
 func (p *GitWorktreeProvider) writeOwnerMarker(branch, baseSHA string) error {
-	data, err := json.Marshal(ownerMarker{
+	return writeMarkerFile(p.worktreesDir, branch, ownerMarker{
 		InstanceID: p.instanceID,
 		PID:        os.Getpid(),
 		CreatedAt:  time.Now().UTC(),
 		BaseSHA:    baseSHA,
 	})
+}
+
+// UpdateOwnerIdentity stamps the assigned handle and role onto the
+// workspace's owner marker (#369), so list and salvage tooling outside
+// a session can show who the dispatch was. The caller must hold the
+// workspace's lease — the provider does, for every workspace it
+// provisioned. A missing marker is a no-op: the stamp is information,
+// never load-bearing, and recreating the marker with only a partial
+// record would lose the base SHA the salvage logic keys on.
+func (p *GitWorktreeProvider) UpdateOwnerIdentity(id, handle, role string) error {
+	return p.updateOwnerMarker(id, func(m *ownerMarker) {
+		m.Handle = handle
+		m.Role = role
+	})
+}
+
+// SetDisposition records what became of the workspace's work (#368):
+// [DispositionApplied] or [DispositionDismissed]. The caller must hold
+// the workspace's lease; a missing marker is a no-op.
+func (p *GitWorktreeProvider) SetDisposition(id, disposition string) error {
+	return p.updateOwnerMarker(id, func(m *ownerMarker) {
+		m.Disposition = disposition
+	})
+}
+
+// updateOwnerMarker read-modify-writes the owner marker of the
+// workspace the registry entry id names. A missing marker is a no-op:
+// the stamp is information, not authority.
+func (p *GitWorktreeProvider) updateOwnerMarker(id string, mutate func(*ownerMarker)) error {
+	e, ok := p.reg.Get(id)
+	if !ok {
+		return fmt.Errorf("dispatch %q is not registered", id)
+	}
+	path := p.ownerPath(e.Branch)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read owner marker for %s: %w", e.Branch, err)
+	}
+	var m ownerMarker
+	if err := json.Unmarshal(data, &m); err != nil {
+		return fmt.Errorf("parse owner marker for %s: %w", e.Branch, err)
+	}
+	mutate(&m)
+	return writeMarkerFile(p.worktreesDir, e.Branch, m)
+}
+
+// writeMarkerFile atomically writes branch's owner marker into dir,
+// the same temp-and-rename writeOwnerMarker has always used.
+func writeMarkerFile(dir, branch string, m ownerMarker) error {
+	data, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(p.worktreesDir, ".*.owner.json.tmp")
+	tmp, err := os.CreateTemp(dir, ".*.owner.json.tmp")
 	if err != nil {
 		return err
 	}
@@ -384,7 +456,7 @@ func (p *GitWorktreeProvider) writeOwnerMarker(branch, baseSHA string) error {
 		os.Remove(name)
 		return err
 	}
-	if err := os.Rename(name, p.ownerPath(branch)); err != nil {
+	if err := os.Rename(name, ownerPathFor(dir, branch)); err != nil {
 		os.Remove(name)
 		return err
 	}
@@ -730,6 +802,23 @@ func (p *GitWorktreeProvider) ReleaseUnworked(ctx context.Context) error {
 // ownership artifacts — and the lease is released last, after
 // everything else is gone.
 func (p *GitWorktreeProvider) removeEntry(ctx context.Context, entry Entry, lease func()) error {
+	markerPath := ""
+	if lease != nil {
+		markerPath = p.ownerPath(entry.Branch)
+	}
+	return removeWorkspaceEntry(ctx, p.repoRoot, entry, markerPath, lease)
+}
+
+// removeWorkspaceEntry tears down one workspace on disk: the worktree
+// (forced if it is dirty), the branch, and the admin entry. Missing
+// artifacts are not errors. The lock file is never unlinked: flock is
+// keyed by inode, so removing it can let two processes lock different
+// inodes at the same path and both believe they own the workspace.
+// When lease is not nil the owner marker is removed — only a lease
+// holder may touch ownership artifacts — and the lease is released
+// last, after everything else is gone. markerPath is the owner marker
+// to remove, empty for none: only a lease holder may pass one.
+func removeWorkspaceEntry(ctx context.Context, repoRoot string, entry Entry, markerPath string, lease func()) error {
 	// Errors are prefixed with the entry so a joined sweep error says
 	// what failed. Orphan entries carry no ID; their branch is the name.
 	label := entry.ID
@@ -737,11 +826,11 @@ func (p *GitWorktreeProvider) removeEntry(ctx context.Context, entry Entry, leas
 		label = entry.Branch
 	}
 	if entry.Path != "" {
-		if err := runGit(ctx, p.repoRoot, nil, "worktree", "remove", entry.Path); err != nil {
+		if err := runGit(ctx, repoRoot, nil, "worktree", "remove", entry.Path); err != nil {
 			// A dirty workspace still removes with --force; a missing
 			// one is already gone and prune cleans the admin entry.
-			if err := runGit(ctx, p.repoRoot, nil, "worktree", "remove", "--force", entry.Path); err != nil {
-				if err := runGit(ctx, p.repoRoot, nil, "worktree", "prune"); err != nil {
+			if err := runGit(ctx, repoRoot, nil, "worktree", "remove", "--force", entry.Path); err != nil {
+				if err := runGit(ctx, repoRoot, nil, "worktree", "prune"); err != nil {
 					return fmt.Errorf("dispatch %s: remove worktree %s: %w", label, entry.Path, err)
 				}
 			}
@@ -752,19 +841,21 @@ func (p *GitWorktreeProvider) removeEntry(ctx context.Context, entry Entry, leas
 		// point of an explicit review step. Existence is checked by exit
 		// code, not by git's message text, so a deleted branch is
 		// tolerated under any locale.
-		if hasBranch(ctx, p.repoRoot, entry.Branch) {
-			if err := runGit(ctx, p.repoRoot, nil, "branch", "-D", entry.Branch); err != nil {
+		if hasBranch(ctx, repoRoot, entry.Branch) {
+			if err := runGit(ctx, repoRoot, nil, "branch", "-D", entry.Branch); err != nil {
 				// A concurrent Release may have deleted the branch
 				// between the existence check and -D; gone is gone, so
 				// only an error on a branch still there is real.
-				if hasBranch(ctx, p.repoRoot, entry.Branch) {
+				if hasBranch(ctx, repoRoot, entry.Branch) {
 					return fmt.Errorf("dispatch %s: delete branch %s: %w", label, entry.Branch, err)
 				}
 			}
 		}
 	}
-	if entry.Branch != "" && lease != nil {
-		os.Remove(p.ownerPath(entry.Branch))
+	if markerPath != "" {
+		os.Remove(markerPath)
+	}
+	if lease != nil {
 		lease()
 	}
 	return nil
