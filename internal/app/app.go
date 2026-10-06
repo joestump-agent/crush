@@ -883,6 +883,10 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 	}
 
 	var err error
+	// #346: every dispatch is served over the process-wide A2A host on a
+	// per-process 0600 unix socket, rooted at the data directory; the
+	// same factory dials the dispatches it serves.
+	a2aFactory := a2a.NewServerFactory(app.config.Config().Options.DataDirectory)
 	coordinatorOpts := agent.CoordinatorOptions{
 		Config:      app.config,
 		Sessions:    app.Sessions,
@@ -900,9 +904,9 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		// snapshots to the TUI. #174's A2A TaskStatusUpdateEvent bridge
 		// attaches as a second sink over the same reduction.
 		DispatchSinks: []dispatch.TodoSink{app},
-		// #70: every dispatch gets an in-process A2A server on loopback,
-		// registered on the dispatch registry for in-memory discovery.
-		DispatchServer: a2a.NewServerFactory(),
+		// #70: every dispatch is registered on the process-wide A2A host
+		// for in-memory discovery and served over its unix socket.
+		DispatchServer: a2aFactory,
 	}
 
 	// Semantic search is opt-in: only wire the store and client when an
@@ -938,6 +942,10 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		slog.Error("Failed to create coder agent", "err", err)
 		return err
 	}
+	// #346: the A2A host (and its socket file) dies with the app.
+	app.cleanupFuncs = append(app.cleanupFuncs, func(ctx context.Context) error {
+		return a2aFactory.Close(ctx)
+	})
 	return nil
 }
 

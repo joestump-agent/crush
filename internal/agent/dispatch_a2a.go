@@ -18,14 +18,15 @@ import (
 // dispatched agent (#70). It is the seam that keeps the dependency
 // direction one-way — internal/a2a imports internal/agent for the
 // Executor's runner, so the agent package only ever sees this
-// interface. The production implementation is a2a.ServerFactory; tests
-// substitute fakes through it, and a nil starter (the default until the
-// app wires the factory) simply serves nothing.
+// interface. The production implementation is a2a.ServerFactory, whose
+// process-wide host serves every dispatch on one per-process unix
+// socket (#346); tests substitute fakes through it, and a nil starter
+// (the default until the app wires the factory) simply serves nothing.
 type DispatchServerStarter interface {
-	// StartDispatchServer stands up the loopback A2A server for one
-	// dispatch and returns its endpoint, the AgentCard to stamp on the
-	// registry entry (opaque here), and the stop function the dispatch
-	// run defers.
+	// StartDispatchServer stands up the A2A server for one dispatch on
+	// the process host and returns its endpoint, the AgentCard to stamp
+	// on the registry entry (opaque here), and the stop function the
+	// dispatch run defers.
 	StartDispatchServer(ctx context.Context, params DispatchServerParams) (endpoint string, card any, stop func(), err error)
 }
 
@@ -35,6 +36,9 @@ type DispatchServerStarter interface {
 // import-clean of internal/a2a; the production value is the dispatch
 // registry's todo collector.
 type DispatchServerParams struct {
+	// DispatchID is the registry entry's id the served dispatch answers
+	// as (#346): the process host routes /agents/<DispatchID> to it.
+	DispatchID string
 	// SessionID is the ephemeral task session backing the dispatch.
 	SessionID string
 	// Runner is the dispatched agent itself.
@@ -376,8 +380,9 @@ func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatc
 	}
 
 	endpoint, card, stop, err := starter.StartDispatchServer(ctx, DispatchServerParams{
-		SessionID: sessionID,
-		Runner:    runner,
+		DispatchID: entryID,
+		SessionID:  sessionID,
+		Runner:     runner,
 		Diff: func(ctx context.Context) (string, error) {
 			entry, ok := reg.Get(entryID)
 			if !ok {

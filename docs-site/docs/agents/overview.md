@@ -148,16 +148,15 @@ shell with `crush dispatch list` and `crush dispatch prune` ([#369](https://gith
 Each dispatch is served in-process by an [A2A](https://a2a-protocol.org)
 server whose agent card is named after the @handle and described by the role.
 Crush drives the run through an A2A client, reading its event stream to a
-terminal state. Today that server is an unauthenticated JSON-RPC endpoint on a
-random `127.0.0.1` port per dispatch: an internal detail, not an interface for
+terminal state. Dispatches answer on one host per Crush process, a `0600`
+unix socket under the data directory: an internal detail, not an interface for
 outside clients. Delegation is one level deep: neither `agent` sub-agents nor
 dispatched agents get `dispatch_agent` or `message_agent`. See
 [Architecture](/agents/architecture) and [A2A protocol](/agents/a2a-protocol).
 
 :::info[Planned]
 A2A becomes the runtime contract: one execution path through the A2A client
-([#347](https://github.com/joestump-agent/crush/issues/347)), one A2A host per Crush process on a `0600` unix socket ([#346](https://github.com/joestump-agent/crush/issues/346)),
-TCP plus TLS as an opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)), and later the other agents too ([#392](https://github.com/joestump-agent/crush/issues/392)).
+([#347](https://github.com/joestump-agent/crush/issues/347)), TCP plus TLS as an opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)), and later the other agents too ([#392](https://github.com/joestump-agent/crush/issues/392)).
 :::
 
 :::info[Planned]

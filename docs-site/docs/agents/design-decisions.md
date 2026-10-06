@@ -48,7 +48,7 @@ current behaviour. What ships today is on
 | 2026-10-02 | Mid-run message injection, handles and send-down ship in v1. | Interaction | Shipped ([#312](https://github.com/joestump-agent/crush/issues/312)) |
 | 2026-10-02 | Wander kill is deterministic and configurable, and workspace state is preserved for salvage. | Interaction | Shipped ([#316](https://github.com/joestump-agent/crush/issues/316)); scope revised 2026-10-04 |
 | 2026-10-04 | **A2A is the runtime contract.** One path through the A2A client, and no direct-run fallback. | Both | Planned: [#347](https://github.com/joestump-agent/crush/issues/347) |
-| 2026-10-04 | **Transport.** One host per Crush process on a 0600 unix socket. TCP is opt-in and requires TLS and auth. | A2A PRD | Planned: [#346](https://github.com/joestump-agent/crush/issues/346), [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357) |
+| 2026-10-04 | **Transport.** One host per Crush process on a 0600 unix socket. TCP is opt-in and requires TLS and auth. | A2A PRD | Shipped ([#346](https://github.com/joestump-agent/crush/issues/346)); TCP planned: [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357) |
 | 2026-10-04 | **Agent definitions.** Built-ins stay backwards compatible but can be overridden, extended, or replaced by an external card. crushrc first. | Both | Planned: [#333](https://github.com/joestump-agent/crush/issues/333), [#431](https://github.com/joestump-agent/crush/issues/431), [#434](https://github.com/joestump-agent/crush/issues/434) |
 | 2026-10-04 | **Extensions.** Metadata is allowed but must be declared on the card and statically typed. | A2A PRD | Shipped ([#359](https://github.com/joestump-agent/crush/issues/359)) |
 | 2026-10-04 | **Kill is `tasks/cancel` with a reason.** Exactly one terminal event per task. | A2A PRD | Planned: [#342](https://github.com/joestump-agent/crush/issues/342), [#348](https://github.com/joestump-agent/crush/issues/348) |
@@ -79,14 +79,17 @@ Tracking: [#347](https://github.com/joestump-agent/crush/issues/347), [#343](htt
 
 ### One host per process, on a unix socket
 
-Today each dispatch opens an unauthenticated JSON-RPC listener on
-`127.0.0.1`, which any local process, or a web page, can use to drive a
-write-capable agent. A 0600 unix socket puts access control in the
-operating system and opens no network listener at all. One host per
-process gives one place to route, authenticate and observe. TCP remains
-available for remote and third-party agents, but plain TCP is refused: it
-needs TLS, auth interceptors and `securitySchemes` on the card.
-Tracking: [#346](https://github.com/joestump-agent/crush/issues/346), [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357).
+Each dispatch used to open an unauthenticated JSON-RPC listener on
+`127.0.0.1`, which any local process, or a web page, could use to drive a
+write-capable agent. Now one host per process listens on a 0600 unix
+socket in a 0700 directory, so the operating system puts access control
+in place and no network listener opens at all, and middleware rejects
+cross-origin, non-JSON and wrong-`Host` requests before any dispatch
+work runs. One host per process gives one place to route, authenticate
+and observe. TCP remains available for remote and third-party agents,
+but plain TCP is refused: it needs TLS, auth interceptors and
+`securitySchemes` on the card.
+Tracking: shipped in [#346](https://github.com/joestump-agent/crush/issues/346); [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357) remain.
 
 ### Agents are definitions
 

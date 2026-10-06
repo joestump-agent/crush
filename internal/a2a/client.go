@@ -39,34 +39,12 @@ const (
 // from being polled into a hole.
 var dispatchResumeBackoff = []time.Duration{250 * time.Millisecond, time.Second, 4 * time.Second}
 
-// dispatchHTTPClient returns the HTTP client the dispatch transport
-// dials with (#344). It carries no total Timeout: the SDK's default
-// three-minute http.Client.Timeout bounds the whole exchange including
-// the SSE body, killing every served dispatch that runs longer than
-// three minutes and throwing its result away. The per-phase bounds —
-// dial, TLS handshake, response headers — still fail fast when the
-// server never answers; bounding a live run is the caller's context
-// and the wander-kill watchdog's job, not the transport's.
-func dispatchHTTPClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-		},
-	}
-}
-
 // newDispatchClient builds the A2A client for one dispatch: in-memory
 // discovery from the dispatch's registered card, with the JSON-RPC
 // transport wired to httpClient — the factory's injected client in
-// tests, the no-total-timeout production client otherwise (#344).
+// tests, the factory's unix-socket client in production (#346).
 // Extra options (the extension-activation interceptor) ride along.
 func newDispatchClient(ctx context.Context, card *a2aspec.AgentCard, httpClient *http.Client, opts ...a2aclient.FactoryOption) (*a2aclient.Client, error) {
-	if httpClient == nil {
-		httpClient = dispatchHTTPClient()
-	}
 	opts = append([]a2aclient.FactoryOption{a2aclient.WithJSONRPCTransport(httpClient)}, opts...)
 	client, err := a2aclient.NewFromCard(ctx, card, opts...)
 	if err != nil {
@@ -97,12 +75,15 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 	if p.Prompt == "" {
 		return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch prompt is empty")
 	}
-
+	httpClient := f.httpClient
+	if httpClient == nil {
+		httpClient = f.dispatchHTTPClient()
+	}
 	// Activate the extensions the remote agent's card declares and this
 	// process registered (#359), and decode the metadata they carry off
 	// the stream's status updates.
 	decoder := newMetadataDecoder(card)
-	client, err := newDispatchClient(ctx, card, f.httpClient, a2aclient.WithCallInterceptors(a2aext.NewActivator(decoder.activatedURIs()...)))
+	client, err := newDispatchClient(ctx, card, httpClient, a2aclient.WithCallInterceptors(a2aext.NewActivator(decoder.activatedURIs()...)))
 	if err != nil {
 		return agent.DispatchTransportOutcome{}, err
 	}
@@ -434,6 +415,27 @@ func statusUpdateMessageText(ev *a2aspec.TaskStatusUpdateEvent) string {
 	return b.String()
 }
 
+// dispatchHTTPClient builds the HTTP client dispatch streams dial
+// through: its transport maps every dial onto the factory's unix socket,
+// ignoring the resolved address, so the card's http://crush-a2a endpoint
+// is a routing label rather than a dial target (#346). There is
+// deliberately no proxy (ProxyFromEnvironment would route an http:// URL
+// at an HTTP proxy, breaking the unix dial) and no overall timeout: the
+// SDK's own 3-minute total timeout is dropped, matching the per-phase
+// bounds the dispatch client carries.
+func (f *ServerFactory) dispatchHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialer := &net.Dialer{Timeout: 10 * time.Second}
+				return dialer.DialContext(ctx, "unix", f.socketPath())
+			},
+			ResponseHeaderTimeout: 30 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+		},
+	}
+}
+
 // dispatchTaskStateToken maps an A2A task state onto the transport's
 // status vocabulary: the terminal tokens are the outcome's, everything
 // non-terminal reports as working (#349).
@@ -465,7 +467,11 @@ func (f *ServerFactory) GetDispatchTask(ctx context.Context, p agent.GetDispatch
 	if p.TaskID == "" {
 		return agent.DispatchTaskStatus{}, fmt.Errorf("a2a: dispatch %s has no task id", p.Endpoint)
 	}
-	client, err := newDispatchClient(ctx, card, f.httpClient)
+	httpClient := f.httpClient
+	if httpClient == nil {
+		httpClient = f.dispatchHTTPClient()
+	}
+	client, err := newDispatchClient(ctx, card, httpClient)
 	if err != nil {
 		return agent.DispatchTaskStatus{}, err
 	}
@@ -534,7 +540,11 @@ func (f *ServerFactory) CancelDispatch(ctx context.Context, p agent.DispatchCanc
 	if p.TaskID == "" {
 		return fmt.Errorf("a2a: dispatch %s has no task id", p.Endpoint)
 	}
-	client, err := newDispatchClient(ctx, card, f.httpClient)
+	httpClient := f.httpClient
+	if httpClient == nil {
+		httpClient = f.dispatchHTTPClient()
+	}
+	client, err := newDispatchClient(ctx, card, httpClient)
 	if err != nil {
 		return err
 	}

@@ -4,8 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"mime"
 	"net"
 	"net/http"
+	"os"
+	"os/user"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,16 +27,39 @@ import (
 	"github.com/charmbracelet/crush/internal/version"
 )
 
-// shutdownTimeout bounds a dispatch server's graceful shutdown: the HTTP
+// shutdownTimeout bounds the A2A host's graceful shutdown: the HTTP
 // server stops accepting, in-flight requests drain, and the Serve
 // goroutine is reaped even when a client holds a stream open.
 const shutdownTimeout = 5 * time.Second
+
+// maxUnixSocketPathLen is the maximum length of a Unix domain socket
+// path. The macOS sun_path field is 104 bytes and must also hold the
+// trailing NUL, so a 104-byte path fails bind with EINVAL there; Linux
+// allows 108. The limit is 103 so a path that fits here binds on both
+// platforms.
+const maxUnixSocketPathLen = 103
+
+// a2aURLHost is the Host header every A2A request must carry. The URL
+// never leaves the process: the card endpoint is a routing label, and
+// the client's dialer maps it onto the process's unix socket.
+const a2aURLHost = "crush-a2a"
+
+// a2aSocketDirName is the directory under the data directory that holds
+// the A2A host socket.
+const a2aSocketDirName = "a2a"
+
+// agentsPathPrefix is the path prefix under which the host routes
+// requests to a dispatch's JSON-RPC handler.
+const agentsPathPrefix = "/agents/"
 
 // ServerParams are the inputs for serving one dispatched agent over A2A
 // (#70): the runner drives the agent's session, Diff and Todos feed the
 // executor's artifact and progress events, and Name/Description/Skills
 // shape the served AgentCard.
 type ServerParams struct {
+	// DispatchID is the registry entry's id the served dispatch answers
+	// as (#346). Required: the host routes /agents/<DispatchID> here.
+	DispatchID string
 	// Runner is the dispatched agent's SessionAgent — the a2a.Runner
 	// slice of it. Required.
 	Runner Runner
@@ -75,44 +105,94 @@ type ServerParams struct {
 	TaskStore taskstore.Store
 }
 
-// Server is one dispatched agent's in-process A2A server (#70): JSON-RPC
-// over HTTP on an ephemeral loopback port, the Executor behind a2asrv,
-// and the AgentCard at the well-known path. Phase 1 is loopback-only —
-// the server exists so the coordinator (and, in #71, the DispatchAgent
-// client) speaks the protocol boundary in-process; process isolation
-// (#72) and remote workers (#73) come later.
+// Server is one dispatched agent's slice of the process-wide A2A host
+// (#346): the endpoint and card the dispatch registry advertises, plus
+// the teardown that unregisters the dispatch's route. The socket, the
+// HTTP server and the route table belong to the [ServerFactory].
 type Server struct {
-	// Endpoint is the base URL the server listens on; the card's
-	// supported interface points here.
+	// Endpoint is the card URL the dispatch serves:
+	// http://<a2aURLHost>/agents/<dispatch id>.
 	Endpoint string
 	// Card is the served AgentCard — the same object registered on the
-	// dispatch registry entry, so in-memory discovery and the well-known
-	// HTTP path can never disagree.
+	// dispatch registry entry, so in-memory discovery can never disagree
+	// with what a client dials.
 	Card *a2aspec.AgentCard
 
-	listener net.Listener
-	server   *http.Server
-	done     chan struct{}
+	factory  *ServerFactory
+	id       string
 	stopOnce sync.Once
 }
 
-// StartServer stands up the loopback A2A server for one dispatch: it
-// binds first (so the card advertises the real, already-bound endpoint),
-// builds the card, wires the Executor behind a2asrv's JSON-RPC handler
-// with the agent card at the well-known path, and serves on a goroutine.
-// Stop shuts it down; the caller owns the lifecycle (the dispatch run).
-func StartServer(ctx context.Context, p ServerParams) (*Server, error) {
+// Stop unregisters the dispatch's route from the process host, canceling
+// the route's context so any in-flight stream on it ends. Safe to call
+// more than once; the host keeps serving the other dispatches.
+func (s *Server) Stop(_ context.Context) error {
+	s.stopOnce.Do(func() {
+		s.factory.unregister(s.id)
+	})
+	return nil
+}
+
+// ServerFactory hosts every in-process A2A server for dispatched agents
+// (#70, #346) on the coordinator's behalf: one unix socket per process
+// at <data dir>/a2a/<pid>.sock (0700 directory, 0600 socket), started
+// lazily on the first [ServerFactory.StartServer], with a mutex-guarded
+// route table mapping /agents/<dispatch id> onto each dispatch's
+// JSON-RPC handler. It implements the agent package's
+// [agent.DispatchServerStarter] seam, which is how the dependency stays
+// one-way: a2a imports agent, never the reverse.
+type ServerFactory struct {
+	dataDir string
+
+	// httpClient, when set, replaces the factory's unix-socket dispatch
+	// client in StreamDispatch — the test injection seam (#344), used
+	// to bound phases of the wire protocol independently of the
+	// defaults.
+	httpClient *http.Client
+
+	mu         sync.Mutex
+	started    bool
+	closed     bool
+	listener   net.Listener
+	sockPath   string
+	httpServer *http.Server
+	done       chan struct{}
+	routes     map[string]*route
+}
+
+// route is one dispatch's slice of the host: its JSON-RPC handler and a
+// context that dies with the dispatch, so Stop (or Close) ends any
+// in-flight stream served for it.
+type route struct {
+	handler http.Handler
+	ctx     context.Context
+	cancel  context.CancelFunc
+}
+
+// NewServerFactory returns the production server factory rooted at
+// dataDir, where the host socket and its directory are created.
+func NewServerFactory(dataDir string, opts ...ServerFactoryOption) *ServerFactory {
+	f := &ServerFactory{dataDir: dataDir, routes: make(map[string]*route)}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
+}
+
+// StartServer serves one dispatched agent over A2A (#70): it builds the
+// card and the Executor behind a2asrv's JSON-RPC handler, lazily starts
+// the process host on the factory's unix socket, and registers the
+// dispatch's route. Stop unregisters it; the caller owns the lifecycle
+// (the dispatch run).
+func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Server, error) {
 	if p.Runner == nil {
 		return nil, errors.New("a2a: server requires a runner")
 	}
 	if p.SessionID == "" {
 		return nil, errors.New("a2a: server requires a session id")
 	}
-
-	var lc net.ListenConfig
-	listener, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, fmt.Errorf("a2a: bind loopback listener: %w", err)
+	if p.DispatchID == "" {
+		return nil, errors.New("a2a: server requires a dispatch id")
 	}
 
 	// The card's version is required by the spec; default to the build
@@ -122,7 +202,7 @@ func StartServer(ctx context.Context, p ServerParams) (*Server, error) {
 		cardVersion = version.Version
 	}
 
-	endpoint := "http://" + listener.Addr().String()
+	endpoint := "http://" + a2aURLHost + agentsPathPrefix + p.DispatchID
 	card := BuildAgentCard(CardParams{
 		Agent:     config.Agent{Name: p.Name, Description: p.Description},
 		Skills:    p.Skills,
@@ -163,46 +243,13 @@ func StartServer(ctx context.Context, p ServerParams) (*Server, error) {
 	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
 	mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
 
-	srv := &Server{
-		Endpoint: endpoint,
-		Card:     card,
-		listener: listener,
-		server:   &http.Server{Handler: mux},
-		done:     make(chan struct{}),
+	if err := f.ensureHost(ctx); err != nil {
+		return nil, err
 	}
-	go func() {
-		defer close(srv.done)
-		// Serve always returns a non-nil error (ErrServerClosed on a
-		// clean Stop); anything else means the server died early.
-		if err := srv.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return
-		}
-	}()
-	return srv, nil
-}
-
-// Stop shuts the server down and waits for its Serve goroutine to exit,
-// so a torn-down dispatch leaks neither the goroutine nor the port. Safe
-// to call more than once.
-func (s *Server) Stop(ctx context.Context) error {
-	var err error
-	s.stopOnce.Do(func() {
-		err = s.server.Shutdown(ctx)
-		<-s.done
-	})
-	return err
-}
-
-// ServerFactory builds in-process A2A servers for dispatched agents
-// (#70) on the coordinator's behalf. It implements the agent package's
-// [agent.DispatchServerStarter] seam, which is how the dependency stays
-// one-way: a2a imports agent, never the reverse.
-type ServerFactory struct {
-	// httpClient, when set, replaces the production dispatch HTTP
-	// client in StreamDispatch — the test injection seam (#344), used
-	// to bound phases of the wire protocol independently of the SDK's
-	// defaults.
-	httpClient *http.Client
+	if err := f.register(p.DispatchID, mux); err != nil {
+		return nil, err
+	}
+	return &Server{Endpoint: endpoint, Card: card, factory: f, id: p.DispatchID}, nil
 }
 
 // ServerFactoryOption customizes the server factory built by
@@ -210,29 +257,22 @@ type ServerFactory struct {
 type ServerFactoryOption func(*ServerFactory)
 
 // WithHTTPClient injects the HTTP client StreamDispatch dials with
-// (#344). Production leaves it unset and uses the no-total-timeout
-// dispatch client; tests use it to shorten a phase and prove the run
-// outlives the transport's own deadline.
+// (#344). Production leaves it unset and dials the factory's unix
+// socket; tests use it to shorten a phase and prove the run outlives
+// the transport's own deadline.
 func WithHTTPClient(client *http.Client) ServerFactoryOption {
 	return func(f *ServerFactory) { f.httpClient = client }
 }
 
-// NewServerFactory returns the production server factory.
-func NewServerFactory(opts ...ServerFactoryOption) *ServerFactory {
-	f := &ServerFactory{}
-	for _, opt := range opts {
-		opt(f)
-	}
-	return f
-}
-
 // StartDispatchServer implements [agent.DispatchServerStarter]: it
-// starts the loopback server and returns its endpoint, the AgentCard to
-// register on the dispatch registry entry, and the stop function the
-// dispatch run defers. The card is returned as the registry's opaque
-// any so the agent package never imports the a2a types.
+// registers the dispatch's route on the process host and returns its
+// endpoint, the AgentCard to stamp on the dispatch registry entry, and
+// the stop function the dispatch run defers. The card is returned as the
+// registry's opaque any so the agent package never imports the a2a
+// types.
 func (f *ServerFactory) StartDispatchServer(ctx context.Context, p agent.DispatchServerParams) (string, any, func(), error) {
-	server, err := StartServer(ctx, ServerParams{
+	server, err := f.StartServer(ctx, ServerParams{
+		DispatchID:        p.DispatchID,
 		Runner:            p.Runner,
 		SessionID:         p.SessionID,
 		Diff:              p.Diff,
@@ -249,11 +289,203 @@ func (f *ServerFactory) StartDispatchServer(ctx context.Context, p agent.Dispatc
 		return "", nil, nil, err
 	}
 	stop := func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		_ = server.Stop(shutdownCtx)
+		_ = server.Stop(context.Background())
 	}
 	return server.Endpoint, server.Card, stop, nil
+}
+
+// Close shuts the process host down (idempotent): every remaining
+// route's context is canceled, in-flight requests drain within the
+// caller's context, the listener is closed and the socket file is
+// removed. App shutdown owns the call.
+func (f *ServerFactory) Close(ctx context.Context) error {
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return nil
+	}
+	f.closed = true
+	if !f.started {
+		f.mu.Unlock()
+		return nil
+	}
+	for id, rt := range f.routes {
+		delete(f.routes, id)
+		rt.cancel()
+	}
+	srv, listener, path, done := f.httpServer, f.listener, f.sockPath, f.done
+	f.mu.Unlock()
+
+	err := srv.Shutdown(ctx)
+	if cerr := listener.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) && err == nil {
+		err = cerr
+	}
+	if rerr := os.Remove(path); rerr != nil && !errors.Is(rerr, os.ErrNotExist) && err == nil {
+		err = rerr
+	}
+	<-done
+	return err
+}
+
+// ensureHost lazily starts the process-wide listener: the socket lives
+// under the data directory (created 0700) and is named after the pid, so
+// a stale file always belongs to a dead process and plain removal before
+// the bind is safe; no live-server probing is needed. The socket is
+// chmod-ed 0600 right after the bind (non-Windows), so only the same
+// user can reach the unauthenticated JSON-RPC surface (#346).
+func (f *ServerFactory) ensureHost(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.started {
+		return nil
+	}
+	if f.closed {
+		return errors.New("a2a: host is closed")
+	}
+
+	path, err := a2aSocketPath(f.dataDir)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("a2a: remove stale socket: %w", err)
+	}
+	var lc net.ListenConfig
+	listener, err := lc.Listen(ctx, "unix", path)
+	if err != nil {
+		return fmt.Errorf("a2a: bind unix listener: %w", err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(path, 0o600); err != nil {
+			_ = listener.Close()
+			return fmt.Errorf("a2a: chmod socket: %w", err)
+		}
+	}
+
+	f.sockPath = path
+	f.listener = listener
+	f.httpServer = &http.Server{
+		Handler:           http.HandlerFunc(f.serveHTTP),
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+	f.done = make(chan struct{})
+	f.started = true
+	go func() {
+		defer close(f.done)
+		// Serve always returns a non-nil error (ErrServerClosed on a
+		// clean Close); anything else means the host died early.
+		if err := f.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("A2A host server died early", "error", err)
+		}
+	}()
+	return nil
+}
+
+// a2aSocketPath returns where the process host binds its socket:
+// under the data directory when the path fits the 104-byte sun_path
+// limit, otherwise under a per-user, 0700 directory in [os.TempDir].
+func a2aSocketPath(dataDir string) (string, error) {
+	uid := "unknown"
+	if usr, err := user.Current(); err == nil && usr.Uid != "" {
+		uid = usr.Uid
+	}
+	name := fmt.Sprintf("%d.sock", os.Getpid())
+	dir := filepath.Join(dataDir, a2aSocketDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("a2a: create socket dir: %w", err)
+	}
+	path := filepath.Join(dir, name)
+	if len(path) <= maxUnixSocketPathLen {
+		return path, nil
+	}
+	dir = filepath.Join(os.TempDir(), "crush-a2a-"+uid)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("a2a: create fallback socket dir: %w", err)
+	}
+	return filepath.Join(dir, name), nil
+}
+
+// serveHTTP is the host's single root handler (#346): middleware first,
+// rejecting cross-origin, non-JSON and wrong-host requests before any
+// dispatch work runs, then the route table maps /agents/<dispatch id>
+// onto that dispatch's JSON-RPC handler. The middleware exists because
+// the served surface is unauthenticated (#357 adds auth): a browser page
+// can CSRF a text/plain POST at any loopback port, DNS-rebind its Host,
+// and fold text into a running agent's turn. The route context is
+// injected so a Stop or Close cancels the in-flight streams it owns.
+func (f *ServerFactory) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Origin") != "" {
+		http.Error(w, "a2a: cross-origin requests are not accepted", http.StatusForbidden)
+		return
+	}
+	if ct, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || ct != "application/json" {
+		http.Error(w, "a2a: only application/json requests are accepted", http.StatusUnsupportedMediaType)
+		return
+	}
+	if r.Host != a2aURLHost {
+		http.Error(w, "a2a: unexpected Host", http.StatusBadRequest)
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, agentsPathPrefix)
+	if id == "" || strings.Contains(id, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	rt, ok := f.routeFor(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	rt.handler.ServeHTTP(w, r.WithContext(rt.ctx))
+}
+
+// register adds the dispatch's route with a context that dies with it.
+func (f *ServerFactory) register(id string, handler http.Handler) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return errors.New("a2a: host is closed")
+	}
+	if _, ok := f.routes[id]; ok {
+		return fmt.Errorf("a2a: dispatch %s is already served", id)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	f.routes[id] = &route{handler: handler, ctx: ctx, cancel: cancel}
+	return nil
+}
+
+// unregister removes the dispatch's route and cancels its context.
+func (f *ServerFactory) unregister(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if rt, ok := f.routes[id]; ok {
+		delete(f.routes, id)
+		rt.cancel()
+	}
+}
+
+// routeFor returns the dispatch's route under the host lock.
+func (f *ServerFactory) routeFor(id string) (*route, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rt, ok := f.routes[id]
+	return rt, ok
+}
+
+// socketPath returns the unix socket path the factory's host listens
+// on; empty before the first StartServer.
+func (f *ServerFactory) socketPath() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sockPath
+}
+
+// SocketPath is socketPath's exported form: a caller customizing its
+// own dispatch client through WithHTTPClient (#344) dials this path to
+// stay on the host's socket instead of the endpoint's routing label.
+func (f *ServerFactory) SocketPath() string {
+	return f.socketPath()
 }
 
 // Resolve returns the AgentCard and endpoint a dispatch registry entry

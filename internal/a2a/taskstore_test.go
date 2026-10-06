@@ -403,12 +403,15 @@ func TestServerPersistsTasksThroughSQLiteStore(t *testing.T) {
 	t.Cleanup(db.ResetPool)
 
 	runner := &fakeRunner{result: textResult("durable answer")}
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    runner,
-		SessionID: "dispatch-session",
-		TaskStore: NewSQLiteStore(database, "test-host", nil),
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "durable-task",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+		TaskStore:  NewSQLiteStore(database, "test-host", nil),
 	})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	params, err := json.Marshal(&a2aspec.SendMessageRequest{
 		Message: a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("run the task")),
@@ -422,7 +425,7 @@ func TestServerPersistsTasksThroughSQLiteStore(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	resp, err := postJSONRPC(t, server.Endpoint+"/", body)
+	resp, err := postJSONRPC(t, unixDialClient(factory), server.Endpoint, body)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)

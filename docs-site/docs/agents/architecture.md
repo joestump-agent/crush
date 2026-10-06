@@ -2,7 +2,7 @@
 id: architecture
 title: How multi-agent works today
 sidebar_label: Architecture
-description: The components behind dispatched agents as they exist on main — coordinator, workspace registry, per-dispatch A2A server and loopback client, injection queue, todo bridge, kill ladder, permission bridge — and one dispatch's lifecycle end to end.
+description: The components behind dispatched agents as they exist on main — coordinator, workspace registry, the per-process A2A host and its socket client, injection queue, todo bridge, kill ladder, permission bridge — and one dispatch's lifecycle end to end.
 ---
 
 # How multi-agent works today
@@ -22,10 +22,10 @@ callout links the fix. The target design is on
 [Design decisions](./design-decisions.md).
 
 In one sentence: `dispatch_agent` provisions a git worktree, builds a
-scoped agent for it, serves that agent over A2A on a loopback port, and
-drives exactly one turn through an A2A client. Steering, permissions, kill,
-progress to the UI and result delivery all happen in-process, outside the
-protocol.
+scoped agent for it, serves that agent over A2A on the process's unix
+socket, and drives exactly one turn through an A2A client. Steering,
+permissions, kill, progress to the UI and result delivery all happen
+in-process, outside the protocol.
 
 ## The pieces
 
@@ -37,10 +37,9 @@ protocol.
    |                                   (worktree, branch, handle, status,
    | start server                       endpoint, card, result)
    v
- A2A server  http://127.0.0.1:<ephemeral port>   one per dispatch
-   |   GET  /.well-known/agent-card.json
-   |   POST /            JSON-RPC 2.0
-   v
+ A2A host  http://crush-a2a/agents/<dispatch id>   one per process (unix socket)
+  |   POST /agents/<dispatch id>   JSON-RPC 2.0
+  v
  Executor ---- Run ----> dispatched SessionAgent (worktree toolchain)
    ^                          |
    | SSE events               | session saves (todos, usage)
@@ -61,7 +60,7 @@ protocol.
 | Coordinator | [`internal/agent/dispatch_tool.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch_tool.go) | Implements the `dispatch_agent` tool and owns each run's lifecycle. |
 | Workspace and dispatch registry | [`internal/dispatch/workspace.go`](https://github.com/joestump-agent/crush/blob/main/internal/dispatch/workspace.go) | Creates and diffs worktrees, and keeps the one in-memory registry that handles, discovery and the UI read. |
 | Dispatch toolchain | [`internal/agent/dispatch.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch.go) | Builds worktree-rooted tools, scoped config, LSP and permissions, plus the permission bridge. |
-| A2A server and card | [`internal/a2a/server.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/server.go), [`agentcard.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/agentcard.go) | One JSON-RPC server per dispatch on `127.0.0.1:0`. |
+| A2A server and card | [`internal/a2a/server.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/server.go), [`agentcard.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/agentcard.go) | One JSON-RPC host per process on a `0600` unix socket; routes `/agents/<dispatch id>` per dispatch. |
 | Executor | [`internal/a2a/executor.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/executor.go) | Maps one `SessionAgent.Run` onto A2A task states and events. |
 | A2A client | [`internal/a2a/client.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/client.go), [`internal/agent/dispatch_a2a.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch_a2a.go) | Sends the prompt and consumes the stream to a terminal state. |
 | Injection queue | [`internal/agent/dispatch_inject.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch_inject.go) | Delivers mid-run messages to a running dispatch. |
@@ -119,22 +118,26 @@ The model-supplied `branch` is not validated with
 
 ### 3. Serve
 
-The coordinator starts the dispatch's A2A server. The server binds
-`127.0.0.1:0` first, so the Agent Card advertises the port it actually
-got. It then mounts the card at `/.well-known/agent-card.json` and the
-JSON-RPC handler at `/`, and stamps the endpoint and card on the registry
-entry. That stamp is the whole discovery mechanism: an in-memory lookup,
-with no directory and no network hop. The wire format is on
-[A2A protocol](./a2a-protocol.md).
+The coordinator registers the dispatch on the process-wide A2A host. The
+host lazily binds the unix socket `<data dir>/a2a/<pid>.sock` on its
+first dispatch (socket `0600` in a `0700` directory, falling back to a
+per-user temp dir when the path would overflow the socket length limit),
+builds the Agent Card with the routed endpoint
+`http://crush-a2a/agents/<dispatch id>`, and stamps the endpoint and card
+on the registry entry. That stamp is the whole discovery mechanism: an
+in-memory lookup, with no directory and no network hop. The wire format
+is on [A2A protocol](./a2a-protocol.md).
 
 **Direct-run fallback.** If the server fails to start, the failure is
 logged at warn level and the dispatch proceeds without it. The run then
 calls `SessionAgent.Run` directly instead of going through the client.
 Tests that wire no factory always take this path.
 
-:::danger[Known issue]
-The listener is unauthenticated, and so is every request to it. Any local
-process that finds the port can drive a write-capable agent ([#346](https://github.com/joestump-agent/crush/issues/346)).
+:::warning[Known gap]
+The served surface is unauthenticated until `securitySchemes` lands
+([#357](https://github.com/joestump-agent/crush/issues/357)). Reach is restricted to the same OS user by the socket
+permissions, and the host rejects cross-origin, non-JSON and wrong-`Host`
+requests before any dispatch work runs.
 :::
 
 ### 4. Stream

@@ -9,6 +9,8 @@ package agent_test
 // outcome.
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,16 +33,26 @@ import (
 func TestDispatchE2EOverServerFactory(t *testing.T) {
 	t.Parallel()
 
-	defaultFactory := func() agent.DispatchServerStarter { return a2a.NewServerFactory() }
+	defaultFactory := func() agent.DispatchServerStarter { return a2a.NewServerFactory(t.TempDir()) }
 
 	// shortClientDeadlineFactory injects the client #344's seam exists
 	// for: a 250ms response-header deadline, with no total timeout. A
 	// reintroduced client Timeout would cut the SSE body and fail the
-	// long-run scenario.
+	// long-run scenario. The custom transport dials the factory's unix
+	// socket (the endpoint is a routing label), so the deadline is the
+	// only thing under test.
 	shortClientDeadlineFactory := func() agent.DispatchServerStarter {
-		return a2a.NewServerFactory(a2a.WithHTTPClient(&http.Client{
-			Transport: &http.Transport{ResponseHeaderTimeout: 250 * time.Millisecond},
+		var f *a2a.ServerFactory
+		f = a2a.NewServerFactory(t.TempDir(), a2a.WithHTTPClient(&http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var dialer net.Dialer
+					return dialer.DialContext(ctx, "unix", f.SocketPath())
+				},
+				ResponseHeaderTimeout: 250 * time.Millisecond,
+			},
 		}))
+		return f
 	}
 
 	blockedModel := func(t *testing.T) (fantasy.LanguageModel, func()) {
