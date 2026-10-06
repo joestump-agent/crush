@@ -6898,25 +6898,31 @@ func (m *UI) openSessionsDialog() tea.Cmd {
 	gen := m.sessionsChildrenGen
 	ws := m.com.Workspace
 	return func() tea.Msg {
-		children, err := ws.ListAllChildSessions(context.TODO())
+		// Bounded: a wedged server (client/server mode) must not leave the
+		// batch in flight for the lifetime of the picker.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		children, err := ws.ListAllChildSessions(ctx)
 		return sessionChildrenLoadedMsg{gen: gen, children: children, err: err}
 	}
 }
 
 // applySessionChildren hands a fetched sub-agent batch to the open
 // sessions picker (#409). A batch for a picker that was closed or since
-// reopened (generation moved on) is dropped; a failed fetch warns once
-// and leaves the picker usable without the tree.
+// reopened (generation moved on) is dropped. A failed fetch still lands,
+// as an empty tree plus one warning, so the picker never sits on
+// "Loading" waiting for a batch that is never coming.
 func (m *UI) applySessionChildren(msg sessionChildrenLoadedMsg) tea.Cmd {
 	if msg.gen != m.sessionsChildrenGen || !m.dialog.ContainsDialog(dialog.SessionsID) {
 		return nil
 	}
-	if msg.err != nil {
-		return util.ReportWarn(fmt.Sprintf("Couldn't load sub-agent sessions: %v", msg.err))
-	}
 	sessionsDialog, ok := m.dialog.Dialog(dialog.SessionsID).(*dialog.Session)
 	if !ok {
 		return nil
+	}
+	if msg.err != nil {
+		sessionsDialog.SetChildren(nil)
+		return util.ReportWarn(fmt.Sprintf("Couldn't load sub-agent sessions: %v", msg.err))
 	}
 	sessionsDialog.SetChildren(msg.children)
 	return nil

@@ -15,6 +15,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/ui/dialog"
+	"github.com/charmbracelet/crush/internal/ui/util"
 )
 
 func sessionsChildrenFixture() (*countingWorkspace, *UI) {
@@ -119,14 +120,23 @@ func TestFailedSessionsChildBatchWarnsAndPickerStaysUsable(t *testing.T) {
 	_, cmd := m.Update(loaded)
 
 	require.NotNil(t, cmd, "a failed fetch warns")
+	warnMsg, ok := cmd().(util.InfoMsg)
+	require.True(t, ok)
+	require.Equal(t, util.InfoTypeWarn, warnMsg.Type)
+	require.Contains(t, warnMsg.Msg, "Couldn't load sub-agent sessions")
+
 	sessionsDialog, ok := m.dialog.Dialog(dialog.SessionsID).(*dialog.Session)
 	require.True(t, ok)
-	require.False(t, sessionsDialog.ChildrenLoaded(), "no batch landed")
+	require.True(t, sessionsDialog.ChildrenLoaded(),
+		"a failed batch lands as an empty tree, so the picker never sits on Loading")
 
-	// The picker keeps working: ctrl+] reports loading instead of
-	// pushing an empty sub-menu, and a retry can still land the tree.
+	// The picker keeps working: ctrl+] reports "no sub-agent sessions"
+	// instead of an endless Loading, and does not push a sub-menu.
 	_, next := m.Update(tea.KeyPressMsg{Code: ']', Mod: tea.ModCtrl})
 	require.NotNil(t, next,
-		"ctrl+] with no batch reports Loading rather than pushing a sub-menu")
-	require.False(t, sessionsDialog.ChildrenLoaded())
+		"ctrl+] with no children reports rather than pushing a sub-menu")
+	infoMsg, ok := next().(util.InfoMsg)
+	require.True(t, ok)
+	require.Equal(t, util.InfoTypeInfo, infoMsg.Type)
+	require.Contains(t, infoMsg.Msg, "No sub-agent sessions")
 }
