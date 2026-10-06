@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -1090,6 +1091,28 @@ func TestWanderKill_HardTimeoutOverServedHost(t *testing.T) {
 	require.NotNil(t, cancels[0].Card)
 }
 
+// cancelGatedModel serves a scripted run but holds its gateAt-th turn
+// (1-based) until the run's context is canceled, so a test of an
+// asynchronous kill can't lose the race to the run finishing first. A
+// kill that never lands releases the turn after a minute and the run
+// completes, which the test then reports, instead of hanging it.
+type cancelGatedModel struct {
+	*scriptedModel
+	gateAt int
+	calls  atomic.Int32
+}
+
+func (m *cancelGatedModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
+	if !isTitleCall(call) && int(m.calls.Add(1)) >= m.gateAt {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Minute):
+		}
+	}
+	return m.scriptedModel.Stream(ctx, call)
+}
+
 // TestWanderKill_IgnoredNudgesOverServedHost pins the ladder kill over
 // the protocol (#348): the enforcement ladder's kill rung routes through
 // the served dispatch's tasks/cancel with the ignored-nudges reason.
@@ -1107,6 +1130,13 @@ func TestWanderKill_IgnoredNudgesOverServedHost(t *testing.T) {
 		KillAfterNudges: 1,
 	}
 	f := newWanderKillFixture(t, model, settings)
+	// The kill rides an asynchronous tasks/cancel, and completion wins
+	// over a kill that lands late (TestWanderKill_CompletionWinsOverLateKill).
+	// An instant scripted model could finish before the cancel landed, so
+	// hold the final step until the cancel ends the run.
+	gated := &cancelGatedModel{scriptedModel: model, gateAt: len(model.steps)}
+	f.runModel = gated
+	f.buildDispatched(t, gated, settings, nil)
 
 	host := &cancelingTransport{reportTask: true}
 	f.wireTransport(t, host)
