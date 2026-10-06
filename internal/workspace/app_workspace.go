@@ -76,7 +76,7 @@ func (w *AppWorkspace) SetSessionChannel(ctx context.Context, sessionID, channel
 }
 
 func (w *AppWorkspace) DeleteSession(ctx context.Context, sessionID string) error {
-	return w.app.Sessions.Delete(ctx, sessionID)
+	return w.app.DeleteSession(ctx, sessionID)
 }
 
 func (w *AppWorkspace) CreateAgentToolSessionID(messageID, toolCallID string) string {
