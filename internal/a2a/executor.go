@@ -59,22 +59,35 @@ var _ TodoSource = (*dispatch.TodoCollector)(nil)
 // A2A task states (submitted -> working -> completed/failed), and emits the git
 // diff as the terminal artifact.
 //
+// The executor is bound to a context, not a session (#350): it resolves the
+// task's A2A ContextID through the host's [ContextRegistry] to the dispatch
+// binding — the runner, the session, and the call template — that owns it.
+// A message whose context is unknown, foreign to this route, or whose
+// binding has been removed (the run ended; sub-agent sessions are not
+// continuable) is rejected without the runner ever being called.
+//
 // While the run is in flight it also streams progress: one non-terminal
 // Working TaskStatusUpdateEvent per todo-list change (#174), with the
 // current activity as the message text and the structured todo snapshot in
 // the event metadata. Terminal semantics (Completed/Failed/Rejected/Canceled,
 // artifact emission) are unchanged, and todo events never race the terminal
 // status — both are yielded from this iterator's single goroutine.
+//
+// A second message on a bound context whose run is still in flight keeps
+// the runner's busy-session behavior — the turn queues behind the active
+// one and the task fails as "did not start a turn" — until #351 turns it
+// into steering.
 type Executor struct {
-	runner    Runner
-	sessionID string
+	// contexts resolves the A2A context ID onto the dispatch binding the
+	// turn runs against (#350). The host owns the registry; the binding
+	// lives exactly as long as the dispatch run.
+	contexts *ContextRegistry
+	// contextID is the context this executor's route owns (#350): a task
+	// naming any other context — unknown or another dispatch's — is
+	// rejected here.
+	contextID string
 	diff      DiffFunc
 	todos     TodoSource
-	// call is the template production dispatches stamp their turns with
-	// (#71): model options, token budget, content width, NonInteractive.
-	// Zero value keeps the minimal call — enough for tests, not for a
-	// real dispatched turn.
-	call agent.SessionAgentCall
 	// inactivityTimeout is the A2A-level backstop (#360): a run that
 	// yields no events for this long while in flight is canceled by
 	// the executor and failed with the reason. Zero (the default)
@@ -107,14 +120,6 @@ type Executor struct {
 
 // Option configures an [Executor].
 type Option func(*Executor)
-
-// WithCallTemplate stamps every turn the executor runs with call's
-// shaping, overriding just the prompt per message (#71): the dispatched
-// agent's turns must carry the dispatch's model options, token budget,
-// content width, and NonInteractive flag, not the minimal test call.
-func WithCallTemplate(call agent.SessionAgentCall) Option {
-	return func(e *Executor) { e.call = call }
-}
 
 // WithDiff sets the function used to collect the completion artifact — the git
 // diff of the dispatched worktree. Without it, runs complete with their text
@@ -158,10 +163,13 @@ func WithUsage(fn func(ctx context.Context) (agent.Usage, error)) Option {
 	return func(e *Executor) { e.usage = fn }
 }
 
-// NewExecutor builds an Executor that drives runner against sessionID — the
-// (ephemeral) session backing the dispatched agent.
-func NewExecutor(runner Runner, sessionID string, opts ...Option) *Executor {
-	e := &Executor{runner: runner, sessionID: sessionID}
+// NewExecutor builds an Executor that serves one dispatch's route (#350):
+// every turn resolves its A2A context — contextID, the route's own —
+// through contexts to the dispatch binding (runner, session, call
+// template) registered there, and a task naming any other context is
+// rejected.
+func NewExecutor(contexts *ContextRegistry, contextID string, opts ...Option) *Executor {
+	e := &Executor{contexts: contexts, contextID: contextID}
 	for _, opt := range opts {
 		opt(e)
 	}
@@ -170,12 +178,15 @@ func NewExecutor(runner Runner, sessionID string, opts ...Option) *Executor {
 
 var _ a2asrv.AgentExecutor = (*Executor)(nil)
 
-// Execute runs one dispatched agent turn. It announces the task submitted
-// (for a new task), emits Working, invokes the SessionAgent, then emits the
-// chunked diff artifact (if any), the typed dispatch-result artifact, and a
-// terminal Completed status carrying the agent's text output. A run error
-// maps to a Failed status with the error surfaced; per the AgentExecutor
-// contract, failures after work has begun are reported as events, not as a
+// Execute runs one dispatched agent turn. It resolves the task's A2A
+// context to the dispatch binding that owns it (#350) — rejecting any
+// message whose context is unknown, foreign to this route, or already
+// unbound — then announces the task submitted (for a new task), emits
+// Working, invokes the SessionAgent, and emits the chunked diff artifact
+// (if any), the typed dispatch-result artifact, and a terminal Completed
+// status carrying the agent's text output. A run error maps to a Failed
+// status with the error surfaced; per the AgentExecutor contract,
+// failures after work has begun are reported as events, not as a
 // returned error.
 func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
@@ -194,9 +205,28 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		// server-side log lines carry and what the usage payload echoes
 		// back, so a parent turn and its dispatched run correlate.
 		traceID := traceIDFromContext(ctx)
-		if e.usage != nil || traceID != "" {
-			slog.Debug("A2A dispatch turn starting", "session_id", e.sessionID, "trace_id", traceID)
+
+		// Resolve the task's context to the dispatch binding (#350):
+		// only this route's own, still-bound context runs. Anything else
+		// — an unknown context, another dispatch's, or one whose run has
+		// ended and taken its binding with it — is rejected without the
+		// runner ever being called: task sessions are not continuable.
+		binding, ok := e.resolve(execCtx.ContextID)
+		if !ok {
+			if execCtx.StoredTask == nil {
+				if !yield(a2aspec.NewSubmittedTask(execCtx, execCtx.Message), nil) {
+					return
+				}
+			}
+			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateRejected,
+				agentMessage(execCtx, noAgentForContextText(execCtx.ContextID))), nil)
+			return
 		}
+		slog.Debug("A2A dispatch turn starting",
+			"context_id", execCtx.ContextID,
+			"session_id", binding.SessionID,
+			"task_id", string(execCtx.TaskID),
+			"trace_id", traceID)
 
 		// A message that referenced no existing task starts a new one:
 		// announce it submitted before transitioning to working.
@@ -221,7 +251,7 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			return
 		}
 
-		result, err := e.runWithTodos(ctx, execCtx, prompt, yield)
+		result, err := e.runWithTodos(ctx, execCtx, binding, prompt, yield)
 		switch {
 		case errors.Is(err, errConsumerStopped):
 			// The consumer stopped consuming mid-run: nothing further can
@@ -245,13 +275,13 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			}
 			ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled,
 				agentMessage(execCtx, e.canceledStatusText()))
-			e.attachUsage(ctx, ev, traceID)
+			e.attachUsage(ctx, ev, binding.SessionID, traceID)
 			yield(ev, nil)
 			return
 		case err != nil:
 			ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
 				agentMessage(execCtx, err.Error()))
-			e.attachUsage(ctx, ev, traceID)
+			e.attachUsage(ctx, ev, binding.SessionID, traceID)
 			yield(ev, nil)
 			return
 		case result == nil:
@@ -262,7 +292,7 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			// fail it and let the caller retry against an idle session.
 			ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
 				agentMessage(execCtx, "agent session did not start a turn (busy or canceled)"))
-			e.attachUsage(ctx, ev, traceID)
+			e.attachUsage(ctx, ev, binding.SessionID, traceID)
 			yield(ev, nil)
 			return
 		}
@@ -297,7 +327,7 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 
 		ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted,
 			agentMessage(execCtx, result.Response.Content.Text()))
-		e.attachUsage(ctx, ev, traceID)
+		e.attachUsage(ctx, ev, binding.SessionID, traceID)
 		yield(ev, nil)
 	}
 }
@@ -307,22 +337,43 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 // dropped with the stream.
 var errConsumerStopped = errors.New("a2a: event consumer stopped")
 
-// runWithTodos invokes the runner while streaming the run's todo progress
-// (#174): the run executes on its own goroutine and the todo subscription
-// is drained inline on the iterator's goroutine, so Working progress events
-// and the terminal status share one yield path and can never race. The
-// subscription is bounded by the run — created after the initial Working
-// status, dropped on run end, consumer stop, and cancel — and a snapshot is
-// only emitted when the todo list actually changed, so usage-only session
-// saves stay silent.
-func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorContext, prompt string, yield func(a2aspec.Event, error) bool) (*fantasy.AgentResult, error) {
+// resolve maps the request's A2A context onto the dispatch binding that
+// owns it (#350). Only this route's own, still-bound context resolves:
+// an unknown context, another dispatch's, or one whose binding was
+// removed when its run ended all reject with the same terminal message.
+func (e *Executor) resolve(contextID string) (ContextBinding, bool) {
+	if contextID != e.contextID || e.contexts == nil {
+		return ContextBinding{}, false
+	}
+	return e.contexts.Lookup(contextID)
+}
+
+// noAgentForContextText is the rejection message for a task whose
+// context resolves to no running agent (#350): unknown, foreign, or
+// already unbound — sub-agent sessions are not continuable.
+func noAgentForContextText(contextID string) string {
+	return fmt.Sprintf("no running agent for context %s; task sessions are not continuable", contextID)
+}
+
+// runWithTodos invokes the binding's runner while streaming the run's todo
+// progress (#174): the run executes on its own goroutine and the todo
+// subscription is drained inline on the iterator's goroutine, so Working
+// progress events and the terminal status share one yield path and can
+// never race. The turn runs against the resolved binding (#350) — its
+// session, its call template, its runner — and the task ID is stamped as
+// the call's RunID, so the run's terminal RunComplete event names the A2A
+// task that started it. The subscription is bounded by the run — created
+// after the initial Working status, dropped on run end, consumer stop,
+// and cancel — and a snapshot is only emitted when the todo list actually
+// changed, so usage-only session saves stay silent.
+func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorContext, binding ContextBinding, prompt string, yield func(a2aspec.Event, error) bool) (*fantasy.AgentResult, error) {
 	var todoCh <-chan dispatch.TodoSnapshot
 	if e.todos != nil {
 		// The subscription ends with this call: run end, consumer stop,
 		// and cancel all return through the deferred cancel.
 		subCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
-		todoCh = e.todos.SubscribeSessionTodos(subCtx, e.sessionID)
+		todoCh = e.todos.SubscribeSessionTodos(subCtx, binding.SessionID)
 	}
 
 	type runOutcome struct {
@@ -339,14 +390,17 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 		// swallow it (#342).
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("Dispatched run panicked", "session_id", e.sessionID, "trace_id", traceIDFromContext(ctx), "panic", r, "stack", string(debug.Stack()))
+				slog.Error("Dispatched run panicked", "session_id", binding.SessionID, "trace_id", traceIDFromContext(ctx), "panic", r, "stack", string(debug.Stack()))
 				done <- runOutcome{err: fmt.Errorf("dispatched run panicked: %v", r)}
 			}
 		}()
-		call := e.call
-		call.SessionID = e.sessionID
+		call := binding.Call
+		call.SessionID = binding.SessionID
 		call.Prompt = prompt
-		result, err := e.runner.Run(ctx, call)
+		// The task is the run (#350): the RunComplete event echoes the
+		// A2A task ID back as RunID, so the task and the run correlate.
+		call.RunID = string(execCtx.TaskID)
+		result, err := binding.Runner.Run(ctx, call)
 		done <- runOutcome{result, err}
 	}()
 
@@ -396,7 +450,7 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 			// reason — never a Canceled, which is reserved for the
 			// executor's Cancel (#360, coordinated with #342).
 			e.markEndedByExecutor(execCtx.TaskID)
-			e.runner.Cancel(e.sessionID)
+			binding.Runner.Cancel(binding.SessionID)
 			// Give the runner a brief window to observe the cancel and
 			// settle; a truly wedged run ignores it, and the outcome is
 			// discarded either way — the task fails with the reason.
@@ -502,7 +556,7 @@ func todoProgress(snap dispatch.TodoSnapshot) agent.TodoProgress {
 // closure erroring, or the value failing to encode — is logged, and the
 // status ships without metadata: usage is accounting, never a reason to
 // fail a finished run.
-func (e *Executor) attachUsage(ctx context.Context, ev *a2aspec.TaskStatusUpdateEvent, traceID string) {
+func (e *Executor) attachUsage(ctx context.Context, ev *a2aspec.TaskStatusUpdateEvent, sessionID, traceID string) {
 	if e.usage == nil {
 		return
 	}
@@ -510,13 +564,13 @@ func (e *Executor) attachUsage(ctx context.Context, ev *a2aspec.TaskStatusUpdate
 	// on its way out, and the totals are durable regardless.
 	usage, err := e.usage(context.WithoutCancel(ctx))
 	if err != nil {
-		slog.Warn("A2A usage collection failed; terminal status carries no usage metadata", "session_id", e.sessionID, "trace_id", traceID, "err", err)
+		slog.Warn("A2A usage collection failed; terminal status carries no usage metadata", "session_id", sessionID, "trace_id", traceID, "err", err)
 		return
 	}
 	usage.TraceID = traceID
 	encoded, err := Encode(UsageExt, usage)
 	if err != nil {
-		slog.Warn("A2A usage failed to encode; terminal status carries no usage metadata", "session_id", e.sessionID, "trace_id", traceID, "err", err)
+		slog.Warn("A2A usage failed to encode; terminal status carries no usage metadata", "session_id", sessionID, "trace_id", traceID, "err", err)
 		return
 	}
 	ev.SetMeta(UsageExt.URI, encoded)
@@ -534,7 +588,7 @@ func traceIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// Cancel stops the in-flight dispatched run for this executor's session
+// Cancel stops the in-flight dispatched run for this executor's context
 // and reports the task canceled. The task is marked as this executor's own
 // cancel before the runner aborts (#342), so the run's returning
 // context.Canceled takes the silent path and this Canceled status stays
@@ -543,11 +597,19 @@ func traceIDFromContext(ctx context.Context) string {
 // terminal Canceled status message so the caller — and any tasks/get
 // reader — sees why the run stopped. Without one, the in-process kill
 // reason (an out-of-band cancel that bypassed tasks/cancel, #342) is
-// used, falling back to the generic "canceled".
+// used, falling back to the generic "canceled". A cancel whose context
+// resolves to no running agent (#350) reports the run already ended and
+// touches no runner.
 func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
+		binding, ok := e.resolve(execCtx.ContextID)
+		if !ok {
+			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled,
+				agentMessage(execCtx, noAgentForContextText(execCtx.ContextID))), nil)
+			return
+		}
 		e.markOwnCancel(string(execCtx.TaskID))
-		e.runner.Cancel(e.sessionID)
+		binding.Runner.Cancel(binding.SessionID)
 		text := cancelReasonFromMetadata(execCtx.Metadata)
 		if text == "" {
 			text = e.canceledStatusText()

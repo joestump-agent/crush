@@ -101,6 +101,12 @@ type DispatchTransportParams struct {
 	Endpoint string
 	Card     any
 	Prompt   string
+	// ContextID is the A2A context the initial task belongs to (#350):
+	// the dispatch's task session ID, sent as Message.ContextID. The
+	// served agent binds this context for the run's lifetime, so the
+	// task, its steering (#351), and its logs all address one context.
+	// Required.
+	ContextID string
 	// OnTask, when set, receives the served task's ID once the stream's
 	// first event names it (#349): the task outlives a dropped stream,
 	// and with the ID the coordinator can stamp the registry entry so
@@ -400,20 +406,25 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 		}
 	}
 	traceID := TraceIDFromTraceparent(TraceparentFromContext(ctx))
-	slog.Debug("Dispatch A2A stream starting", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "trace_id", traceID)
+	slog.Debug("Dispatch A2A stream starting", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "context_id", run.sessionID, "trace_id", traceID)
 	outcome, err := transport.StreamDispatch(ctx, DispatchTransportParams{
 		Endpoint: entry.Endpoint,
 		Card:     entry.AgentCard,
 		Prompt:   run.prompt,
+		// The context is the task session (#350): the served executor
+		// resolves it to this dispatch's runner and session, and any
+		// other context is rejected.
+		ContextID: run.sessionID,
 		// The served task outlives a dropped stream (#349): stamp the
 		// task ID the moment the stream names it, so the run stays
 		// recoverable and answerable through the registry.
 		OnTask: func(taskID string) {
 			run.reg.SetTaskID(run.entry.ID, taskID)
+			slog.Debug("Dispatch A2A task started", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "context_id", run.sessionID, "task_id", taskID, "trace_id", traceID)
 		},
 	})
 	if err != nil {
-		slog.Error("Dispatch A2A stream failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "trace_id", traceID, "error", err)
+		slog.Error("Dispatch A2A stream failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "context_id", run.sessionID, "trace_id", traceID, "error", err)
 		// The served task runs on a detached context (#344): a stream
 		// error before a terminal state leaves the agent running
 		// unsupervised with its result headed for the trash. Cancel it

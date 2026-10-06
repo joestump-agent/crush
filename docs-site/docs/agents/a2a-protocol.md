@@ -122,7 +122,8 @@ drops mid-run — the two resume methods.
 ### The request
 
 The coordinator sends one user message whose only part is the dispatch
-prompt. It sets no `taskId` and no `contextId`, so the server assigns both.
+prompt. It sets `contextId` to the dispatch's task session ID and leaves
+`taskId` unset, so the server assigns one task per run.
 
 ```json
 {
@@ -133,11 +134,18 @@ prompt. It sets no `taskId` and no `contextId`, so the server assigns both.
     "message": {
       "messageId": "9a41…",
       "role": "ROLE_USER",
+      "contextId": "task-session…",
       "parts": [{ "text": "Add table-driven tests for pkg/x…" }]
     }
   }
 }
 ```
+
+The `contextId` is the Crush task session: the server rejects any message
+whose context does not name the session its dispatch serves, including
+one whose run has ended — task sessions are not continuable. The
+`taskId` identifies one run: each turn is a new task, and the terminal
+status echoes it as the run ID.
 
 The executor joins every text part of the message with newlines and
 ignores any other kind of part.
@@ -334,9 +342,6 @@ A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/c
 
 ## Not implemented
 
-- **`contextId` and `taskId` mapping.** Each server is bound to one session
-  and ignores `contextId`. Every task on a server shares that session
-  ([#350](https://github.com/joestump-agent/crush/issues/350)).
 - **Follow-up messages.** A second message to a busy dispatch is queued and
   run, but its task reports `TASK_STATE_FAILED`. Steering uses the
   in-process injection queue instead ([#351](https://github.com/joestump-agent/crush/issues/351)).

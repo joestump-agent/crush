@@ -134,7 +134,7 @@ func TestExecuteTodoHappyPath(t *testing.T) {
 
 	runner := newPacedRunner("all done")
 	source := newPipeTodoSource()
-	exec := NewExecutor(runner, "sess-1", WithTodos(source), WithDiff(func(context.Context) (string, error) {
+	exec := newBoundExecutor(runner, WithTodos(source), WithDiff(func(context.Context) (string, error) {
 		return "the diff", nil
 	}))
 
@@ -211,7 +211,7 @@ func TestExecuteTodoFallbackSummary(t *testing.T) {
 
 	runner := newPacedRunner("done")
 	source := newPipeTodoSource()
-	exec := NewExecutor(runner, "sess-1", WithTodos(source))
+	exec := newBoundExecutor(runner, WithTodos(source))
 
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 	evsCh := make(chan []a2aspec.Event, 1)
@@ -250,7 +250,7 @@ func TestExecuteNoTodoEventsAfterTerminal(t *testing.T) {
 
 	runner := newPacedRunner("done")
 	source := newPipeTodoSource()
-	exec := NewExecutor(runner, "sess-1", WithTodos(source))
+	exec := newBoundExecutor(runner, WithTodos(source))
 
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 	evsCh := make(chan []a2aspec.Event, 1)
@@ -290,7 +290,7 @@ func TestExecuteConsumerStopEndsTodoStream(t *testing.T) {
 
 	runner := newPacedRunner("done")
 	source := newPipeTodoSource()
-	exec := NewExecutor(runner, "sess-1", WithTodos(source))
+	exec := newBoundExecutor(runner, WithTodos(source))
 
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 	done := make(chan struct{})
@@ -329,7 +329,7 @@ func TestExecuteTodoStreamCanceledMidRun(t *testing.T) {
 
 	runner := newPacedRunner("done")
 	source := newPipeTodoSource()
-	exec := NewExecutor(runner, "sess-1", WithTodos(source))
+	exec := newBoundExecutor(runner, WithTodos(source))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))

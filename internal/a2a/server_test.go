@@ -35,6 +35,7 @@ func TestServerRegisterResolveTeardown(t *testing.T) {
 		DispatchID:  "dispatch-1",
 		Runner:      runner,
 		SessionID:   "dispatch-session",
+		ContextID:   "dispatch-session",
 		Name:        "tester",
 		Description: "writes tests",
 	})
@@ -80,6 +81,7 @@ func TestServerServesTaskLifecycle(t *testing.T) {
 		DispatchID:  "dispatch-1",
 		Runner:      runner,
 		SessionID:   "dispatch-session",
+		ContextID:   "dispatch-session",
 		Name:        "tester",
 		Description: "writes tests",
 	})
@@ -98,7 +100,7 @@ func TestServerServesTaskLifecycle(t *testing.T) {
 
 	// A JSON-RPC message/send runs the dispatched agent and completes the
 	// task with its text output.
-	resp, err = postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "run the task"))
+	resp, err = postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "dispatch-session", "run the task"))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -130,7 +132,10 @@ func TestStartServerValidation(t *testing.T) {
 	_, err = factory.StartServer(t.Context(), ServerParams{DispatchID: "d", Runner: &fakeRunner{}})
 	require.ErrorContains(t, err, "requires a session id")
 
-	_, err = factory.StartServer(t.Context(), ServerParams{Runner: &fakeRunner{}, SessionID: "s"})
+	_, err = factory.StartServer(t.Context(), ServerParams{DispatchID: "d", Runner: &fakeRunner{}, SessionID: "s"})
+	require.ErrorContains(t, err, "requires a context id")
+
+	_, err = factory.StartServer(t.Context(), ServerParams{Runner: &fakeRunner{}, SessionID: "s", ContextID: "c"})
 	require.ErrorContains(t, err, "requires a dispatch id")
 }
 
@@ -157,7 +162,7 @@ func TestServerFactoryImplementsStarterSeam(t *testing.T) {
 	require.Equal(t, "tester", typed.Name)
 
 	client := unixDialClient(factory)
-	resp, err := postJSONRPC(t, client, endpoint, sendMessageBody(t, "run the task"))
+	resp, err := postJSONRPC(t, client, endpoint, sendMessageBody(t, "dispatch-session", "run the task"))
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -165,7 +170,7 @@ func TestServerFactoryImplementsStarterSeam(t *testing.T) {
 	stop()
 	// The stop unregistered the route: the host answers, the dispatch
 	// serves nothing.
-	resp, err = postJSONRPC(t, client, endpoint, sendMessageBody(t, "run the task"))
+	resp, err = postJSONRPC(t, client, endpoint, sendMessageBody(t, "dispatch-session", "run the task"))
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
@@ -188,6 +193,7 @@ func TestServerStopReleasesSocket(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     &fakeRunner{result: textResult("done")},
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 
@@ -201,13 +207,13 @@ func TestServerStopReleasesSocket(t *testing.T) {
 	}
 
 	client := unixDialClient(factory)
-	resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "x"))
+	resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "dispatch-session", "x"))
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
 	require.NoError(t, factory.Close(context.Background()))
-	resp, err = postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "x"))
+	resp, err = postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "dispatch-session", "x"))
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -227,13 +233,14 @@ func TestHostRejectsNonJSON(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	client := unixDialClient(factory)
 	for _, ct := range []string{"text/plain", ""} {
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.Endpoint, bytes.NewReader(sendMessageBody(t, "run the task")))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.Endpoint, bytes.NewReader(sendMessageBody(t, "dispatch-session", "run the task")))
 		require.NoError(t, err)
 		if ct != "" {
 			req.Header.Set("Content-Type", ct)
@@ -256,13 +263,14 @@ func TestHostRejectsOrigin(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	client := unixDialClient(factory)
 	for _, ct := range []string{"application/json", "text/plain"} {
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.Endpoint, bytes.NewReader(sendMessageBody(t, "run the task")))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.Endpoint, bytes.NewReader(sendMessageBody(t, "dispatch-session", "run the task")))
 		require.NoError(t, err)
 		req.Header.Set("Content-Type", ct)
 		req.Header.Set("Origin", "https://evil.example")
@@ -282,12 +290,13 @@ func TestHostRejectsWrongHost(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	client := unixDialClient(factory)
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://rebind.evil.example/agents/dispatch-1", bytes.NewReader(sendMessageBody(t, "run the task")))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://rebind.evil.example/agents/dispatch-1", bytes.NewReader(sendMessageBody(t, "dispatch-session", "run the task")))
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
@@ -308,6 +317,7 @@ func TestHostSocketPermissions(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     &fakeRunner{result: textResult("done")},
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
@@ -323,7 +333,8 @@ func TestHostSocketPermissions(t *testing.T) {
 
 // Two concurrent dispatches each reach their own executor through the
 // shared host: the route table maps /agents/<id> separately, and the
-// prompts never cross (#346).
+// prompts never cross (#346). Each dispatch owns its own A2A context
+// (#350) — its task session ID — and each task runs on its own session.
 func TestHostRoutesTwoDispatches(t *testing.T) {
 	one := &fakeRunner{result: textResult("from one")}
 	two := &fakeRunner{result: textResult("from two")}
@@ -332,19 +343,21 @@ func TestHostRoutesTwoDispatches(t *testing.T) {
 		DispatchID: "one",
 		Runner:     one,
 		SessionID:  "session-one",
+		ContextID:  "session-one",
 	})
 	require.NoError(t, err)
 	serverTwo, err := factory.StartServer(t.Context(), ServerParams{
 		DispatchID: "two",
 		Runner:     two,
 		SessionID:  "session-two",
+		ContextID:  "session-two",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	client := unixDialClient(factory)
-	drive := func(server *Server, runner *fakeRunner, prompt string) error {
-		resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, prompt))
+	drive := func(server *Server, runner *fakeRunner, contextID, prompt string) error {
+		resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, contextID, prompt))
 		if err != nil {
 			return err
 		}
@@ -374,12 +387,15 @@ func TestHostRoutesTwoDispatches(t *testing.T) {
 	}
 
 	errs := make(chan error, 2)
-	go func() { errs <- drive(serverOne, one, "prompt one") }()
-	go func() { errs <- drive(serverTwo, two, "prompt two") }()
+	go func() { errs <- drive(serverOne, one, "session-one", "prompt one") }()
+	go func() { errs <- drive(serverTwo, two, "session-two", "prompt two") }()
 	require.NoError(t, <-errs)
 	require.NoError(t, <-errs)
 	require.Equal(t, "prompt one", one.gotCall.Prompt)
 	require.Equal(t, "prompt two", two.gotCall.Prompt)
+	// Each task ran on its own session (#350): the contexts never cross.
+	require.Equal(t, "session-one", one.gotCall.SessionID)
+	require.Equal(t, "session-two", two.gotCall.SessionID)
 }
 
 // A deep data directory would overflow the 104-byte sun_path limit: the
@@ -395,6 +411,7 @@ func TestHostLongDataDirFallsBack(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     &fakeRunner{result: textResult("done")},
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
@@ -402,7 +419,7 @@ func TestHostLongDataDirFallsBack(t *testing.T) {
 		"the socket must fall back to the per-user temp dir, got %s", factory.socketPath())
 
 	client := unixDialClient(factory)
-	resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "run the task"))
+	resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "dispatch-session", "run the task"))
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -426,13 +443,14 @@ func TestHostReplacesStaleSocket(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     &fakeRunner{result: textResult("done")},
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 	require.Equal(t, stale, factory.socketPath())
 
 	client := unixDialClient(factory)
-	resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "run the task"))
+	resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "dispatch-session", "run the task"))
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -488,12 +506,15 @@ func postJSONRPC(t *testing.T, client *http.Client, url string, body []byte) (*h
 	return client.Do(req)
 }
 
-// sendMessageBody marshals a JSON-RPC message/send envelope for prompt.
-func sendMessageBody(t *testing.T, prompt string) []byte {
+// sendMessageBody marshals a JSON-RPC message/send envelope for prompt,
+// addressed to contextID (#350): the client supplies the A2A context, the
+// same way the dispatch client does — the served executor resolves it to
+// the dispatch's binding or rejects the task.
+func sendMessageBody(t *testing.T, contextID, prompt string) []byte {
 	t.Helper()
-	params, err := json.Marshal(&a2aspec.SendMessageRequest{
-		Message: a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart(prompt)),
-	})
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart(prompt))
+	msg.ContextID = contextID
+	params, err := json.Marshal(&a2aspec.SendMessageRequest{Message: msg})
 	require.NoError(t, err)
 	body, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",

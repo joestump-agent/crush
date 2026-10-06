@@ -72,6 +72,16 @@ func newExecCtx(msg *a2aspec.Message) *a2asrv.ExecutorContext {
 	}
 }
 
+// newBoundExecutor builds an Executor the way production does (#350): its
+// host registry binds ctx-1 — the context newExecCtx names — to sess-1
+// with runner, and the executor resolves its session from the task's A2A
+// context instead of holding one.
+func newBoundExecutor(runner Runner, opts ...Option) *Executor {
+	reg := NewContextRegistry()
+	reg.Bind("ctx-1", ContextBinding{Runner: runner, SessionID: "sess-1", Started: time.Now()})
+	return NewExecutor(reg, "ctx-1", opts...)
+}
+
 func collect(t *testing.T, seq iter.Seq2[a2aspec.Event, error]) []a2aspec.Event {
 	t.Helper()
 	var evs []a2aspec.Event
@@ -135,7 +145,7 @@ func TestExecuteHappyPathWithDiff(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{result: textResult("all done")}
-	exec := NewExecutor(runner, "sess-1", WithDiff(func(context.Context) (string, error) {
+	exec := newBoundExecutor(runner, WithDiff(func(context.Context) (string, error) {
 		return "the diff", nil
 	}))
 
@@ -154,6 +164,10 @@ func TestExecuteHappyPathWithDiff(t *testing.T) {
 	require.True(t, runner.ran, "runner.Run was not called")
 	require.Equal(t, "sess-1", runner.gotCall.SessionID)
 	require.Equal(t, "do the thing", runner.gotCall.Prompt)
+	// The task is the run (#350): the RunID echoes the A2A task ID, so
+	// the run's terminal RunComplete event names the task that started
+	// it.
+	require.Equal(t, "task-1", runner.gotCall.RunID)
 
 	// The diff artifact carries the chunk (one, for a short diff), the
 	// task's identifiers, and the diff identity.
@@ -194,7 +208,7 @@ func TestExecuteNoDiffFunc(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{result: textResult("done")}
-	exec := NewExecutor(runner, "sess-1")
+	exec := newBoundExecutor(runner)
 
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 	evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
@@ -211,7 +225,7 @@ func TestExecuteEmptyDiffEmitsNoArtifact(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{result: textResult("done")}
-	exec := NewExecutor(runner, "sess-1", WithDiff(func(context.Context) (string, error) {
+	exec := newBoundExecutor(runner, WithDiff(func(context.Context) (string, error) {
 		return "", nil // clean worktree
 	}))
 
@@ -236,7 +250,7 @@ func TestExecuteDiffErrorStillCompletes(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{result: textResult("done")}
-	exec := NewExecutor(runner, "sess-1", WithDiff(func(context.Context) (string, error) {
+	exec := newBoundExecutor(runner, WithDiff(func(context.Context) (string, error) {
 		return "", errors.New("not a git repo")
 	}))
 
@@ -265,7 +279,7 @@ func TestExecuteRunFailure(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{err: errors.New("model exploded")}
-	exec := NewExecutor(runner, "sess-1", WithDiff(func(context.Context) (string, error) {
+	exec := newBoundExecutor(runner, WithDiff(func(context.Context) (string, error) {
 		return "should not be called", nil
 	}))
 
@@ -290,7 +304,7 @@ func TestExecuteRunnerPanicFails(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{panicValue: errors.New("tool blew up")}
-	exec := NewExecutor(runner, "sess-1", WithDiff(func(context.Context) (string, error) {
+	exec := newBoundExecutor(runner, WithDiff(func(context.Context) (string, error) {
 		return "should not be called", nil
 	}))
 
@@ -307,7 +321,8 @@ func TestExecuteRunnerPanicFails(t *testing.T) {
 
 	// The recovered error must not wrap context.Canceled, so the
 	// canceled branch of Execute cannot swallow it (#342).
-	_, err := exec.runWithTodos(context.Background(), newExecCtx(msg), "go",
+	binding := ContextBinding{Runner: runner, SessionID: "sess-1", Started: time.Now()}
+	_, err := exec.runWithTodos(context.Background(), newExecCtx(msg), binding, "go",
 		func(a2aspec.Event, error) bool { return true })
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "panicked")
@@ -321,7 +336,7 @@ func TestExecuteNilResultFails(t *testing.T) {
 	// the session is busy (prompt silently queued) or a cancel landed
 	// during dispatch. The task must not report Completed.
 	runner := &fakeRunner{result: nil, err: nil}
-	exec := NewExecutor(runner, "sess-1", WithDiff(func(context.Context) (string, error) {
+	exec := newBoundExecutor(runner, WithDiff(func(context.Context) (string, error) {
 		return "should not become an artifact", nil
 	}))
 
@@ -390,7 +405,7 @@ func TestExecuteOutOfBandCancelEmitsCanceled(t *testing.T) {
 			t.Parallel()
 
 			runner := &fakeRunner{err: context.Canceled}
-			exec := NewExecutor(runner, "sess-1", tt.opts...)
+			exec := newBoundExecutor(runner, tt.opts...)
 
 			msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 			evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
@@ -412,7 +427,7 @@ func TestExecuteOwnCancelEmitsOneTerminal(t *testing.T) {
 	// The executor's own Cancel emits the terminal Canceled status; the
 	// run ending on that same cancel must not emit a second one.
 	runner := &blockingCancelRunner{started: make(chan struct{}), kill: make(chan struct{})}
-	exec := NewExecutor(runner, "sess-1")
+	exec := newBoundExecutor(runner)
 
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 	evsCh := make(chan []a2aspec.Event, 1)
@@ -443,7 +458,7 @@ func TestExecuteEmptyPromptRejects(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{result: textResult("never")}
-	exec := NewExecutor(runner, "sess-1")
+	exec := newBoundExecutor(runner)
 
 	// A message with no text parts carries nothing to run.
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewDataPart(map[string]any{"k": "v"}))
@@ -457,11 +472,149 @@ func TestExecuteEmptyPromptRejects(t *testing.T) {
 	require.False(t, runner.ran, "runner.Run must not be called for an empty prompt")
 }
 
+// TestExecuteRoutesByContext pins the #350 mapping at the executor level:
+// two dispatches share one host registry, each bound to its own context
+// and session, and each task runs against the binding its context names
+// — its own session, with the task ID stamped as the call's RunID.
+func TestExecuteRoutesByContext(t *testing.T) {
+	t.Parallel()
+
+	one := &fakeRunner{result: textResult("one done")}
+	two := &fakeRunner{result: textResult("two done")}
+	reg := NewContextRegistry()
+	reg.Bind("ctx-1", ContextBinding{Runner: one, SessionID: "sess-1", Started: time.Now()})
+	reg.Bind("ctx-2", ContextBinding{Runner: two, SessionID: "sess-2", Started: time.Now()})
+	execOne := NewExecutor(reg, "ctx-1")
+	execTwo := NewExecutor(reg, "ctx-2")
+
+	ctxFor := func(contextID, taskID string) *a2asrv.ExecutorContext {
+		execCtx := newExecCtx(a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("do the thing")))
+		execCtx.ContextID = contextID
+		execCtx.TaskID = a2aspec.TaskID(taskID)
+		return execCtx
+	}
+
+	evsOne := collect(t, execOne.Execute(context.Background(), ctxFor("ctx-1", "task-1")))
+	evsTwo := collect(t, execTwo.Execute(context.Background(), ctxFor("ctx-2", "task-2")))
+
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateCompleted,
+	}, states(t, evsOne))
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateCompleted,
+	}, states(t, evsTwo))
+
+	// Each task ran on its own session, and each RunComplete carries its
+	// task ID as RunID.
+	require.Equal(t, "sess-1", one.gotCall.SessionID)
+	require.Equal(t, "task-1", one.gotCall.RunID)
+	require.Equal(t, "sess-2", two.gotCall.SessionID)
+	require.Equal(t, "task-2", two.gotCall.RunID)
+}
+
+// TestExecuteRejectsUnknownContext pins the rejection half of #350: a
+// task naming a context the registry does not know is rejected without
+// the runner ever being called.
+func TestExecuteRejectsUnknownContext(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{result: textResult("never")}
+	exec := newBoundExecutor(runner)
+
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+	execCtx := newExecCtx(msg)
+	execCtx.ContextID = "ctx-unknown"
+	evs := collect(t, exec.Execute(context.Background(), execCtx))
+
+	want := []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateRejected,
+	}
+	require.Equal(t, want, states(t, evs))
+	require.Contains(t, statusMessageText(t, evs[1]),
+		"no running agent for context ctx-unknown; task sessions are not continuable")
+	require.False(t, runner.ran, "runner.Run must not be called for an unknown context")
+}
+
+// TestExecuteRejectsForeignContext pins the route isolation (#350): a
+// message that arrives on one dispatch's route naming another dispatch's
+// context is rejected on that route, and the foreign dispatch's runner
+// is never called.
+func TestExecuteRejectsForeignContext(t *testing.T) {
+	t.Parallel()
+
+	one := &fakeRunner{result: textResult("never")}
+	two := &fakeRunner{result: textResult("never")}
+	reg := NewContextRegistry()
+	reg.Bind("ctx-1", ContextBinding{Runner: one, SessionID: "sess-1", Started: time.Now()})
+	reg.Bind("ctx-2", ContextBinding{Runner: two, SessionID: "sess-2", Started: time.Now()})
+	execOne := NewExecutor(reg, "ctx-1")
+
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+	execCtx := newExecCtx(msg)
+	execCtx.ContextID = "ctx-2"
+	evs := collect(t, execOne.Execute(context.Background(), execCtx))
+
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateRejected,
+	}, states(t, evs))
+	require.False(t, one.ran, "the route's runner must not be called for a foreign context")
+	require.False(t, two.ran, "the foreign dispatch's runner must not be called")
+}
+
+// TestExecuteRejectsEndedRun pins the binding lifetime (#350): once the
+// run ends its binding is removed, and the next message on the context
+// is rejected — sub-agent sessions are not continuable.
+func TestExecuteRejectsEndedRun(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{result: textResult("never")}
+	reg := NewContextRegistry()
+	reg.Bind("ctx-1", ContextBinding{Runner: runner, SessionID: "sess-1", Started: time.Now()})
+	exec := NewExecutor(reg, "ctx-1")
+	reg.Unbind("ctx-1")
+
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+	evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateRejected,
+	}, states(t, evs))
+	require.Contains(t, statusMessageText(t, evs[1]),
+		"no running agent for context ctx-1; task sessions are not continuable")
+	require.False(t, runner.ran, "runner.Run must not be called after the run ended")
+}
+
+// TestCancelRejectsUnboundContext: a cancel whose context resolves to no
+// running agent reports the run already ended and touches no runner.
+func TestCancelRejectsUnboundContext(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{}
+	reg := NewContextRegistry()
+	reg.Bind("ctx-1", ContextBinding{Runner: runner, SessionID: "sess-1", Started: time.Now()})
+	exec := NewExecutor(reg, "ctx-1")
+	reg.Unbind("ctx-1")
+
+	evs := collect(t, exec.Cancel(context.Background(), newExecCtx(nil)))
+
+	require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateCanceled}, states(t, evs))
+	require.Contains(t, statusMessageText(t, evs[0]),
+		"no running agent for context ctx-1; task sessions are not continuable")
+	require.Empty(t, runner.canceledFor, "an unbound cancel must not cancel a runner")
+}
+
 func TestExecuteConsumerStopsBeforeRun(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{result: textResult("never")}
-	exec := NewExecutor(runner, "sess-1")
+	exec := newBoundExecutor(runner)
 
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 	// Stop consuming after the first (Submitted) event, as a disconnecting
@@ -477,7 +630,7 @@ func TestExecuteExistingTaskSkipsSubmitted(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{result: textResult("done")}
-	exec := NewExecutor(runner, "sess-1")
+	exec := newBoundExecutor(runner)
 
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 	execCtx := newExecCtx(msg)
@@ -496,7 +649,7 @@ func TestCancel(t *testing.T) {
 	t.Parallel()
 
 	runner := &fakeRunner{}
-	exec := NewExecutor(runner, "sess-1")
+	exec := newBoundExecutor(runner)
 
 	evs := collect(t, exec.Cancel(context.Background(), newExecCtx(nil)))
 
@@ -549,7 +702,7 @@ func TestCancelCarriesReason(t *testing.T) {
 			t.Parallel()
 
 			runner := &fakeRunner{}
-			exec := NewExecutor(runner, "sess-1", tt.opts...)
+			exec := newBoundExecutor(runner, tt.opts...)
 			execCtx := newExecCtx(nil)
 			execCtx.Metadata = tt.metadata
 
@@ -763,7 +916,7 @@ func (r *inactivityRunner) cancels() int {
 func TestExecuteInactivitySilentRunFails(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		runner := newInactivityRunner("never")
-		exec := NewExecutor(runner, "sess-1", WithInactivityTimeout(5*time.Minute))
+		exec := newBoundExecutor(runner, WithInactivityTimeout(5*time.Minute))
 
 		msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 		evsCh := make(chan []a2aspec.Event, 1)
@@ -803,7 +956,7 @@ func TestExecuteInactivityProgressResetsTimer(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		runner := newInactivityRunner("done")
 		source := newPipeTodoSource()
-		exec := NewExecutor(runner, "sess-1", WithTodos(source), WithInactivityTimeout(10*time.Second))
+		exec := newBoundExecutor(runner, WithTodos(source), WithInactivityTimeout(10*time.Second))
 
 		msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 		evsCh := make(chan []a2aspec.Event, 1)
@@ -848,7 +1001,7 @@ func TestExecuteInactivityProgressResetsTimer(t *testing.T) {
 func TestExecuteInactivityDisabledNoTimer(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		runner := newInactivityRunner("done")
-		exec := NewExecutor(runner, "sess-1", WithInactivityTimeout(0))
+		exec := newBoundExecutor(runner, WithInactivityTimeout(0))
 
 		msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 		evsCh := make(chan []a2aspec.Event, 1)
@@ -964,7 +1117,7 @@ func TestExecuteDiffChunkedArtifact(t *testing.T) {
 	diff := "diff --git a/big.txt b/big.txt\n" + b.String()
 
 	runner := &fakeRunner{result: textResult("done")}
-	exec := NewExecutor(runner, "sess-1", WithDiff(func(context.Context) (string, error) {
+	exec := newBoundExecutor(runner, WithDiff(func(context.Context) (string, error) {
 		return diff, nil
 	}))
 
