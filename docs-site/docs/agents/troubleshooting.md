@@ -196,9 +196,10 @@ From the shell, `crush dispatch list` shows every workspace and `crush
 dispatch prune` removes decided ones, or every dead owner's with
 `--all-dead`; `--dry-run` previews ([#369](https://github.com/joestump-agent/crush/issues/369)).
 
-:::info[Planned]
-You'll apply or dismiss each dispatch explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)).
-:::
+Record the decision in the session with the `apply_dispatch` and
+`dismiss_dispatch` tools ([#368](https://github.com/joestump-agent/crush/issues/368)): apply brings the work in (merge,
+squash, or cherry-pick — uncommitted changes included), dismiss discards it and
+removes the workspace.
 
 ### Orphan worktrees and `crush-dispatch-*` branches pile up
 

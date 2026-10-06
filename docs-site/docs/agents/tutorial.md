@@ -210,22 +210,16 @@ git worktree remove .crush/worktrees/crush-dispatch-<id>
 git branch -D crush-dispatch-<id>
 ```
 
-:::warning[Known issue]
-Crush cannot record your decision about a dispatch yet ([#368](https://github.com/joestump-agent/crush/issues/368)),
-so cleanup is still by hand: commit work in the worktree as above and copy the
-branch to a name without the prefix, `git branch keep/lexer-tests crush-dispatch-<id>`,
-then remove the worktree. Quitting is safe: exit already keeps any dispatch
-with commits or uncommitted changes ([#367](https://github.com/joestump-agent/crush/issues/367)).
-:::
+Record your decision in the session instead, with `apply_dispatch` or
+`dismiss_dispatch` ([#368](https://github.com/joestump-agent/crush/issues/368)): apply brings the work into your checkout (merge,
+squash, or cherry-pick — uncommitted changes included) and removes the
+workspace; dismiss discards the work and removes it. Quitting is safe: exit
+already keeps any dispatch with commits or uncommitted changes
+([#367](https://github.com/joestump-agent/crush/issues/367)).
 
 From the shell, `crush dispatch list` shows every workspace and `crush
 dispatch prune` removes decided ones, or every dead owner's with
 `--all-dead`; `--dry-run` previews ([#369](https://github.com/joestump-agent/crush/issues/369)).
-
-:::info[Planned]
-`apply_dispatch` and `dismiss_dispatch` will record your decision about a
-workspace directly ([#368](https://github.com/joestump-agent/crush/issues/368)).
-:::
 
 ## Revisit later
 
