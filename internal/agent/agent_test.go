@@ -16,6 +16,7 @@ import (
 	"charm.land/x/vcr"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/gittest"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
@@ -26,9 +27,14 @@ import (
 
 func TestMain(m *testing.M) {
 	slog.SetLogLoggerLevel(slog.LevelError)
+	gitRestore, err := gittest.Setup()
+	if err != nil {
+		panic(fmt.Sprintf("hermetic git env: %v", err))
+	}
 	cleanup := isolateGlobalConfig()
 	code := m.Run()
 	cleanup()
+	gitRestore()
 	os.Exit(code)
 }
 
