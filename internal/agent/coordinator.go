@@ -289,10 +289,11 @@ type coordinator struct {
 	// context.Background.
 	dispatchCtx   context.Context
 	dispatchSinks []dispatch.TodoSink
-	// dispatchServer starts in-process A2A servers for dispatches (#70);
-	// nil until the app wires a2a.ServerFactory, and nil means dispatches
-	// simply are not served.
-	dispatchServer DispatchServerStarter
+	// dispatchHost is the A2A protocol boundary every dispatch runs
+	// behind (#70, #71); nil until the app wires a2a.ServerFactory, and
+	// nil means dispatches are refused at the tool — nothing runs
+	// unserved (#347).
+	dispatchHost DispatchHost
 
 	// semanticStore and semanticClient back the semantic_search and
 	// semantic_index tools. Both are nil unless an embedding provider is
@@ -339,11 +340,12 @@ type CoordinatorOptions struct {
 	// callers that do not observe progress.
 	DispatchSinks []dispatch.TodoSink
 
-	// DispatchServer starts in-process A2A servers for dispatched agents
-	// (#70); the app passes a2a.ServerFactory. Nil (tests, or any caller
-	// without the factory wired) means dispatches run unserved — Phase 1
-	// has no A2A client in the dispatch loop yet (#71).
-	DispatchServer DispatchServerStarter
+	// DispatchHost is the A2A protocol boundary every dispatch runs
+	// behind (#70, #71): the app passes a2a.ServerFactory. Nil (tests
+	// that opt out, or any caller without the factory wired) means
+	// dispatches are refused at the tool — there is no unserved run
+	// (#347).
+	DispatchHost DispatchHost
 }
 
 func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, error) {
@@ -388,7 +390,7 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		dispatchReg:     dispatch.NewAgentRegistry(),
 		dispatchCtx:     ctx,
 		dispatchSinks:   opts.DispatchSinks,
-		dispatchServer:  opts.DispatchServer,
+		dispatchHost:    opts.DispatchHost,
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]

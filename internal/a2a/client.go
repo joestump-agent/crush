@@ -590,9 +590,9 @@ func (f *ServerFactory) CancelDispatch(ctx context.Context, p agent.DispatchCanc
 	return nil
 }
 
-// Compile-time proof the factory also satisfies the transport and
-// cancel seams.
+// Compile-time proof the factory satisfies the dispatch host and the
+// cancel seam.
 var (
-	_ agent.DispatchTransport = (*ServerFactory)(nil)
-	_ agent.DispatchCanceler  = (*ServerFactory)(nil)
+	_ agent.DispatchHost     = (*ServerFactory)(nil)
+	_ agent.DispatchCanceler = (*ServerFactory)(nil)
 )

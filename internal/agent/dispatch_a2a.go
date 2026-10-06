@@ -17,20 +17,26 @@ import (
 	"github.com/charmbracelet/crush/internal/skills"
 )
 
-// DispatchServerStarter starts an in-process A2A server for one
-// dispatched agent (#70). It is the seam that keeps the dependency
-// direction one-way — internal/a2a imports internal/agent for the
-// Executor's runner, so the agent package only ever sees this
-// interface. The production implementation is a2a.ServerFactory, whose
-// process-wide host serves every dispatch on one per-process unix
-// socket (#346); tests substitute fakes through it, and a nil starter
-// (the default until the app wires the factory) simply serves nothing.
-type DispatchServerStarter interface {
+// DispatchHost is the A2A protocol boundary every dispatch runs behind
+// (#70, #71): it serves the dispatch on the process host and drives the
+// served task's initial run over the A2A client. One interface, one
+// production implementation (a2a.ServerFactory), and — since #347 — one
+// execution path: a coordinator with no host refuses dispatches at the
+// tool, and a host whose server fails to start fails the dispatch. The
+// interface keeps the dependency direction one-way — internal/a2a
+// imports internal/agent for the Executor's runner, so the agent
+// package only ever sees this interface; tests substitute fakes through
+// it.
+type DispatchHost interface {
 	// StartDispatchServer stands up the A2A server for one dispatch on
 	// the process host and returns its endpoint, the AgentCard to stamp
 	// on the registry entry (opaque here), and the stop function the
 	// dispatch run defers.
 	StartDispatchServer(ctx context.Context, params DispatchServerParams) (endpoint string, card any, stop func(), err error)
+
+	// StreamDispatch sends the dispatch prompt to the served dispatch and
+	// returns its terminal outcome.
+	StreamDispatch(ctx context.Context, params DispatchTransportParams) (DispatchTransportOutcome, error)
 }
 
 // DispatchServerParams is one dispatch's slice of the A2A server (#70):
@@ -82,18 +88,6 @@ type DispatchServerParams struct {
 	Usage func(ctx context.Context) (Usage, error)
 }
 
-// DispatchTransport drives one dispatch's initial task over the A2A
-// protocol (#71): prompt out as a streaming message, the SSE event
-// stream back to its terminal state. Implemented by the same a2a factory
-// that starts the servers, so one wired object serves both halves of the
-// protocol boundary; the coordinator falls back to the direct in-process
-// run when no transport is wired or the dispatch is not served.
-type DispatchTransport interface {
-	// StreamDispatch sends the dispatch prompt to the served dispatch and
-	// returns its terminal outcome.
-	StreamDispatch(ctx context.Context, params DispatchTransportParams) (DispatchTransportOutcome, error)
-}
-
 // DispatchTransportParams is one dispatch's slice of the A2A client
 // (#71): where to send it and what to say. Card is the registry entry's
 // opaque AgentCard — the transport owns its concrete type.
@@ -136,9 +130,9 @@ type DispatchCancelParams struct {
 // route one dispatched run's kill through the protocol's tasks/cancel,
 // carrying the kill reason, instead of the in-process SessionAgent
 // cancel an out-of-process agent (#72/#73) could never see. Implemented
-// by the same a2a factory that streams and serves the dispatch;
+// by the same a2a host that streams and serves the dispatch;
 // coordinators assert to it and fall back to the direct cancel when the
-// wired starter does not implement it.
+// wired host does not implement it.
 type DispatchCanceler interface {
 	// CancelDispatch sends one tasks/cancel for the served dispatch.
 	// It returns once the server accepted the cancel; the run's actual
@@ -368,11 +362,11 @@ func isKillReason(text string) bool {
 // runDispatchOverTransport drives one dispatch through the A2A client
 // (#71): the served endpoint is read from the registry entry the server
 // stamped, the prompt goes out as a streaming message, and the SSE
-// stream runs to its terminal state. Returns (nil, nil, false) when this
-// dispatch is not transport-driven — no endpoint, no card, or no wired
-// transport — so the caller falls back to the direct in-process run.
-// The outcome maps through the same terminal assembly as the direct
-// path (#343): the kill state decides killed-vs-natural on both.
+// stream runs to its terminal state. This is the only execution path
+// (#347): a dispatch with no wired host or no endpoint on its registry
+// entry cannot run, and assembles as failed rather than falling back to
+// a direct in-process run.
+// The outcome maps through the same terminal assembly #343 unified.
 //
 // The parent turn carries trace context (#364): a W3C traceparent is
 // generated when the caller supplied none, sent as the traceparent
@@ -380,16 +374,23 @@ func isKillReason(text string) bool {
 // status' usage metadata — the parent's client call and the dispatch's
 // server-side logs and usage share one trace ID. The decoded usage is
 // returned alongside the result; the caller applies it to the parent
-// session with one atomic UPDATE, replacing the row-copy the direct
-// path still uses.
-func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatchRun) (dispatch.DispatchResult, *Usage, bool) {
-	transport, ok := c.dispatchServerStarter().(DispatchTransport)
-	if !ok || transport == nil {
-		return dispatch.DispatchResult{}, nil, false
+// session with one atomic UPDATE.
+func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatchRun) (dispatch.DispatchResult, *Usage) {
+	host := c.a2aHost()
+	if host == nil {
+		slog.Error("Dispatch has no A2A host; failing the dispatch", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
+		return c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcomeFromTransport(DispatchTransportOutcome{
+			Status: transportStatusFailed,
+			Text:   "dispatch unavailable: no A2A host is wired",
+		})), nil
 	}
 	entry, ok := run.reg.Get(run.entry.ID)
 	if !ok || entry.Endpoint == "" || entry.AgentCard == nil {
-		return dispatch.DispatchResult{}, nil, false
+		slog.Error("Dispatch is not served on the A2A host; failing the dispatch", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
+		return c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcomeFromTransport(DispatchTransportOutcome{
+			Status: transportStatusFailed,
+			Text:   "dispatch unavailable: no A2A endpoint on its registry entry",
+		})), nil
 	}
 	if TraceparentFromContext(ctx) == "" {
 		tp, err := NewTraceparent()
@@ -401,7 +402,7 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 	}
 	traceID := TraceIDFromTraceparent(TraceparentFromContext(ctx))
 	slog.Debug("Dispatch A2A stream starting", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "trace_id", traceID)
-	outcome, err := transport.StreamDispatch(ctx, DispatchTransportParams{
+	outcome, err := host.StreamDispatch(ctx, DispatchTransportParams{
 		Endpoint: entry.Endpoint,
 		Card:     entry.AgentCard,
 		Prompt:   run.prompt,
@@ -430,7 +431,7 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 	// in-process salvage-diff fallback cannot race a job still writing
 	// the workspace (#385).
 	c.killDispatchSessionJobs(ctx, run)
-	return c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcomeFromTransport(outcome)), outcome.Usage, true
+	return c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcomeFromTransport(outcome)), outcome.Usage
 }
 
 // cancelOrphanedDispatchRun cancels a dispatched agent whose transport
@@ -461,34 +462,31 @@ func (c *coordinator) cancelOrphanedDispatchRun(ctx context.Context, run dispatc
 	}
 }
 
-// SetDispatchServerStarter wires the A2A server factory (#70). Call once
-// at app construction, before the first dispatch; nil disables serving
-// (tests, or a build without the factory wired). When the same object
-// also implements [DispatchTransport] — the production factory does —
-// served dispatches are driven over the protocol (#71).
-func (c *coordinator) SetDispatchServerStarter(starter DispatchServerStarter) {
+// SetDispatchHost wires the A2A host (#70). Call once at app
+// construction, before the first dispatch; nil disables dispatching —
+// the tool refuses, and no dispatch ever runs unserved (#347).
+func (c *coordinator) SetDispatchHost(host DispatchHost) {
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
-	c.dispatchServer = starter
+	c.dispatchHost = host
 }
 
-// dispatchServerStarter returns the wired A2A server starter, if any.
-func (c *coordinator) dispatchServerStarter() DispatchServerStarter {
+// dispatchHost returns the wired A2A host, if any.
+func (c *coordinator) a2aHost() DispatchHost {
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
-	return c.dispatchServer
+	return c.dispatchHost
 }
 
 // startDispatchServer stands up the dispatch's A2A server (#70) and
 // stamps its endpoint and card on the registry entry — the in-memory
-// discovery surface. A start failure is logged and swallowed: the
-// dispatch itself does not depend on being served, and Phase 1 has no
-// A2A client in the loop yet (#71 adds it); failing the dispatch over a
-// loopback server would trade working dispatches for protocol purity.
-func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string, usage func(ctx context.Context) (Usage, error)) (stop func()) {
-	starter := c.dispatchServerStarter()
+// discovery surface. A start failure is a dispatch failure (#347): the
+// caller tears the dispatch down and reports the tool error; nothing
+// ever runs unserved.
+func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string, usage func(ctx context.Context) (Usage, error)) (stop func(), err error) {
+	starter := c.a2aHost()
 	if starter == nil {
-		return nil
+		return nil, errors.New("no A2A host is wired")
 	}
 
 	endpoint, card, stop, err := starter.StartDispatchServer(ctx, DispatchServerParams{
@@ -512,12 +510,11 @@ func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatc
 		Usage:             usage,
 	})
 	if err != nil {
-		slog.Warn("Dispatch A2A server failed to start", "dispatch_id", entryID, "error", err)
-		return nil
+		return nil, err
 	}
 	reg.SetEndpoint(entryID, endpoint, card)
 	slog.Debug("Dispatch A2A server started", "dispatch_id", entryID, "endpoint", endpoint)
-	return stop
+	return stop, nil
 }
 
 // resolvedSkills loads the skills a dispatch runs with from its scoped
