@@ -144,6 +144,7 @@ delete. Booleans accept `true/false/1/0/yes/no/on/off` in any case.
 | `hook` | [Hooks](/features/hooks) |
 | `permissions` | [Tool permissions](/configuration/permissions) |
 | `option` | General behaviour, paths, attribution, and the TUI |
+| `agent` | [Agent definitions](/agents/configuration#agent-definitions) |
 
 Every flag for every one of them is in the
 **[config command reference](/configuration/command-reference)**.
@@ -155,6 +156,28 @@ the nudging, the hard gate, and the dispatched-run timeouts (the JSON form
 keeps them under `options.todo_enforcement`). Durations accept a Go duration
 (`5m`) or a bare number of seconds; `off` means zero, and a negative value
 or an unparseable one fails the load, naming the key.
+
+## Agent definitions
+
+The `agent` builtin defines and overrides [agents](/agents/configuration#agent-definitions)
+the same way `crush.json`'s `agents` block does; the two resolve
+identically.
+
+```bash
+agent defaults --nudge-after 4 --kill-after-nudges off
+agent set coder --deny-tool sourcegraph
+agent add reviewer --role dispatch --runtime a2a \
+  --card https://reviewer.example.net/.well-known/agent-card.json \
+  --bearer '$REVIEWER_TOKEN' --workspace none --idle-timeout 2m
+```
+
+`agent add` defines or overlays an id, `agent set` only overlays an existing
+one and refuses `--role` and `--runtime`, and `agent remove` deletes a
+user-added id (built-ins are disabled with `agent set <id> --disabled true`).
+A `--tools` or `--mcp` list is variadic: every argument until the next flag
+joins the list. `--bearer` only accepts a `$VAR` reference, so a token never
+lands in the config file. Every flag is in the
+**[config command reference](/configuration/command-reference)**.
 
 | Key | Effect |
 | --- | --- |

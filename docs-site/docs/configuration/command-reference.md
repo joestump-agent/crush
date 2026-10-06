@@ -211,6 +211,125 @@ Usage:
   mcp rm <name>
 ```
 
+## agent
+
+See [Multi-agent configuration](/agents/configuration) for what the
+`agents` block does and how definitions resolve.
+
+```text
+Usage:
+  agent [command]
+
+Available Commands:
+  defaults  Set the todos and kill defaults every agent inherits
+  add       Define or overlay an agent
+  set       Overlay an existing agent (no --role, no --runtime)
+  remove    Remove a user-added agent
+  rm        Alias for remove
+```
+
+### `agent defaults`
+
+Only the todos and kill flags are allowed; this writes the `agents.$defaults`
+block every definition inherits from.
+
+```text
+Usage:
+  agent defaults [flags]
+
+Flags:
+      --nudge bool                  inject nudges when working without todos
+      --nudge-after int|off         tool calls before the first nudge
+      --hard-gate bool              reject mutating tools until todos exist
+      --kill-after-nudges int|off   ignored nudges before the wander kill
+      --stall duration|off          kill a run whose todos stop updating
+      --timeout duration|off        kill a run after this long
+```
+
+```bash
+agent defaults --nudge-after 4 --kill-after-nudges off
+```
+
+### `agent add`
+
+Defines a new agent or overlays an existing one (built-in or added earlier in
+the same `crushrc`), field by field.
+
+```text
+Usage:
+  agent add <id> [flags]
+
+Flags:
+      --role string              main, subagent, or dispatch
+      --runtime string           builtin, or a2a for an external Agent Card
+      --name string              display name
+      --description string       agent description
+      --disabled bool            disable without removing
+      --model string             large, small, or provider/model
+      --prompt string            builtin:<id>, file:<path>, or a bare path
+      --prompt-append string     a prompt file appended to the system prompt
+      --workspace string         dispatch isolation: worktree or none
+      --card string              external Agent Card URL (runtime a2a)
+      --tools string             tool allow list (variadic: entries until the
+                                 next flag), each a tool name, @read, @write, or *
+      --deny-tool string         tool to deny (repeatable)
+      --mcp string               MCP allow list (variadic), each *, server, or server:tool
+      --skill string             skill name (repeatable)
+      --context-path string      context file path (repeatable)
+      --nudge bool               see agent defaults
+      --nudge-after int|off      see agent defaults
+      --hard-gate bool           see agent defaults
+      --kill-after-nudges int|off  see agent defaults
+      --stall duration|off       see agent defaults
+      --timeout duration|off     see agent defaults
+      --bearer '$VAR'            bearer auth for runtime a2a agents; the value
+                                 must be a $VAR reference, so no secret is
+                                 ever written to the config
+      --idle-timeout duration    end a silent runtime a2a run after this long
+```
+
+```bash
+agent add worker --role dispatch --model openai/gpt-5-mini \
+  --prompt builtin:dispatch --prompt-append .crush/prompts/worker.md \
+  --tools @read @write job_output job_kill lsp_diagnostics \
+  --kill-after-nudges 2 --stall 5m --timeout 30m
+agent add reviewer --role dispatch --runtime a2a \
+  --card https://reviewer.example.net/.well-known/agent-card.json \
+  --bearer '$REVIEWER_TOKEN' --workspace none --idle-timeout 2m
+```
+
+Counts take a non-negative integer or `off`; durations take a Go duration
+(`5m`), a bare number of seconds, or `off`. Unknown tools, role changes on
+built-ins, and other semantic errors are reported when the config loads, not
+here.
+
+### `agent set`
+
+```text
+Usage:
+  agent set <id> [flags]
+```
+
+The same flags as `agent add`, except `--role` and `--runtime`: those change
+what an existing agent is, and `set` only overlays fields. The id must be a
+built-in or already defined.
+
+### `agent remove`
+
+```text
+Usage:
+  agent remove <id>
+  agent rm <id>
+```
+
+Removes a user-added agent. Built-in agents cannot be removed; disable one
+instead:
+
+```bash
+agent remove scribe
+agent set plan --disabled true
+```
+
 ## lsp
 
 See [Language servers](/features/lsp).

@@ -90,10 +90,12 @@ the two are deep-merged, and Crush logs a warning that both exist. Tracked in
 
 ### Per-agent overrides
 
-The Go config type has a `todo_enforcement` field on each agent definition,
-but you cannot reach it. Agent definitions are not loaded from config files,
-and an `agents` key in `crush.json` is silently ignored. Dispatched agents are
-always built from the global `options.todo_enforcement`.
+Agent definitions load and validate from both config formats
+([#333](https://github.com/joestump-agent/crush/issues/333),
+[#431](https://github.com/joestump-agent/crush/issues/431)), and each carries
+its own `todos` and `kill` blocks. The dispatch runtime does not read them
+yet: dispatched agents are still built from the global
+`options.todo_enforcement`.
 
 :::info[Planned]
 Per-agent thresholds arrive with agent definitions: the `todos` and `kill`
@@ -216,11 +218,13 @@ Sub-agents and dispatched agents never get these tools in any case.
 ## Agent definitions
 
 :::info[Partially shipped]
-The data model works: an `agents` block in `crush.json` loads, validates, and
-resolves, and the error paths described below are live
-([#333](https://github.com/joestump-agent/crush/issues/333)). What is still
-planned: a `crushrc` builtin ([#431](https://github.com/joestump-agent/crush/issues/431)), honoring per-agent model, prompt,
-tools and MCP access at runtime ([#432](https://github.com/joestump-agent/crush/issues/432)), and the `agent`
+The data model works in both config formats: an `agents` block in
+`crush.json` and the `agent` builtin in `crushrc` load, validate, and
+resolve to the same definitions, and the error paths described below are
+live ([#333](https://github.com/joestump-agent/crush/issues/333),
+[#431](https://github.com/joestump-agent/crush/issues/431)). What is still
+planned: honoring per-agent model, prompt, tools and MCP access at runtime
+([#432](https://github.com/joestump-agent/crush/issues/432)), and the `agent`
 parameter on `dispatch_agent` ([#433](https://github.com/joestump-agent/crush/issues/433)). Fields the runtime does not
 honor yet load with a one-time warning.
 :::

@@ -7,6 +7,7 @@ import (
 	"maps"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // flagKind is the value type a flag parses from the command line.
@@ -28,6 +29,17 @@ const (
 	flagJSONObject
 	// flagJSONAny parses the value as arbitrary JSON.
 	flagJSONAny
+	// flagStringList consumes every argument until the next one that
+	// starts with "--", storing them as one list, e.g. --tools @read
+	// @write.
+	flagStringList
+	// flagCountOrOff parses a non-negative integer, or "off" stored as
+	// the string "off" (the form the config's IntOrOff knob decodes as
+	// zero). A negative integer is an error.
+	flagCountOrOff
+	// flagDurationOrOff parses a Go duration ("5m"), a bare number of
+	// seconds, or "off". A negative duration is an error.
+	flagDurationOrOff
 )
 
 // flagOp is how a parsed flag value is written into the target map.
@@ -44,6 +56,14 @@ const (
 	// opMergeChild merges a JSON object into childMap(target, child), e.g.
 	// --provider-options '{...}'.
 	opMergeChild
+	// opSetChildValue assigns the whole parsed value to
+	// childMap(target, child)[jsonKey], replacing any previous one, e.g.
+	// a --tools list under tools.allow.
+	opSetChildValue
+	// opAppendChild appends the parsed value to the list at
+	// childMap(target, child)[jsonKey], e.g. a repeated --deny-tool under
+	// tools.deny.
+	opAppendChild
 )
 
 // flagSpec declares one command-line flag: how it parses, where it writes,
@@ -60,6 +80,12 @@ type flagSpec struct {
 	// It receives the value as string, bool, int64, float64, or
 	// map[string]any depending on kind.
 	validate func(any) error
+
+	// parse, if non-nil, replaces the kind-based parse: it receives args
+	// and the flag's index and returns the value plus the index to resume
+	// from, so a flag can derive its stored shape (e.g. --model
+	// provider/model becomes an object).
+	parse func(args []string, i int) (any, int, error)
 }
 
 // applyFlags parses args[start:] against specs and writes the results into
@@ -100,6 +126,10 @@ func findFlag(specs []flagSpec, name string) (flagSpec, bool) {
 // parseFlagValue reads the value(s) for spec starting at args[i] and returns
 // the parsed value plus the index to resume from.
 func parseFlagValue(spec flagSpec, args []string, i int) (any, int, error) {
+	if spec.parse != nil {
+		return spec.parse(args, i)
+	}
+
 	name := strings.TrimPrefix(spec.name, "--")
 
 	switch spec.kind {
@@ -174,6 +204,56 @@ func parseFlagValue(spec flagSpec, args []string, i int) (any, int, error) {
 		}
 		return parsed, i + 2, nil
 
+	case flagStringList:
+		var list []string
+		for j := i + 1; j < len(args) && !strings.HasPrefix(args[j], "--"); j++ {
+			list = append(list, args[j])
+		}
+		if len(list) == 0 {
+			return nil, 0, fmt.Errorf("%s: --%s requires at least one value", args[0], name)
+		}
+		return list, i + 1 + len(list), nil
+
+	case flagCountOrOff:
+		v, err := nextArg(args, i, name)
+		if err != nil {
+			return nil, 0, err
+		}
+		if strings.EqualFold(v, "off") {
+			return "off", i + 2, nil
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, 0, fmt.Errorf("%s: --%s expects an integer or off, got %q", args[0], name, v)
+		}
+		if n < 0 {
+			return nil, 0, fmt.Errorf("%s: --%s must not be negative, got %d", args[0], name, n)
+		}
+		return n, i + 2, nil
+
+	case flagDurationOrOff:
+		v, err := nextArg(args, i, name)
+		if err != nil {
+			return nil, 0, err
+		}
+		if strings.EqualFold(v, "off") {
+			return "off", i + 2, nil
+		}
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			if n < 0 {
+				return nil, 0, fmt.Errorf("%s: --%s must not be negative, got %d", args[0], name, n)
+			}
+			return n, i + 2, nil
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, 0, fmt.Errorf("%s: --%s expects a duration (5m) or off, got %q", args[0], name, v)
+		}
+		if d < 0 {
+			return nil, 0, fmt.Errorf("%s: --%s must not be negative, got %q", args[0], name, v)
+		}
+		return v, i + 2, nil
+
 	default:
 		return nil, 0, fmt.Errorf("%s: --%s has unknown flag kind", args[0], name)
 	}
@@ -198,6 +278,13 @@ func storeFlag(target map[string]any, spec flagSpec, val any) {
 	case opSetChild:
 		if kv, ok := val.([2]string); ok {
 			childMap(target, spec.child)[kv[0]] = kv[1]
+		}
+	case opSetChildValue:
+		childMap(target, spec.child)[spec.jsonKey] = val
+	case opAppendChild:
+		child := childMap(target, spec.child)
+		if s, ok := val.(string); ok {
+			child[spec.jsonKey] = appendArr(child, spec.jsonKey, s)
 		}
 	case opMergeChild:
 		if obj, ok := val.(map[string]any); ok {
