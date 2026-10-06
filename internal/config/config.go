@@ -592,15 +592,16 @@ type TodoEnforcementConfig struct {
 	// injects todo nudges; the hard gate is governed by its own field.
 	Enabled *bool `json:"enabled,omitempty" jsonschema:"description=Inject a context nudge when an agent works without a todo list,default=true"`
 	// NudgeThreshold is how many tool calls without todos activity trip
-	// the first nudge. A mutating tool call (write/edit/multiedit/bash)
+	// the first nudge. A mutating tool call (a file writer, a
+	// non-read-only bash command, an MCP tool without a read-only hint)
 	// trips it immediately regardless of count. 0 or "off" disables
 	// nudging, the same as enabled: false; a negative value is a load
 	// error.
 	NudgeThreshold *IntOrOff `json:"nudge_threshold,omitempty" jsonschema:"description=Tool calls without todos activity before a nudge is injected; a mutating tool call trips it immediately. 0 or 'off' disables nudging\\, the same as enabled: false; a negative value is a load error"`
-	// HardGate rejects mutating tools (write/edit/multiedit/bash) until
-	// the session has a todo list. Deterministic but brittle; off by
-	// default.
-	HardGate *bool `json:"hard_gate,omitempty" jsonschema:"description=Reject mutating tools (write\\, edit\\, multiedit\\, bash) until a todo list exists,default=false"`
+	// HardGate rejects mutating tools (file writers, non-read-only bash
+	// commands, MCP tools without a read-only hint) until the session
+	// has a todo list. Deterministic but brittle; off by default.
+	HardGate *bool `json:"hard_gate,omitempty" jsonschema:"description=Reject mutating tools (file writers\\, non-read-only bash commands\\, MCP tools without a read-only hint) until a todo list exists,default=false"`
 	// KillAfterNudges is the wander-kill rung (#316): how many nudges a
 	// run may ignore before the coordinator kills it deterministically.
 	// The default of 2 kills after both the nudge and the escalating

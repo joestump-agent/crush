@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -49,21 +50,73 @@ const todoNudgeMessage = "You have made tool calls without recording a todo list
 // continued ignoring escalates (wander kill, #316).
 const todoEscalatingNudgeMessage = "You are still working without a todo list after being reminded. Call the todos tool immediately, before any further tool calls. Ignoring this again will escalate."
 
-// mutatingToolNames are the tools the ladder treats as mutating: they
-// change state, so a run using them without a plan is exactly the run the
-// ladder exists for. Mirrors the design doc's write/edit/bash set plus
-// multiedit, which is edit's multi-application form.
-var mutatingToolNames = []string{
-	tools.WriteToolName,
-	tools.EditToolName,
-	tools.MultiEditToolName,
-	tools.BashToolName,
+// unwrapTool peels the wrappers the agent wraps its tools in, so
+// classification sees the tool itself: the hook runner's decorator and
+// the hard gate's. Both forward Info(), so the name survives unwrapping;
+// only the duck-typed MCP checks need the inner tool, and a wrapper
+// hides them (a hooked MCP tool would classify as a reader).
+func unwrapTool(tool fantasy.AgentTool) fantasy.AgentTool {
+	for {
+		switch t := tool.(type) {
+		case *hookedTool:
+			tool = t.inner
+		case *todoGateTool:
+			tool = t.inner
+		default:
+			return tool
+		}
+	}
 }
 
-// isMutatingTool reports whether name is one of the ladder's mutating
-// tools.
-func isMutatingTool(name string) bool {
-	return slices.Contains(mutatingToolNames, name)
+// isMutatingCall reports whether a call to tool with its raw JSON input
+// mutates state. It is the ladder's single classification, used by both
+// rungs: the nudge counter trips on a mutating call regardless of the
+// threshold, and the hard gate wraps the tools it would reject. The file
+// writers count outright; bash counts unless the command parses as
+// read-only; an MCP tool can have side effects the ladder cannot see, so
+// it counts unless its server marked it read-only; everything else, the
+// readers, counts read-only. Unparseable input fails closed.
+func isMutatingCall(tool fantasy.AgentTool, input string) bool {
+	tool = unwrapTool(tool)
+	switch tool.Info().Name {
+	case tools.WriteToolName, tools.EditToolName, tools.MultiEditToolName,
+		tools.DownloadToolName, tools.RenameToolName, tools.ReplaceSymbolToolName:
+		return true
+	case tools.BashToolName:
+		return !isReadOnlyBashInput(input)
+	}
+	if isMCPTool(tool) {
+		return !hasReadOnlyHint(tool)
+	}
+	return false
+}
+
+// isMCPTool reports whether tool is an MCP tool: the same duck-typed
+// check the channel filter applies (agent.go).
+func isMCPTool(tool fantasy.AgentTool) bool {
+	_, ok := tool.(interface{ MCP() string })
+	return ok
+}
+
+// hasReadOnlyHint reports whether the tool carries the MCP server's
+// read-only annotation.
+func hasReadOnlyHint(tool fantasy.AgentTool) bool {
+	hint, ok := tool.(interface{ ReadOnlyHint() bool })
+	return ok && hint.ReadOnlyHint()
+}
+
+// isReadOnlyBashInput reports whether a bash tool input parses as a
+// read-only command, for the ladder's mutation check: the gate lets such
+// a call through without a todo list, and the nudge counter does not
+// treat it as a state change. Unparseable input fails closed.
+func isReadOnlyBashInput(input string) bool {
+	var params struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal([]byte(input), &params); err != nil {
+		return false
+	}
+	return tools.IsReadOnlyCommand(params.Command)
 }
 
 // hasTodosTool reports whether ts carries the todos tool. Every rung of
@@ -113,6 +166,10 @@ type todoEnforcementRun struct {
 	onKill func(reason string)
 
 	mu sync.Mutex
+	// tools maps the run's tool names to the tools themselves (a gated
+	// tool as its inner tool), so recordToolCall can classify each call
+	// against the tool, not just its name.
+	tools map[string]fantasy.AgentTool
 	// todosSatisfied records that the run's todos are alive: the session
 	// carried a todo list at run start, or the todos tool ran during it.
 	todosSatisfied bool
@@ -129,9 +186,10 @@ type todoEnforcementRun struct {
 }
 
 // newRun starts the ladder for one run, seeded with whether the session
-// already carries a todo list. A nil enforcement yields a nil run, the
-// no-op fast path every method also guards for.
-func (e *todoEnforcement) newRun(sessionHasTodos bool, onKill func(reason string)) *todoEnforcementRun {
+// already carries a todo list; toolByName maps the run's tool names to
+// the tools, for the mutation classification. A nil enforcement yields a
+// nil run, the no-op fast path every method also guards for.
+func (e *todoEnforcement) newRun(sessionHasTodos bool, onKill func(reason string), toolByName map[string]fantasy.AgentTool) *todoEnforcementRun {
 	if e == nil {
 		return nil
 	}
@@ -139,12 +197,16 @@ func (e *todoEnforcement) newRun(sessionHasTodos bool, onKill func(reason string
 		enforcement:    e,
 		onKill:         onKill,
 		todosSatisfied: sessionHasTodos,
+		tools:          toolByName,
 	}
 }
 
-// recordToolCall observes one tool call from the model. A todos tool call
-// is todos activity; anything else advances the since-nudge counters.
-func (r *todoEnforcementRun) recordToolCall(toolName string) {
+// recordToolCall observes one tool call from the model, with the raw
+// JSON input the ladder classifies it with. A todos tool call is todos
+// activity; anything else advances the since-nudge counters, and a call
+// counts as mutating when its tool and input do: a tool the run's map
+// does not carry fails closed.
+func (r *todoEnforcementRun) recordToolCall(toolName, input string) {
 	if r == nil {
 		return
 	}
@@ -155,7 +217,8 @@ func (r *todoEnforcementRun) recordToolCall(toolName string) {
 		return
 	}
 	r.toolCalls++
-	if isMutatingTool(toolName) {
+	tool, ok := r.tools[toolName]
+	if !ok || isMutatingCall(tool, input) {
 		r.mutatingCall = true
 	}
 }
@@ -238,17 +301,18 @@ func (e *todoEnforcement) gate(ctx context.Context, sessionID string) error {
 	return fmt.Errorf("no todo list exists for this session; call the todos tool to record your plan before mutating anything (todo enforcement hard gate)")
 }
 
-// wrapTodoGate wraps the mutating tools in ts with the hard-gate wrapper
-// when the gate is on. Other tools pass through untouched, and a nil
-// enforcement, a disabled gate or a tool set without the todos tool
-// returns the slice unchanged.
+// wrapTodoGate wraps the tools the hard gate governs in ts with the gate
+// wrapper: the file writers, bash (a read-only command clears the gate at
+// run time), and MCP tools the server has not marked read-only. Other
+// tools pass through untouched, and a nil enforcement, a disabled gate or
+// a tool set without the todos tool returns the slice unchanged.
 func wrapTodoGate(ts []fantasy.AgentTool, e *todoEnforcement) []fantasy.AgentTool {
 	if e == nil || !e.settings.HardGate || !hasTodosTool(ts) {
 		return ts
 	}
 	out := make([]fantasy.AgentTool, len(ts))
 	for i, tool := range ts {
-		if isMutatingTool(tool.Info().Name) {
+		if isMutatingCall(tool, "") {
 			out[i] = &todoGateTool{inner: tool, enforcement: e}
 			continue
 		}
@@ -276,6 +340,11 @@ func (g *todoGateTool) SetProviderOptions(opts fantasy.ProviderOptions) {
 }
 
 func (g *todoGateTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	// A read-only bash command is observation, not a state change, so it
+	// clears the gate even before a todo list exists.
+	if g.inner.Info().Name == tools.BashToolName && isReadOnlyBashInput(call.Input) {
+		return g.inner.Run(ctx, call)
+	}
 	if err := g.enforcement.gate(ctx, tools.GetSessionFromContext(ctx)); err != nil {
 		resp := fantasy.NewTextErrorResponse(err.Error())
 		resp.Metadata = `{"todo_gate":true}`
