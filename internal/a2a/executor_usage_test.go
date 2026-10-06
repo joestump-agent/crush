@@ -165,18 +165,22 @@ func TestStreamDispatchCarriesUsageAndTraceparent(t *testing.T) {
 	tp, err := agent.NewTraceparent()
 	require.NoError(t, err)
 
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    &fakeRunner{result: textResult("done")},
-		SessionID: "dispatch-session",
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID:  "dispatch-usage",
+		Runner:      &fakeRunner{result: textResult("done")},
+		SessionID:   "dispatch-session",
+		Name:        "tester",
+		Description: "serves usage",
 		Usage: func(context.Context) (agent.Usage, error) {
 			return fixedUsage, nil
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	ctx := agent.WithTraceparent(t.Context(), tp)
-	outcome, err := NewServerFactory().StreamDispatch(ctx, agent.DispatchTransportParams{
+	outcome, err := factory.StreamDispatch(ctx, agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "fix the bug",
@@ -197,14 +201,18 @@ func TestStreamDispatchCarriesUsageAndTraceparent(t *testing.T) {
 // A served dispatch with no usage wired completes with no usage on the
 // outcome: the parent's cost is left untouched, not zeroed (#364).
 func TestStreamDispatchWithoutUsage(t *testing.T) {
-	server, err := StartServer(t.Context(), ServerParams{
-		Runner:    &fakeRunner{result: textResult("done")},
-		SessionID: "dispatch-session",
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID:  "dispatch-plain",
+		Runner:      &fakeRunner{result: textResult("done")},
+		SessionID:   "dispatch-session",
+		Name:        "tester",
+		Description: "serves no usage",
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
-	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "fix the bug",
