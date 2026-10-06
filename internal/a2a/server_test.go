@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -578,6 +579,94 @@ func TestHostTokenNeverLogged(t *testing.T) {
 
 	require.NotContains(t, buf.String(), factory.authToken(),
 		"the host token must never be written to the log")
+}
+
+// A request carrying an A2A-Version the host does not serve is answered
+// with the spec's VersionNotSupportedError envelope (-32009) before any
+// dispatch work runs (TCK VER-SERVER-002), the request id echoed back;
+// the current version passes through and serves normally.
+func TestHostRejectsUnsupportedVersion(t *testing.T) {
+	runner := &fakeRunner{result: textResult("done")}
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	client := unixDialClient(factory)
+	post := func(version string) string {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.Endpoint, bytes.NewReader(sendMessageBody(t, "version probe")))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(bearerAuthorizationHeader, "Bearer "+factory.authToken())
+		req.Header.Set(a2aspec.SvcParamVersion, version)
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		return string(body)
+	}
+
+	body := post("99.0")
+	require.False(t, runner.ran, "the runner must not see an unsupported version")
+	var rpcResp struct {
+		ID    json.RawMessage `json:"id"`
+		Error struct {
+			Code    int              `json:"code"`
+			Message string           `json:"message"`
+			Data    []map[string]any `json:"data"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(body), &rpcResp))
+	require.Equal(t, -32009, rpcResp.Error.Code)
+	require.NotEmpty(t, rpcResp.Error.Message)
+	require.Equal(t, json.RawMessage("1"), rpcResp.ID, "the envelope echoes the request id")
+	require.NotEmpty(t, rpcResp.Error.Data, "the error carries typed details")
+	require.Equal(t, "VERSION_NOT_SUPPORTED", rpcResp.Error.Data[0]["reason"])
+
+	post(string(a2aspec.Version))
+	require.True(t, runner.ran, "the current version serves normally")
+}
+
+// GetExtendedAgentCard answers UnsupportedOperationError (-32004) when
+// the served card does not declare the extendedAgentCard capability
+// (TCK CORE-CAP-003): the handler's capability checks see the card.
+func TestHostExtendedCardUnsupportedOperation(t *testing.T) {
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     &fakeRunner{result: textResult("done")},
+		SessionID:  "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+	require.False(t, server.Card.Capabilities.ExtendedAgentCard)
+
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "GetExtendedAgentCard",
+		"params":  map[string]any{},
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.Endpoint, bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(bearerAuthorizationHeader, "Bearer "+factory.authToken())
+	resp, err := unixDialClient(factory).Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	var rpcResp struct {
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rpcResp))
+	require.Equal(t, -32004, rpcResp.Error.Code, "expected UnsupportedOperationError")
 }
 
 // The peer-uid half of the auth decision (#357): a pure table test —

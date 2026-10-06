@@ -36,16 +36,17 @@ const (
 // DispatchOutcome is the typed payload the dispatch-result artifact
 // carries: the work product's shape when the diff itself is absent or
 // unreadable, so a capture error crosses the wire instead of surfacing
-// as "(no changes)".
+// as "(no changes)". Field names are lowerCamelCase per the A2A wire
+// format (TCK DM-SERIAL-001).
 type DispatchOutcome struct {
 	// DiffBytes is the diff's size in bytes; 0 when capture failed or
 	// the run changed nothing.
-	DiffBytes int `json:"diff_bytes"`
+	DiffBytes int `json:"diffBytes"`
 	// DiffError carries the diff-capture error's message, empty on
 	// success. A run with a diff error still completes.
-	DiffError string `json:"diff_error,omitempty"`
+	DiffError string `json:"diffError,omitempty"`
 	// FilesChanged counts the per-file sections of the diff.
-	FilesChanged int `json:"files_changed"`
+	FilesChanged int `json:"filesChanged"`
 }
 
 // The SDK's task store persists artifact parts through encoding/gob, and a
