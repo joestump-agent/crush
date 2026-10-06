@@ -62,12 +62,30 @@ func hyperBuilder(model string) builderFunc {
 }
 
 func testEnv(t *testing.T) fakeEnv {
+	return testEnvAtDir(t, t.TempDir())
+}
+
+// testEnvFixedDir is testEnv rooted at the pre-#422 fixed directory. The
+// VCR cassettes under testdata/TestCoderAgent/** record
+// "Working directory: /tmp/crush-test/..." in the request body, and
+// charm.land/x/vcr matches request bodies exactly, so setupAgent must
+// keep replaying against this path.
+func testEnvFixedDir(t *testing.T) fakeEnv {
+	t.Helper()
 	workingDir := filepath.Join("/tmp/crush-test/", t.Name())
 	os.RemoveAll(workingDir)
+	require.NoError(t, os.MkdirAll(workingDir, 0o755))
+	env := testEnvAtDir(t, workingDir)
+	t.Cleanup(func() { os.RemoveAll(workingDir) })
+	return env
+}
 
-	err := os.MkdirAll(workingDir, 0o755)
-	require.NoError(t, err)
-
+// testEnvAtDir builds a fakeEnv working in workingDir. t.TempDir()
+// cleanups remove the directory only after every t.Cleanup has run, so a
+// background run a test started still finds its directory until it ends
+// (#422).
+func testEnvAtDir(t *testing.T, workingDir string) fakeEnv {
+	t.Helper()
 	conn, err := db.Connect(t.Context(), t.TempDir())
 	require.NoError(t, err)
 
@@ -82,7 +100,6 @@ func testEnv(t *testing.T) fakeEnv {
 
 	t.Cleanup(func() {
 		conn.Close()
-		os.RemoveAll(workingDir)
 	})
 
 	return fakeEnv{

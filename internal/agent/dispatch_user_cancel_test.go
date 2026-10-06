@@ -91,7 +91,7 @@ func TestCancelDispatchRefusesUnknownAndFinished(t *testing.T) {
 	require.ErrorContains(t, c.CancelDispatch(t.Context(), "@no-such-handle"), "no dispatch")
 	require.Empty(t, agent.cancels())
 
-	close(agent.gate)
+	agent.release()
 	waitTerminalDispatch(t, c, handle.DispatchID, dispatch.StatusCompleted)
 
 	require.ErrorContains(t, c.CancelDispatch(t.Context(), handle.DispatchID), "already finished")

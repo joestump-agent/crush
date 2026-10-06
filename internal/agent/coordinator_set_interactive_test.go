@@ -94,5 +94,5 @@ func TestSetInteractiveKeepsDispatchAddressable(t *testing.T) {
 	require.Equal(t, "still there?", injected[0].Prompt)
 	require.Equal(t, handle.SessionID, injected[0].SessionID)
 
-	close(gated.gate)
+	gated.release()
 }

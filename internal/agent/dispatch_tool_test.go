@@ -96,6 +96,7 @@ func newDispatchToolEnv(t *testing.T, agent *dispatchTestAgent) (*coordinator, f
 	initGitRepo(t, env.workingDir)
 
 	c := newDispatchTestCoordinator(t, env)
+	reapDispatchRuns(t, c)
 	c.dispatchAgentBuilder = func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error) {
 		return &dispatchedAgent{
 			agent:       agent,

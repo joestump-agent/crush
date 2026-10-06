@@ -24,7 +24,11 @@ type gatedDispatchAgent struct {
 	entered chan struct{}
 	result  *fantasy.AgentResult
 
+	// enterOnce latches the entered notification; gateOnce makes release
+	// idempotent (#422): the env's cleanup may release a gate the test
+	// body already released.
 	enterOnce sync.Once
+	gateOnce  sync.Once
 	mu        sync.Mutex
 	queued    []SessionAgentCall
 	lastCall  *SessionAgentCall
@@ -80,6 +84,13 @@ func (f *gatedDispatchAgent) waitRunning(t *testing.T) {
 	}
 }
 
+// release opens the gate exactly once so a parked Run can finish. It is
+// idempotent (#422): the env's cleanup releases any gate the test body
+// already released.
+func (f *gatedDispatchAgent) release() {
+	f.gateOnce.Do(func() { close(f.gate) })
+}
+
 func (f *gatedDispatchAgent) EnqueueWhenBusy(call SessionAgentCall) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -128,6 +139,7 @@ func newInjectionEnv(t *testing.T, agent *gatedDispatchAgent) (*coordinator, fak
 	env := testEnv(t)
 	initGitRepo(t, env.workingDir)
 	c := newDispatchTestCoordinator(t, env)
+	reapDispatchRuns(t, c, agent.release)
 	c.dispatchAgentBuilder = func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error) {
 		return &dispatchedAgent{
 			agent:       agent,
@@ -187,7 +199,7 @@ func TestDeliverAgentMessageMidRunThenRefusalAfterFinish(t *testing.T) {
 	require.True(t, injected[0].Steer)
 
 	// Finish the run; the injection target is gone with it.
-	close(agent.gate)
+	agent.release()
 	require.Eventually(t, func() bool {
 		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status == dispatch.StatusCompleted
@@ -257,7 +269,7 @@ func TestDeliverAgentMessageRefusesOnceRegistryIsTerminal(t *testing.T) {
 	agent.waitRunning(t)
 
 	sessions.park(handle.SessionID)
-	close(agent.gate)
+	agent.release()
 	select {
 	case <-sessions.parked:
 	case <-time.After(10 * time.Second):
@@ -311,7 +323,7 @@ func TestDeliverAgentMessageOrderingAndConcurrency(t *testing.T) {
 		[]string{injected[0].Prompt, injected[1].Prompt, injected[2].Prompt},
 		"sequential sends keep their order at the head of the queue")
 
-	close(agent.gate)
+	agent.release()
 }
 
 // A registry entry that is still running but has no injection target —
@@ -334,7 +346,7 @@ func TestDeliverAgentMessageRunningWithoutTargetIsNotFinished(t *testing.T) {
 	require.ErrorContains(t, err, "no running agent for session")
 	require.NotContains(t, err.Error(), "finished")
 
-	close(agent.gate)
+	agent.release()
 }
 
 // Unknown sessions and argument validation fail fast with actionable
@@ -374,7 +386,7 @@ func TestMessageAgentToolDeliversAndRefuses(t *testing.T) {
 	require.Contains(t, resp.Content, "next input")
 	require.Len(t, agent.injected(), 1)
 
-	close(agent.gate)
+	agent.release()
 	require.Eventually(t, func() bool {
 		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status == dispatch.StatusCompleted
