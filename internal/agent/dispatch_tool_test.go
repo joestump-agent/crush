@@ -679,14 +679,6 @@ func TestReleaseDispatchesKeepsWork(t *testing.T) {
 	require.True(t, os.IsNotExist(err), "workless workspace must be released")
 	require.False(t, branchExists(t, env.workingDir, empty.Branch), "branch of released workspace must be gone")
 	require.Len(t, c.dispatchRegistry().List(), 1, "only the kept workspace stays registered")
-
-	// The kept workspace stays leased on purpose — a real session leaves
-	// it for salvage. Release it here so the TempDir cleanup can remove
-	// the lock file: windows refuses to unlink an open file.
-	provider, err := c.dispatchWorkspaceProvider()
-	require.NoError(t, err)
-	require.NoError(t, provider.Release(t.Context(), entry))
-	c.dispatchRegistry().Remove(withWork.DispatchID)
 }
 
 // The session-end backstop: when the coordinator's context ends, a
