@@ -177,20 +177,20 @@ func TestBuildToolsGatesDispatchOnInteractive(t *testing.T) {
 		want        map[string]bool
 	}{
 		{
-			name:        "interactive main agent keeps both",
+			name:        "interactive main agent keeps all dispatch tools",
 			interactive: true,
-			want:        map[string]bool{DispatchAgentToolName: true, MessageAgentToolName: true, CancelDispatchToolName: true},
+			want:        map[string]bool{DispatchAgentToolName: true, MessageAgentToolName: true, CancelDispatchToolName: true, ApplyDispatchToolName: true, DismissDispatchToolName: true},
 		},
 		{
-			name:        "non-interactive main agent drops both",
+			name:        "non-interactive main agent drops all dispatch tools",
 			interactive: false,
-			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false, CancelDispatchToolName: false},
+			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false, CancelDispatchToolName: false, ApplyDispatchToolName: false, DismissDispatchToolName: false},
 		},
 		{
-			name:        "interactive sub-agent still drops both",
+			name:        "interactive sub-agent still drops all dispatch tools",
 			interactive: true,
 			subAgent:    true,
-			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false, CancelDispatchToolName: false},
+			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false, CancelDispatchToolName: false, ApplyDispatchToolName: false, DismissDispatchToolName: false},
 		},
 	}
 	for _, tt := range tests {
@@ -224,6 +224,42 @@ func TestBuildToolsGatesDispatchOnInteractive(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The apply and dismiss tools vanish from the main agent's palette when
+// listed in disabled_tools, like any other tool; the rest of the
+// dispatch palette is intact (#368).
+func TestBuildToolsHonorsDisabledToolsForApplyAndDismiss(t *testing.T) {
+	c := newDispatchTestCoordinator(t, testEnv(t))
+	c.interactive = true
+	c.cfg.Config().Options.DisabledTools = []string{ApplyDispatchToolName, DismissDispatchToolName}
+	c.cfg.Config().SetupAgents()
+
+	const providerID = "test-provider"
+	c.cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+		ID:      providerID,
+		Name:    "Test",
+		Type:    openaicompat.Name,
+		BaseURL: "http://127.0.0.1:0/v1",
+		APIKey:  "test",
+		Models:  []catwalk.Model{{ID: "test-model", DefaultMaxTokens: 4096}},
+	})
+	selected := config.SelectedModel{Provider: providerID, Model: "test-model"}
+	c.cfg.OverridePreferredModel(config.SelectedModelTypeLarge, selected)
+	c.cfg.OverridePreferredModel(config.SelectedModelTypeSmall, selected)
+
+	agentCfg := c.cfg.Config().Agents[config.AgentCoder]
+	built, err := c.buildTools(t.Context(), agentCfg, false)
+	require.NoError(t, err)
+
+	names := make(map[string]bool, len(built))
+	for _, tool := range built {
+		names[tool.Info().Name] = true
+	}
+	require.False(t, names[ApplyDispatchToolName], "apply_dispatch must be disabled")
+	require.False(t, names[DismissDispatchToolName], "dismiss_dispatch must be disabled")
+	require.True(t, names[DispatchAgentToolName], "the rest of the palette is intact")
+	require.True(t, names[CancelDispatchToolName], "the rest of the palette is intact")
 }
 
 // mustWorktreesDir returns the worktrees directory the coordinator
@@ -1076,7 +1112,7 @@ func TestDeliverDispatchResultToParentSession(t *testing.T) {
 	require.Empty(t, run.RunID)
 	require.Contains(t, run.Prompt, `"dispatch_id": "d-deliver"`)
 	require.Contains(t, run.Prompt, `"key_findings": "fixed the bug"`)
-	require.Contains(t, run.Prompt, "Review the diff and decide whether to merge or dismiss")
+	require.Contains(t, run.Prompt, "Review the diff and decide whether to keep it or discard it")
 }
 
 // Delivery is dropped, not panicked on, when the parent session is gone
@@ -1127,7 +1163,7 @@ func TestDeliverDispatchResultSurvivesClearQueue(t *testing.T) {
 	require.True(t, run.HiddenUserMessage)
 	require.Empty(t, run.RunID)
 	require.Contains(t, run.Prompt, `"dispatch_id": "d-clear"`)
-	require.Contains(t, run.Prompt, "Review the diff and decide whether to merge or dismiss")
+	require.Contains(t, run.Prompt, "Review the diff and decide whether to keep it or discard it")
 
 	time.Sleep(300 * time.Millisecond)
 	require.Equal(t, 1, main.runCount(), "exactly one delivery turn must run")

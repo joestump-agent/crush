@@ -1267,6 +1267,18 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 		allTools = append(allTools, c.cancelDispatchTool())
 	}
 
+	// Apply and dismiss (#368) are the model-facing front door for the
+	// review decision a finished dispatch's terminal message asks for.
+	// They ride the same gate as cancel: main agents only, interactive
+	// only — a non-interactive run exits with the parent's turn, so
+	// nothing is left to apply or dismiss.
+	if !isSubAgent && interactive && slices.Contains(allowedTools, ApplyDispatchToolName) {
+		allTools = append(allTools, c.applyDispatchTool())
+	}
+	if !isSubAgent && interactive && slices.Contains(allowedTools, DismissDispatchToolName) {
+		allTools = append(allTools, c.dismissDispatchTool())
+	}
+
 	// Get the model name for the agent: an explicit pin (#432) names it,
 	// otherwise the agent's slot does.
 	modelID := ""

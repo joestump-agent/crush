@@ -217,14 +217,15 @@ func TestDispatchResultTerminalMessage(t *testing.T) {
 	require.Contains(t, msg, `finished with status "completed"`)
 	require.Contains(t, msg, "d-1")
 	// The instruction is the no-automated-merge contract: the main agent
-	// reviews and decides.
-	require.Contains(t, msg, "Review the diff and decide whether to merge or dismiss")
+	// reviews and decides through the apply/dismiss tools (#368), never
+	// by hand-run git.
+	require.Contains(t, msg, "Review the diff and decide whether to keep it or discard it")
+	require.Contains(t, msg, "apply_dispatch")
+	require.Contains(t, msg, "dismiss_dispatch")
 	require.Contains(t, msg, "never merges itself")
-	// #367: the workspace survives exit — it stays until the human
-	// applies or dismisses, and uncommitted changes count as work, so
-	// no worktree-removal instruction goes to the model.
-	require.Contains(t, msg, "applied or dismissed")
-	require.Contains(t, msg, "uncommitted changes count as part of the work")
+	// #367: the workspace survives exit — it stays until the agent
+	// applies or dismisses, and uncommitted changes count as work.
+	require.Contains(t, msg, "uncommitted changes are brought in too")
 	require.NotContains(t, msg, "git worktree remove")
 	require.Contains(t, msg, `"key_findings": "fixed the bug"`)
 	require.Contains(t, msg, `"diff_summary": "a.go | +2 -1"`)

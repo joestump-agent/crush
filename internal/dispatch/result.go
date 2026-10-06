@@ -122,8 +122,9 @@ func (r DispatchResult) Render() string {
 // TerminalMessage renders the payload delivered to the main agent when a
 // dispatch finishes (#66): the review instruction plus the stable JSON
 // shape. The result is informational — no automated merge, ever — the
-// main agent reviews the diff and merges or dismisses; dismissal cleans
-// the workspace up through Remove (#63).
+// main agent reviews the diff and applies or dismisses it through the
+// apply_dispatch and dismiss_dispatch tools (#368), which clean the
+// workspace up.
 func (r DispatchResult) TerminalMessage() string {
 	var b strings.Builder
 	if r.Status == StatusKilled {
@@ -131,12 +132,12 @@ func (r DispatchResult) TerminalMessage() string {
 		// kill never auto-discards work-in-progress a human might want),
 		// so the instruction points the parent at the
 		// re-dispatch-or-dismiss decision instead of plain review.
-		fmt.Fprintf(&b, "A dispatched agent was killed (reason: %q; dispatch %s, branch %s). Its workspace is preserved: nothing was discarded, and cleanup still waits on your decision. The agent's last state and the salvageable diff are below. Decide whether to re-dispatch the task or dismiss the workspace (git worktree remove and branch delete).\n\n", r.KilledReason, r.DispatchID, r.Branch)
+		fmt.Fprintf(&b, "A dispatched agent was killed (reason: %q; dispatch %s, branch %s). Its workspace is preserved: nothing was discarded, and cleanup still waits on your decision. The agent's last state and the salvageable diff are below. Decide whether to re-dispatch the task (dispatch a new agent with the follow-up) or dismiss the workspace with the dismiss_dispatch tool.\n\n", r.KilledReason, r.DispatchID, r.Branch)
 		r.writeUndeliveredSteers(&b)
 		b.WriteString(r.Render())
 		return b.String()
 	}
-	fmt.Fprintf(&b, "A dispatched agent finished with status %q (dispatch %s, branch %s). Its result is below. Review the diff and decide whether to merge or dismiss it — the dispatch never merges itself. The workspace and its branch are preserved until the work is applied or dismissed; uncommitted changes count as part of the work, so cleanup waits on your decision and nothing was discarded at exit.\n\n", r.Status, r.DispatchID, r.Branch)
+	fmt.Fprintf(&b, "A dispatched agent finished with status %q (dispatch %s, branch %s). Its result is below. Review the diff and decide whether to keep it or discard it — the dispatch never merges itself. Keep it with the apply_dispatch tool (merge, squash, or cherry-pick; the workspace's uncommitted changes are brought in too), or discard it with dismiss_dispatch, which removes the workspace and its branch. Until you decide, the workspace and its branch are preserved and nothing was discarded at exit.\n\n", r.Status, r.DispatchID, r.Branch)
 	r.writeUndeliveredSteers(&b)
 	b.WriteString(r.Render())
 	return b.String()
