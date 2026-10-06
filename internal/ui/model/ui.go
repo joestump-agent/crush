@@ -387,8 +387,11 @@ type UI struct {
 	// inspectDispatchTargets marks which ring members are dispatch blocks
 	// (vs plain agent tools), so ctrl+x only offers a cancel for them.
 	// inspectSeq numbers inspect transitions so a child load that lands
-	// after a later one is dropped. inspectPending is a task session
-	// picked from the sessions dialog, waiting for its parent to load.
+	// after a later one is dropped. inspectWindow holds the transition
+	// whose snapshot is in flight: its target session and the message
+	// events buffered for it until the snapshot lands (#406).
+	// inspectPending is a task session picked from the sessions dialog,
+	// waiting for its parent to load.
 	inspecting             *session.Session
 	inspectScroll          [2]int
 	inspectFollow          bool
@@ -396,6 +399,7 @@ type UI struct {
 	inspectRingPos         int
 	inspectDispatchTargets map[string]bool
 	inspectSeq             int
+	inspectWindow          *inspectWindow
 	inspectPending         *session.Session
 
 	// onboarding state
@@ -1040,6 +1044,13 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
+	case inspectFetchFailedMsg:
+		// Inspect transition fetch failed (#406): close the pending
+		// window so later events apply normally.
+		if cmd := m.handleInspectFetchFailed(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
 	case modeSwitchedMsg:
 		m.modeSwitching = false
 		cmds = append(cmds, m.applyModeSwitch(msg)...)
@@ -1158,6 +1169,43 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pubsub.Event[message.Message]:
 		// Check if this is a child session message for an agent tool.
 		if m.session == nil {
+			break
+		}
+		if m.inspectWindow != nil && msg.Payload.SessionID == m.inspectWindow.sessionID {
+			// An inspect transition's snapshot is in flight (#406):
+			// buffer the target's events and replay them when it lands,
+			// so nothing races the transcript swap. Each kind keeps its
+			// usual live feed while the window is open.
+			switch {
+			case msg.Payload.SessionID == m.session.ID:
+				// Exit window: the chat still shows the child, so parent
+				// events stay off screen until the restore lands. Busy
+				// and queue state still refresh.
+				if msg.Type == pubsub.CreatedEvent {
+					m.invalidateBusyCaches()
+					m.invalidatePromptQueue()
+					if cmd := m.dispatchBusyRefresh(); cmd != nil {
+						cmds = append(cmds, cmd)
+					}
+					if cmd := m.dispatchPromptQueueRefresh(); cmd != nil {
+						cmds = append(cmds, cmd)
+					}
+				}
+			case m.isInspecting() && msg.Payload.SessionID == m.inspectingSessionID():
+				// Reloading the viewed child (a wrap in the cycle):
+				// keep painting live.
+				if cmd := m.handleInspectChildMessage(msg); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			default:
+				// Entering, or cycling to another child: the chat shows
+				// the parent or the previous child; the target's events
+				// feed the parent's agent blocks as usual.
+				if cmd := m.handleChildSessionMessage(msg); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+			m.inspectWindow.events = append(m.inspectWindow.events, msg)
 			break
 		}
 		if msg.Payload.SessionID != m.session.ID {
