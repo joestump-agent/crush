@@ -137,10 +137,14 @@ this process's own workspaces are touched ([#367](https://github.com/joestump-ag
 nothing; the next launch reconciles the same way.
 :::
 
+From the shell, `crush dispatch list` summarizes every workspace (handle,
+branch, disposition, owner liveness, pending changes) and `crush dispatch
+prune` removes decided ones, or every dead owner's with `--all-dead`;
+`--dry-run` previews without deleting ([#369](https://github.com/joestump-agent/crush/issues/369)).
+
 :::info[Planned]
 You'll record your decision about a workspace explicitly with
-`apply_dispatch` and `dismiss_dispatch` ([#368](https://github.com/joestump-agent/crush/issues/368)), and manage them from the
-shell with `crush dispatch list` and `crush dispatch prune` ([#369](https://github.com/joestump-agent/crush/issues/369)).
+`apply_dispatch` and `dismiss_dispatch` ([#368](https://github.com/joestump-agent/crush/issues/368)).
 :::
 
 ## Under the hood: A2A

@@ -192,18 +192,21 @@ git branch rescue-<id> <sha>      # once you've found it with git show <sha>
 
 Uncommitted changes in a removed worktree are gone.
 
+From the shell, `crush dispatch list` shows every workspace and `crush
+dispatch prune` removes decided ones, or every dead owner's with
+`--all-dead`; `--dry-run` previews ([#369](https://github.com/joestump-agent/crush/issues/369)).
+
 :::info[Planned]
-You'll apply or dismiss each dispatch explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)) and manage
-workspaces from the shell with `crush dispatch list` and `crush dispatch
-prune` ([#369](https://github.com/joestump-agent/crush/issues/369)).
+You'll apply or dismiss each dispatch explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)).
 :::
 
 ### Orphan worktrees and `crush-dispatch-*` branches pile up
 
 Normal quits usually leave worktrees behind (see above), and so do crashes. A
 failed parallel dispatch can leave a branch with no worktree, which the sweep
-never finds ([#381](https://github.com/joestump-agent/crush/issues/381)). Each orphan is a full checkout, so clean them up by
-hand.
+never finds ([#381](https://github.com/joestump-agent/crush/issues/381)). `crush dispatch prune --all-dead` clears the worktree
+directories whose owner is gone ([#369](https://github.com/joestump-agent/crush/issues/369)); a branch with no worktree still
+needs removing by hand.
 
 ### Recover a dispatch by hand
 
