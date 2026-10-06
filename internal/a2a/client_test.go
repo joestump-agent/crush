@@ -51,6 +51,7 @@ func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return "--- a/x\n+++ b/x\n@@\n+changed", nil
 		},
@@ -65,9 +66,10 @@ func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
 	go func() {
 		var err error
 		outcome, err = factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-			Endpoint: server.Endpoint,
-			Card:     server.Card,
-			Prompt:   "fix the bug",
+			Endpoint:  server.Endpoint,
+			Card:      server.Card,
+			Prompt:    "fix the bug",
+			ContextID: "dispatch-session",
 		})
 		streamErr <- err
 	}()
@@ -111,14 +113,16 @@ func TestStreamDispatchWithoutTodosSingleWorking(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     &fakeRunner{result: textResult("done")},
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
@@ -138,6 +142,7 @@ func TestStreamDispatchTodoEventOnWire(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 		Todos:      source,
 	})
 	require.NoError(t, err)
@@ -153,6 +158,7 @@ func TestStreamDispatchTodoEventOnWire(t *testing.T) {
 	req := &a2aspec.SendMessageRequest{
 		Message: a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("fix the bug")),
 	}
+	req.Message.ContextID = "dispatch-session"
 	evsCh := make(chan []a2aspec.Event, 1)
 	go func() {
 		var evs []a2aspec.Event
@@ -267,14 +273,16 @@ func TestStreamDispatchFailedRun(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     &fakeRunner{err: errors.New("provider exploded")},
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusFailed, outcome.Status)
@@ -289,14 +297,16 @@ func TestStreamDispatchRunnerPanicFails(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     &fakeRunner{panicValue: errors.New("adapter blew up")},
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusFailed, outcome.Status)
@@ -314,6 +324,7 @@ func TestStreamDispatchOutOfBandCancelEnds(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 		CancelReason: func() string {
 			return "wander kill: hard timeout"
 		},
@@ -330,9 +341,10 @@ func TestStreamDispatchOutOfBandCancelEnds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	outcome, err := factory.StreamDispatch(ctx, agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
 	require.Less(t, time.Since(start), 5*time.Second, "the stream must end well before the caller's deadline")
@@ -350,6 +362,7 @@ func TestCancelDispatchEndsStream(t *testing.T) {
 		DispatchID: "dispatch-cancel",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
@@ -361,10 +374,11 @@ func TestCancelDispatchEndsStream(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		outcome, err := factory.StreamDispatch(ctx, agent.DispatchTransportParams{
-			Endpoint: server.Endpoint,
-			Card:     server.Card,
-			Prompt:   "fix the bug",
-			OnTask:   func(taskID string) { taskIDCh <- taskID },
+			Endpoint:  server.Endpoint,
+			Card:      server.Card,
+			Prompt:    "fix the bug",
+			ContextID: "dispatch-session",
+			OnTask:    func(taskID string) { taskIDCh <- taskID },
 		})
 		outcomeCh <- outcome
 		errCh <- err
@@ -420,18 +434,20 @@ func TestStreamDispatchTransportErrors(t *testing.T) {
 
 	// No card to build a client from.
 	_, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: "http://127.0.0.1:1",
-		Card:     "not a card",
-		Prompt:   "x",
+		Endpoint:  "http://127.0.0.1:1",
+		Card:      "not a card",
+		Prompt:    "x",
+		ContextID: "dispatch-session",
 	})
 	require.ErrorContains(t, err, "no resolvable agent card")
 
 	// A card advertising an endpoint nothing serves.
 	dead := BuildAgentCard(CardParams{Agent: config.Agent{Name: "dead-agent"}, Endpoint: "http://127.0.0.1:1", Transport: a2aspec.TransportProtocolJSONRPC})
 	_, err = factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: "http://127.0.0.1:1",
-		Card:     dead,
-		Prompt:   "x",
+		Endpoint:  "http://127.0.0.1:1",
+		Card:      dead,
+		Prompt:    "x",
+		ContextID: "dispatch-session",
 	})
 	require.Error(t, err)
 
@@ -460,6 +476,7 @@ func TestStreamDispatchLargeDiffRoundTrips(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return diff, nil
 		},
@@ -468,9 +485,10 @@ func TestStreamDispatchLargeDiffRoundTrips(t *testing.T) {
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "change everything",
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "change everything",
+		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
@@ -490,6 +508,7 @@ func TestStreamDispatchDiffErrorStillCompletes(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return "", errors.New("not a git repo")
 		},
@@ -498,9 +517,10 @@ func TestStreamDispatchDiffErrorStillCompletes(t *testing.T) {
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
@@ -533,6 +553,7 @@ func TestStreamDispatchOutlivesShortClientDeadline(t *testing.T) {
 		DispatchID: "dispatch-1",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 		Todos:      &fakeTodoSource{},
 	})
 	require.NoError(t, err)
@@ -548,9 +569,10 @@ func TestStreamDispatchOutlivesShortClientDeadline(t *testing.T) {
 		},
 	}
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
@@ -694,6 +716,7 @@ func resumeTestParams() ServerParams {
 		DispatchID: "resume-task",
 		Runner:     &fakeRunner{result: textResult("resumed to the end"), delay: 2 * time.Second},
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return "--- a/x\n+++ b/x\n@@\n+changed", nil
 		},
@@ -734,10 +757,11 @@ func TestStreamDispatchResumesAfterDrop(t *testing.T) {
 		Transport: &cuttingTransport{base: unixDialClient(serverFactory).Transport},
 	}))
 	outcome, err := cutFactory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
-		OnTask:   func(taskID string) { onTask <- taskID },
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
+		OnTask:    func(taskID string) { onTask <- taskID },
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
@@ -749,9 +773,10 @@ func TestStreamDispatchResumesAfterDrop(t *testing.T) {
 		"the resumed run counts exactly the two post-cut todo Working events")
 
 	controlOutcome, err := controlFactory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: control.Endpoint,
-		Card:     control.Card,
-		Prompt:   "fix the bug",
+		Endpoint:  control.Endpoint,
+		Card:      control.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, controlOutcome.Status)
@@ -786,6 +811,7 @@ func TestStreamDispatchRecoversViaGetTask(t *testing.T) {
 		DispatchID: "gettask-task",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return "--- a/y\n+++ b/y\n@@\n+late", nil
 		},
@@ -798,10 +824,11 @@ func TestStreamDispatchRecoversViaGetTask(t *testing.T) {
 		Transport: &cuttingTransport{base: unixDialClient(serverFactory).Transport},
 	}))
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
-		OnTask:   func(taskID string) { onTask <- taskID },
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
+		OnTask:    func(taskID string) { onTask <- taskID },
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
@@ -821,6 +848,7 @@ func TestStreamDispatchGivesUpAfterRetries(t *testing.T) {
 		DispatchID: "retry-task",
 		Runner:     &fakeRunner{result: textResult("never seen"), delay: 2 * time.Second},
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = serverFactory.Close(context.Background()) })
@@ -831,10 +859,11 @@ func TestStreamDispatchGivesUpAfterRetries(t *testing.T) {
 		Transport: &cuttingTransport{base: unixDialClient(serverFactory).Transport, failAfterCut: true},
 	}))
 	_, err = factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
-		OnTask:   func(taskID string) { onTask <- taskID },
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
+		OnTask:    func(taskID string) { onTask <- taskID },
 	})
 	require.Error(t, err)
 	require.ErrorContains(t, err, "a2a: dispatch stream")

@@ -408,13 +408,16 @@ func TestServerPersistsTasksThroughSQLiteStore(t *testing.T) {
 		DispatchID: "durable-task",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
 		TaskStore:  NewSQLiteStore(database, "test-host", nil),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("run the task"))
+	msg.ContextID = "dispatch-session"
 	params, err := json.Marshal(&a2aspec.SendMessageRequest{
-		Message: a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("run the task")),
+		Message: msg,
 	})
 	require.NoError(t, err)
 	body, err := json.Marshal(map[string]any{

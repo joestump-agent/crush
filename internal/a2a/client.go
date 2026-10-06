@@ -63,10 +63,11 @@ func newDispatchClient(ctx context.Context, card *a2aspec.AgentCard, httpClient 
 // StreamDispatch drives one dispatch's initial task over the A2A
 // protocol (#71): it builds a client from the dispatch's registered
 // AgentCard — in-memory discovery, no directory hop — sends the prompt as
-// a streaming message, and consumes the SSE event stream to its terminal
-// state. The returned outcome carries the agent's final text (the
-// terminal status message), the artifact (the diff), and how many
-// Working progress events were observed on the wire.
+// a streaming message carrying the dispatch's ContextID (#350), and
+// consumes the SSE event stream to its terminal state. The returned
+// outcome carries the agent's final text (the terminal status message),
+// the artifact (the diff), and how many Working progress events were
+// observed on the wire.
 //
 // In-process the agent block keeps rendering from the dispatch
 // registry's todo collector — the same snapshots the server re-emits as
@@ -82,6 +83,9 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 	if p.Prompt == "" {
 		return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch prompt is empty")
 	}
+	if p.ContextID == "" {
+		return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch context id is empty")
+	}
 	httpClient := f.httpClient
 	if httpClient == nil {
 		httpClient = f.dispatchHTTPClient()
@@ -96,9 +100,14 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 		return agent.DispatchTransportOutcome{}, err
 	}
 
+	// The A2A context is the task session (#350): the served executor
+	// resolves it to the dispatch's runner and session, and the SDK
+	// stamps it on the new task, so every event the stream carries is
+	// addressable under one context.
 	req := &a2aspec.SendMessageRequest{
 		Message: a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart(p.Prompt)),
 	}
+	req.Message.ContextID = p.ContextID
 
 	var outcome agent.DispatchTransportOutcome
 	var taskID a2aspec.TaskID
