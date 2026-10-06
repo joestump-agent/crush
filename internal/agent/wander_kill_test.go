@@ -566,6 +566,12 @@ func TestWanderKill_IgnoredNudgesEndToEnd(t *testing.T) {
 	require.True(t, branchExists(t, f.env.workingDir, f.entry.Branch))
 	_, ok := f.reg.Get(f.entry.ID)
 	require.True(t, ok, "the killed entry stays registered so it can still be removed")
+
+	// The kept workspace stays leased on purpose — a real session leaves
+	// it for salvage. Release it here so the TempDir cleanup can remove
+	// the lock file: windows refuses to unlink an open file.
+	require.NoError(t, f.provider.Release(t.Context(), f.entry))
+	f.reg.Remove(f.entry.ID)
 }
 
 // TestWanderKill_HardTimeout pins the watchdog's hard timeout: a run
