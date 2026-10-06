@@ -280,7 +280,9 @@ func (app *App) resolveSession(ctx context.Context, continueSessionID string, us
 
 	case useLast:
 		sess, err := app.Sessions.GetLast(ctx)
-		if err != nil {
+		// GetLastSession selects top-level sessions only; the guard
+		// keeps --continue safe if that ever changes (#413).
+		if err != nil || sess.ParentSessionID != "" {
 			return session.Session{}, fmt.Errorf("no sessions found to continue")
 		}
 		return sess, nil
@@ -804,14 +806,58 @@ func (app *App) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapsho
 	return app.AgentCoordinator.DispatchByHandle(sessionID, handle)
 }
 
-// DeliverAgentMessageByHandle routes an editor @handle message to the
-// running dispatched agent's injection queue (#312/#313). A handle
-// another session dispatched refuses (#399).
-func (app *App) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+// DeliverAgentMessageByHandle routes an editor @handle message and its
+// attachments (#414) to the running dispatched agent's injection queue
+// (#312/#313). A handle another session dispatched refuses (#399).
+func (app *App) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	if app.AgentCoordinator == nil {
 		return errors.New("no agent coordinator")
 	}
-	return app.AgentCoordinator.DeliverAgentMessageByHandle(ctx, sessionID, handle, text)
+	return app.AgentCoordinator.DeliverAgentMessageByHandle(ctx, sessionID, handle, text, attachments)
+}
+
+// CancelDispatch stops one dispatched agent on demand (#373): the ref
+// resolves through the dispatch registry as a dispatch ID, an @handle,
+// or the dispatched agent's child session ID.
+func (app *App) CancelDispatch(ctx context.Context, ref string) error {
+	if app.AgentCoordinator == nil {
+		return errors.New("no agent coordinator")
+	}
+	return app.AgentCoordinator.CancelDispatch(ctx, ref)
+}
+
+// DeleteSession deletes a session and every descendant session in one
+// transaction (#418). It refuses while a dispatch is still running from
+// the session or from any descendant, because the cascade would delete
+// the dispatched agent's session; dispatch worktrees and branches are
+// never touched, so they stay manageable with `crush dispatch` (#369).
+func (app *App) DeleteSession(ctx context.Context, id string) error {
+	ids := []string{id}
+	queue := []string{id}
+	seen := map[string]bool{id: true}
+	for len(queue) > 0 {
+		var next []string
+		for _, parentID := range queue {
+			children, err := app.Sessions.ListChildren(ctx, parentID)
+			if err != nil {
+				return err
+			}
+			for _, child := range children {
+				if !seen[child.ID] {
+					seen[child.ID] = true
+					ids = append(ids, child.ID)
+					next = append(next, child.ID)
+				}
+			}
+		}
+		queue = next
+	}
+	for _, sessionID := range ids {
+		if len(app.DispatchLive(sessionID)) > 0 {
+			return errors.New("an agent dispatched from this session is still running; cancel it first")
+		}
+	}
+	return app.Sessions.Delete(ctx, id)
 }
 
 // InitCoderAgentNonInteractive initializes the coder agent without
@@ -825,6 +871,17 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 	if coderAgentCfg.ID == "" {
 		return fmt.Errorf("coder agent configuration is missing")
 	}
+
+	// #420: the coordinator is a per-App singleton. Every client attach
+	// (TUI startup, `crush run`, a reconnect) lands here, and rebuilding
+	// the coordinator would drop the dispatch registry, the injection
+	// targets and the cron scheduler with the old instance. Reuse it and
+	// only flip the tool palette to the mode the attach asks for; the
+	// last attach still decides the mode.
+	if app.AgentCoordinator != nil {
+		return app.AgentCoordinator.SetInteractive(ctx, interactive)
+	}
+
 	var err error
 	coordinatorOpts := agent.CoordinatorOptions{
 		Config:      app.config,

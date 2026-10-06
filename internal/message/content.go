@@ -71,6 +71,11 @@ type TextContent struct {
 	Text string `json:"text"`
 	// Hidden marks generated user continuations that remain in model history.
 	Hidden bool `json:"hidden,omitempty"`
+	// Steer marks a message injected into a running dispatched agent
+	// (#312). It is UI metadata only — it never reaches the model — and
+	// lets a rebuilt transcript tell steers apart from the dispatch's
+	// initial prompt and from todo nudges (#410).
+	Steer bool `json:"steer,omitempty"`
 }
 
 func (tc TextContent) String() string {
@@ -306,7 +311,7 @@ func (m *Message) AppendContent(delta string) {
 	found := false
 	for i, part := range m.Parts {
 		if c, ok := part.(TextContent); ok {
-			m.Parts[i] = TextContent{Text: c.Text + delta, Hidden: c.Hidden}
+			m.Parts[i] = TextContent{Text: c.Text + delta, Hidden: c.Hidden, Steer: c.Steer}
 			found = true
 		}
 	}

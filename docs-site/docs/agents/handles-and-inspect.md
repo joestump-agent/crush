@@ -128,18 +128,19 @@ The schema marks `session_id` required, though either field works ([#400](https:
 
 Each `dispatch_agent` call renders as an agent block in the main chat. Its
 header reads like `tester · working · 2m14s · 14.2K tokens · 2/5 todos`: handle,
-state (`queued`, `working`, `complete`, `failed`, `killed`), elapsed time,
+state (`queued`, `working`, `complete`, `failed`, `killed` — shown as `canceled` when you stopped it yourself), elapsed time,
 tokens, and todo progress. Below it come the task prompt, the current todo
 (`→ …`), the messages you've sent with the agent's replies, and its tool calls.
 
 When the agent finishes, the block becomes a durable record that never clears:
-`Killed` or `Error` with a reason if the run didn't complete, then
+`Killed` (rendered as `Canceled` with the reason `canceled by user` when you
+stopped it with <kbd>ctrl+x</kbd>) or `Error` with a reason if the run didn't complete, then
 **Findings** (its final message) and **Diff** (per-file stat and diff, cut off
 at 250 lines). Focus the block and press <kbd>space</kbd> to expand clipped
 sections.
 
 `agent`-tool blocks can be inspected too, but have no handle and can't be
-steered.
+steered or canceled — <kbd>ctrl+x</kbd> is dispatch-only.
 
 :::warning[Known issue]
 Messages you send an agent are kept only in memory ([#410](https://github.com/joestump-agent/crush/issues/410)). They vanish from
@@ -157,6 +158,7 @@ results, todo nudges — in the chat window while the main session stays active.
 | --- | --- | --- |
 | <kbd>ctrl+]</kbd> | Open the selected agent block, or the first live agent if none is selected | Cycle to the next live agent |
 | <kbd>ctrl+[</kbd> | Acts as <kbd>esc</kbd> where the terminal can't tell them apart | Back to the chat, scroll restored |
+| <kbd>ctrl+x</kbd> | Cancel the selected live dispatch block | Cancel the dispatch you are viewing |
 | <kbd>esc</kbd> | Unchanged | Depends on the terminal; see below |
 
 - The keys work from the editor or the chat; an open dialog takes them first.
@@ -242,12 +244,6 @@ server, and no API exposes them yet.
 | Mentions | No card |
 | Inspect mode | A selected block opens, but there are no live agents to cycle |
 | Sessions tree | Works |
-
-:::warning[Known issue]
-The server builds its coordinator on a short-lived request context, so dispatch
-progress tracking stops at once ([#419](https://github.com/joestump-agent/crush/issues/419)), and each attaching client replaces
-the coordinator, orphaning running dispatches ([#420](https://github.com/joestump-agent/crush/issues/420)).
-:::
 
 :::info[Planned]
 The TUI becomes an A2A client of the per-process A2A host, so status, steering,

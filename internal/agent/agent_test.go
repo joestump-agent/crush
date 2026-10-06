@@ -16,6 +16,7 @@ import (
 	"charm.land/x/vcr"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/gittest"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/assert"
@@ -26,9 +27,14 @@ import (
 
 func TestMain(m *testing.M) {
 	slog.SetLogLoggerLevel(slog.LevelError)
+	gitRestore, err := gittest.Setup()
+	if err != nil {
+		panic(fmt.Sprintf("hermetic git env: %v", err))
+	}
 	cleanup := isolateGlobalConfig()
 	code := m.Run()
 	cleanup()
+	gitRestore()
 	os.Exit(code)
 }
 
@@ -90,7 +96,10 @@ func getModels(t *testing.T, r *vcr.Recorder, pair modelPair) (fantasy.LanguageM
 func setupAgent(t *testing.T, pair modelPair) (SessionAgent, fakeEnv) {
 	r := vcr.NewRecorder(t)
 	large, small := getModels(t, r, pair)
-	env := testEnv(t)
+	// The cassettes under testdata/TestCoderAgent/** record the fixed
+	// working directory in the request body, so only this call site
+	// keeps it (#422).
+	env := testEnvFixedDir(t)
 
 	createSimpleGoProject(t, env.workingDir)
 	agent, err := coderAgent(r, env, large, small)

@@ -94,6 +94,7 @@ with your shell's privileges, before the UI appears.
 | `option context-path …` | `options.context_paths[]` |
 | `option global-context-path …` | `options.global_context_paths[]` |
 | `option attribution-*` | `options.attribution.*` |
+| `option todo-*/dispatch-*` | `options.todo_enforcement.<key>` |
 | `option ui <key> <value>` | `options.tui.<key>` |
 
 Note that the JSON names are not a mechanical transliteration of the builtin
@@ -105,25 +106,9 @@ names: `permissions deny` writes `options.disabled_tools`, and several
 
 The top-level `options` object also carries a few keys with no `crushrc`
 builtin yet: `allowed_commands`, `allow_all_commands` (see
-[Permissions](/configuration/permissions#blocked-commands)), `disable_a2ui`
-(see [A2UI](/features/a2ui)), and `todo_enforcement` (see
-[Todo enforcement](/agents/todo-enforcement)). Top-level `tools` tunes the
+[Permissions](/configuration/permissions#blocked-commands)), and `disable_a2ui`
+(see [A2UI](/features/a2ui)). Top-level `tools` tunes the
 `glob`, `grep`, and `ls` tool limits.
-
-For `todo_enforcement` that makes `crush.json` the only place to set it — the
-`option` builtin rejects it as an unknown key. Both formats merge, so a small
-`crush.json` beside your `crushrc` works:
-
-```json
-{
-  "$schema": "https://charm.land/crush.json",
-  "options": {
-    "todo_enforcement": { "nudge_threshold": 8, "kill_after_nudges": 0 }
-  }
-}
-```
-
-Tracked as [#403](https://github.com/joestump-agent/crush/issues/403).
 
 :::info[Fork feature]
 These `crush.json` keys do not exist upstream: `options.allowed_commands`,

@@ -22,11 +22,44 @@ func isHandleTokenChar(b byte) bool {
 	return strings.IndexByte(handleTokenChars, b) >= 0
 }
 
+// handleBoundary is the punctuation a @handle token may be closed by:
+// the token ends at whitespace or the end of the line, or at one of
+// these characters when it is itself followed by whitespace or the end
+// of the line — "@tester: stop" and "ask @tester." address the tester,
+// while "@main.go" and "@tester's" stay a file mention and prose.
+const handleBoundary = ":,.?!"
+
+// handleTokenClosed reports whether the handle token ending at end
+// closes there: the next byte is whitespace, the end of the text, or a
+// handleBoundary character that itself looks out at whitespace or the
+// end of the text. skip is true when a boundary character was consumed,
+// so the caller starts the rest past it — "@tester: stop" gives rest
+// "stop", not ": stop".
+func handleTokenClosed(text string, end int) (closed, skip bool) {
+	if end >= len(text) {
+		return true, false
+	}
+	switch b := text[end]; {
+	case b == ' ' || b == '\t' || b == '\n':
+		return true, false
+	case strings.IndexByte(handleBoundary, b) >= 0:
+		if end+1 < len(text) {
+			n := text[end+1]
+			if n != ' ' && n != '\t' && n != '\n' {
+				return false, false
+			}
+		}
+		return true, true
+	}
+	return false, false
+}
+
 // splitLeadingHandle splits a submitted prompt whose first token is a
-// @handle candidate (#313): it returns the candidate (without the "@") and
-// the remaining prompt text. The candidate must be the very first token of
-// the very first line, followed by whitespace or the end of the prompt —
-// "why are @tester and ..." does not route, it mentions. ok=false when the
+// @handle candidate (#313, #415): it returns the candidate (without the
+// "@") and the remaining prompt text. The candidate must be the very
+// first token of the very first line, closed by whitespace, the end of
+// the prompt, or a boundary character ("@tester: stop") — "why are
+// @tester and ..." does not route, it mentions. ok=false when the
 // prompt does not open with a handle-shaped token.
 func splitLeadingHandle(prompt string) (handle, rest string, ok bool) {
 	prompt = strings.TrimLeft(prompt, " \t")
@@ -41,12 +74,17 @@ func splitLeadingHandle(prompt string) (handle, rest string, ok bool) {
 		return "", "", false
 	}
 	handle = prompt[1:end]
-	rest = strings.TrimLeft(prompt[end:], " \t\n")
-	// The token must end at whitespace or the end of the prompt; a token
-	// glued to more text ("@tester's work") is prose, not an address.
-	if end < len(prompt) && prompt[end] != ' ' && prompt[end] != '\t' && prompt[end] != '\n' {
+	// The token must close at whitespace, end of prompt, or a boundary
+	// character that looks out at whitespace: a token glued to more text
+	// ("@tester's work") is prose, not an address.
+	closed, skip := handleTokenClosed(prompt, end)
+	if !closed {
 		return "", "", false
 	}
+	if skip {
+		end++
+	}
+	rest = strings.TrimLeft(prompt[end:], " \t\n")
 	return handle, rest, true
 }
 
@@ -72,10 +110,12 @@ func mentionHandles(prompt string) []string {
 			if handle == "" {
 				continue
 			}
-			// The token must close at whitespace or end of line: a token
+			// The token must close at whitespace, end of line, or a
+			// boundary character that looks out at whitespace: a token
 			// glued to more text ("@main.go", "@tester's") is prose or a
 			// file mention, never a handle.
-			if end < len(line) && line[end] != ' ' && line[end] != '\t' {
+			closed, _ := handleTokenClosed(line, end)
+			if !closed {
 				continue
 			}
 			// Skip the very first token of the very first line: it is the
@@ -175,35 +215,41 @@ func (m *UI) agentMentionAttachments(prompt string) []message.Attachment {
 // (#313): the message routes directly to that agent's injection queue
 // (#312) instead of starting a parent turn. handled reports whether the
 // prompt was consumed — routed, refused, or invalid — and the caller must
-// not also send it to the parent session. An unresolvable leading token
-// (a file path, an unknown name) falls back to the normal prompt path.
-func (m *UI) routeLeadingAgentHandle(prompt string) (cmd tea.Cmd, handled bool) {
+// not also send it to the parent session. delivered reports whether the
+// message actually reached the agent's queue; a consumed prompt that was
+// refused or failed to deliver is handled but not delivered, and the
+// caller restores the editor's pre-submit state for it (#414).
+// attachments are the editor's captured chips, delivered with the steer.
+// An unresolvable leading token (a file path, an unknown name) falls
+// back to the normal prompt path.
+func (m *UI) routeLeadingAgentHandle(prompt string, attachments []message.Attachment) (cmd tea.Cmd, handled, delivered bool) {
 	handle, rest, ok := splitLeadingHandle(prompt)
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
 	// Handles are stored slugged; resolve through the slug so the user's
 	// casing never matters, exactly like the message_agent tool path.
 	handle = dispatch.HandleSlug(handle)
-	if rest == "" {
-		return util.ReportWarn("Nothing to send @handle — write the message after the handle, e.g. \"@" + handle + " stop writing Rust\"."), true
-	}
 	snap, found := m.com.Workspace.DispatchByHandle(m.currentSessionID(), handle)
 	if !found {
-		// Not a dispatch handle: most likely a file mention or a typo.
-		// The normal prompt path owns it.
-		return nil, false
+		// Not a dispatch handle: most likely a file mention, an unknown
+		// bare token, or a typo. The normal prompt path owns it, whatever
+		// the message is — an unknown token must never be swallowed.
+		return nil, false, false
+	}
+	if rest == "" {
+		return util.ReportWarn("Nothing to send @handle — write the message after the handle, e.g. \"@" + handle + " stop writing Rust\"."), true, false
 	}
 	if snap.Entry.Status.IsTerminal() {
-		return util.ReportError(fmt.Errorf("agent @%s finished (%s); task sessions are never continuable — dispatch a new agent instead", handle, snap.Entry.Status)), true
+		return util.ReportError(fmt.Errorf("agent @%s finished (%s); task sessions are never continuable — dispatch a new agent instead", handle, snap.Entry.Status)), true, false
 	}
-	if err := m.com.Workspace.DeliverAgentMessageByHandle(context.Background(), m.currentSessionID(), handle, rest); err != nil {
-		return util.ReportError(err), true
+	if err := m.com.Workspace.DeliverAgentMessageByHandle(context.Background(), m.currentSessionID(), handle, rest, attachments); err != nil {
+		return util.ReportError(err), true, false
 	}
 	// The steer and the agent's response appear on its dispatch block in
 	// the chat (the child session's message events); nothing lands in the
 	// parent session.
-	return nil, true
+	return nil, true, true
 }
 
 // agentCompletionValues composes the live-agents source for the @

@@ -19,6 +19,7 @@ import (
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/shell"
+	"github.com/google/uuid"
 )
 
 //go:embed templates/dispatch_tool.md
@@ -26,6 +27,20 @@ var dispatchToolDescription string
 
 // DispatchAgentToolName is the registered name of the DispatchAgent tool.
 const DispatchAgentToolName = "dispatch_agent"
+
+// dispatchRetryBackoff paces the dispatch-delivery retry chain (#388):
+// every failed delivery attempt re-pends and re-arms the flush, so a
+// deterministic failure would otherwise loop back-to-back.
+const dispatchRetryBackoff = 2 * time.Second
+
+// dispatchResultPersistWindow bounds how long the run waits for the
+// parent turn to persist the dispatch_agent tool result before stamping
+// the terminal result onto it (#410): the run is launched before the
+// tool returns, so a run that ends almost instantly can beat the write.
+const dispatchResultPersistWindow = 5 * time.Second
+
+// dispatchResultPersistPoll paces that wait.
+const dispatchResultPersistPoll = 200 * time.Millisecond
 
 // DispatchAgentParams are the DispatchAgent tool's arguments.
 type DispatchAgentParams struct {
@@ -68,10 +83,11 @@ type dispatchAgentOptions struct {
 	// Skills restricts the rendered available-skills set; empty means
 	// every skill discovered in the workspace.
 	Skills []string
-	// TodoKill observes the wander-kill escalation (#316): invoked when
-	// the dispatched run ignores its nudges past the kill threshold, so
-	// the coordinator can record the reason against this dispatch. The
-	// run's cancellation is intrinsic; this only observes.
+	// TodoKill is the wander-kill escalation's supervisor hook (#316):
+	// invoked when the dispatched run ignores its nudges past the kill
+	// threshold. The observer owns the kill (#348): it records the
+	// reason against this dispatch and routes the kill through the
+	// served run's tasks/cancel, with the direct cancel as the fallback.
 	TodoKill func(sessionID string, reason string)
 	// LoopStop observes the loop-detection stop (#343): invoked when the
 	// dispatched run's step loop ends on the loop-detection stop
@@ -122,10 +138,67 @@ type dispatchedAgent struct {
 	providerCfg config.ProviderConfig
 }
 
+// dispatchFindings is one dispatched run's turn-text record (#397): the
+// work turn's findings and the replies of steers that arrived as
+// follow-up turns, kept apart so a steer accepted while the final step
+// was streaming cannot replace the findings. The mutex guards both:
+// turn observers fire from the run's turns while the terminal assembly
+// reads the record.
+type dispatchFindings struct {
+	mu       sync.Mutex
+	workText string
+	replies  []string
+}
+
+// setWork records the work turn's text, last write wins: a summarize
+// continuation re-queues the same call, so the continuation's finished
+// text replaces the cut turn's.
+func (f *dispatchFindings) setWork(text string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.workText = text
+	f.mu.Unlock()
+}
+
+// addSteerReply appends one steer turn's reply, in turn order.
+func (f *dispatchFindings) addSteerReply(text string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.replies = append(f.replies, text)
+	f.mu.Unlock()
+}
+
+// work returns the last recorded work-turn text, empty when no work turn
+// finished (a nil receiver is an unrecorded run).
+func (f *dispatchFindings) work() string {
+	if f == nil {
+		return ""
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.workText
+}
+
+// steerReplies returns a copy of the recorded steer replies, nil when
+// none landed (a nil receiver is an unrecorded run).
+func (f *dispatchFindings) steerReplies() []string {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.replies...)
+}
+
 // dispatchRun carries one backgrounded dispatch from the tool call that
 // started it to the goroutine that runs it.
 type dispatchRun struct {
-	workspace   *dispatch.Workspace
+	reg         *dispatch.AgentRegistry
+	provider    *dispatch.GitWorktreeProvider
 	entry       dispatch.Entry
 	toolchain   *DispatchToolchain
 	agent       SessionAgent
@@ -156,9 +229,20 @@ type dispatchRun struct {
 	// a no-op for an unregistered session (#430). Nil where a run is
 	// driven without a root (tests that assemble or observe only).
 	cancel context.CancelFunc
+	// holdsSlot reports that the run holds the dispatch concurrency slot
+	// its tool call reserved (#390): the run's teardown releases it when
+	// the dispatch reaches a terminal state. Runs driven without a
+	// reservation (tests that call runDispatch directly) do not.
+	holdsSlot bool
 	// killSettings are the resolved wander-kill thresholds for this
 	// dispatch: nudges-before-kill, todos stall window, hard timeout.
 	killSettings config.TodoEnforcementSettings
+	// findings records the run's work-turn text and steer replies
+	// (#397): a pointer, because the dispatchRun value is copied into
+	// the background run and both copies must name the same record.
+	// Nil where a run is driven without the record (tests that assemble
+	// only); the accessors are nil-safe.
+	findings *dispatchFindings
 }
 
 // registerLiveDispatch records a running dispatch (#371). The map is
@@ -188,6 +272,117 @@ func (c *coordinator) teardownLiveDispatch(id string) {
 	close(live.done)
 }
 
+// cancelDispatchesForShutdown is CancelAll's dispatch phase (#372): the
+// agent cancel before it reaches only the main agent, and every
+// dispatched agent runs on its own detached context, so quitting Crush
+// must cancel them here. Each live dispatch records the shutdown kill
+// reason and takes the same graceful agent.Cancel path the watchdog
+// uses, then the phase waits one shared bound for every run's teardown
+// to close its done channel. A dispatch still running when the bound
+// expires gets its root cancel, which also unblocks a transport-path
+// client stream, and one more shared bound; anything that outlives that
+// is logged with its dispatch ID and left to its run goroutine.
+func (c *coordinator) cancelDispatchesForShutdown() {
+	// Raise the flag before touching any dispatch: from here on a
+	// finishing dispatch records its terminal state but starts no
+	// parent delivery turn.
+	c.shuttingDown.Store(true)
+
+	type shutdownTarget struct {
+		id   string
+		live *liveDispatch
+	}
+	c.dispatchMu.Lock()
+	targets := make([]shutdownTarget, 0, len(c.liveDispatches))
+	for id, live := range c.liveDispatches {
+		targets = append(targets, shutdownTarget{id: id, live: live})
+	}
+	c.dispatchMu.Unlock()
+	if len(targets) == 0 {
+		return
+	}
+
+	cancelWait, rootWait := c.dispatchShutdownWait, c.dispatchShutdownRootWait
+	if cancelWait <= 0 {
+		cancelWait = 5 * time.Second
+	}
+	if rootWait <= 0 {
+		rootWait = time.Second
+	}
+
+	for _, target := range targets {
+		if target.live.kill != nil {
+			target.live.kill.kill(dispatch.ReasonShutdown)
+		}
+		target.live.agent.Cancel(target.live.sessionID)
+	}
+
+	deadline := time.NewTimer(cancelWait)
+	defer deadline.Stop()
+	var remaining []shutdownTarget
+waitLoop:
+	for i, target := range targets {
+		select {
+		case <-target.live.done:
+		case <-deadline.C:
+			remaining = targets[i:]
+			break waitLoop
+		}
+	}
+	if len(remaining) == 0 {
+		return
+	}
+
+	rootDeadline := time.NewTimer(rootWait)
+	defer rootDeadline.Stop()
+	for _, target := range remaining {
+		if target.live.cancel != nil {
+			target.live.cancel()
+		}
+	}
+	var stuck []shutdownTarget
+	for _, target := range remaining {
+		select {
+		case <-target.live.done:
+		case <-rootDeadline.C:
+			stuck = append(stuck, target)
+		}
+	}
+	for _, target := range stuck {
+		slog.Warn("Dispatch still running after shutdown cancel", "dispatch_id", target.id, "session_id", target.live.sessionID)
+	}
+}
+
+// reserveDispatchSlot checks the resolved dispatch.max_concurrent cap
+// (#390) against the dispatches currently holding a slot — live
+// dispatches plus setups still in flight — and reserves one more under
+// the same lock, so parallel tool calls within one step cannot overshoot
+// the cap. It reports whether the slot was reserved, and how many
+// dispatches hold slots when the cap refused.
+func (c *coordinator) reserveDispatchSlot() (bool, int) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	limit := c.cfg.Config().Options.GetDispatchMaxConcurrent()
+	if c.dispatchSlots >= limit {
+		return false, c.dispatchSlots
+	}
+	c.dispatchSlots++
+	return true, 0
+}
+
+// releaseDispatchSlot frees a dispatch slot held by a setup that failed
+// before its run took ownership, or by a run that reached a terminal
+// state (#390). Each reservation is released exactly once; the clamp
+// keeps a spurious release from drifting the counter negative and
+// silently raising the cap.
+func (c *coordinator) releaseDispatchSlot() {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	if c.dispatchSlots > 0 {
+		c.dispatchSlots--
+	}
+}
+
 // call builds the full SessionAgentCall a dispatch's turns run with:
 // the chosen model's shaping, the parent turn's content width, and the
 // non-interactive flag. Built per consumer — the server stamps its
@@ -198,7 +393,7 @@ func (r dispatchRun) call(c *coordinator) SessionAgentCall {
 	if r.model.ModelCfg.MaxTokens != 0 {
 		maxTokens = r.model.ModelCfg.MaxTokens
 	}
-	return SessionAgentCall{
+	call := SessionAgentCall{
 		SessionID:        r.sessionID,
 		ContentWidth:     r.contentWidth,
 		Prompt:           r.prompt,
@@ -212,6 +407,11 @@ func (r dispatchRun) call(c *coordinator) SessionAgentCall {
 		NonInteractive:   true,
 		OnAuthRefresh:    c.makeAuthRefreshCallback(r.providerCfg),
 	}
+	// The work-turn observer (#397): every turn the run drives — the
+	// served turn and the direct turn alike — reports its finished text
+	// into the run's findings.
+	call.turnText = r.findings.setWork
+	return call
 }
 
 // dispatchTool builds the DispatchAgent tool (#64): provision a clean
@@ -260,19 +460,48 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse("dispatch unavailable: bash/edit/write are disabled by your configuration (disabled_tools / permissions deny)"), nil
 			}
 
-			workspace, err := c.dispatchWorkspace()
+			provider, err := c.dispatchWorkspaceProvider()
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("dispatch unavailable: %s", err)), nil
+			}
+			reg := c.dispatchRegistry()
+
+			// The concurrency cap (#390): count the slots in flight —
+			// live dispatches plus setups still provisioning — and
+			// reserve one more under the same lock, so parallel tool
+			// calls within one step cannot overshoot the cap. At the
+			// cap, refuse before provisioning anything. The slot is
+			// released by the setup-failure paths below, or by the run's
+			// teardown once the dispatch reaches a terminal state.
+			reserved, running := c.reserveDispatchSlot()
+			if !reserved {
+				limit := c.cfg.Config().Options.GetDispatchMaxConcurrent()
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"dispatch at capacity: %d agents are already running (dispatch.max_concurrent=%d); wait for one to finish or cancel one",
+					running, limit)), nil
 			}
 
 			// Provision, bootstrap, and build while the tool call is
 			// still open: every step is local and fast, and failures
 			// here are actionable tool errors rather than silent
-			// background failures.
-			entry, err := workspace.Provision(ctx, dispatch.ProvisionOptions{Base: params.Branch})
+			// background failures. The provider owns the directory; the
+			// registry owns the entry, registered here so every setup
+			// failure below tears both down.
+			id := uuid.NewString()
+			placement, err := provider.Provision(ctx, id, dispatch.ProvisionOptions{Base: params.Branch})
 			if err != nil {
+				c.releaseDispatchSlot()
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("provision dispatch workspace: %s", err)), nil
 			}
+			entry := dispatch.Entry{
+				ID:      id,
+				Path:    placement.Path,
+				Branch:  placement.Branch,
+				Base:    placement.Base,
+				BaseSHA: placement.BaseSHA,
+				Status:  dispatch.StatusProvisioned,
+			}
+			reg.Register(entry)
 
 			// The dispatch outlives the turn that started it: its root
 			// context is detached from the tool call's, so the run and
@@ -289,13 +518,15 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			toolchain, err := c.BuildDispatchToolchain(rootCtx, DispatchToolchainOptions{WorkingDir: entry.Path})
 			if err != nil {
 				rootCancel()
-				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				c.releaseDispatchSlot()
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("build dispatch toolchain: %s", err)), nil
 			}
 
 			if unknown := missingSkills(toolchain.Config(), params.Skills); len(unknown) > 0 {
 				rootCancel()
-				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				c.releaseDispatchSlot()
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("unknown skills: %s", strings.Join(unknown, ", "))), nil
 			}
 
@@ -312,8 +543,15 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				Toolchain: toolchain,
 				ModelType: modelType,
 				Skills:    params.Skills,
+				// The ladder's kill rung (#316) reports here; the
+				// supervisor owns the kill (#348): the reason rides a
+				// tasks/cancel to the served dispatch, with the direct
+				// cancel as the fallback while the task ID is still
+				// unknown. The dispatched agent's ladder closure no
+				// longer cancels itself.
 				TodoKill: func(sessionID string, reason string) {
 					kill.kill(reason)
+					c.killDispatch(reg, entry.ID, reason, nil)
 				},
 				LoopStop: func(sessionID string) {
 					kill.kill(dispatch.ReasonToolLoop)
@@ -321,7 +559,8 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			})
 			if err != nil {
 				rootCancel()
-				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				c.releaseDispatchSlot()
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("build dispatched agent: %s", err)), nil
 			}
 
@@ -331,7 +570,8 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			taskSession, err := c.sessions.CreateTaskSession(ctx, taskSessionID, sessionID, "Dispatched Agent")
 			if err != nil {
 				rootCancel()
-				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				c.releaseDispatchSlot()
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("create session: %s", err)), nil
 			}
 
@@ -339,18 +579,20 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// and #313's handles read these entries. The handle is assigned
 			// after the session so the assignment event carries the complete
 			// entry — handle, role, session, running state.
-			workspace.SetSession(entry.ID, taskSession.ID)
-			workspace.SetParentSessionID(entry.ID, sessionID)
-			workspace.SetStatus(entry.ID, dispatch.StatusRunning)
-			assignedHandle, ok := workspace.AssignHandle(entry.ID, params.Handle, params.Role)
+			reg.SetSession(entry.ID, taskSession.ID)
+			reg.SetParentSessionID(entry.ID, sessionID)
+			reg.SetStatus(entry.ID, dispatch.StatusRunning)
+			assignedHandle, ok := reg.AssignHandle(entry.ID, params.Handle, params.Role)
 			if !ok {
 				rootCancel()
-				c.removeDispatch(ctx, workspace, entry.ID, toolchain)
+				c.releaseDispatchSlot()
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse("assign dispatch handle: registry entry vanished"), nil
 			}
 
 			run := dispatchRun{
-				workspace:       workspace,
+				reg:             reg,
+				provider:        provider,
 				entry:           entry,
 				toolchain:       toolchain,
 				agent:           dispatched.agent,
@@ -363,6 +605,8 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				kill:            kill,
 				killSettings:    killSettings,
 				cancel:          rootCancel,
+				findings:        &dispatchFindings{},
+				holdsSlot:       true,
 			}
 
 			// Stand up the dispatch's in-process A2A server (#70) and stamp
@@ -374,7 +618,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// settings, and the kill's reason (#316) rides along (#342):
 			// an out-of-band kill surfaces on the A2A task as a Canceled
 			// status carrying it.
-			run.stopServer = c.startDispatchServer(ctx, workspace, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current)
+			run.stopServer = c.startDispatchServer(ctx, provider, reg, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current)
 
 			// The dispatch runs on its root context, detached from the
 			// tool call's (#371): the permission bridge bound to the root
@@ -389,7 +633,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				done:      make(chan struct{}),
 			}
 			c.registerLiveDispatch(entry.ID, live)
-			go c.runDispatch(rootCtx, run)
+			c.startDispatchRun(func() { c.runDispatch(rootCtx, run) })
 
 			handle := dispatch.DispatchResult{
 				DispatchID:    entry.ID,
@@ -472,6 +716,17 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 	return &dispatchedAgent{agent: agent, model: model, providerCfg: providerCfg}, nil
 }
 
+// startDispatchRun starts one dispatch's background run. Tests install
+// spawnDispatch to track every run they start, so none can be racing the
+// test's cleanup (#422); production starts the goroutine directly.
+func (c *coordinator) startDispatchRun(run func()) {
+	if c.spawnDispatch != nil {
+		c.spawnDispatch(run)
+		return
+	}
+	go run()
+}
+
 // runDispatch runs one dispatched agent to completion in the background
 // (#64): it drives the ephemeral session's turn, keeps the registry's
 // status current, propagates the dispatched session's cost to the parent,
@@ -489,7 +744,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		// a dead endpoint. It stops before the toolchain closes, which
 		// ends the shared process-wide resources underneath it.
 		if run.stopServer != nil {
-			c.stopDispatchServer(run.workspace, run.entry.ID, run.stopServer)
+			c.stopDispatchServer(run.reg, run.entry.ID, run.stopServer)
 		}
 		// The toolchain outlives the turn: Close stops the permission
 		// bridge and the scoped LSP clients once nothing runs in the
@@ -500,6 +755,12 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		// live record keeps the registry holding exactly the running
 		// dispatches.
 		c.teardownLiveDispatch(run.entry.ID)
+		// The dispatch's concurrency slot (#390) is held from the tool
+		// call's reservation to here, when the dispatch has reached its
+		// terminal state.
+		if run.holdsSlot {
+			c.releaseDispatchSlot()
+		}
 	}()
 
 	watchStop := c.startDispatchKillWatch(ctx, run)
@@ -512,7 +773,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// shaping, and the target is dropped the moment the run returns so a
 	// finished dispatch refuses instead of running another turn.
 	if injectable, ok := run.agent.(injectableAgent); ok {
-		c.registerDispatchRun(run.sessionID, injectable, call)
+		c.registerDispatchRun(run.sessionID, injectable, call, run.findings)
 		defer c.unregisterDispatchRun(run.sessionID)
 	}
 
@@ -553,7 +814,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 			runErr:        err,
 			stoppedInLoop: dispatchRunStoppedInLoop(result),
 			diff: func(ctx context.Context) (string, error) {
-				return run.workspace.Diff(ctx, run.entry.ID)
+				return run.provider.Diff(ctx, run.entry)
 			},
 		})
 	}
@@ -576,8 +837,13 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// Record the terminal payload before the terminal status so the
 	// terminal entry event carries it: the completed agent block (#65)
 	// renders its durable record from the registry.
-	run.workspace.SetResult(run.entry.ID, terminal)
-	run.workspace.SetStatus(run.entry.ID, terminal.Status)
+	run.reg.SetResult(run.entry.ID, terminal)
+	run.reg.SetStatus(run.entry.ID, terminal.Status)
+
+	// Stamp the terminal result onto the parent's persisted dispatch_agent
+	// tool result (#410): the card's durable record after a restart or in
+	// client/server mode, where the in-memory registry is unreachable.
+	c.persistDispatchTerminalResult(ctx, run, terminal)
 
 	// Cost propagation is best-effort, mirroring runSubAgent: a failure
 	// here must not lose the run's outcome.
@@ -586,6 +852,83 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	}
 
 	c.deliverDispatchResult(ctx, run.parentSessionID, terminal)
+}
+
+// persistDispatchTerminalResult records the terminal DispatchResult on
+// the parent session's persisted dispatch_agent tool result (#410):
+// the result lands in ToolResult.Metadata as JSON, Content stays the
+// running handle the model already saw, so the tool result the model
+// reads is byte-identical before and after completion. The card parses
+// Metadata in preference to Content, which is what makes a finished
+// dispatch render its terminal state after a restart and in
+// client/server mode, where the in-memory registry is unreachable.
+//
+// The parent turn persists the tool result after dispatchTool returns,
+// and the run is launched before that, so a run that ends almost
+// instantly can race the write. The wait is bounded: on giveup the
+// terminal record stays only in the registry and the delivery turn,
+// logged at Warn.
+func (c *coordinator) persistDispatchTerminalResult(ctx context.Context, run dispatchRun, terminal dispatch.DispatchResult) {
+	_, toolCallID, ok := c.sessions.ParseAgentToolSessionID(run.sessionID)
+	if !ok {
+		slog.Warn("Cannot persist dispatch terminal result: session is not an agent tool session", "session_id", run.sessionID, "dispatch_id", run.entry.ID)
+		return
+	}
+	b, err := json.Marshal(terminal)
+	if err != nil {
+		slog.Warn("Failed to encode dispatch terminal result", "dispatch_id", run.entry.ID, "error", err)
+		return
+	}
+	metadata := string(b)
+
+	deadline := time.Now().Add(dispatchResultPersistWindow)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		msgs, err := c.messages.List(ctx, run.parentSessionID)
+		if err != nil {
+			slog.Warn("Failed to list parent session for dispatch terminal result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "error", err)
+			return
+		}
+		for i, msg := range msgs {
+			if msg.Role != message.Tool {
+				continue
+			}
+			stamped := false
+			for j, part := range msg.Parts {
+				tr, ok := part.(message.ToolResult)
+				if !ok || tr.ToolCallID != toolCallID || tr.Metadata == metadata {
+					continue
+				}
+				tr.Metadata = metadata
+				msg.Parts[j] = tr
+				stamped = true
+			}
+			if !stamped {
+				continue
+			}
+			if err := c.messages.Update(ctx, msgs[i]); err != nil {
+				slog.Warn("Failed to persist dispatch terminal result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "error", err)
+				return
+			}
+			// The service may debounce updates; flush so any later read
+			// (a session reload, the client's event stream) sees it now.
+			if err := c.messages.Flush(ctx, msg.ID); err != nil {
+				slog.Debug("Failed to flush dispatch terminal result update", "message_id", msg.ID, "error", err)
+			}
+			return
+		}
+		if !time.Now().Before(deadline) {
+			slog.Warn("Gave up waiting for the parent's dispatch tool result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "tool_call_id", toolCallID, "waited", dispatchResultPersistWindow)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(dispatchResultPersistPoll):
+		}
+	}
 }
 
 // dispatchNaturalOutcome is the path-neutral natural outcome of one
@@ -597,7 +940,9 @@ type dispatchNaturalOutcome struct {
 	// completed reports whether the run finished its turn naturally —
 	// false for failed, canceled, and runs that never started a turn.
 	completed bool
-	// findings is the run's final assistant text.
+	// findings is the run's final assistant text. A steer's follow-up
+	// turn text may arrive here as the last turn's; assembleDispatchResult
+	// prefers the run's findings record over it (#397).
 	findings string
 	// runErr is the run's error; nil when the turn ran to a natural end
 	// or was stopped by the loop-detection stop condition.
@@ -615,6 +960,13 @@ type dispatchNaturalOutcome struct {
 	// unavailable: ...)" instead of "(no changes)" (#361 puts the error
 	// on the wire and deletes this).
 	diff func(ctx context.Context) (string, error)
+	// killReason is a kill reason the transport outcome carried (#348):
+	// a terminal Canceled whose status message is one of the kill
+	// reasons. The in-process kill state is the first witness and wins;
+	// this is the mapping for a kill this process never recorded — an
+	// out-of-process supervisor (#72/#73) that killed the served task
+	// directly. Empty unless the wire said killed.
+	killReason string
 }
 
 // assembleTerminalDispatchResult maps a finished dispatched run onto its
@@ -633,6 +985,11 @@ func (c *coordinator) assembleTerminalDispatchResult(ctx context.Context, run di
 		if natural.runErr != nil || reason == dispatch.ReasonToolLoop || natural.stoppedInLoop {
 			return c.assembleKilledDispatchResult(ctx, run, reason)
 		}
+	} else if natural.killReason != "" {
+		// A kill this process never recorded, reported by the wire
+		// (#348): the served task's Canceled status message is a kill
+		// reason, so the parent reads killed with it.
+		return c.assembleKilledDispatchResult(ctx, run, natural.killReason)
 	} else if natural.stoppedInLoop {
 		// Loop detection's StopWhen ended the run in-process with no kill
 		// recorded; the block records it as the tool-loop kill reason.
@@ -681,16 +1038,19 @@ func (c *coordinator) startDispatchKillWatch(ctx context.Context, run dispatchRu
 	killFromWatch := func(reason string) {
 		run.kill.kill(reason)
 		slog.Warn("Dispatch run killed by watchdog", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "reason", reason)
-		// Cancel the dispatch's root first (#430): a kill landing before
-		// the dispatched agent's Run registered the session leaves
-		// agent.Cancel a no-op, and the run's context is detached from
-		// every parent cancel, so without this the agent keeps running
-		// with no bound. The registered-session cancel below still runs
-		// for the post-registration case and is a no-op otherwise.
-		if run.cancel != nil {
-			run.cancel()
-		}
-		run.agent.Cancel(run.sessionID)
+		// The kill travels the protocol (#348): a tasks/cancel carrying
+		// the reason ends the served task, so the terminal Canceled
+		// status says why the run stopped. The fallback keeps #430's
+		// guarantee for a kill landing before the dispatched agent's Run
+		// registered the session — or before the stream named the task —
+		// where agent.Cancel alone is a no-op: it also cancels the run's
+		// detached root.
+		c.killDispatch(run.reg, run.entry.ID, reason, func() {
+			if run.cancel != nil {
+				run.cancel()
+			}
+			run.agent.Cancel(run.sessionID)
+		})
 	}
 
 	if settings.HardTimeout > 0 {
@@ -722,9 +1082,13 @@ func (c *coordinator) startDispatchKillWatch(ctx context.Context, run dispatchRu
 }
 
 // watchTodosStall polls the dispatched session's todo list and kills the
-// run once an existing list goes untouched for the stall window ("stalled
-// todos"). The poll cadence is a quarter of the window, clamped so tiny
-// windows still poll and huge ones do not hammer the DB.
+// run once the list has gone untouched for the stall window ("stalled
+// todos"). The dispatch session starts empty, so a missing list is not a
+// stall: the watcher keeps polling until the first todo write, arms from
+// there, and a run that never writes todos is never stall-killed (an
+// absent list is the nudge ladder's problem, not a stall). The poll
+// cadence is a quarter of the window, clamped so tiny windows still poll
+// and huge ones do not hammer the DB.
 func (c *coordinator) watchTodosStall(ctx context.Context, run dispatchRun, window time.Duration, kill func(string)) {
 	tick := window / 4
 	if tick < 50*time.Millisecond {
@@ -736,11 +1100,10 @@ func (c *coordinator) watchTodosStall(ctx context.Context, run dispatchRun, wind
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 
-	fingerprint, ok := c.dispatchTodosFingerprint(ctx, run.sessionID)
-	if !ok {
-		return
-	}
-	stalledSince := time.Now()
+	// An empty fingerprint cannot equal a real list: the first todo
+	// write is a "change" that arms the window.
+	fingerprint := ""
+	stalledSince := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -797,10 +1160,10 @@ func (c *coordinator) assembleKilledDispatchResult(ctx context.Context, run disp
 	// The handle was assigned after the dispatchRun's entry snapshot was
 	// taken, so read it back from the registry like the natural result:
 	// the killed payload is what the parent re-dispatches against.
-	if entry, ok := run.workspace.Get(run.entry.ID); ok {
+	if entry, ok := run.reg.Get(run.entry.ID); ok {
 		terminal.Handle = entry.Handle
 	}
-	diff, diffErr := run.workspace.Diff(ctx, run.entry.ID)
+	diff, diffErr := run.provider.Diff(ctx, run.entry)
 	switch {
 	case diffErr != nil:
 		terminal.DiffSummary = fmt.Sprintf("(diff unavailable: %s)", diffErr)
@@ -848,7 +1211,7 @@ func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRu
 	// The handle was assigned after the dispatchRun's entry snapshot was
 	// taken, so read it back from the registry: the terminal payload is
 	// the model's addressable record of the run (#313).
-	if entry, ok := run.workspace.Get(run.entry.ID); ok {
+	if entry, ok := run.reg.Get(run.entry.ID); ok {
 		terminal.Handle = entry.Handle
 	}
 	switch {
@@ -861,6 +1224,17 @@ func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRu
 	default:
 		terminal.Status = dispatch.StatusCompleted
 		terminal.KeyFindings = natural.findings
+		// The work-turn findings reader (#397): on both paths the result
+		// carried here is the last turn's — a steer accepted while the
+		// final step was streaming runs as the follow-up turn, and its
+		// reply would replace the work's report. The run's record keeps
+		// the work turn's text apart; when it holds nothing (a run
+		// driven without the record, or no finished turn) the reader's
+		// text stands, exactly as before.
+		if work := run.findings.work(); work != "" {
+			terminal.KeyFindings = work
+		}
+		terminal.SteerReplies = run.findings.steerReplies()
 		diff, diffErr := natural.diff(ctx)
 		switch {
 		case diffErr != nil:
@@ -874,68 +1248,184 @@ func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRu
 	return terminal
 }
 
-// deliverDispatchResult hands the terminal payload to the main agent
-// (#66). The tool call that started the dispatch returned its running
-// handle long ago, so the payload is delivered as a follow-up turn on
-// the parent session — hidden, so it reads as dispatch output rather
-// than a user message — through the same path a scheduled task fires
-// (fireScheduledTask): a normal run that respects the session's busy
-// queue. This is the in-process Phase 1 stand-in for #71's A2A terminal
-// status message; the payload shape is identical either way.
+// deliverDispatchResult records the terminal payload for delivery to
+// the main agent (#66) and triggers the flush. The result joins the
+// parent session's pending set (#388) rather than the prompt queue:
+// a delivery that lands while the parent is busy waits there — outside
+// the queue the user's Esc, Cancel, and ClearQueue tear through — and
+// is delivered on the next idle, so the parent always sees the
+// findings and the diff. This is the in-process Phase 1 stand-in for
+// #71's A2A terminal status message; the payload shape is identical
+// either way.
 //
-// Delivery is dropped, logged, when there is nothing to deliver into: a
-// parent session that no longer exists (deleted, or a `crush run`
-// process that already exited), or no runnable main agent.
+// The ctx is deliberately not carried into the delivery turn: it still
+// carries the dispatch tool call's RunID, which the delivery must not
+// echo (a queued delivery under that RunID suppresses or duplicates
+// the tool call's terminal RunComplete in `crush run`).
 func (c *coordinator) deliverDispatchResult(ctx context.Context, parentSessionID string, terminal dispatch.DispatchResult) {
-	if _, err := c.sessions.Get(ctx, parentSessionID); err != nil {
-		slog.Debug("Dispatch result dropped: parent session is gone", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
+	// Shutdown starts no parent delivery turn (#372): the run above
+	// already recorded its terminal result and status, and a turn here
+	// would run against a coordinator that is canceling everything.
+	if c.shuttingDown.Load() {
+		slog.Debug("Dispatch result delivery skipped: shutting down", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
 		return
 	}
-	if c.currentAgent() == nil {
-		slog.Debug("Dispatch result dropped: no main agent", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
+	c.dispatchMu.Lock()
+	if c.pendingResults == nil {
+		c.pendingResults = make(map[string][]dispatch.DispatchResult)
+	}
+	c.pendingResults[parentSessionID] = append(c.pendingResults[parentSessionID], terminal)
+	c.dispatchMu.Unlock()
+	c.flushPendingResults(parentSessionID)
+}
+
+// flushPendingResults delivers every pending dispatch result for
+// parentSessionID in one hidden turn (#388). It is called when a result
+// lands in the pending set and every time a run on the parent session
+// ends; while the parent is busy it leaves the results pending, and a
+// parent session that no longer exists drops them, logged.
+//
+// The turn is attempted on a detached goroutine: the pending results
+// are handed to it up front, and only a run that returns a non-nil
+// result with no error counts as delivered — an error puts them back
+// into the pending set and re-arms the flush, while a nil result with
+// no error means the turn was queued behind a busy session, in which
+// case the queued (system-delivery) call now owns the delivery and
+// nothing is re-pended.
+func (c *coordinator) flushPendingResults(parentSessionID string) {
+	agent := c.currentAgent()
+	if agent == nil {
+		return
+	}
+	if c.shuttingDown.Load() {
+		// Shutdown is canceling everything (#372): a delivery turn
+		// must not start here either. The results stay pending, and
+		// the process exit disposes of them (#355 owns persistence).
+		return
+	}
+	if agent.IsSessionBusy(parentSessionID) {
+		// Busy: the next run end on this session re-arms the flush.
+		return
+	}
+	if _, err := c.sessions.Get(context.Background(), parentSessionID); err != nil {
+		c.dispatchMu.Lock()
+		pending := c.pendingResults[parentSessionID]
+		delete(c.pendingResults, parentSessionID)
+		c.dispatchMu.Unlock()
+		for _, terminal := range pending {
+			slog.Debug("Pending dispatch result dropped: parent session is gone", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID)
+		}
 		return
 	}
 
-	payload := terminal.TerminalMessage()
+	c.dispatchMu.Lock()
+	pending := c.pendingResults[parentSessionID]
+	delete(c.pendingResults, parentSessionID)
+	c.dispatchMu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+
+	// One turn for every result that stacked up while the parent was
+	// busy: each payload's terminal message in order.
+	var prompt strings.Builder
+	for _, terminal := range pending {
+		prompt.WriteString(terminal.TerminalMessage())
+		prompt.WriteString("\n\n")
+	}
+
 	go func() {
-		// Detached: the dispatch goroutine's context ends when this
-		// function returns, and the delivered turn must outlive it. The
-		// hidden marker keeps the injected prompt out of the chat UI —
-		// the agent block (#65) is the visible surface for dispatch
-		// state, and the parent's own reply to the payload is the
-		// visible outcome.
-		runCtx := message.WithHiddenUserMessage(context.WithoutCancel(ctx))
-		if _, err := c.run(runCtx, nil, parentSessionID, payload); err != nil {
-			slog.Error("Dispatch result delivery failed", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID, "error", err)
+		// Detached: the flush caller (a dispatch goroutine or a run-end
+		// hook) must not block on the delivery turn. WithoutCancel: the
+		// dispatch goroutine's context ends when deliverDispatchResult
+		// returns, and the delivered turn must outlive it. The hidden
+		// marker keeps the injected prompt out of the chat UI — the
+		// agent block (#65) is the visible surface for dispatch state —
+		// and WithRunID("") strips the tool call's RunID so the
+		// delivery's terminal event is never mistaken for the tool
+		// call's. The system-delivery marker keeps the queued call (if
+		// the parent turned busy in the window before Run) alive across
+		// queue clears.
+		runCtx := message.WithHiddenUserMessage(
+			WithRunID(WithSystemDelivery(context.WithoutCancel(context.Background())), ""),
+		)
+		result, err := c.run(runCtx, nil, parentSessionID, prompt.String())
+		switch {
+		case err == nil && result != nil:
+			// Delivered.
+		case err == nil && result == nil:
+			// The turn was queued behind a busy session; the queued
+			// system-delivery call owns the delivery now.
+		default:
+			slog.Error("Dispatch result delivery failed; pended for retry", "parent_session", parentSessionID, "error", err)
+			c.dispatchMu.Lock()
+			if c.pendingResults == nil {
+				c.pendingResults = make(map[string][]dispatch.DispatchResult)
+			}
+			c.pendingResults[parentSessionID] = append(c.pendingResults[parentSessionID], pending...)
+			c.dispatchMu.Unlock()
+			// The run-end hook that fires inside c.run raced this
+			// re-pend; arm the flush again so the retry is not lost
+			// until the next unrelated run end. A busy parent no-ops.
+			// The delay keeps a deterministic failure (a provider that
+			// is not configured, a model that will not resolve) from
+			// spinning the retry chain hot: every failed attempt
+			// re-pends and re-arms, so an instantly-failing run with no
+			// pause loops at full tilt, an Error line per turn.
+			time.AfterFunc(dispatchRetryBackoff, func() {
+				c.flushPendingResults(parentSessionID)
+			})
 		}
 	}()
 }
 
-// dispatchWorkspace returns the coordinator's dispatch workspace
-// registry, creating it on first use. Creation can fail — the working
-// directory may not be a git repository — and the failure is cached so
-// every later dispatch reports it instead of retrying, while coordinator
-// construction stays git-agnostic. The first successful creation also
-// starts the todo collector (#65): one subscription to the session
-// event stream and the registry's own transitions, reduced once and
-// sunk to every configured sink (the agent block now, #174's A2A
-// bridge later).
-func (c *coordinator) dispatchWorkspace() (*dispatch.Workspace, error) {
+// dispatchRegistry returns the coordinator's dispatch registry,
+// creating it on first use. Unlike the workspace provider it never
+// fails: the registry is pure in-memory state, so callers can resolve
+// handles and sessions whether or not any git-backed dispatch ever
+// ran. NewCoordinator creates it eagerly; the nil branch covers tests
+// that construct the coordinator struct directly.
+func (c *coordinator) dispatchRegistry() *dispatch.AgentRegistry {
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
-	if c.dispatchWS == nil && c.dispatchWSErr == nil {
+	if c.dispatchReg == nil {
+		c.dispatchReg = dispatch.NewAgentRegistry()
+	}
+	return c.dispatchReg
+}
+
+// dispatchWorkspaceProvider returns the coordinator's git worktree
+// provider, creating it on first use. Creation can fail — the working
+// directory may not be a git repository — and the failure is cached so
+// every later dispatch reports it instead of retrying, while
+// coordinator construction stays git-agnostic. The first successful
+// creation also starts the todo collector (#65): one subscription to
+// the session event stream and the registry's own transitions, reduced
+// once and sunk to every configured sink (the agent block now, #174's
+// A2A bridge later).
+func (c *coordinator) dispatchWorkspaceProvider() (*dispatch.GitWorktreeProvider, error) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	if c.dispatchProvider == nil && c.dispatchProviderErr == nil {
 		// Worktrees live under the data directory, never beside the
 		// working directory: a launch from a repo subdirectory must not
 		// create a new <cwd>/.crush that git picks up and that later
 		// launches treat as their data directory (#383).
 		worktreesDir, err := dispatch.WorktreesDir(c.cfg.Config().Options.DataDirectory, c.cfg.WorkingDir())
 		if err != nil {
-			c.dispatchWSErr = err
+			c.dispatchProviderErr = err
 		} else {
-			c.dispatchWS, c.dispatchWSErr = dispatch.NewWorkspace(c.cfg.WorkingDir(), worktreesDir)
+			// The registry is created inline, not via dispatchRegistry():
+			// that accessor takes dispatchMu, and this method already
+			// holds it. NewCoordinator creates the registry eagerly; the
+			// nil branch covers tests that build the struct directly.
+			if c.dispatchReg == nil {
+				c.dispatchReg = dispatch.NewAgentRegistry()
+			}
+			c.dispatchProvider, c.dispatchProviderErr = dispatch.NewGitWorktreeProvider(c.cfg.WorkingDir(), worktreesDir, c.dispatchReg)
 		}
-		if c.dispatchWS != nil {
-			c.dispatchCollector = dispatch.NewTodoCollector(c.dispatchWS, c.sessions, c.dispatchSinks...)
+		if c.dispatchProvider != nil {
+			c.dispatchCollector = dispatch.NewTodoCollector(c.dispatchReg, c.sessions, c.dispatchSinks...)
 			ctx := c.dispatchCtx
 			if ctx == nil {
 				// Tests construct the coordinator struct directly; a nil
@@ -948,7 +1438,7 @@ func (c *coordinator) dispatchWorkspace() (*dispatch.Workspace, error) {
 			c.dispatchCollector.Start(ctx)
 		}
 	}
-	return c.dispatchWS, c.dispatchWSErr
+	return c.dispatchProvider, c.dispatchProviderErr
 }
 
 // DispatchStatus returns the current progress snapshot for the
@@ -967,22 +1457,48 @@ func (c *coordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, b
 }
 
 // ReleaseDispatches is the synchronous session-end cleanup (#367): it
-// tears down this session's dispatch workspaces that are safe to remove
-// — decided entries (applied or dismissed) and pending ones with no
-// work — and leaves completed or killed work with commits on disk for
-// salvage. It is called from App.Shutdown on the live coordinator
-// context, bounded by dispatchSweepTimeout so a wedged worktree cannot
-// hang shutdown.
+// releases this session's dispatch workspaces that are safe to remove —
+// the ones that never produced work — and leaves completed or killed
+// work with commits or uncommitted changes on disk for salvage. It is
+// called from App.Shutdown on the live coordinator context, bounded by
+// dispatchSweepTimeout so a wedged worktree cannot hang shutdown.
 func (c *coordinator) ReleaseDispatches(ctx context.Context) {
 	c.dispatchMu.Lock()
-	workspace := c.dispatchWS
+	provider := c.dispatchProvider
 	c.dispatchMu.Unlock()
-	if workspace == nil {
+	if provider == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, dispatchSweepTimeout)
 	defer cancel()
-	if err := workspace.Release(ctx); err != nil {
+	if err := provider.ReleaseUnworked(ctx); err != nil {
+		slog.Error("Dispatch workspace release failed", "error", err)
+	}
+}
+
+// sweepDispatchOnDone is the session-end backstop for the synchronous
+// ReleaseDispatches App.Shutdown runs: when the coordinator's context
+// ends without it — a crash path — the same selective release still
+// runs. A workspace with salvageable work stays on disk; only workless
+// ones are removed. In-flight runs fail against a removed workspace;
+// wander kill in #316 owns deterministic cancellation of live runs.
+func (c *coordinator) sweepDispatchOnDone(ctx context.Context) {
+	<-ctx.Done()
+	c.sweepDispatch()
+}
+
+// sweepDispatch runs the session-end release on a fresh, bounded
+// context: the coordinator's own is already done.
+func (c *coordinator) sweepDispatch() {
+	c.dispatchMu.Lock()
+	provider := c.dispatchProvider
+	c.dispatchMu.Unlock()
+	if provider == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dispatchSweepTimeout)
+	defer cancel()
+	if err := provider.ReleaseUnworked(ctx); err != nil {
 		slog.Error("Dispatch workspace release failed", "error", err)
 	}
 }
@@ -990,12 +1506,13 @@ func (c *coordinator) ReleaseDispatches(ctx context.Context) {
 // removeDispatch tears down a dispatch that failed before its background
 // run started: the registry entry, the workspace, and the toolchain. Best
 // effort — the tool error being returned to the model matters more.
-func (c *coordinator) removeDispatch(ctx context.Context, workspace *dispatch.Workspace, id string, toolchain *DispatchToolchain) {
+func (c *coordinator) removeDispatch(ctx context.Context, reg *dispatch.AgentRegistry, provider *dispatch.GitWorktreeProvider, entry dispatch.Entry, toolchain *DispatchToolchain) {
 	if toolchain != nil {
 		toolchain.Close(ctx)
 	}
-	if err := workspace.Remove(ctx, id); err != nil {
-		slog.Warn("Failed to remove failed dispatch workspace", "dispatch_id", id, "error", err)
+	reg.Remove(entry.ID)
+	if err := provider.Release(ctx, entry); err != nil {
+		slog.Warn("Failed to remove failed dispatch workspace", "dispatch_id", entry.ID, "error", err)
 	}
 }
 

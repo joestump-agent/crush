@@ -71,11 +71,16 @@ type runningDispatch struct {
 	sessionID string
 	agent     injectableAgent
 	baseCall  SessionAgentCall
+	// findings is the run's turn-text record (#397): a steer enqueued
+	// behind a finished work turn runs as a follow-up turn, and its
+	// reply is kept out of the findings.
+	findings *dispatchFindings
 }
 
 // registerDispatchRun makes the dispatched agent running on sessionID
-// addressable for mid-run injection, capturing the run's call shaping.
-func (c *coordinator) registerDispatchRun(sessionID string, agent injectableAgent, baseCall SessionAgentCall) {
+// addressable for mid-run injection, capturing the run's call shaping
+// and findings record.
+func (c *coordinator) registerDispatchRun(sessionID string, agent injectableAgent, baseCall SessionAgentCall, findings *dispatchFindings) {
 	if sessionID == "" || agent == nil {
 		return
 	}
@@ -84,7 +89,7 @@ func (c *coordinator) registerDispatchRun(sessionID string, agent injectableAgen
 	if c.dispatchRuns == nil {
 		c.dispatchRuns = make(map[string]*runningDispatch)
 	}
-	c.dispatchRuns[sessionID] = &runningDispatch{sessionID: sessionID, agent: agent, baseCall: baseCall}
+	c.dispatchRuns[sessionID] = &runningDispatch{sessionID: sessionID, agent: agent, baseCall: baseCall, findings: findings}
 }
 
 // unregisterDispatchRun drops the injection target for sessionID when the
@@ -117,15 +122,15 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 
 	c.dispatchMu.Lock()
 	target := c.dispatchRuns[msg.SessionID]
-	workspace := c.dispatchWS
 	c.dispatchMu.Unlock()
+	reg := c.dispatchRegistry()
 
 	// Scope to the caller's session (#399): a message carrying a
 	// FromSessionID that does not own this dispatch refuses exactly like
 	// an unknown one, so the caller learns nothing about the other
 	// session's agent.
-	if msg.FromSessionID != "" && workspace != nil {
-		if entry, ok := workspace.BySession(msg.SessionID); ok && entry.ParentSessionID != "" && entry.ParentSessionID != msg.FromSessionID {
+	if msg.FromSessionID != "" {
+		if entry, ok := reg.BySession(msg.SessionID); ok && entry.ParentSessionID != "" && entry.ParentSessionID != msg.FromSessionID {
 			return fmt.Errorf("no running agent for session %s in this session; dispatch one first", msg.SessionID)
 		}
 	}
@@ -137,10 +142,8 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 		// being returned and the background run registering its injection
 		// target) must not claim "finished": the entry is not done, and
 		// the caller would be told to dispatch a duplicate.
-		if workspace != nil {
-			if entry, ok := workspace.BySession(msg.SessionID); ok && entry.Status != dispatch.StatusRunning && entry.Status != dispatch.StatusProvisioned {
-				return fmt.Errorf("agent %s finished (%s); task sessions are never continuable — dispatch a new agent instead", msg.SessionID, entry.Status)
-			}
+		if entry, ok := reg.BySession(msg.SessionID); ok && entry.Status != dispatch.StatusRunning && entry.Status != dispatch.StatusProvisioned {
+			return fmt.Errorf("agent %s finished (%s); task sessions are never continuable — dispatch a new agent instead", msg.SessionID, entry.Status)
 		}
 		return fmt.Errorf("no running agent for session %s; dispatch one first", msg.SessionID)
 	}
@@ -149,13 +152,21 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 	// non-interactive) with the message as its prompt. RunID and accept
 	// state stay empty: a RunID-bearing queued call runs as its own turn
 	// with its own lifecycle, while an untracked one folds into the
-	// running agent's next input — the injection contract.
+	// running agent's next input — the injection contract. Steer marks
+	// the persisted message as an injection (#410), so the dispatch card
+	// never mistakes it for the initial prompt or a todo nudge.
 	call := target.baseCall
 	call.Prompt = msg.Text
 	call.Attachments = msg.Attachments
 	call.RunID = ""
+	call.Steer = true
 	call.Accepted = nil
 	call.OnComplete = nil
+	// The steer's own turn observer (#397): a steer folded into the
+	// running turn is part of the work turn and inherits its observer;
+	// a steer that lands as the follow-up turn records its reply in the
+	// run's findings instead of replacing the work's.
+	call.turnText = target.findings.addSteerReply
 
 	if !target.agent.EnqueueWhenBusy(call) {
 		// The run ended between the registry lookup and the enqueue — the
@@ -188,7 +199,7 @@ func (c *coordinator) messageAgentTool() fantasy.AgentTool {
 					Text:          params.Message,
 				})
 			case params.Handle != "":
-				err = c.DeliverAgentMessageByHandle(ctx, tools.GetSessionFromContext(ctx), dispatch.HandleSlug(params.Handle), params.Message)
+				err = c.DeliverAgentMessageByHandle(ctx, tools.GetSessionFromContext(ctx), dispatch.HandleSlug(params.Handle), params.Message, nil)
 			default:
 				err = errors.New("session id or handle is required")
 			}

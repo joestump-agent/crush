@@ -76,7 +76,7 @@ func (w *AppWorkspace) SetSessionChannel(ctx context.Context, sessionID, channel
 }
 
 func (w *AppWorkspace) DeleteSession(ctx context.Context, sessionID string) error {
-	return w.app.Sessions.Delete(ctx, sessionID)
+	return w.app.DeleteSession(ctx, sessionID)
 }
 
 func (w *AppWorkspace) CreateAgentToolSessionID(messageID, toolCallID string) string {
@@ -349,8 +349,12 @@ func (w *AppWorkspace) DispatchByHandle(sessionID, handle string) (dispatch.Todo
 	return w.app.DispatchByHandle(sessionID, handle)
 }
 
-func (w *AppWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
-	return w.app.DeliverAgentMessageByHandle(ctx, sessionID, handle, text)
+func (w *AppWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
+	return w.app.DeliverAgentMessageByHandle(ctx, sessionID, handle, text, attachments)
+}
+
+func (w *AppWorkspace) CancelDispatch(ctx context.Context, ref string) error {
+	return w.app.CancelDispatch(ctx, ref)
 }
 
 // -- LSP --

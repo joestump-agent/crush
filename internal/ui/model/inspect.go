@@ -76,16 +76,20 @@ func (m *UI) inspectingSessionID() string {
 	return m.inspecting.ID
 }
 
-// clearInspectState drops the inspect state without touching the chat.
-// Called whenever the active session changes underneath inspect mode
-// (session switch, new session) so the view never claims to inspect a
-// session it is not showing. Bumping inspectSeq drops any child load
-// still in flight.
+// clearInspectState drops the inspect state. Called whenever the active
+// session changes underneath inspect mode (session switch, new session)
+// or the view leaves, so it never claims to inspect a session it is not
+// showing. Bumping inspectSeq drops any child load still in flight. The
+// chat's read-only flag goes off with it (#407): every transcript rebuilt
+// after a clear is the parent's — or the landing screen's — and must be
+// interactive again.
 func (m *UI) clearInspectState() {
 	m.inspecting = nil
 	m.inspectRing = nil
 	m.inspectRingPos = 0
+	m.inspectDispatchTargets = nil
 	m.inspectSeq++
+	m.chat.SetA2UIReadOnly(false)
 }
 
 // agentBlocks enumerates the drill-in targets in the chat transcript in
@@ -125,6 +129,21 @@ func (m *UI) liveAgentSessionIDs() []string {
 	for _, ref := range m.agentBlocks() {
 		if ref.live {
 			ids = append(ids, ref.sessionID)
+		}
+	}
+	return ids
+}
+
+// liveDispatchSessionIDs returns the session IDs of the transcript's live
+// dispatch blocks in transcript order, as a set. ctrl+x is a dispatch
+// cancel (#373), so plain agent-tool children never become targets even
+// though they ride the same inspect ring.
+func (m *UI) liveDispatchSessionIDs() map[string]bool {
+	ids := make(map[string]bool, 4)
+	for i := range m.chat.Len() {
+		block, ok := m.chat.ItemAt(i).(*chat.DispatchToolMessageItem)
+		if ok && block.IsLive() && block.DispatchSessionID() != "" {
+			ids[block.DispatchSessionID()] = true
 		}
 	}
 	return ids
@@ -175,10 +194,12 @@ func (m *UI) takeInspectPending(loadedID string) *session.Session {
 	return pending
 }
 
-// handleInspectKeys routes ctrl+] and ctrl+[ (#314). It runs after the
-// dialog routing in handleKeyPressMsg, so open dialogs keep their keys,
-// and before every other handler, so the bindings work from both editor
-// and chat focus. Only these two chords match; Esc and every other key
+// handleInspectKeys routes ctrl+], ctrl+[ and ctrl+x (#314, #373). It
+// runs after the dialog routing in handleKeyPressMsg, so open dialogs
+// keep their keys, and before every other handler, so the bindings work
+// from both editor and chat focus. ctrl+] drills in, ctrl+[ leaves
+// inspect mode, and ctrl+x cancels the dispatch being viewed (or the
+// selected live dispatch card in the chat). Esc and every other key
 // fall through untouched, except where Esc is ctrl+[ (escIsInspectBack).
 func (m *UI) handleInspectKeys(msg tea.KeyPressMsg) (handled bool, cmd tea.Cmd) {
 	switch {
@@ -189,6 +210,11 @@ func (m *UI) handleInspectKeys(msg tea.KeyPressMsg) (handled bool, cmd tea.Cmd) 
 			return false, nil
 		}
 		return true, m.exitInspect()
+	case key.Matches(msg, m.keyMap.CancelAgent):
+		if sid := m.focusedLiveDispatchSessionID(); sid != "" {
+			return true, m.cancelDispatchAgent(sid)
+		}
+		return false, nil
 	}
 	return false, nil
 }
@@ -230,18 +256,19 @@ func (m *UI) handleInspectDrill() tea.Cmd {
 
 // enterInspect captures the parent's scroll position and live-agent ring
 // (only on the transition into inspect mode) and starts the child
-// transcript load.
+// transcript load. The ring position names the viewed session; when the
+// session is not in the ring (a finished block, or a task session picked
+// in the sessions picker) it is -1, so the first ctrl+] cycles to the
+// first live agent instead of skipping it.
 func (m *UI) enterInspect(ref agentBlockRef) tea.Cmd {
 	if !m.isInspecting() {
 		idx, line := m.chat.ScrollPosition()
 		m.inspectScroll = [2]int{idx, line}
 		m.inspectFollow = m.chat.Follow()
 		m.inspectRing = m.liveAgentSessionIDs()
-		m.inspectRingPos = 0
+		m.inspectDispatchTargets = m.liveDispatchSessionIDs()
 	}
-	if pos := slices.Index(m.inspectRing, ref.sessionID); pos >= 0 {
-		m.inspectRingPos = pos
-	}
+	m.inspectRingPos = slices.Index(m.inspectRing, ref.sessionID)
 	return m.loadInspectSession(ref.sessionID)
 }
 
@@ -294,6 +321,10 @@ func (m *UI) handleInspectLoaded(msg inspectSessionLoadedMsg) tea.Cmd {
 	live := slices.Contains(m.inspectRing, msg.sess.ID)
 
 	cmd := m.setSessionMessages(msg.messages)
+	// The viewed transcript is read-only (#407): a form it carries must
+	// not take focus or start a turn on the parent. Applied after
+	// setSessionMessages so any surface the rebuild focused is blurred.
+	m.chat.SetA2UIReadOnly(true)
 	if live {
 		// A running child keeps its spinners going; setSessionMessages
 		// gates the animation clock on the parent's busy state.
@@ -379,7 +410,7 @@ func (m *UI) inspectPlaceholder() string {
 		title = m.inspecting.Title
 	}
 	pos := ""
-	if len(m.inspectRing) > 1 {
+	if len(m.inspectRing) > 1 && m.inspectRingPos >= 0 {
 		pos = fmt.Sprintf(" (%d/%d)", m.inspectRingPos+1, len(m.inspectRing))
 	}
 	const prefix = "Inspecting "

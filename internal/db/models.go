@@ -8,6 +8,18 @@ import (
 	"database/sql"
 )
 
+type A2aTask struct {
+	ID        string `json:"id"`
+	ContextID string `json:"context_id"`
+	User      string `json:"user"`
+	HostID    string `json:"host_id"`
+	State     string `json:"state"`
+	Version   int64  `json:"version"`
+	TaskJson  string `json:"task_json"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
 type Chunk struct {
 	ChunkID   int64          `json:"chunk_id"`
 	SessionID sql.NullString `json:"session_id"`

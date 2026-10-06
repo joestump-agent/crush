@@ -23,11 +23,14 @@ import (
 
 // killRecorder is a thread-safe capture of the wander-kill observer's
 // calls, standing in for the coordinator's kill state in unit tests.
+// The cancel hook is what the production observer does after recording
+// (#348): the observer owns ending the run.
 type killRecorder struct {
 	mu     sync.Mutex
 	killID string
 	reason string
 	calls  int
+	cancel func(sessionID string)
 }
 
 func (k *killRecorder) observe(sessionID, reason string) {
@@ -36,6 +39,9 @@ func (k *killRecorder) observe(sessionID, reason string) {
 	k.calls++
 	k.killID = sessionID
 	k.reason = reason
+	if k.cancel != nil {
+		k.cancel(sessionID)
+	}
 }
 
 func (k *killRecorder) recorded() (int, string, string) {
@@ -63,6 +69,9 @@ func TestTodoKill_FiresAfterIgnoredNudges(t *testing.T) {
 		NudgeThreshold:  1,
 		KillAfterNudges: 1,
 	}, []todoAgentOpt{withTodoKill(killed.observe)}, probeTool())
+	// The observer owns the kill (#348): the recorder cancels the run the
+	// way the production supervisor does.
+	killed.cancel = func(sessionID string) { sa.Cancel(sessionID) }
 
 	// The run is expected to end canceled: the kill is what ends it.
 	sess, err := env.sessions.Create(t.Context(), "session")
@@ -99,6 +108,9 @@ func TestTodoKill_KillAfterNudgesHonored(t *testing.T) {
 		NudgeThreshold:  1,
 		KillAfterNudges: 3,
 	}, []todoAgentOpt{withTodoKill(killed.observe)}, probeTool())
+	// The observer owns the kill (#348): the recorder cancels the run the
+	// way the production supervisor does.
+	killed.cancel = func(sessionID string) { sa.Cancel(sessionID) }
 
 	// The run is expected to end canceled: the kill is what ends it.
 	sess, err := env.sessions.Create(t.Context(), "session")
@@ -306,7 +318,8 @@ func (m *blockingScriptedModel) Stream(ctx context.Context, call fantasy.Call) (
 type wanderKillFixture struct {
 	env        fakeEnv
 	c          *coordinator
-	ws         *dispatch.Workspace
+	reg        *dispatch.AgentRegistry
+	provider   *dispatch.GitWorktreeProvider
 	entry      dispatch.Entry
 	taskSess   session.Session
 	parentSess session.Session
@@ -358,13 +371,12 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 	}
 	f.buildDispatched(t, model, dispatchedSettings, nil)
 
-	ws, err := dispatch.NewWorkspace(env.workingDir, filepath.Join(env.workingDir, "worktrees"))
+	f.reg = dispatch.NewAgentRegistry()
+	ws, err := dispatch.NewGitWorktreeProvider(env.workingDir, filepath.Join(env.workingDir, "worktrees"), f.reg)
 	require.NoError(t, err)
-	f.ws = ws
+	f.provider = ws
 
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
-	f.entry = entry
+	f.entry = provisionProviderEntry(t, f.provider, f.reg, dispatch.ProvisionOptions{})
 
 	parent, err := env.sessions.Create(t.Context(), "parent")
 	require.NoError(t, err)
@@ -373,9 +385,9 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 	require.NoError(t, err)
 	f.taskSess = task
 
-	ws.SetSession(entry.ID, task.ID)
-	ws.SetStatus(entry.ID, dispatch.StatusRunning)
-	if _, ok := ws.AssignHandle(entry.ID, "tester", "dispatch tester"); !ok {
+	f.reg.SetSession(f.entry.ID, task.ID)
+	f.reg.SetStatus(f.entry.ID, dispatch.StatusRunning)
+	if _, ok := f.reg.AssignHandle(f.entry.ID, "tester", "dispatch tester"); !ok {
 		t.Fatal("assign dispatch handle")
 	}
 
@@ -388,14 +400,18 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 
 // buildDispatched constructs the dispatched agent the way the real
 // builder would (newSessionAgent with the kill observer recording into
-// the fixture's kill state) and installs it as the coordinator's
-// dispatchAgentBuilder. extra feeds extra tools.
+// the fixture's kill state and killing the way the production observer
+// does, #348) and installs it as the coordinator's dispatchAgentBuilder.
+// extra feeds extra tools.
 func (f *wanderKillFixture) buildDispatched(t *testing.T, model fantasy.LanguageModel, settings config.TodoEnforcementSettings, extra []fantasy.AgentTool) {
 	t.Helper()
 	opts := []todoAgentOpt{
 		withTodoKill(func(sessionID, reason string) {
 			f.killHookInvoked = true
 			f.kill.kill(reason)
+			// The observer owns the kill (#348): route it through the
+			// served dispatch's tasks/cancel, direct-cancel fallback.
+			f.c.killDispatch(f.reg, f.entry.ID, reason, nil)
 		}),
 		withLoopStop(func(sessionID string) {
 			f.kill.kill(dispatch.ReasonToolLoop)
@@ -413,10 +429,26 @@ func (f *wanderKillFixture) buildDispatched(t *testing.T, model fantasy.Language
 }
 
 // buildRun assembles the dispatchRun the fixture drives, so the
-// transport wiring can build the same served call the run carries.
+// transport wiring can build the same served call the run carries. It
+// also registers the live record the dispatch tool wires in production:
+// killDispatch's direct fallback resolves the running agent through it.
+// The cancel is a no-op when the test drives the run without a root —
+// production always arms one.
 func (f *wanderKillFixture) buildRun() dispatchRun {
+	liveCancel := f.runCancel
+	if liveCancel == nil {
+		liveCancel = func() {}
+	}
+	f.c.registerLiveDispatch(f.entry.ID, &liveDispatch{
+		cancel:    liveCancel,
+		sessionID: f.taskSess.ID,
+		agent:     f.dispatched,
+		kill:      f.kill,
+		done:      make(chan struct{}),
+	})
 	return dispatchRun{
-		workspace:       f.ws,
+		reg:             f.reg,
+		provider:        f.provider,
 		entry:           f.entry,
 		agent:           f.dispatched,
 		model:           Model{Model: f.runModel, CatwalkCfg: catwalkModelCfg()},
@@ -451,18 +483,18 @@ func (f *wanderKillFixture) runDispatchSync(t *testing.T) {
 // startDispatchServer path records the runner and call on the transport
 // and stamps the endpoint and card on the registry entry, so the run
 // takes the served transport path instead of the direct one.
-func (f *wanderKillFixture) wireTransport(t *testing.T, rt *runnerTransport) {
+func (f *wanderKillFixture) wireTransport(t *testing.T, rt DispatchServerStarter) {
 	t.Helper()
 	run := f.buildRun()
 	f.c.SetDispatchServerStarter(rt)
-	stop := f.c.startDispatchServer(context.Background(), f.ws, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current)
+	stop := f.c.startDispatchServer(context.Background(), f.provider, f.reg, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current)
 	t.Cleanup(func() {
 		if stop != nil {
 			stop()
 		}
-		f.c.stopDispatchServer(f.ws, f.entry.ID, nil)
+		f.c.stopDispatchServer(f.reg, f.entry.ID, nil)
 	})
-	entry, ok := f.ws.Get(f.entry.ID)
+	entry, ok := f.reg.Get(f.entry.ID)
 	require.True(t, ok)
 	require.NotEmpty(t, entry.Endpoint, "the dispatch must be served for the transport to drive it")
 }
@@ -471,7 +503,7 @@ func (f *wanderKillFixture) wireTransport(t *testing.T, rt *runnerTransport) {
 // workspace.
 func (f *wanderKillFixture) requireKilled(t *testing.T, reason string) dispatch.Entry {
 	t.Helper()
-	entry, ok := f.ws.Get(f.entry.ID)
+	entry, ok := f.reg.Get(f.entry.ID)
 	require.True(t, ok, "a killed dispatch's registry entry must survive (cleanup defers to the parent)")
 	require.Equal(t, dispatch.StatusKilled, entry.Status)
 	require.NotNil(t, entry.Result)
@@ -532,8 +564,8 @@ func TestWanderKill_IgnoredNudgesEndToEnd(t *testing.T) {
 	f.c.ReleaseDispatches(context.Background())
 	require.DirExists(t, f.entry.Path, "release must not discard a killed workspace's work")
 	require.True(t, branchExists(t, f.env.workingDir, f.entry.Branch))
-	_, ok := f.ws.Get(f.entry.ID)
-	require.True(t, ok, "the killed entry stays registered so Remove can still decide it")
+	_, ok := f.reg.Get(f.entry.ID)
+	require.True(t, ok, "the killed entry stays registered so it can still be removed")
 }
 
 // TestWanderKill_HardTimeout pins the watchdog's hard timeout: a run
@@ -612,6 +644,166 @@ func TestWanderKill_StalledTodos(t *testing.T) {
 		<-done
 
 		f.requireKilled(t, dispatch.ReasonStalledTodos)
+	})
+}
+
+// TestWanderKill_StalledTodosWrittenAfterStart pins the watcher arming on
+// the first todo write (#396): the dispatch session starts empty, the run
+// writes todos shortly after it starts and never updates them, and the
+// run is stall-killed about one window after that first write. A real
+// clock with a 400ms window keeps it fast outside synctest (#430).
+func TestWanderKill_StalledTodosWrittenAfterStart(t *testing.T) {
+	t.Parallel()
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+	settings := config.TodoEnforcementSettings{
+		Enabled:     false,
+		StallWindow: 400 * time.Millisecond,
+	}
+	f := newWanderKillFixture(t, model, settings)
+	f.runModel = blocked
+	f.buildDispatched(t, blocked, settings, nil)
+	f.armRunRoot()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.runDispatchSync(t)
+	}()
+
+	// The task session starts empty (a fresh dispatch's real shape): the
+	// watcher must survive the empty list and arm when the first todo
+	// lands.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		sess, err := f.env.sessions.Get(t.Context(), f.taskSess.ID)
+		if err != nil {
+			t.Errorf("Get task session: %v", err)
+			return
+		}
+		sess.Todos = []session.Todo{{Content: "late plan", Status: session.TodoStatusInProgress, ActiveForm: "Stalling"}}
+		if _, err := f.env.sessions.Save(t.Context(), sess); err != nil {
+			t.Errorf("Save late todos: %v", err)
+		}
+	}()
+
+	require.Eventually(t, func() bool {
+		entry, ok := f.reg.Get(f.entry.ID)
+		return ok && entry.Status == dispatch.StatusKilled
+	}, 5*time.Second, 25*time.Millisecond,
+		"a todo list that never updates after its first write must be stall-killed")
+	<-done
+	f.requireKilled(t, dispatch.ReasonStalledTodos)
+}
+
+// TestWanderKill_NoTodosNeverStallKilled pins the flip side of the arming
+// fix (#396): a run that never writes todos is not stall-killed, even
+// though it stays open far past the window — an absent list is the nudge
+// ladder's problem, not a stall.
+func TestWanderKill_NoTodosNeverStallKilled(t *testing.T) {
+	t.Parallel()
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+	settings := config.TodoEnforcementSettings{
+		Enabled:     false,
+		StallWindow: 400 * time.Millisecond,
+	}
+	f := newWanderKillFixture(t, model, settings)
+	f.runModel = blocked
+	f.buildDispatched(t, blocked, settings, nil)
+	f.armRunRoot()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.runDispatchSync(t)
+	}()
+
+	// Hold the run open for 3x the window with no todos written, then
+	// let the scripted model finish it.
+	time.Sleep(3 * settings.StallWindow)
+	close(blocked.hold)
+	<-done
+
+	entry, ok := f.reg.Get(f.entry.ID)
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusCompleted, entry.Status, "a run that never writes todos must not be stall-killed")
+	require.NotNil(t, entry.Result)
+	assert.Empty(t, entry.Result.KilledReason)
+}
+
+// TestWanderKill_TodosUpdatedWithinWindowNotKilled pins the reset half of
+// the stall window (#396): a run that keeps refreshing its todo list
+// within each window is never stall-killed, even though it stays open
+// far past a single window. It runs under synctest: on a real clock a
+// 200ms refresh against a 400ms window was stall-killed whenever a loaded
+// runner delayed one refresh past the window, while the bubble's clock
+// only advances once every goroutine is idle, so a refresh can't be late.
+func TestWanderKill_TodosUpdatedWithinWindowNotKilled(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		model := &scriptedModel{steps: []scriptedStep{
+			{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+			{text: "done"},
+		}}
+		blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+		settings := config.TodoEnforcementSettings{
+			Enabled:     false,
+			StallWindow: 10 * time.Minute,
+		}
+		f := newWanderKillFixture(t, model, settings)
+		f.runModel = blocked
+		f.buildDispatched(t, blocked, settings, nil)
+		f.armRunRoot()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			f.runDispatchSync(t)
+		}()
+
+		// Keep the todo list fresh until the run ends: the first write
+		// arms the window, and every update within it resets the timer.
+		updated := make(chan struct{})
+		go func() {
+			defer close(updated)
+			step := 0
+			for {
+				select {
+				case <-done:
+					return
+				case <-time.After(settings.StallWindow / 2):
+				}
+				step++
+				sess, err := f.env.sessions.Get(t.Context(), f.taskSess.ID)
+				if err != nil {
+					t.Errorf("Get task session: %v", err)
+					return
+				}
+				sess.Todos = []session.Todo{{Content: fmt.Sprintf("progress %d", step), Status: session.TodoStatusInProgress, ActiveForm: "Working"}}
+				if _, err := f.env.sessions.Save(t.Context(), sess); err != nil {
+					t.Errorf("Save refreshed todos: %v", err)
+					return
+				}
+			}
+		}()
+
+		time.Sleep(3 * settings.StallWindow)
+		close(blocked.hold)
+		<-done
+		<-updated
+
+		entry, ok := f.reg.Get(f.entry.ID)
+		require.True(t, ok)
+		require.Equal(t, dispatch.StatusCompleted, entry.Status, "a run that refreshes its todos within each window must not be stall-killed")
+		require.NotNil(t, entry.Result)
+		assert.Empty(t, entry.Result.KilledReason)
 	})
 }
 
@@ -706,7 +898,8 @@ func TestWanderKill_CompletionWinsOverLateKill(t *testing.T) {
 	f.kill.kill(dispatch.ReasonHardTimeout)
 
 	run := dispatchRun{
-		workspace:    f.ws,
+		reg:          f.reg,
+		provider:     f.provider,
 		entry:        f.entry,
 		model:        Model{Model: f.runModel, CatwalkCfg: catwalkModelCfg()},
 		sessionID:    f.taskSess.ID,
@@ -717,7 +910,7 @@ func TestWanderKill_CompletionWinsOverLateKill(t *testing.T) {
 		completed: true,
 		findings:  "all done",
 		diff: func(ctx context.Context) (string, error) {
-			return run.workspace.Diff(ctx, run.entry.ID)
+			return run.provider.Diff(ctx, run.entry)
 		},
 	})
 
@@ -743,7 +936,7 @@ func TestWanderKill_KilledCarriesLastStateAndDiff(t *testing.T) {
 		Enabled:         true,
 		NudgeThreshold:  1,
 		KillAfterNudges: 1,
-	}, []fantasy.AgentTool{writeMarkerTool(f.ws, f.entry.ID)})
+	}, []fantasy.AgentTool{writeMarkerTool(f.reg, f.entry.ID)})
 
 	f.runDispatchSync(t)
 
@@ -757,12 +950,12 @@ func TestWanderKill_KilledCarriesLastStateAndDiff(t *testing.T) {
 // writeMarkerTool is a bash-named tool that writes a marker file into
 // the dispatch's workspace, giving the diff something salvageable to
 // show. It resolves the workspace path at call time from the registry.
-func writeMarkerTool(ws *dispatch.Workspace, id string) fantasy.AgentTool {
+func writeMarkerTool(reg *dispatch.AgentRegistry, id string) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		"bash",
 		"Write the marker.",
 		func(ctx context.Context, params struct{}, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			entry, ok := ws.Get(id)
+			entry, ok := reg.Get(id)
 			if !ok {
 				return fantasy.NewTextErrorResponse("unknown dispatch"), nil
 			}
@@ -817,4 +1010,238 @@ func TestDispatchResult_KilledRoundTrips(t *testing.T) {
 func TestDispatchRunStoppedInLoop(t *testing.T) {
 	t.Parallel()
 	assert.False(t, dispatchRunStoppedInLoop(nil))
+}
+
+// cancelingTransport is the served test host for the protocol kill
+// (#348): runnerTransport's serving plus the cancel seam, recording the
+// tasks/cancel calls the coordinator sends and ending the run the way
+// the real server does — by canceling the served runner. reportTask
+// mirrors the first-event stamp: when false, the stream never names the
+// task, so a kill must fall back to the direct cancel.
+type cancelingTransport struct {
+	runnerTransport
+
+	mu         sync.Mutex
+	cancels    []DispatchCancelParams
+	reportTask bool
+	fail       bool
+}
+
+func (f *cancelingTransport) StreamDispatch(ctx context.Context, p DispatchTransportParams) (DispatchTransportOutcome, error) {
+	f.mu.Lock()
+	report := f.reportTask
+	f.mu.Unlock()
+	if report && p.OnTask != nil {
+		p.OnTask("task-host-1")
+	}
+	return f.runnerTransport.StreamDispatch(ctx, p)
+}
+
+func (f *cancelingTransport) CancelDispatch(_ context.Context, p DispatchCancelParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancels = append(f.cancels, p)
+	if f.fail {
+		return fmt.Errorf("cancel refused")
+	}
+	if last := f.lastServed(); last.Runner != nil {
+		last.Runner.Cancel(last.SessionID)
+	}
+	return nil
+}
+
+func (f *cancelingTransport) recordedCancels() []DispatchCancelParams {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]DispatchCancelParams(nil), f.cancels...)
+}
+
+// TestWanderKill_HardTimeoutOverServedHost pins the protocol kill
+// (#348): a hard-timeout kill on a served dispatch sends exactly one
+// tasks/cancel carrying the hard-timeout reason, the host's task ends,
+// and the parent receives killed with the reason.
+func TestWanderKill_HardTimeoutOverServedHost(t *testing.T) {
+	t.Parallel()
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+	settings := config.TodoEnforcementSettings{
+		Enabled:     false,
+		HardTimeout: 200 * time.Millisecond,
+	}
+	f := newWanderKillFixture(t, model, settings)
+	f.runModel = blocked
+	f.buildDispatched(t, blocked, settings, nil)
+	f.armRunRoot()
+
+	host := &cancelingTransport{reportTask: true}
+	f.wireTransport(t, host)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.runDispatchSync(t)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		close(blocked.hold)
+		t.Fatal("the served kill must end the dispatch in seconds")
+	}
+
+	f.requireKilled(t, dispatch.ReasonHardTimeout)
+	cancels := host.recordedCancels()
+	require.Len(t, cancels, 1, "exactly one tasks/cancel")
+	require.Equal(t, dispatch.ReasonHardTimeout, cancels[0].Reason)
+	require.Equal(t, "task-host-1", cancels[0].TaskID)
+	require.NotEmpty(t, cancels[0].Endpoint)
+	require.NotNil(t, cancels[0].Card)
+}
+
+// TestWanderKill_IgnoredNudgesOverServedHost pins the ladder kill over
+// the protocol (#348): the enforcement ladder's kill rung routes through
+// the served dispatch's tasks/cancel with the ignored-nudges reason.
+func TestWanderKill_IgnoredNudgesOverServedHost(t *testing.T) {
+	t.Parallel()
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	settings := config.TodoEnforcementSettings{
+		Enabled:         true,
+		NudgeThreshold:  1,
+		KillAfterNudges: 1,
+	}
+	f := newWanderKillFixture(t, model, settings)
+
+	host := &cancelingTransport{reportTask: true}
+	f.wireTransport(t, host)
+
+	f.runDispatchSync(t)
+
+	f.requireKilled(t, dispatch.ReasonIgnoredNudges)
+	assert.True(t, f.killHookInvoked, "the enforcement hook must have fired")
+	cancels := host.recordedCancels()
+	require.Len(t, cancels, 1, "exactly one tasks/cancel")
+	require.Equal(t, dispatch.ReasonIgnoredNudges, cancels[0].Reason)
+	require.Equal(t, "task-host-1", cancels[0].TaskID)
+}
+
+// TestWanderKill_ServedKillBeforeTaskIDFallsBack pins the fallback
+// (#348, #430): a kill that lands before the stream has named the task
+// cannot send a tasks/cancel — the direct cancel ends the dispatch, and
+// no protocol cancel was attempted.
+func TestWanderKill_ServedKillBeforeTaskIDFallsBack(t *testing.T) {
+	t.Parallel()
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+	settings := config.TodoEnforcementSettings{
+		Enabled:     false,
+		HardTimeout: 200 * time.Millisecond,
+	}
+	f := newWanderKillFixture(t, model, settings)
+	f.runModel = blocked
+	f.buildDispatched(t, blocked, settings, nil)
+	f.armRunRoot()
+
+	host := &cancelingTransport{reportTask: false}
+	f.wireTransport(t, host)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.runDispatchSync(t)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		close(blocked.hold)
+		t.Fatal("the fallback kill must end the dispatch")
+	}
+
+	f.requireKilled(t, dispatch.ReasonHardTimeout)
+	require.Empty(t, host.recordedCancels(), "no tasks/cancel without a task ID")
+}
+
+// TestWanderKill_TransportCancelFailureFallsBack pins the fallback on
+// error: a tasks/cancel that the host refuses still ends the dispatch
+// through the direct cancel, killed with the reason.
+func TestWanderKill_TransportCancelFailureFallsBack(t *testing.T) {
+	t.Parallel()
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+	settings := config.TodoEnforcementSettings{
+		Enabled:     false,
+		HardTimeout: 200 * time.Millisecond,
+	}
+	f := newWanderKillFixture(t, model, settings)
+	f.runModel = blocked
+	f.buildDispatched(t, blocked, settings, nil)
+	f.armRunRoot()
+
+	host := &cancelingTransport{reportTask: true, fail: true}
+	f.wireTransport(t, host)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.runDispatchSync(t)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		close(blocked.hold)
+		t.Fatal("the fallback kill must end the dispatch")
+	}
+
+	f.requireKilled(t, dispatch.ReasonHardTimeout)
+	cancels := host.recordedCancels()
+	require.Len(t, cancels, 1, "the refused cancel was attempted once")
+	require.Equal(t, dispatch.ReasonHardTimeout, cancels[0].Reason)
+}
+
+// TestDispatchFromTransportOutcomeKillReason pins the parent mapping
+// (#348): a terminal Canceled whose status message is a kill reason —
+// a kill this process never recorded — assembles as killed with that
+// reason; an ordinary canceled outcome still reads failed.
+func TestDispatchFromTransportOutcomeKillReason(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestRepoForTransport(t)
+	reg := dispatch.NewAgentRegistry()
+	ws, err := dispatch.NewGitWorktreeProvider(repo, filepath.Join(repo, "worktrees"), reg)
+	require.NoError(t, err)
+	entry := provisionProviderEntry(t, ws, reg, dispatch.ProvisionOptions{})
+	run := dispatchRun{
+		reg:       reg,
+		provider:  ws,
+		entry:     entry,
+		sessionID: "session-x",
+		kill:      &dispatchKill{},
+	}
+	reg.SetHandle(entry.ID, "tester")
+
+	killed := assembleFromTransport(t, run, DispatchTransportOutcome{
+		Status: transportStatusCanceled,
+		Text:   dispatch.ReasonHardTimeout,
+	})
+	require.Equal(t, dispatch.StatusKilled, killed.Status)
+	require.Equal(t, dispatch.ReasonHardTimeout, killed.KilledReason)
+
+	plain := assembleFromTransport(t, run, DispatchTransportOutcome{
+		Status: transportStatusCanceled,
+		Text:   "user asked",
+	})
+	require.Equal(t, dispatch.StatusFailed, plain.Status)
+	require.Contains(t, plain.Error, "user asked")
 }

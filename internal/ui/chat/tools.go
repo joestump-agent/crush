@@ -189,8 +189,11 @@ type baseToolMessageItem struct {
 	// so a re-render with the same metadata reuses the live models (and
 	// their edited values) instead of rebuilding; surfaceBuildFailed
 	// counts payloads that never produced a drawable model, so the
-	// renderer can alert on them.
+	// renderer can alert on them. a2uiReadOnly holds the item's MCP
+	// surfaces in their read-only state — no focus, no keys — while the
+	// item is part of an inspected transcript (#407).
 	a2ui               a2uiSurfaceHost
+	a2uiReadOnly       bool
 	surfaceSrcHash     uint64
 	surfaceScanned     bool
 	surfaceBuildFailed int

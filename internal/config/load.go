@@ -91,6 +91,13 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 		return nil, fmt.Errorf("invalid todo enforcement configuration: %w", err)
 	}
 
+	// Validate the dispatch concurrency cap with the same rule: a
+	// positive value configures it, a value below 1 is a load error
+	// that names its path (#390).
+	if err := cfg.Options.Dispatch.Validate("options.dispatch"); err != nil {
+		return nil, fmt.Errorf("invalid dispatch configuration: %w", err)
+	}
+
 	if !isInsideWorktree() {
 		const depth = 2
 		const items = 100

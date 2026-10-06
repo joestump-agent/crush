@@ -215,6 +215,10 @@ func (c *scriptedCoordinator) CancelAll() {
 	}
 }
 
+func (c *scriptedCoordinator) CancelDispatch(context.Context, string) error {
+	return errors.New("not implemented")
+}
+
 func (c *scriptedCoordinator) IsBusy() bool                                  { return false }
 func (c *scriptedCoordinator) IsSessionBusy(string) bool                     { return false }
 func (c *scriptedCoordinator) QueuedPrompts(string) int                      { return 0 }
@@ -224,6 +228,7 @@ func (c *scriptedCoordinator) ListCronTasks(string) []scheduler.Task         { r
 func (c *scriptedCoordinator) Summarize(context.Context, string) error       { return nil }
 func (c *scriptedCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (c *scriptedCoordinator) UpdateModels(context.Context) error            { return nil }
+func (c *scriptedCoordinator) SetInteractive(context.Context, bool) error    { return nil }
 func (c *scriptedCoordinator) SetMainAgent(string) error                     { return nil }
 func (c *scriptedCoordinator) GenerateTitle(context.Context, string, string) {}
 
@@ -762,6 +767,6 @@ func (c *scriptedCoordinator) DispatchByHandle(sessionID, handle string) (dispat
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (c *scriptedCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+func (c *scriptedCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	return errors.New("not implemented")
 }

@@ -1,0 +1,9 @@
+  ● Dispatch working                                    
+                                                        
+     Task  implement the login form with validation     
+  → refactor the streaming answer path so that          
+    token deltas never re-render the markdown           
+    body                                                
+   on it, splitting the render pass                     
+                                                        
+  ...............                                       

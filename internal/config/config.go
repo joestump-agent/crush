@@ -495,6 +495,48 @@ type Options struct {
 	// TodoEnforcement carries the global todo enforcement defaults
 	// (#315); per agent type overrides live on the agent definitions.
 	TodoEnforcement *TodoEnforcementConfig `json:"todo_enforcement,omitempty" jsonschema:"description=Proactive todo enforcement: inject a nudge when an agent works without a todo list, and optionally reject mutating tools until one exists"`
+	// Dispatch carries the dispatch_agent tool's limits (#390).
+	Dispatch *DispatchOptions `json:"dispatch,omitempty" jsonschema:"description=Dispatched agent options"`
+}
+
+// DefaultDispatchMaxConcurrent bounds how many dispatched agents run at
+// once when the user has not configured a cap (#390): each dispatch
+// provisions a worktree, a scoped LSP manager, an A2A listener and a
+// model session, so an unbounded loop of dispatch calls would exhaust
+// disk, memory and API budget.
+const DefaultDispatchMaxConcurrent = 4
+
+// DispatchOptions configures the dispatch_agent tool (#390).
+type DispatchOptions struct {
+	// MaxConcurrent caps the concurrently running dispatched agents:
+	// live dispatches plus setups still in flight. A value below 1 is
+	// a load error; nil resolves to DefaultDispatchMaxConcurrent.
+	MaxConcurrent *int `json:"max_concurrent,omitempty" jsonschema:"description=Maximum number of concurrently running dispatched agents; a value below 1 is a load error,default=4,example=2"`
+}
+
+// GetDispatchMaxConcurrent returns the resolved dispatch concurrency cap
+// (#390): the configured max_concurrent, or DefaultDispatchMaxConcurrent
+// when unset. The nil receiver and the unset field both mean the default,
+// so callers can ask without unwrapping either.
+func (o *Options) GetDispatchMaxConcurrent() int {
+	if o == nil || o.Dispatch == nil || o.Dispatch.MaxConcurrent == nil {
+		return DefaultDispatchMaxConcurrent
+	}
+	return *o.Dispatch.MaxConcurrent
+}
+
+// Validate checks the dispatch concurrency cap: a positive value
+// configures it, and a value below 1 is a load error, not a setting —
+// a cap of 0 would refuse every dispatch. The path names the block in
+// the config file, so the error points at the offending key.
+func (d *DispatchOptions) Validate(path string) error {
+	if d == nil {
+		return nil
+	}
+	if d.MaxConcurrent != nil && *d.MaxConcurrent < 1 {
+		return fmt.Errorf("%s.max_concurrent: must be at least 1 (got %d)", path, *d.MaxConcurrent)
+	}
+	return nil
 }
 
 // DefaultRequestTimeout bounds each LLM API request when the user has not
@@ -1279,6 +1321,7 @@ func allToolNames() []string {
 		"download",
 		"dispatch_agent",
 		"message_agent",
+		"cancel_dispatch",
 		"edit",
 		"multiedit",
 		"lsp_diagnostics",

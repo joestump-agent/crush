@@ -85,7 +85,14 @@ type SessionAgentCall struct {
 	// ambiguous when concurrent turns share the same session.
 	RunID             string
 	HiddenUserMessage bool
-	Channel           string
+	// Steer marks the call as a mid-run injection into a running
+	// dispatched agent (#312): the persisted user message carries
+	// TextContent.Steer so a rebuilt transcript can tell steers apart
+	// from the dispatch's initial prompt and from todo nudges (#410).
+	// Only the injection paths set it; callers cannot forge it onto an
+	// ordinary prompt.
+	Steer   bool
+	Channel string
 	// ContentWidth is the UI's chat content width hint in cells (0 when
 	// the turn has no interactive UI). Tools rendering width-sensitive
 	// remote content (e.g. A2UI surfaces with pre-sized bar geometry)
@@ -101,6 +108,15 @@ type SessionAgentCall struct {
 	FrequencyPenalty *float64
 	PresencePenalty  *float64
 	NonInteractive   bool
+	// systemDelivery marks a dispatch-result delivery turn (#388): a
+	// queue partition keeps it where it would drop a user prompt
+	// (ClearQueue, Cancel, the cancel-covered handoffs), and the
+	// queued-prompt surfaces the UI reads (QueuedPrompts,
+	// QueuedPromptsList) skip it, so Esc-clears-queue never drops a
+	// delivery and the queue pill never counts one. It is set from the
+	// WithSystemDelivery context marker on the delivery path and is
+	// unexported so external callers cannot forge it.
+	systemDelivery bool
 	// OnComplete, when non-nil, replaces the default RunComplete
 	// publish path: the inner Run hands the terminal payload to this
 	// callback instead of emitting it on the RunComplete broker. The
@@ -143,6 +159,14 @@ type SessionAgentCall struct {
 	// fantasy retries the stream transparently. Returning an error
 	// surfaces the original auth error without retry.
 	OnAuthRefresh func(ctx context.Context, err *fantasy.ProviderError) error
+	// turnText, when non-nil, is called once with the finished turn's
+	// response text as its argument, after the turn's final step but
+	// before the run hands off to a queued follow-up. enqueueCall strips
+	// only the exported hooks, so the field survives queueing: a turn
+	// re-queued by a summarize continuation reports into the same
+	// holder. Nil everywhere but dispatched agents, which use it to keep
+	// a steer's follow-up reply out of the work turn's findings (#397).
+	turnText func(text string)
 }
 
 func filterToolsForChannel(agentTools []fantasy.AgentTool, channel string, states map[string]mcp.ClientInfo) []fantasy.AgentTool {
@@ -296,10 +320,12 @@ type SessionAgentOptions struct {
 	// both false), which keeps direct constructors — tests and the
 	// default agents — unchanged.
 	TodoEnforcement config.TodoEnforcementSettings
-	// TodoKill observes the wander-kill escalation (#316): invoked when
-	// a run ignores its nudges past the resolved kill threshold. The
-	// cancel itself is intrinsic to the run; this is the coordinator's
-	// chance to record the reason. Nil everywhere but dispatched agents,
+	// TodoKill is the wander-kill escalation's supervisor hook (#316):
+	// invoked when a run ignores its nudges past the resolved kill
+	// threshold. The observer owns the kill (#348): it records the
+	// reason and ends the run — routing it through the dispatched run's
+	// tasks/cancel, or the direct fallback — so the ladder closure does
+	// not cancel the run itself. Nil everywhere but dispatched agents,
 	// so only they can be killed.
 	TodoKill func(sessionID string, reason string)
 	// LoopStop observes the loop-detection stop (#343): invoked when the
@@ -510,6 +536,13 @@ func (a *sessionAgent) drainQueueForStep(sessionID string) (fold, canceledWithRu
 	queuedCalls, _ := a.messageQueue.Get(sessionID)
 	var keep []SessionAgentCall
 	for _, queued := range queuedCalls {
+		if queued.systemDelivery {
+			// Dispatch-result delivery (#388): never folded into the
+			// active turn and never covered by a pending cancel — it
+			// waits for its own turn.
+			keep = append(keep, queued)
+			continue
+		}
 		if a.canceledBySeq(sessionID, queued.acceptSeq) {
 			if queued.RunID != "" {
 				canceledWithRunID = append(canceledWithRunID, queued)
@@ -570,11 +603,25 @@ func (a *sessionAgent) publishCanceledQueueDrops(drops []SessionAgentCall) {
 // hanging when their queued prompt is discarded without running.
 func (a *sessionAgent) clearQueueAndNotify(sessionID string) {
 	queued, ok := a.messageQueue.Get(sessionID)
-	a.messageQueue.Del(sessionID)
 	if !ok {
 		return
 	}
-	a.publishCanceledQueueDrops(queued)
+	// System deliveries (#388) are exempt: a dispatch result the parent
+	// has not consumed yet survives the clear and still runs.
+	var drops, keep []SessionAgentCall
+	for _, call := range queued {
+		if call.systemDelivery {
+			keep = append(keep, call)
+			continue
+		}
+		drops = append(drops, call)
+	}
+	if len(keep) > 0 {
+		a.messageQueue.Set(sessionID, keep)
+	} else {
+		a.messageQueue.Del(sessionID)
+	}
+	a.publishCanceledQueueDrops(drops)
 }
 
 // clearPendingCancel removes any pending-cancel mark for sessionID. It
@@ -819,10 +866,15 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	var onKill func(reason string)
 	if a.todoKill != nil {
 		todoKillFn := a.todoKill
+		// The observer owns the kill (#348): the supervisor records the
+		// reason and routes the kill through the dispatched run's
+		// tasks/cancel, or its direct fallback. The ladder closure here
+		// only reports — canceling itself would bypass the protocol
+		// reason entirely, and an out-of-process agent (#72/#73) has no
+		// in-process cancel to call.
 		onKill = func(reason string) {
 			todoKillFn(call.SessionID, reason)
 			slog.Warn("Todo enforcement killed the run", "session_id", call.SessionID, "reason", reason)
-			a.Cancel(call.SessionID)
 		}
 	}
 	var todoRun *todoEnforcementRun
@@ -1378,6 +1430,17 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		a.sendChannelReply(ctx, call, currentAssistant.Content().String(), completedToolCalls)
 	}
 
+	// Report the finished turn's text to the per-turn observer (#397):
+	// the same guard as the channel reply — the error path already
+	// returned, and a summarize cut that queued a continuation reports
+	// when that continuation finishes. Runs before the queue handoff
+	// below so a steer accepted during the final step, which becomes
+	// the handed-off turn, is attributed to its own call's observer
+	// and never replaces this turn's findings.
+	if call.turnText != nil && currentAssistant != nil && (!shouldSummarize || len(currentAssistant.ToolCalls()) == 0) {
+		call.turnText(result.Response.Content.Text())
+	}
+
 	// Release active request before publishing the notification.
 	// TUI handlers poll IsSessionBusy() and only re-evaluate when a
 	// tea.Msg arrives, so the cleanup must precede the notify or
@@ -1419,6 +1482,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		var kept []SessionAgentCall
 		var canceledRunIDDrops []SessionAgentCall
 		for _, q := range queuedMessages {
+			if q.systemDelivery {
+				// Dispatch-result delivery (#388): the cancel covers
+				// user prompts, never an undelivered dispatch result.
+				kept = append(kept, q)
+				continue
+			}
 			if q.acceptSeq == 0 || q.acceptSeq <= mark {
 				if q.RunID != "" {
 					canceledRunIDDrops = append(canceledRunIDDrops, q)
@@ -1679,7 +1748,7 @@ func sessionHeaders(sessionID string) map[string]string {
 }
 
 func (a *sessionAgent) createUserMessage(ctx context.Context, call SessionAgentCall) (message.Message, error) {
-	parts := []message.ContentPart{message.TextContent{Text: call.Prompt, Hidden: call.HiddenUserMessage}}
+	parts := []message.ContentPart{message.TextContent{Text: call.Prompt, Hidden: call.HiddenUserMessage, Steer: call.Steer}}
 	var attachmentParts []message.ContentPart
 	for _, attachment := range call.Attachments {
 		attachmentParts = append(attachmentParts, message.BinaryContent{Path: attachment.FilePath, MIMEType: attachment.MimeType, Data: attachment.Content, Kind: attachment.Kind, PromptArgCount: attachment.PromptArgCount})
@@ -2273,7 +2342,16 @@ func (a *sessionAgent) QueuedPrompts(sessionID string) int {
 	if !ok {
 		return 0
 	}
-	return len(l)
+	n := 0
+	for _, call := range l {
+		if call.systemDelivery {
+			// Dispatch-result deliveries (#388) are invisible to the
+			// queue surfaces: the pill counts prompts, not system turns.
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 func (a *sessionAgent) QueuedPromptsList(sessionID string) []string {
@@ -2281,9 +2359,12 @@ func (a *sessionAgent) QueuedPromptsList(sessionID string) []string {
 	if !ok {
 		return nil
 	}
-	prompts := make([]string, len(l))
-	for i, call := range l {
-		prompts[i] = call.Prompt
+	var prompts []string
+	for _, call := range l {
+		if call.systemDelivery {
+			continue
+		}
+		prompts = append(prompts, call.Prompt)
 	}
 	return prompts
 }

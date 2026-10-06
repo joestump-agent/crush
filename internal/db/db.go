@@ -27,6 +27,12 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.addSessionCostStmt, err = db.PrepareContext(ctx, addSessionCost); err != nil {
 		return nil, fmt.Errorf("error preparing query AddSessionCost: %w", err)
 	}
+	if q.countA2ATasksStmt, err = db.PrepareContext(ctx, countA2ATasks); err != nil {
+		return nil, fmt.Errorf("error preparing query CountA2ATasks: %w", err)
+	}
+	if q.createA2ATaskStmt, err = db.PrepareContext(ctx, createA2ATask); err != nil {
+		return nil, fmt.Errorf("error preparing query CreateA2ATask: %w", err)
+	}
 	if q.createFileStmt, err = db.PrepareContext(ctx, createFile); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateFile: %w", err)
 	}
@@ -50,6 +56,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.deleteSessionMessagesStmt, err = db.PrepareContext(ctx, deleteSessionMessages); err != nil {
 		return nil, fmt.Errorf("error preparing query DeleteSessionMessages: %w", err)
+	}
+	if q.getA2ATaskStmt, err = db.PrepareContext(ctx, getA2ATask); err != nil {
+		return nil, fmt.Errorf("error preparing query GetA2ATask: %w", err)
 	}
 	if q.getAverageResponseTimeStmt, err = db.PrepareContext(ctx, getAverageResponseTime); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAverageResponseTime: %w", err)
@@ -99,6 +108,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getUsageByModelStmt, err = db.PrepareContext(ctx, getUsageByModel); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUsageByModel: %w", err)
 	}
+	if q.listA2ATasksStmt, err = db.PrepareContext(ctx, listA2ATasks); err != nil {
+		return nil, fmt.Errorf("error preparing query ListA2ATasks: %w", err)
+	}
 	if q.listAllChildSessionsStmt, err = db.PrepareContext(ctx, listAllChildSessions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAllChildSessions: %w", err)
 	}
@@ -144,6 +156,12 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.setSessionChannelStmt, err = db.PrepareContext(ctx, setSessionChannel); err != nil {
 		return nil, fmt.Errorf("error preparing query SetSessionChannel: %w", err)
 	}
+	if q.updateA2ATaskStmt, err = db.PrepareContext(ctx, updateA2ATask); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateA2ATask: %w", err)
+	}
+	if q.updateA2ATaskIfVersionStmt, err = db.PrepareContext(ctx, updateA2ATaskIfVersion); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateA2ATaskIfVersion: %w", err)
+	}
 	if q.updateMessageStmt, err = db.PrepareContext(ctx, updateMessage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateMessage: %w", err)
 	}
@@ -161,6 +179,16 @@ func (q *Queries) Close() error {
 	if q.addSessionCostStmt != nil {
 		if cerr := q.addSessionCostStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing addSessionCostStmt: %w", cerr)
+		}
+	}
+	if q.countA2ATasksStmt != nil {
+		if cerr := q.countA2ATasksStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing countA2ATasksStmt: %w", cerr)
+		}
+	}
+	if q.createA2ATaskStmt != nil {
+		if cerr := q.createA2ATaskStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing createA2ATaskStmt: %w", cerr)
 		}
 	}
 	if q.createFileStmt != nil {
@@ -201,6 +229,11 @@ func (q *Queries) Close() error {
 	if q.deleteSessionMessagesStmt != nil {
 		if cerr := q.deleteSessionMessagesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing deleteSessionMessagesStmt: %w", cerr)
+		}
+	}
+	if q.getA2ATaskStmt != nil {
+		if cerr := q.getA2ATaskStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getA2ATaskStmt: %w", cerr)
 		}
 	}
 	if q.getAverageResponseTimeStmt != nil {
@@ -283,6 +316,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getUsageByModelStmt: %w", cerr)
 		}
 	}
+	if q.listA2ATasksStmt != nil {
+		if cerr := q.listA2ATasksStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listA2ATasksStmt: %w", cerr)
+		}
+	}
 	if q.listAllChildSessionsStmt != nil {
 		if cerr := q.listAllChildSessionsStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listAllChildSessionsStmt: %w", cerr)
@@ -358,6 +396,16 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing setSessionChannelStmt: %w", cerr)
 		}
 	}
+	if q.updateA2ATaskStmt != nil {
+		if cerr := q.updateA2ATaskStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateA2ATaskStmt: %w", cerr)
+		}
+	}
+	if q.updateA2ATaskIfVersionStmt != nil {
+		if cerr := q.updateA2ATaskIfVersionStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateA2ATaskIfVersionStmt: %w", cerr)
+		}
+	}
 	if q.updateMessageStmt != nil {
 		if cerr := q.updateMessageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateMessageStmt: %w", cerr)
@@ -413,6 +461,8 @@ type Queries struct {
 	db                                   DBTX
 	tx                                   *sql.Tx
 	addSessionCostStmt                   *sql.Stmt
+	countA2ATasksStmt                    *sql.Stmt
+	createA2ATaskStmt                    *sql.Stmt
 	createFileStmt                       *sql.Stmt
 	createMessageStmt                    *sql.Stmt
 	createSessionStmt                    *sql.Stmt
@@ -421,6 +471,7 @@ type Queries struct {
 	deleteSessionStmt                    *sql.Stmt
 	deleteSessionFilesStmt               *sql.Stmt
 	deleteSessionMessagesStmt            *sql.Stmt
+	getA2ATaskStmt                       *sql.Stmt
 	getAverageResponseTimeStmt           *sql.Stmt
 	getFileStmt                          *sql.Stmt
 	getFileByPathAndSessionStmt          *sql.Stmt
@@ -437,6 +488,7 @@ type Queries struct {
 	getUsageByDayOfWeekStmt              *sql.Stmt
 	getUsageByHourStmt                   *sql.Stmt
 	getUsageByModelStmt                  *sql.Stmt
+	listA2ATasksStmt                     *sql.Stmt
 	listAllChildSessionsStmt             *sql.Stmt
 	listAllUserMessagesStmt              *sql.Stmt
 	listChildSessionsStmt                *sql.Stmt
@@ -452,6 +504,8 @@ type Queries struct {
 	recordFileReadStmt                   *sql.Stmt
 	renameSessionStmt                    *sql.Stmt
 	setSessionChannelStmt                *sql.Stmt
+	updateA2ATaskStmt                    *sql.Stmt
+	updateA2ATaskIfVersionStmt           *sql.Stmt
 	updateMessageStmt                    *sql.Stmt
 	updateSessionStmt                    *sql.Stmt
 	updateSessionTitleAndUsageStmt       *sql.Stmt
@@ -462,6 +516,8 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		db:                                   tx,
 		tx:                                   tx,
 		addSessionCostStmt:                   q.addSessionCostStmt,
+		countA2ATasksStmt:                    q.countA2ATasksStmt,
+		createA2ATaskStmt:                    q.createA2ATaskStmt,
 		createFileStmt:                       q.createFileStmt,
 		createMessageStmt:                    q.createMessageStmt,
 		createSessionStmt:                    q.createSessionStmt,
@@ -470,6 +526,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		deleteSessionStmt:                    q.deleteSessionStmt,
 		deleteSessionFilesStmt:               q.deleteSessionFilesStmt,
 		deleteSessionMessagesStmt:            q.deleteSessionMessagesStmt,
+		getA2ATaskStmt:                       q.getA2ATaskStmt,
 		getAverageResponseTimeStmt:           q.getAverageResponseTimeStmt,
 		getFileStmt:                          q.getFileStmt,
 		getFileByPathAndSessionStmt:          q.getFileByPathAndSessionStmt,
@@ -486,6 +543,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getUsageByDayOfWeekStmt:              q.getUsageByDayOfWeekStmt,
 		getUsageByHourStmt:                   q.getUsageByHourStmt,
 		getUsageByModelStmt:                  q.getUsageByModelStmt,
+		listA2ATasksStmt:                     q.listA2ATasksStmt,
 		listAllChildSessionsStmt:             q.listAllChildSessionsStmt,
 		listAllUserMessagesStmt:              q.listAllUserMessagesStmt,
 		listChildSessionsStmt:                q.listChildSessionsStmt,
@@ -501,6 +559,8 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		recordFileReadStmt:                   q.recordFileReadStmt,
 		renameSessionStmt:                    q.renameSessionStmt,
 		setSessionChannelStmt:                q.setSessionChannelStmt,
+		updateA2ATaskStmt:                    q.updateA2ATaskStmt,
+		updateA2ATaskIfVersionStmt:           q.updateA2ATaskIfVersionStmt,
 		updateMessageStmt:                    q.updateMessageStmt,
 		updateSessionStmt:                    q.updateSessionStmt,
 		updateSessionTitleAndUsageStmt:       q.updateSessionTitleAndUsageStmt,

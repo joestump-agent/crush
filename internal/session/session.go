@@ -72,7 +72,7 @@ type Service interface {
 	GetLast(ctx context.Context) (Session, error)
 	List(ctx context.Context) ([]Session, error)
 	// ListChildren returns the sessions whose ParentSessionID is the
-	// given session, oldest update first — the inverse of List's
+	// given session, oldest first (creation order) — the inverse of List's
 	// parent-only filter (#314). Includes every child kind (task
 	// sessions and title sessions); callers filter by kind.
 	ListChildren(ctx context.Context, parentID string) ([]Session, error)
@@ -163,23 +163,84 @@ func (s *service) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err = qtx.DeleteSessionMessages(ctx, dbSession.ID); err != nil {
-		return fmt.Errorf("deleting session messages: %w", err)
+
+	// Descendants breadth-first, level by level, so the cascade handles
+	// any depth of delegation, not just one (#418). The visited set
+	// guards against a parent cycle.
+	visited := map[string]bool{id: true}
+	var levels [][]db.Session
+	queue, err := qtx.ListChildSessions(ctx, sql.NullString{String: id, Valid: true})
+	if err != nil {
+		return fmt.Errorf("listing child sessions: %w", err)
 	}
-	if err = qtx.DeleteSessionFiles(ctx, dbSession.ID); err != nil {
-		return fmt.Errorf("deleting session files: %w", err)
+	for len(queue) > 0 {
+		level := make([]db.Session, 0, len(queue))
+		for _, child := range queue {
+			if !visited[child.ID] {
+				visited[child.ID] = true
+				level = append(level, child)
+			}
+		}
+		if len(level) == 0 {
+			break
+		}
+		levels = append(levels, level)
+		var next []db.Session
+		for _, child := range level {
+			kids, err := qtx.ListChildSessions(ctx, sql.NullString{String: child.ID, Valid: true})
+			if err != nil {
+				return fmt.Errorf("listing child sessions: %w", err)
+			}
+			next = append(next, kids...)
+		}
+		queue = next
 	}
-	if err = qtx.DeleteSession(ctx, dbSession.ID); err != nil {
-		return fmt.Errorf("deleting session: %w", err)
+
+	// Deepest level first, then the parent; a failure anywhere rolls
+	// back the whole transaction, so no half-deleted tree survives
+	// (#418).
+	for i := len(levels) - 1; i >= 0; i-- {
+		for _, child := range levels[i] {
+			if err := s.deleteSessionRows(ctx, qtx, child.ID); err != nil {
+				return err
+			}
+		}
+	}
+	if err := s.deleteSessionRows(ctx, qtx, dbSession.ID); err != nil {
+		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("committing transaction: %w", err)
 	}
 
-	session := s.fromDBItem(dbSession)
-	s.clearEstimatedUsageState(dbSession.ID)
-	s.Publish(pubsub.DeletedEvent, session)
+	deleted := make([]Session, 0, len(visited))
+	for i := len(levels) - 1; i >= 0; i-- {
+		for _, child := range levels[i] {
+			deleted = append(deleted, s.fromDBItem(child))
+		}
+	}
+	deleted = append(deleted, s.fromDBItem(dbSession))
+	for _, session := range deleted {
+		s.clearEstimatedUsageState(session.ID)
+		s.Publish(pubsub.DeletedEvent, session)
+	}
 	event.SessionDeleted()
+	return nil
+}
+
+// deleteSessionRows removes one session's messages, files and row; every
+// session in a cascading Delete (#418) goes through the same three
+// statements.
+func (s *service) deleteSessionRows(ctx context.Context, q *db.Queries, sessionID string) error {
+	if err := q.DeleteSessionMessages(ctx, sessionID); err != nil {
+		return fmt.Errorf("deleting session messages: %w", err)
+	}
+	if err := q.DeleteSessionFiles(ctx, sessionID); err != nil {
+		return fmt.Errorf("deleting session files: %w", err)
+	}
+	if err := q.DeleteSession(ctx, sessionID); err != nil {
+		return fmt.Errorf("deleting session: %w", err)
+	}
 	return nil
 }
 

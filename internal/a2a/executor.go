@@ -464,12 +464,21 @@ func todoMetadata(todos []session.Todo) []any {
 // and reports the task canceled. The task is marked as this executor's own
 // cancel before the runner aborts (#342), so the run's returning
 // context.Canceled takes the silent path and this Canceled status stays
-// the only terminal one.
+// the only terminal one. The reason travels the protocol (#348): the
+// cancel request's declared metadata carries it, and it lands on the
+// terminal Canceled status message so the caller — and any tasks/get
+// reader — sees why the run stopped. Without one, the in-process kill
+// reason (an out-of-band cancel that bypassed tasks/cancel, #342) is
+// used, falling back to the generic "canceled".
 func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
 		e.markOwnCancel(string(execCtx.TaskID))
 		e.runner.Cancel(e.sessionID)
-		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled, nil), nil)
+		text := cancelReasonFromMetadata(execCtx.Metadata)
+		if text == "" {
+			text = e.canceledStatusText()
+		}
+		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled, agentMessage(execCtx, text)), nil)
 	}
 }
 

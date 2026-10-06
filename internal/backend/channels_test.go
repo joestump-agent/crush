@@ -148,9 +148,12 @@ func (c *recordingCoordinator) RunAccepted(ctx context.Context, _ *agent.Accepte
 	return nil, nil
 }
 
-func (c *recordingCoordinator) BeginAccepted(string) *agent.AcceptedRun       { return nil }
-func (c *recordingCoordinator) Cancel(string)                                 {}
-func (c *recordingCoordinator) CancelAll()                                    {}
+func (c *recordingCoordinator) BeginAccepted(string) *agent.AcceptedRun { return nil }
+func (c *recordingCoordinator) Cancel(string)                           {}
+func (c *recordingCoordinator) CancelAll()                              {}
+func (c *recordingCoordinator) CancelDispatch(context.Context, string) error {
+	return errors.New("not implemented")
+}
 func (c *recordingCoordinator) IsBusy() bool                                  { return false }
 func (c *recordingCoordinator) IsSessionBusy(string) bool                     { return false }
 func (c *recordingCoordinator) QueuedPrompts(string) int                      { return 0 }
@@ -161,6 +164,7 @@ func (c *recordingCoordinator) ListCronTasks(string) []scheduler.Task         { 
 func (c *recordingCoordinator) Summarize(context.Context, string) error       { return nil }
 func (c *recordingCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (c *recordingCoordinator) UpdateModels(context.Context) error            { return nil }
+func (c *recordingCoordinator) SetInteractive(context.Context, bool) error    { return nil }
 func (c *recordingCoordinator) GenerateTitle(context.Context, string, string) {}
 
 // fullFakeSessions adapts fakeChannelSessions to the full session.Service
@@ -371,6 +375,6 @@ func (c *recordingCoordinator) DispatchByHandle(sessionID, handle string) (dispa
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (c *recordingCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+func (c *recordingCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	return errors.New("not implemented")
 }

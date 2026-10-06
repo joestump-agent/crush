@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/lock"
@@ -41,12 +41,33 @@ func newTestRepo(t *testing.T) string {
 	return repo
 }
 
-// newWorkspace creates a workspace whose worktrees live under the repo
-// itself (the default before #383 moved them), nested so the ignore
-// file lands beside the per-repo key directory.
-func newWorkspace(t *testing.T, repo string) (*Workspace, error) {
+// newProvider creates a git worktree provider whose worktrees live
+// under the repo itself (the default before #383 moved them), nested
+// so the ignore file lands beside the per-repo key directory, backed
+// by its own registry.
+func newProvider(t *testing.T, repo string) (*GitWorktreeProvider, error) {
 	t.Helper()
-	return NewWorkspace(repo, filepath.Join(repo, "worktrees", "repo-key"))
+	return NewGitWorktreeProvider(repo, filepath.Join(repo, "worktrees", "repo-key"), NewAgentRegistry())
+}
+
+// provisionEntry provisions a workspace on p and registers its entry
+// with StatusProvisioned, the same two steps the dispatch tool
+// performs. It returns the registered entry for Diff and Release.
+func provisionEntry(t *testing.T, p *GitWorktreeProvider, opts ProvisionOptions) Entry {
+	t.Helper()
+	id := uuid.NewString()
+	placement, err := p.Provision(t.Context(), id, opts)
+	require.NoError(t, err)
+	entry := Entry{
+		ID:      id,
+		Path:    placement.Path,
+		Branch:  placement.Branch,
+		Base:    placement.Base,
+		BaseSHA: placement.BaseSHA,
+		Status:  StatusProvisioned,
+	}
+	p.reg.Register(entry)
+	return entry
 }
 
 func write(t *testing.T, path, content string) {
@@ -81,21 +102,20 @@ func branchExists(t *testing.T, repo, branch string) bool {
 }
 
 // The full lifecycle: provision a workspace (branch + directory +
-// registry entry), record the dispatched agent's session/handle/status,
-// capture a diff that includes committed, uncommitted, and untracked
-// work, and clean up idempotently.
+// registry entry), record the dispatched agent's session/handle/status
+// in the registry, capture a diff that includes committed, uncommitted,
+// and untracked work, and clean up idempotently.
 func TestWorkspaceLifecycle(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
-	entry, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	entry := provisionEntry(t, p, ProvisionOptions{})
 	require.NotEmpty(t, entry.ID)
 	require.Equal(t, BranchPrefix+entry.ID, entry.Branch)
-	require.Equal(t, filepath.Join(ws.worktreesDir, entry.Branch), entry.Path)
+	require.Equal(t, filepath.Join(p.worktreesDir, entry.Branch), entry.Path)
 	require.Equal(t, StatusProvisioned, entry.Status)
 	require.NotEmpty(t, entry.BaseSHA)
 
@@ -109,21 +129,21 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	// Every provisioned workspace holds a lease and carries an owner
 	// marker, both next to the worktree so they never appear in a
 	// diff.
-	require.FileExists(t, ws.leasePath(entry.Branch))
-	require.FileExists(t, ws.ownerPath(entry.Branch))
+	require.FileExists(t, p.leasePath(entry.Branch))
+	require.FileExists(t, p.ownerPath(entry.Branch))
 
 	// The registry tracks the entry and answers the later-phase
 	// queries: by handle, by session, and the flat list.
-	got, ok := ws.Get(entry.ID)
+	got, ok := p.reg.Get(entry.ID)
 	require.True(t, ok)
 	require.Equal(t, entry, got)
 
-	require.True(t, ws.SetSession(entry.ID, "session-1"))
-	require.True(t, ws.SetHandle(entry.ID, "coder-a"))
-	require.True(t, ws.SetStatus(entry.ID, StatusRunning))
-	require.True(t, ws.SetEndpoint(entry.ID, "http://127.0.0.1:9999", "card"))
+	require.True(t, p.reg.SetSession(entry.ID, "session-1"))
+	require.True(t, p.reg.SetHandle(entry.ID, "coder-a"))
+	require.True(t, p.reg.SetStatus(entry.ID, StatusRunning))
+	require.True(t, p.reg.SetEndpoint(entry.ID, "http://127.0.0.1:9999", "card"))
 
-	byHandle, ok := ws.ByHandle("coder-a")
+	byHandle, ok := p.reg.ByHandle("coder-a")
 	require.True(t, ok)
 	require.Equal(t, entry.ID, byHandle.ID)
 	require.Equal(t, "session-1", byHandle.SessionID)
@@ -131,10 +151,10 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	require.Equal(t, "http://127.0.0.1:9999", byHandle.Endpoint)
 	require.Equal(t, "card", byHandle.AgentCard)
 
-	bySession, ok := ws.BySession("session-1")
+	bySession, ok := p.reg.BySession("session-1")
 	require.True(t, ok)
 	require.Equal(t, entry.ID, bySession.ID)
-	require.Len(t, ws.List(), 1)
+	require.Len(t, p.reg.List(), 1)
 
 	// The dispatched agent's work product: a committed change, an
 	// uncommitted edit, and an untracked file. All three must appear in
@@ -145,7 +165,7 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	write(t, filepath.Join(entry.Path, "f.txt"), "one edited")
 	write(t, filepath.Join(entry.Path, "untracked.txt"), "untracked")
 
-	diff, err := ws.Diff(ctx, entry.ID)
+	diff, err := p.Diff(ctx, entry)
 	require.NoError(t, err)
 	require.Contains(t, diff, "committed.txt")
 	require.Contains(t, diff, "untracked.txt")
@@ -159,21 +179,22 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	// staged entry would mean Diff dirtied the real index).
 	require.Empty(t, strings.TrimSpace(gitIn(t, entry.Path, "diff", "--cached", "--name-only")), "Diff staged changes into the real index")
 
-	// Cleanup removes directory, branch, and registry entry — and is
-	// idempotent.
-	require.NoError(t, ws.Remove(ctx, entry.ID))
+	// Release removes directory, branch, and lease — and is idempotent.
+	// The registry entry is the caller's to drop.
+	require.NoError(t, p.Release(ctx, entry))
 	_, err = os.Stat(entry.Path)
-	require.True(t, os.IsNotExist(err), "worktree directory survived Remove")
+	require.True(t, os.IsNotExist(err), "worktree directory survived Release")
 	require.False(t, branchExists(t, repo, entry.Branch))
-	_, ok = ws.Get(entry.ID)
+	require.NoError(t, p.Release(ctx, entry))
+	require.True(t, p.reg.Remove(entry.ID))
+	_, ok = p.reg.Get(entry.ID)
 	require.False(t, ok)
-	require.NoError(t, ws.Remove(ctx, entry.ID))
 
 	// The owner marker goes with the workspace. The lock file stays on
 	// disk — flock is keyed by inode, so it is never unlinked — but
 	// nobody holds it.
-	require.NoFileExists(t, ws.ownerPath(entry.Branch))
-	rel, err := lock.TryFile(ws.leasePath(entry.Branch))
+	require.NoFileExists(t, p.ownerPath(entry.Branch))
+	rel, err := lock.TryFile(p.leasePath(entry.Branch))
 	require.NoError(t, err)
 	rel()
 }
@@ -185,15 +206,12 @@ func TestSweepContinuesPastLockedWorktree(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
-	one, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	locked, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	three, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	one := provisionEntry(t, p, ProvisionOptions{})
+	locked := provisionEntry(t, p, ProvisionOptions{})
+	three := provisionEntry(t, p, ProvisionOptions{})
 
 	// Lock the worktree, as a stale run or a Windows hold would.
 	out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "lock", locked.Path).CombinedOutput()
@@ -203,7 +221,7 @@ func TestSweepContinuesPastLockedWorktree(t *testing.T) {
 		gitIn(t, repo, "worktree", "prune")
 	})
 
-	err = ws.Sweep(ctx)
+	err = p.Sweep(ctx)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), locked.ID, "sweep error must name the locked entry")
 
@@ -213,19 +231,19 @@ func TestSweepContinuesPastLockedWorktree(t *testing.T) {
 		_, statErr := os.Stat(gone.Path)
 		require.True(t, os.IsNotExist(statErr), "sweep left %s behind", gone.Path)
 		require.False(t, branchExists(t, repo, gone.Branch), "sweep left branch %s behind", gone.Branch)
-		_, ok := ws.Get(gone.ID)
+		_, ok := p.reg.Get(gone.ID)
 		require.False(t, ok, "removed entry %s still registered", gone.ID)
 	}
 
 	// The locked entry is still registered so a later sweep can retry.
-	_, ok := ws.Get(locked.ID)
+	_, ok := p.reg.Get(locked.ID)
 	require.True(t, ok)
-	require.Len(t, ws.List(), 1)
+	require.Len(t, p.reg.List(), 1)
 
 	// Unlock and sweep again: the retry succeeds and nothing is left.
 	gitIn(t, repo, "worktree", "unlock", locked.Path)
-	require.NoError(t, ws.Sweep(ctx))
-	require.Empty(t, ws.List())
+	require.NoError(t, p.Sweep(ctx))
+	require.Empty(t, p.reg.List())
 	_, statErr := os.Stat(locked.Path)
 	require.True(t, os.IsNotExist(statErr), "retry sweep left %s behind", locked.Path)
 	require.False(t, branchExists(t, repo, locked.Branch))
@@ -238,11 +256,10 @@ func TestRemoveToleratesMissingBranch(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
-	entry, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	entry := provisionEntry(t, p, ProvisionOptions{})
 
 	// Delete the worktree and the branch out from under the registry.
 	out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "remove", "--force", entry.Path).CombinedOutput()
@@ -250,9 +267,9 @@ func TestRemoveToleratesMissingBranch(t *testing.T) {
 	out, err = exec.CommandContext(ctx, "git", "-C", repo, "branch", "-D", entry.Branch).CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	require.NoError(t, ws.Sweep(ctx))
-	require.Empty(t, ws.List())
-	require.NoError(t, ws.Remove(ctx, entry.ID))
+	require.NoError(t, p.Sweep(ctx))
+	require.Empty(t, p.reg.List())
+	require.NoError(t, p.Release(ctx, entry))
 }
 
 // hasBranch decides by git's exit code, never by its message text.
@@ -274,35 +291,33 @@ func TestWorkspaceSweepRemovesTrackedAndOrphans(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
-	tracked, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	abandoned, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	require.True(t, ws.SetStatus(abandoned.ID, StatusRunning))
+	tracked := provisionEntry(t, p, ProvisionOptions{})
+	abandoned := provisionEntry(t, p, ProvisionOptions{})
+	require.True(t, p.reg.SetStatus(abandoned.ID, StatusRunning))
 
 	// An orphan: a worktree this process did not register, as a crashed
 	// run would leave behind. Its lease file survives the crash — the
 	// kernel releases the lock, not the file — so the orphan here gets
 	// a lock file nobody holds, and is still reclaimed.
 	orphanBranch := BranchPrefix + "orphaned"
-	orphanPath := filepath.Join(ws.worktreesDir, orphanBranch)
+	orphanPath := filepath.Join(p.worktreesDir, orphanBranch)
 	out, err := exec.CommandContext(t.Context(), "git", "-C", repo, "worktree", "add", "-b", orphanBranch, orphanPath).CombinedOutput()
 	require.NoError(t, err, string(out))
-	orphanRelease, err := lock.TryFile(ws.leasePath(orphanBranch))
+	orphanRelease, err := lock.TryFile(p.leasePath(orphanBranch))
 	require.NoError(t, err)
 	orphanRelease()
 
 	// A worktree with no lease file at all: ownership cannot be
 	// proven, so Sweep must leave it alone.
 	unmarkedBranch := BranchPrefix + "unmarked"
-	unmarkedPath := filepath.Join(ws.worktreesDir, unmarkedBranch)
+	unmarkedPath := filepath.Join(p.worktreesDir, unmarkedBranch)
 	out, err = exec.CommandContext(t.Context(), "git", "-C", repo, "worktree", "add", "-b", unmarkedBranch, unmarkedPath).CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	require.NoError(t, ws.Sweep(ctx))
+	require.NoError(t, p.Sweep(ctx))
 
 	for _, path := range []string{tracked.Path, abandoned.Path, orphanPath} {
 		_, err := os.Stat(path)
@@ -314,36 +329,35 @@ func TestWorkspaceSweepRemovesTrackedAndOrphans(t *testing.T) {
 	_, err = os.Stat(unmarkedPath)
 	require.NoError(t, err, "sweep removed a worktree with no lease file")
 	require.True(t, branchExists(t, repo, unmarkedBranch))
-	require.Empty(t, ws.List())
+	require.Empty(t, p.reg.List())
 }
 
 // dropLeases simulates process exit: it releases every lease the
-// workspace holds without removing any workspace, leaving the lock
+// provider holds without removing any workspace, leaving the lock
 // files on disk unheld — exactly what a crashed run leaves behind.
-func dropLeases(ws *Workspace) {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	for _, release := range ws.leases {
+func dropLeases(p *GitWorktreeProvider) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, release := range p.leases {
 		release()
 	}
-	ws.leases = make(map[string]func())
+	p.leases = make(map[string]func())
 }
 
-// A second Workspace on the same repository is a live peer: its
+// A second provider on the same repository is a live peer: its
 // provisioned workspaces — committed and uncommitted work included —
 // survive another instance's Sweep, and keep diffing.
 func TestSweepLeavesOtherInstancesLiveWorkspaces(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	a, err := newWorkspace(t, repo)
+	a, err := newProvider(t, repo)
 	require.NoError(t, err)
-	b, err := newWorkspace(t, repo)
+	b, err := newProvider(t, repo)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = b.Sweep(context.Background()) })
 
-	entry, err := b.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	entry := provisionEntry(t, b, ProvisionOptions{})
 	write(t, filepath.Join(entry.Path, "committed.txt"), "committed")
 	gitIn(t, entry.Path, "add", "-A")
 	gitIn(t, entry.Path, "-c", "commit.gpgsign=false", "commit", "-qm", "dispatched work")
@@ -357,14 +371,14 @@ func TestSweepLeavesOtherInstancesLiveWorkspaces(t *testing.T) {
 	require.FileExists(t, filepath.Join(entry.Path, "committed.txt"))
 	require.FileExists(t, filepath.Join(entry.Path, "f.txt"))
 
-	diff, err := b.Diff(ctx, entry.ID)
+	diff, err := b.Diff(ctx, entry)
 	require.NoError(t, err)
 	require.Contains(t, diff, "committed.txt")
 	require.Contains(t, diff, "+one edited")
 	require.NotContains(t, diff, ".lock")
 	require.NotContains(t, diff, ".owner.json")
 
-	_, ok := b.Get(entry.ID)
+	_, ok := b.reg.Get(entry.ID)
 	require.True(t, ok)
 }
 
@@ -375,12 +389,11 @@ func TestSweepReclaimsDeadOwnersWorkspace(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	b, err := newWorkspace(t, repo)
+	b, err := newProvider(t, repo)
 	require.NoError(t, err)
-	entry, err := b.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	entry := provisionEntry(t, b, ProvisionOptions{})
 
-	a, err := newWorkspace(t, repo)
+	a, err := newProvider(t, repo)
 	require.NoError(t, err)
 	dropLeases(b)
 
@@ -413,11 +426,10 @@ func TestWorkspaceExplicitBaseAndFallback(t *testing.T) {
 	out, err = exec.CommandContext(t.Context(), "git", "-C", repo, "checkout", "-q", "-").CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
-	entry, err := ws.Provision(ctx, ProvisionOptions{Base: "feature-base"})
-	require.NoError(t, err)
+	entry := provisionEntry(t, p, ProvisionOptions{Base: "feature-base"})
 	require.Equal(t, "feature-base", entry.Base)
 	require.Equal(t, baseSHA, entry.BaseSHA)
 	require.FileExists(t, filepath.Join(entry.Path, "base.txt"))
@@ -430,11 +442,11 @@ func TestWorkspaceExplicitBaseAndFallback(t *testing.T) {
 	out, err = exec.CommandContext(t.Context(), "git", "-C", repo, "branch", "-D", "feature-base").CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	diff, err := ws.Diff(ctx, entry.ID)
+	diff, err := p.Diff(ctx, entry)
 	require.NoError(t, err)
 	require.Contains(t, diff, "work.txt")
 
-	require.NoError(t, ws.Remove(ctx, entry.ID))
+	require.NoError(t, p.Release(ctx, entry))
 }
 
 // A detached parent (a CI checkout, a rebase or bisect in progress, any
@@ -446,11 +458,10 @@ func TestDiffDetachedParent(t *testing.T) {
 
 	gitIn(t, repo, "checkout", "--detach")
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
-	entry, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	entry := provisionEntry(t, p, ProvisionOptions{})
 	require.Equal(t, "HEAD", entry.Base)
 	require.NotEmpty(t, entry.BaseSHA)
 
@@ -461,12 +472,12 @@ func TestDiffDetachedParent(t *testing.T) {
 	commitIn(t, entry.Path, "committed work")
 	write(t, filepath.Join(entry.Path, "uncommitted.txt"), "uncommitted")
 
-	diff, err := ws.Diff(ctx, entry.ID)
+	diff, err := p.Diff(ctx, entry)
 	require.NoError(t, err)
 	require.Contains(t, diff, "b/committed.txt")
 	require.Contains(t, diff, "b/uncommitted.txt")
 
-	require.NoError(t, ws.Remove(ctx, entry.ID))
+	require.NoError(t, p.Release(ctx, entry))
 }
 
 // A model-supplied relative base ("HEAD~1") resolves at provision time;
@@ -480,11 +491,10 @@ func TestDiffRelativeBase(t *testing.T) {
 	gitIn(t, repo, "add", "-A")
 	commitIn(t, repo, "second")
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
-	entry, err := ws.Provision(ctx, ProvisionOptions{Base: "HEAD~1"})
-	require.NoError(t, err)
+	entry := provisionEntry(t, p, ProvisionOptions{Base: "HEAD~1"})
 	require.Equal(t, "HEAD~1", entry.Base)
 
 	// Two agent commits on top of the relative base.
@@ -495,12 +505,12 @@ func TestDiffRelativeBase(t *testing.T) {
 	gitIn(t, entry.Path, "add", "-A")
 	commitIn(t, entry.Path, "second agent commit")
 
-	diff, err := ws.Diff(ctx, entry.ID)
+	diff, err := p.Diff(ctx, entry)
 	require.NoError(t, err)
 	require.Contains(t, diff, "a.txt")
 	require.Contains(t, diff, "b.txt")
 
-	require.NoError(t, ws.Remove(ctx, entry.ID))
+	require.NoError(t, p.Release(ctx, entry))
 }
 
 // A base branch that moves forward after provision does not leak into
@@ -510,11 +520,10 @@ func TestDiffIgnoresAdvancedBase(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
-	entry, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	entry := provisionEntry(t, p, ProvisionOptions{})
 
 	// The dispatch works; meanwhile the base branch advances.
 	write(t, filepath.Join(entry.Path, "work.txt"), "dispatched")
@@ -524,34 +533,33 @@ func TestDiffIgnoresAdvancedBase(t *testing.T) {
 	gitIn(t, repo, "add", "-A")
 	commitIn(t, repo, "base advanced")
 
-	diff, err := ws.Diff(ctx, entry.ID)
+	diff, err := p.Diff(ctx, entry)
 	require.NoError(t, err)
 	require.Contains(t, diff, "work.txt")
 	require.NotContains(t, diff, "advanced.txt")
 
-	require.NoError(t, ws.Remove(ctx, entry.ID))
+	require.NoError(t, p.Release(ctx, entry))
 }
 
 // An entry with no recorded base SHA is an error, never a fallback to
 // some other revision (#380).
 func TestDiffMissingBaseSHA(t *testing.T) {
 	repo := newTestRepo(t)
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
 	// A directory standing in for a workspace whose registry entry lost
 	// its base SHA.
-	path := filepath.Join(ws.worktreesDir, BranchPrefix+"no-base")
+	path := filepath.Join(p.worktreesDir, BranchPrefix+"no-base")
 	require.NoError(t, os.MkdirAll(path, 0o755))
+	entry := Entry{ID: "no-base", Path: path, Base: "HEAD"}
+	p.reg.Register(entry)
 	t.Cleanup(func() {
-		ws.mu.Lock()
-		delete(ws.entries, "no-base")
-		ws.mu.Unlock()
+		p.reg.Remove(entry.ID)
 		os.RemoveAll(path)
 	})
-	ws.entries["no-base"] = Entry{ID: "no-base", Path: path, Base: "HEAD"}
 
-	_, err = ws.Diff(t.Context(), "no-base")
+	_, err = p.Diff(t.Context(), entry)
 	require.Error(t, err)
 }
 
@@ -562,9 +570,9 @@ func TestWorkspaceProvisionRejectsBadBases(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+	t.Cleanup(func() { _ = p.Sweep(context.Background()) })
 
 	worktreesBefore := gitIn(t, repo, "worktree", "list", "--porcelain")
 	branchesBefore := gitIn(t, repo, "branch", "--list", BranchPrefix+"*")
@@ -580,14 +588,14 @@ func TestWorkspaceProvisionRejectsBadBases(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.base, func(t *testing.T) {
-			_, err := ws.Provision(ctx, ProvisionOptions{Base: tt.base})
+			_, err := p.Provision(ctx, uuid.NewString(), ProvisionOptions{Base: tt.base})
 			require.ErrorContains(t, err, tt.err)
 		})
 	}
 
 	require.Equal(t, worktreesBefore, gitIn(t, repo, "worktree", "list", "--porcelain"))
 	require.Equal(t, branchesBefore, gitIn(t, repo, "branch", "--list", BranchPrefix+"*"))
-	require.Empty(t, ws.List())
+	require.Empty(t, p.reg.List())
 }
 
 // Branch, tag, full SHA, and HEAD~1 bases still work: BaseSHA is the
@@ -604,7 +612,7 @@ func TestWorkspaceProvisionValidBases(t *testing.T) {
 	gitIn(t, repo, "branch", "stable", "v1")
 	baseSHA := strings.TrimSpace(gitIn(t, repo, "rev-parse", "v1^{commit}"))
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -619,244 +627,20 @@ func TestWorkspaceProvisionValidBases(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			entry, err := ws.Provision(ctx, ProvisionOptions{Base: tt.base})
-			require.NoError(t, err)
+			entry := provisionEntry(t, p, ProvisionOptions{Base: tt.base})
 			require.Equal(t, tt.base, entry.Base)
 			require.Equal(t, tt.want, entry.BaseSHA)
 			require.Equal(t, tt.want, strings.TrimSpace(gitIn(t, entry.Path, "rev-parse", "HEAD")))
-			require.NoError(t, ws.Remove(ctx, entry.ID))
+			require.NoError(t, p.Release(ctx, entry))
 		})
 	}
 }
 
-func TestWorkspaceDiffUnknownID(t *testing.T) {
-	repo := newTestRepo(t)
-	ws, err := newWorkspace(t, repo)
-	require.NoError(t, err)
-
-	_, err = ws.Diff(t.Context(), "no-such-dispatch")
-	require.Error(t, err)
-}
-
+// The provider refuses a directory that is not inside a git
+// repository.
 func TestWorkspaceRequiresGitRepo(t *testing.T) {
-	_, err := NewWorkspace(t.TempDir(), filepath.Join(t.TempDir(), "worktrees"))
+	_, err := NewGitWorktreeProvider(t.TempDir(), filepath.Join(t.TempDir(), "worktrees"), NewAgentRegistry())
 	require.Error(t, err)
-}
-
-// Registry mutations on unknown entries report false rather than
-// panicking or silently succeeding.
-func TestWorkspaceUpdateUnknownEntry(t *testing.T) {
-	repo := newTestRepo(t)
-	ws, err := newWorkspace(t, repo)
-	require.NoError(t, err)
-
-	require.False(t, ws.SetStatus("nope", StatusRunning))
-	require.False(t, ws.SetSession("nope", "s"))
-	require.False(t, ws.SetHandle("nope", "h"))
-	require.False(t, ws.SetEndpoint("nope", "e", nil))
-	require.False(t, ws.Update("nope", func(e *Entry) {}))
-	require.False(t, ws.Update("", nil))
-
-	_, ok := ws.ByHandle("")
-	require.False(t, ok)
-	_, ok = ws.BySession("")
-	require.False(t, ok)
-}
-
-// HandleSlug normalizes candidates into handle form and leaves
-// unhandle-able ones empty so the caller can fall through.
-func TestHandleSlug(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct{ in, want string }{
-		{"tester", "tester"},
-		{"@Tester", "tester"},
-		{"  @Team Lead  ", "team-lead"},
-		{"Docs_Writer", "docs-writer"},
-		{"---weird__name---", "weird-name"},
-		{"🤖 robot", "robot"},
-		{"@__", ""},
-		{"", ""},
-	}
-	for _, tc := range cases {
-		require.Equal(t, tc.want, HandleSlug(tc.in), "HandleSlug(%q)", tc.in)
-	}
-}
-
-// AssignHandle assigns the requested handle, derives one from the role,
-// falls back to "agent", and suffixes collisions numerically against the
-// running agents only (#399): a finished dispatch releases its handle for
-// reuse. Reserved names are suffixed like collisions, and the 32-byte
-// cap holds even with a suffix.
-func TestAssignHandle(t *testing.T) {
-	repo := newTestRepo(t)
-	ws, err := newWorkspace(t, repo)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
-	ctx := t.Context()
-
-	a, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	b, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	c, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-
-	// Explicit handle, with the leading @ tolerated.
-	handle, ok := ws.AssignHandle(a.ID, "@Tester", "writes tests")
-	require.True(t, ok)
-	require.Equal(t, "tester", handle)
-
-	// Derived from the role when no handle was requested.
-	handle, ok = ws.AssignHandle(b.ID, "", "Docs Writer")
-	require.True(t, ok)
-	require.Equal(t, "docs-writer", handle)
-
-	// Default when neither handle nor role was given.
-	handle, ok = ws.AssignHandle(c.ID, "", "")
-	require.True(t, ok)
-	require.Equal(t, "agent", handle)
-
-	// The entry carries handle and role, and ByHandle resolves it.
-	entry, ok := ws.Get(a.ID)
-	require.True(t, ok)
-	require.Equal(t, "tester", entry.Handle)
-	require.Equal(t, "writes tests", entry.Role)
-	got, ok := ws.ByHandle("tester")
-	require.True(t, ok)
-	require.Equal(t, a.ID, got.ID)
-
-	// A fourth dispatch asking for an in-use handle gets a suffix.
-	d, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	handle, ok = ws.AssignHandle(d.ID, "tester", "")
-	require.True(t, ok)
-	require.Equal(t, "tester-2", handle)
-
-	// A finished dispatch releases its handle: the next dispatch asking
-	// for it gets the bare handle again, even though the finished entry
-	// still carries it (#399).
-	ws.SetStatus(a.ID, StatusCompleted)
-	e, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	handle, ok = ws.AssignHandle(e.ID, "tester", "")
-	require.True(t, ok)
-	require.Equal(t, "tester", handle)
-
-	// A reserved name is never assigned outright: it is suffixed like a
-	// collision (#399).
-	f, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	handle, ok = ws.AssignHandle(f.ID, "task", "")
-	require.True(t, ok)
-	require.Equal(t, "task-2", handle)
-
-	// A 60-character role yields a handle of at most 32 bytes (#399).
-	g, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	long := strings.Repeat("x", 60)
-	handle, ok = ws.AssignHandle(g.ID, long, "")
-	require.True(t, ok)
-	require.Equal(t, strings.Repeat("x", MaxHandleLength), handle)
-
-	// A collision on an already-capped handle suffixes with the base
-	// truncated so "-2" fits: the result stays within the cap.
-	h, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	handle, ok = ws.AssignHandle(h.ID, long, "")
-	require.True(t, ok)
-	require.Equal(t, strings.Repeat("x", MaxHandleLength-2)+"-2", handle)
-	require.LessOrEqual(t, len(handle), MaxHandleLength)
-
-	// A removed entry releases its handle for reuse.
-	require.NoError(t, ws.Remove(ctx, b.ID))
-	handle, ok = ws.AssignHandle(e.ID, "", "docs writer")
-	require.True(t, ok)
-	require.Equal(t, "docs-writer", handle)
-
-	// Unknown entry: not assigned.
-	_, ok = ws.AssignHandle("no-such-id", "x", "")
-	require.False(t, ok)
-}
-
-// IsTerminal marks exactly the terminal statuses.
-func TestStatusIsTerminal(t *testing.T) {
-	t.Parallel()
-
-	for _, s := range []Status{StatusCompleted, StatusFailed, StatusKilled} {
-		require.True(t, s.IsTerminal(), "%s must be terminal", s)
-	}
-	for _, s := range []Status{StatusProvisioned, StatusRunning} {
-		require.False(t, s.IsTerminal(), "%s must not be terminal", s)
-	}
-}
-
-// HandleSlug caps a slug at MaxHandleLength bytes (#399), trimming a
-// trailing dash the cap leaves.
-func TestHandleSlugLengthCap(t *testing.T) {
-	t.Parallel()
-
-	capped := HandleSlug(strings.Repeat("a", 60))
-	require.Len(t, capped, MaxHandleLength)
-	require.Equal(t, strings.Repeat("a", MaxHandleLength), capped)
-
-	// The cap lands after a dash run: the trailing dash is trimmed.
-	dashed := HandleSlug(strings.Repeat("a", 30) + "-" + strings.Repeat("b", 30))
-	require.LessOrEqual(t, len(dashed), MaxHandleLength)
-	require.False(t, strings.HasSuffix(dashed, "-"), "a capped slug never ends with a dash")
-	require.Equal(t, strings.Repeat("a", 30)+"-b", dashed)
-}
-
-// ByHandle prefers the live entry carrying the handle; when only
-// finished entries carry it, the most recently finished one answers
-// (#399), so a mention of a finished @handle still renders its card
-// until the handle is reused.
-func TestByHandlePrefersLiveEntry(t *testing.T) {
-	repo := newTestRepo(t)
-	ws, err := newWorkspace(t, repo)
-	require.NoError(t, err)
-	// Sweep releases this process's leases so Windows can unlink the
-	// lock files during TempDir cleanup.
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
-	ctx := t.Context()
-
-	// Release the entries' ownership leases on the way out: the open
-	// lock files keep t.TempDir's RemoveAll from cleaning up on
-	// Windows.
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
-
-	a, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	_, ok := ws.AssignHandle(a.ID, "tester", "")
-	require.True(t, ok)
-
-	// Finish a; its handle still resolves, as the finished fallback.
-	require.True(t, ws.SetStatus(a.ID, StatusCompleted))
-	require.True(t, ws.Update(a.ID, func(e *Entry) { e.FinishedAt = time.Now().Add(-time.Minute) }))
-	got, ok := ws.ByHandle("tester")
-	require.True(t, ok, "a finished handle still resolves")
-	require.Equal(t, a.ID, got.ID)
-
-	// A newer finished entry wins the fallback over an older one.
-	b, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	_, ok = ws.AssignHandle(b.ID, "tester", "")
-	require.True(t, ok)
-	require.True(t, ws.SetStatus(b.ID, StatusKilled))
-	require.True(t, ws.Update(b.ID, func(e *Entry) { e.FinishedAt = time.Now() }))
-	got, ok = ws.ByHandle("tester")
-	require.True(t, ok)
-	require.Equal(t, b.ID, got.ID, "the most recently finished entry answers")
-
-	// A new dispatch reuses the released handle; the live entry now wins.
-	c, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	handle, ok := ws.AssignHandle(c.ID, "tester", "")
-	require.True(t, ok)
-	require.Equal(t, "tester", handle, "the handle was free again")
-	got, ok = ws.ByHandle("tester")
-	require.True(t, ok)
-	require.Equal(t, c.ID, got.ID, "the live entry answers over finished ones")
 }
 
 // newTestRepoWithRemote extends a test repo with a bare "origin" and
@@ -923,9 +707,9 @@ func TestProvisionConcurrent(t *testing.T) {
 	repo := newTestRepoWithRemote(t)
 	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+	t.Cleanup(func() { _ = p.Sweep(context.Background()) })
 
 	const n = 12
 	errs := make([]error, n)
@@ -934,7 +718,19 @@ func TestProvisionConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = ws.Provision(ctx, ProvisionOptions{Base: "origin/main"})
+			id := uuid.NewString()
+			placement, err := p.Provision(ctx, id, ProvisionOptions{Base: "origin/main"})
+			if err == nil {
+				p.reg.Register(Entry{
+					ID:      id,
+					Path:    placement.Path,
+					Branch:  placement.Branch,
+					Base:    placement.Base,
+					BaseSHA: placement.BaseSHA,
+					Status:  StatusProvisioned,
+				})
+			}
+			errs[i] = err
 		}(i)
 	}
 	wg.Wait()
@@ -944,7 +740,7 @@ func TestProvisionConcurrent(t *testing.T) {
 
 	// Every provision is registered, its directory is on disk, and the
 	// branch count matches the registry.
-	entries := ws.List()
+	entries := p.reg.List()
 	require.Len(t, entries, n)
 	for _, entry := range entries {
 		require.DirExists(t, entry.Path, "worktree directory missing for %s", entry.ID)
@@ -962,24 +758,24 @@ func TestProvisionFailureCleansUp(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+	t.Cleanup(func() { _ = p.Sweep(context.Background()) })
 
 	var failedBranch string
 	// A non-empty target directory makes worktree add fail after the
 	// branch is created — the exact residue the fix must remove.
-	ws.provisionHook = func(branch, path string) {
+	p.provisionHook = func(branch, path string) {
 		failedBranch = branch
 		require.NoError(t, os.MkdirAll(path, 0o755))
 		require.NoError(t, os.WriteFile(filepath.Join(path, "stuck.txt"), []byte("x"), 0o644))
 	}
 
-	_, err = ws.Provision(ctx, ProvisionOptions{})
+	_, err = p.Provision(ctx, uuid.NewString(), ProvisionOptions{})
 	require.Error(t, err)
 
 	require.False(t, branchExists(t, repo, failedBranch), "failed provision left its branch")
-	_, statErr := os.Stat(filepath.Join(ws.worktreesDir, failedBranch))
+	_, statErr := os.Stat(filepath.Join(p.worktreesDir, failedBranch))
 	require.True(t, os.IsNotExist(statErr), "failed provision left its directory")
 	require.Empty(t, dispatchBranches(t, repo))
 
@@ -996,18 +792,18 @@ func TestCleanupFailedProvision(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
 
 	// Residue from a crashed provision: the branch exists, its
 	// directory is gone, and a stale admin entry remains.
 	branch := BranchPrefix + "crashed"
-	path := filepath.Join(ws.worktreesDir, branch)
+	path := filepath.Join(p.worktreesDir, branch)
 	out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "-b", branch, path).CombinedOutput()
 	require.NoError(t, err, string(out))
 	require.NoError(t, os.RemoveAll(path))
 
-	ws.cleanupFailedProvision(ctx, branch, path)
+	p.cleanupFailedProvision(ctx, branch, path)
 
 	require.False(t, branchExists(t, repo, branch))
 	require.Empty(t, dispatchBranches(t, repo))
@@ -1016,11 +812,11 @@ func TestCleanupFailedProvision(t *testing.T) {
 
 	// A partial directory is removed even without a branch.
 	partial := BranchPrefix + "partial"
-	partialPath := filepath.Join(ws.worktreesDir, partial)
+	partialPath := filepath.Join(p.worktreesDir, partial)
 	require.NoError(t, os.MkdirAll(partialPath, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(partialPath, "leftover"), []byte("x"), 0o644))
 
-	ws.cleanupFailedProvision(ctx, partial, partialPath)
+	p.cleanupFailedProvision(ctx, partial, partialPath)
 
 	_, statErr := os.Stat(partialPath)
 	require.True(t, os.IsNotExist(statErr))
@@ -1062,15 +858,16 @@ func TestWorktreesDirRequiresGitRepo(t *testing.T) {
 	require.Error(t, err)
 }
 
-// NewWorkspace keeps the worktrees location out of git: a "*" .gitignore
-// is written beside the per-repo worktrees directory — one level up, so
-// a single file covers every key sharing the root — and a workspace
-// created over the same location again leaves the file alone (#383).
+// NewGitWorktreeProvider keeps the worktrees location out of git: a
+// "*" .gitignore is written beside the per-repo worktrees directory —
+// one level up, so a single file covers every key sharing the root —
+// and a provider created over the same location again leaves the file
+// alone (#383).
 func TestNewWorkspaceWritesGitignore(t *testing.T) {
 	repo := newTestRepo(t)
 	wtDir := filepath.Join(repo, "worktrees", "key")
 
-	_, err := NewWorkspace(repo, wtDir)
+	_, err := NewGitWorktreeProvider(repo, wtDir, NewAgentRegistry())
 	require.NoError(t, err)
 
 	ignorePath := filepath.Join(filepath.Dir(wtDir), ".gitignore")
@@ -1080,17 +877,18 @@ func TestNewWorkspaceWritesGitignore(t *testing.T) {
 
 	before, err := os.Stat(ignorePath)
 	require.NoError(t, err)
-	_, err = NewWorkspace(repo, wtDir)
+	_, err = NewGitWorktreeProvider(repo, wtDir, NewAgentRegistry())
 	require.NoError(t, err)
 	after, err := os.Stat(ignorePath)
 	require.NoError(t, err)
 	require.Equal(t, before.ModTime(), after.ModTime())
 }
 
-// TestDiffIgnoresUserDiffConfig verifies Workspace.Diff returns a plain
-// unified diff even when the user's global git config forces an external
-// diff driver and always-on color: the parsed diff keeps its a/ b/
-// headers and carries no external-tool output or escape sequences.
+// TestDiffIgnoresUserDiffConfig verifies GitWorktreeProvider.Diff
+// returns a plain unified diff even when the user's global git config
+// forces an external diff driver and always-on color: the parsed diff
+// keeps its a/ b/ headers and carries no external-tool output or
+// escape sequences.
 func TestDiffIgnoresUserDiffConfig(t *testing.T) {
 	// A shell script only runs on Unix; on Windows git would fail to
 	// invoke it, so the external-diff half of the test cannot apply.
@@ -1111,10 +909,9 @@ func TestDiffIgnoresUserDiffConfig(t *testing.T) {
 	t.Setenv("GIT_CONFIG_GLOBAL", global)
 
 	ctx := t.Context()
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
-	entry, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	entry := provisionEntry(t, p, ProvisionOptions{})
 
 	// A committed change and an uncommitted edit: both must appear.
 	write(t, filepath.Join(entry.Path, "committed.txt"), "committed")
@@ -1122,20 +919,20 @@ func TestDiffIgnoresUserDiffConfig(t *testing.T) {
 	gitIn(t, entry.Path, "commit", "-qm", "dispatched work")
 	write(t, filepath.Join(entry.Path, "f.txt"), "one edited")
 
-	diff, err := ws.Diff(ctx, entry.ID)
+	diff, err := p.Diff(ctx, entry)
 	require.NoError(t, err)
 	require.Contains(t, diff, "+++ b/")
 	require.Contains(t, diff, "committed.txt")
 	require.NotContains(t, diff, "EXTERNAL")
 	require.NotContains(t, diff, "\x1b")
 
-	require.NoError(t, ws.Remove(ctx, entry.ID))
+	require.NoError(t, p.Release(ctx, entry))
 }
 
 // TestGitEnvScrubbed verifies the workspace lifecycle ignores git
 // variables inherited from the environment (here GIT_DIR, GIT_WORK_TREE
 // and GIT_INDEX_FILE all pointing at a different repository) and acts
-// only on the repository the workspace was given, leaving the other one
+// only on the repository the provider was given, leaving the other one
 // untouched.
 func TestGitEnvScrubbed(t *testing.T) {
 	decoy := newTestRepo(t)
@@ -1148,21 +945,20 @@ func TestGitEnvScrubbed(t *testing.T) {
 	t.Setenv("GIT_INDEX_FILE", filepath.Join(decoy, ".git", "index"))
 
 	ctx := t.Context()
-	ws, err := newWorkspace(t, repo)
+	p, err := newProvider(t, repo)
 	require.NoError(t, err)
-	entry, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	entry := provisionEntry(t, p, ProvisionOptions{})
 
 	// An uncommitted change in the dispatch worktree must appear in the
 	// diff, proving the diff acted on the dispatch repository.
 	write(t, filepath.Join(entry.Path, "dispatched.txt"), "dispatched")
 
-	diff, err := ws.Diff(ctx, entry.ID)
+	diff, err := p.Diff(ctx, entry)
 	require.NoError(t, err)
 	require.Contains(t, diff, "dispatched.txt")
 	require.Contains(t, diff, "+dispatched")
 
-	require.NoError(t, ws.Remove(ctx, entry.ID))
+	require.NoError(t, p.Release(ctx, entry))
 
 	// The decoy was never touched: no dispatch branch and a clean tree.
 	require.False(t, branchExists(t, decoy, entry.Branch))
@@ -1170,29 +966,27 @@ func TestGitEnvScrubbed(t *testing.T) {
 		"decoy repository was modified")
 }
 
-// Release is the selective exit cleanup (#367): entries the human
-// decided about (applied or dismissed) and pending ones that never
-// produced work are removed with their branches; pending ones with
+// ReleaseUnworked is the selective exit cleanup (#367): entries that
+// never produced work are removed with their branches; entries with
 // work — committed or just uncommitted — stay on disk for salvage and
 // stay registered.
 func TestReleaseSelectivity(t *testing.T) {
 	ctx := t.Context()
 	tests := []struct {
-		name        string
-		disposition Disposition
-		work        func(t *testing.T, ws *Workspace, entry Entry)
-		wantKept    bool
+		name     string
+		work     func(t *testing.T, entry Entry)
+		wantKept bool
 	}{
 		{
-			name: "pending with uncommitted changes is kept",
-			work: func(t *testing.T, ws *Workspace, entry Entry) {
+			name: "with uncommitted changes is kept",
+			work: func(t *testing.T, entry Entry) {
 				write(t, filepath.Join(entry.Path, "wip.txt"), "wip")
 			},
 			wantKept: true,
 		},
 		{
-			name: "pending with a commit is kept",
-			work: func(t *testing.T, ws *Workspace, entry Entry) {
+			name: "with a commit is kept",
+			work: func(t *testing.T, entry Entry) {
 				write(t, filepath.Join(entry.Path, "done.txt"), "done")
 				gitIn(t, entry.Path, "add", "-A")
 				commitIn(t, entry.Path, "dispatched work")
@@ -1200,59 +994,35 @@ func TestReleaseSelectivity(t *testing.T) {
 			wantKept: true,
 		},
 		{
-			name:     "pending and clean is removed",
-			wantKept: false,
-		},
-		{
-			name:        "dismissed with work is removed",
-			disposition: DispositionDismissed,
-			work: func(t *testing.T, ws *Workspace, entry Entry) {
-				write(t, filepath.Join(entry.Path, "done.txt"), "done")
-				gitIn(t, entry.Path, "add", "-A")
-				commitIn(t, entry.Path, "dispatched work")
-			},
-			wantKept: false,
-		},
-		{
-			name:        "applied with work is removed",
-			disposition: DispositionApplied,
-			work: func(t *testing.T, ws *Workspace, entry Entry) {
-				write(t, filepath.Join(entry.Path, "done.txt"), "done")
-				gitIn(t, entry.Path, "add", "-A")
-				commitIn(t, entry.Path, "dispatched work")
-			},
+			name:     "clean is removed",
 			wantKept: false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := newTestRepo(t)
-			ws, err := newWorkspace(t, repo)
+			ws, err := newProvider(t, repo)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
 
-			entry, err := ws.Provision(ctx, ProvisionOptions{})
-			require.NoError(t, err)
+			entry := provisionEntry(t, ws, ProvisionOptions{})
 			if tt.work != nil {
-				tt.work(t, ws, entry)
-			}
-			if tt.disposition != "" {
-				require.True(t, ws.SetDisposition(entry.ID, tt.disposition))
+				tt.work(t, entry)
 			}
 
-			require.NoError(t, ws.Release(ctx))
+			require.NoError(t, ws.ReleaseUnworked(ctx))
 
 			if tt.wantKept {
 				require.DirExists(t, entry.Path)
 				require.True(t, branchExists(t, repo, entry.Branch))
-				got, ok := ws.Get(entry.ID)
-				require.True(t, ok, "kept entry stays registered so Remove can still decide it")
+				got, ok := ws.reg.Get(entry.ID)
+				require.True(t, ok, "kept entry stays registered so Release can still decide it")
 				require.Equal(t, entry.ID, got.ID)
 			} else {
 				_, err := os.Stat(entry.Path)
 				require.True(t, os.IsNotExist(err), "released workspace directory survived")
 				require.False(t, branchExists(t, repo, entry.Branch), "released branch survived")
-				_, ok := ws.Get(entry.ID)
+				_, ok := ws.reg.Get(entry.ID)
 				require.False(t, ok, "released entry stayed registered")
 			}
 		})
@@ -1260,31 +1030,21 @@ func TestReleaseSelectivity(t *testing.T) {
 }
 
 // Startup reconciliation (#367): after a crash — leases released,
-// registry gone, owner markers on disk — a fresh Workspace removes a
-// dead owner's workless workspace and a decided one, and keeps a dead
-// owner's workspace that produced work.
+// registry gone, owner markers on disk — a fresh provider removes a
+// dead owner's workless workspace and keeps a dead owner's workspace
+// that produced work.
 func TestStartupReconciliation(t *testing.T) {
 	repo := newTestRepo(t)
-	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	ws, err := newProvider(t, repo)
 	require.NoError(t, err)
 
-	kept, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	kept := provisionEntry(t, ws, ProvisionOptions{})
 	write(t, filepath.Join(kept.Path, "salvage.txt"), "salvage")
 	gitIn(t, kept.Path, "add", "-A")
 	commitIn(t, kept.Path, "dispatched work")
 
-	empty, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-
-	decided, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
-	write(t, filepath.Join(decided.Path, "done.txt"), "done")
-	gitIn(t, decided.Path, "add", "-A")
-	commitIn(t, decided.Path, "dispatched work")
-	require.True(t, ws.SetDisposition(decided.ID, DispositionDismissed))
+	empty := provisionEntry(t, ws, ProvisionOptions{})
 
 	// The crash: every lease released, nothing else cleaned up.
 	dropLeases(ws)
@@ -1297,7 +1057,7 @@ func TestStartupReconciliation(t *testing.T) {
 	traversal := filepath.Join(ws.worktreesDir, BranchPrefix+"..owner.json")
 	write(t, traversal, "{}")
 
-	fresh, err := newWorkspace(t, repo)
+	fresh, err := newProvider(t, repo)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = fresh.Sweep(context.Background()) })
 
@@ -1311,10 +1071,6 @@ func TestStartupReconciliation(t *testing.T) {
 	_, err = os.Stat(empty.Path)
 	require.True(t, os.IsNotExist(err), "crashed run's workless workspace must be reconciled away")
 	require.False(t, branchExists(t, repo, empty.Branch))
-
-	_, err = os.Stat(decided.Path)
-	require.True(t, os.IsNotExist(err), "decided workspace must be reconciled away")
-	require.False(t, branchExists(t, repo, decided.Branch))
 }
 
 // A marker replaced by a symlink pointing outside the worktrees
@@ -1327,13 +1083,11 @@ func TestStartupReconciliationIgnoresEscapingMarkerSymlink(t *testing.T) {
 		t.Skip("creating symlinks requires privileges on windows")
 	}
 	repo := newTestRepo(t)
-	ctx := t.Context()
 
-	ws, err := newWorkspace(t, repo)
+	ws, err := newProvider(t, repo)
 	require.NoError(t, err)
 
-	victim, err := ws.Provision(ctx, ProvisionOptions{})
-	require.NoError(t, err)
+	victim := provisionEntry(t, ws, ProvisionOptions{})
 	dropLeases(ws)
 
 	// A plausible-looking marker outside the worktrees directory: the
@@ -1347,7 +1101,7 @@ func TestStartupReconciliationIgnoresEscapingMarkerSymlink(t *testing.T) {
 	require.NoError(t, os.Remove(markerPath))
 	require.NoError(t, os.Symlink(outside, markerPath))
 
-	fresh, err := newWorkspace(t, repo)
+	fresh, err := newProvider(t, repo)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = fresh.Sweep(context.Background()) })
 

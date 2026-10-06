@@ -198,13 +198,32 @@ func (t *baseToolMessageItem) ApplyToolA2UIUpdate(surfaceID string, msgs []a2ui.
 // focusToolA2UISurfaces grants focus to the first live surface and blurs the
 // rest. MCP surfaces are long-lived app UIs — unlike chat-scanned
 // forms they are never retired on submission, so every live surface is
-// focusable.
+// focusable — except while the item is read-only (#407): a surface in an
+// inspected transcript must not take focus or receive keys.
 func (t *baseToolMessageItem) focusToolA2UISurfaces() {
+	if t.a2uiReadOnly {
+		t.a2ui.blurAll()
+		return
+	}
 	for i, s := range t.a2ui.surfaces {
 		if s != nil {
 			t.a2ui.focus(i)
 			return
 		}
+	}
+}
+
+// SetA2UIReadOnly toggles read-only rendering of the item's MCP A2UI
+// surfaces (#407): read-only surfaces never receive focus or keys, so a
+// surface in an inspected transcript cannot round-trip to its owning
+// server without the parent ever asking. Toggling back re-grants focus
+// when the item is selected.
+func (t *baseToolMessageItem) SetA2UIReadOnly(readOnly bool) {
+	t.a2uiReadOnly = readOnly
+	if readOnly {
+		t.a2ui.blurAll()
+	} else if t.isFocused() {
+		t.focusToolA2UISurfaces()
 	}
 }
 
@@ -246,6 +265,11 @@ func (t *baseToolMessageItem) renderToolA2UISurfaces(width int) (string, int) {
 // a2uievent.ButtonClicked tea.Cmd, which the UI model routes per the
 // surface's provenance.
 func (t *baseToolMessageItem) handleA2UIKeyEvent(key tea.KeyMsg) (bool, tea.Cmd) {
+	// Read-only surfaces never take focus, so this guard only matters if
+	// focus state went stale (#407): keys must not reach them either way.
+	if t.a2uiReadOnly {
+		return false, nil
+	}
 	if idx := t.a2ui.focusedIndex(); idx >= 0 && a2uiSurfaceWantsKey(t.a2ui.surfaces[idx], key) {
 		t.Bump()
 		return true, t.a2ui.update(idx, key)

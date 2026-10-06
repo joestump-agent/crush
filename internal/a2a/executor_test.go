@@ -33,6 +33,10 @@ type fakeRunner struct {
 	// returning (#345).
 	panicValue any
 
+	// delay, when non-zero, makes Run take that long before returning,
+	// for tests that need a served run slower than a transport deadline.
+	delay time.Duration
+
 	gotCall     agent.SessionAgentCall
 	ran         bool
 	canceledFor string
@@ -43,6 +47,9 @@ func (f *fakeRunner) Run(_ context.Context, call agent.SessionAgentCall) (*fanta
 	f.gotCall = call
 	if f.panicValue != nil {
 		panic(f.panicValue)
+	}
+	if f.delay > 0 {
+		time.Sleep(f.delay)
 	}
 	return f.result, f.err
 }
@@ -495,6 +502,63 @@ func TestCancel(t *testing.T) {
 
 	require.Equal(t, "sess-1", runner.canceledFor)
 	require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateCanceled}, states(t, evs))
+}
+
+// TestCancelCarriesReason pins #348: the reason a tasks/cancel request
+// carried in its declared metadata lands on the terminal Canceled
+// status message — the wire's JSON round-trip of the typed payload, a
+// direct typed payload, and a bare string all decode. Without metadata
+// the in-process kill reason (#342) is used, falling back to the
+// generic "canceled".
+func TestCancelCarriesReason(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		metadata map[string]any
+		opts     []Option
+		want     string
+	}{
+		{
+			name:     "typed reason from the wire round-trip",
+			metadata: map[string]any{CancelReasonMetadataKey: map[string]any{"reason": "hard timeout"}},
+			want:     "hard timeout",
+		},
+		{
+			name:     "direct typed payload",
+			metadata: map[string]any{CancelReasonMetadataKey: CancelReason{Reason: "ignored nudges"}},
+			want:     "ignored nudges",
+		},
+		{
+			name:     "bare string",
+			metadata: map[string]any{CancelReasonMetadataKey: "stalled todos"},
+			want:     "stalled todos",
+		},
+		{
+			name: "no metadata falls back to the in-process reason",
+			opts: []Option{WithCancelReason(func() string { return "crush exited" })},
+			want: "crush exited",
+		},
+		{
+			name: "no metadata and no in-process reason",
+			want: "canceled",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			runner := &fakeRunner{}
+			exec := NewExecutor(runner, "sess-1", tt.opts...)
+			execCtx := newExecCtx(nil)
+			execCtx.Metadata = tt.metadata
+
+			evs := collect(t, exec.Cancel(context.Background(), execCtx))
+
+			require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateCanceled}, states(t, evs))
+			require.Equal(t, tt.want, statusMessageText(t, evs[0]))
+		})
+	}
 }
 
 func TestMessageText(t *testing.T) {

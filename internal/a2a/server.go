@@ -11,6 +11,7 @@ import (
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/config"
@@ -36,7 +37,7 @@ type ServerParams struct {
 	// Required.
 	SessionID string
 	// Diff collects the completion artifact. Optional; the a2a.GitDiff
-	// or dispatch.Workspace.Diff contracts both fit.
+	// or dispatch.WorkspaceProvider.Diff contracts both fit.
 	Diff DiffFunc
 	// Todos streams per-session progress as TaskStatusUpdateEvents
 	// (#174). Optional; the production source is the dispatch
@@ -67,6 +68,11 @@ type ServerParams struct {
 	// the production value is the dispatch run's kill reason. A nil func
 	// or an empty string falls back to "canceled".
 	CancelReason func() string
+	// TaskStore persists served tasks durably (#354) instead of the
+	// SDK's in-process default, so task state survives a restart.
+	// Optional; the production store arrives with #355. nil keeps
+	// today's in-memory behavior.
+	TaskStore taskstore.Store
 }
 
 // Server is one dispatched agent's in-process A2A server (#70): JSON-RPC
@@ -149,6 +155,9 @@ func StartServer(ctx context.Context, p ServerParams) (*Server, error) {
 	if p.InactivityTimeout > 0 {
 		handlerOpts = append(handlerOpts, a2asrv.WithAgentInactivityTimeout(p.InactivityTimeout+time.Minute))
 	}
+	if p.TaskStore != nil {
+		handlerOpts = append(handlerOpts, a2asrv.WithTaskStore(p.TaskStore))
+	}
 	handler := a2asrv.NewHandler(executor, handlerOpts...)
 	mux := http.NewServeMux()
 	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
@@ -188,10 +197,34 @@ func (s *Server) Stop(ctx context.Context) error {
 // (#70) on the coordinator's behalf. It implements the agent package's
 // [agent.DispatchServerStarter] seam, which is how the dependency stays
 // one-way: a2a imports agent, never the reverse.
-type ServerFactory struct{}
+type ServerFactory struct {
+	// httpClient, when set, replaces the production dispatch HTTP
+	// client in StreamDispatch — the test injection seam (#344), used
+	// to bound phases of the wire protocol independently of the SDK's
+	// defaults.
+	httpClient *http.Client
+}
+
+// ServerFactoryOption customizes the server factory built by
+// NewServerFactory.
+type ServerFactoryOption func(*ServerFactory)
+
+// WithHTTPClient injects the HTTP client StreamDispatch dials with
+// (#344). Production leaves it unset and uses the no-total-timeout
+// dispatch client; tests use it to shorten a phase and prove the run
+// outlives the transport's own deadline.
+func WithHTTPClient(client *http.Client) ServerFactoryOption {
+	return func(f *ServerFactory) { f.httpClient = client }
+}
 
 // NewServerFactory returns the production server factory.
-func NewServerFactory() *ServerFactory { return &ServerFactory{} }
+func NewServerFactory(opts ...ServerFactoryOption) *ServerFactory {
+	f := &ServerFactory{}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
+}
 
 // StartDispatchServer implements [agent.DispatchServerStarter]: it
 // starts the loopback server and returns its endpoint, the AgentCard to

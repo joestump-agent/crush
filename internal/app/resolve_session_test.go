@@ -188,3 +188,19 @@ func TestResolveSession_Last_NoSessions(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no sessions found")
 }
+
+// TestResolveSession_Last_RefusesChild pins the second guard of #413:
+// even if GetLast ever returns a child session, --continue must not
+// continue it.
+func TestResolveSession_Last_RefusesChild(t *testing.T) {
+	mock := &mockSessionService{
+		sessions: []session.Session{
+			{ID: "msg-1$$call-1", ParentSessionID: "parent-id", Title: "Task session"},
+		},
+	}
+	app := newTestApp(mock)
+
+	_, err := app.resolveSession(t.Context(), "", true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no sessions found to continue")
+}

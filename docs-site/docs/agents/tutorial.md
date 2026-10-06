@@ -43,11 +43,6 @@ forever and the agent stalls ([#371](https://github.com/joestump-agent/crush/iss
   [Allowing tools](/configuration/permissions#allowing-tools).
 :::
 
-:::warning[Known issue]
-Dispatches that run longer than 3 minutes are reported as failed ([#344](https://github.com/joestump-agent/crush/issues/344)). Size
-the task so it can finish in that time: one package, one kind of change.
-:::
-
 ## Ask for parallel work
 
 Ask for the split in plain language. Name a role, and pass along any
@@ -93,12 +88,10 @@ Focus the block and press <kbd>space</kbd> to expand it.
 At the same moment, the main agent gets the result as a hidden follow-up turn
 and replies with its review.
 
-:::warning[Known issue]
-If the main agent is busy when the result arrives, the delivery waits in its
-prompt queue. Pressing <kbd>esc</kbd> to clear that queue throws the result
-away ([#388](https://github.com/joestump-agent/crush/issues/388)). To recover it, ask *"what did @tester find?"*. The mention
-attaches the agent's findings and diff.
-:::
+If the main agent is busy when the result arrives, the delivery waits
+outside the prompt queue and is delivered when the agent next goes
+idle — pressing <kbd>esc</kbd> to clear the queue or canceling does not
+discard it ([#388](https://github.com/joestump-agent/crush/issues/388)).
 
 ## Steer an agent
 

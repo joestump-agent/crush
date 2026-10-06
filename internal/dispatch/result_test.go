@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -242,6 +243,33 @@ func TestDispatchResultFailedShape(t *testing.T) {
 	require.Contains(t, rendered, `"error": "boom"`)
 	require.NotContains(t, rendered, "key_findings")
 	require.NotContains(t, rendered, "diff_summary")
+}
+
+// The steer replies (#397) round-trip the stable JSON shape, and a
+// dispatch with no such steer renders exactly as before: the field is
+// omitted.
+func TestDispatchResultSteerRepliesRoundTrip(t *testing.T) {
+	r := DispatchResult{
+		DispatchID:   "d-3",
+		Status:       StatusCompleted,
+		KeyFindings:  "fixed 3 bugs",
+		SteerReplies: []string{"ack, noted"},
+	}
+	rendered := r.Render()
+	require.Contains(t, rendered, `"steer_replies": [`)
+	require.Contains(t, rendered, `"ack, noted"`)
+	require.Contains(t, rendered, `"key_findings": "fixed 3 bugs"`)
+
+	var back DispatchResult
+	require.NoError(t, json.Unmarshal([]byte(rendered), &back))
+	require.Equal(t, r, back)
+
+	plain := DispatchResult{
+		DispatchID:  "d-4",
+		Status:      StatusCompleted,
+		KeyFindings: "fixed 3 bugs",
+	}
+	require.NotContains(t, plain.Render(), "steer_replies")
 }
 
 // One 100 KB minified line must not land whole in the parent's

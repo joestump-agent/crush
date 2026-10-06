@@ -8,24 +8,21 @@ import (
 
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
-	"github.com/stretchr/testify/require"
 )
 
 // Subscribing and unsubscribing concurrently with snapshots being reduced
 // must not panic: emit's listener delivery and the unsubscribe goroutine's
 // channel close race unless both hold the collector mutex (#174).
 func TestTodoCollectorSubscribeUnsubscribeRace(t *testing.T) {
-	ws, err := newWorkspace(t, newTestRepo(t))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+	reg := NewAgentRegistry()
 
 	sessions := pubsub.NewBroker[session.Session]()
-	collector := NewTodoCollector(ws, sessions)
+	collector := NewTodoCollector(reg, sessions)
 	collector.Start(t.Context())
 
-	entry, err := ws.Provision(t.Context(), ProvisionOptions{})
-	require.NoError(t, err)
-	ws.SetSession(entry.ID, "msg$$call")
+	entry := Entry{ID: "dispatch-1", Status: StatusProvisioned}
+	reg.Register(entry)
+	reg.SetSession(entry.ID, "msg$$call")
 
 	stop := make(chan struct{})
 	var emitDone sync.WaitGroup

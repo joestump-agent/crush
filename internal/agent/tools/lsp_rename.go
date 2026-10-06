@@ -45,7 +45,10 @@ func NewRenameTool(
 			if params.NewName == "" {
 				return fantasy.NewTextErrorResponse("new_name is required"), nil
 			}
-			workingDir := cmp.Or(params.Path, ".")
+			workingDir, err := ContainPath(ctx, cmp.Or(params.Path, "."))
+			if err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
 			resolved, err := resolveSymbol(ctx, lspManager, params.Symbol, workingDir)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Symbol '%s' not found", params.Symbol)), nil

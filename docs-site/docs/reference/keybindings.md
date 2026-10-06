@@ -107,6 +107,7 @@ both the editor and the chat; an open dialog keeps its own keys.
 | --- | --- |
 | <kbd>ctrl+]</kbd> | On a focused agent block, open that agent's transcript. With no block focused, open the first live agent. While inspecting, cycle to the next live agent |
 | <kbd>ctrl+[</kbd> | Return to the chat, with the scroll position restored |
+| <kbd>ctrl+x</kbd> | Cancel the selected live dispatch card, or the dispatch you are inspecting. Runs end killed with reason "canceled by user"; the workspace is kept. Shown in the <kbd>ctrl+g</kbd> help only while a live dispatch is targeted |
 | <kbd>esc</kbd> | Depends on the terminal — see the warning below |
 | <kbd>ctrl+]</kbd> in the session picker | Open the selected session's sub-agent list. See [Sessions](/features/sessions#sub-agent-sessions) |
 
