@@ -133,11 +133,15 @@ logged at warn level and the dispatch proceeds without it. The run then
 calls `SessionAgent.Run` directly instead of going through the client.
 Tests that wire no factory always take this path.
 
-:::warning[Known gap]
-The served surface is unauthenticated until `securitySchemes` lands
-([#357](https://github.com/joestump-agent/crush/issues/357)). Reach is restricted to the same OS user by the socket
-permissions, and the host rejects cross-origin, non-JSON and wrong-`Host`
-requests before any dispatch work runs.
+:::info[Authentication]
+Every served call must carry the host's bearer token, declared on the
+card as a `crush-bearer` `securitySchemes` entry
+([#357](https://github.com/joestump-agent/crush/issues/357)). The token is
+32 bytes of `crypto/rand` minted when the host binds and held only in
+memory; where the platform reports socket peer credentials, the peer must
+also be the same OS user. Reach is restricted to the same user by the
+socket permissions, and the host rejects cross-origin, non-JSON and
+wrong-`Host` requests before any dispatch work runs.
 :::
 
 ### 4. Stream
