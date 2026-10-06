@@ -159,6 +159,14 @@ type SessionAgentCall struct {
 	// fantasy retries the stream transparently. Returning an error
 	// surfaces the original auth error without retry.
 	OnAuthRefresh func(ctx context.Context, err *fantasy.ProviderError) error
+	// turnText, when non-nil, is called once with the finished turn's
+	// response text as its argument, after the turn's final step but
+	// before the run hands off to a queued follow-up. enqueueCall strips
+	// only the exported hooks, so the field survives queueing: a turn
+	// re-queued by a summarize continuation reports into the same
+	// holder. Nil everywhere but dispatched agents, which use it to keep
+	// a steer's follow-up reply out of the work turn's findings (#397).
+	turnText func(text string)
 }
 
 func filterToolsForChannel(agentTools []fantasy.AgentTool, channel string, states map[string]mcp.ClientInfo) []fantasy.AgentTool {
@@ -1420,6 +1428,17 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// overtake its reply.
 	if currentAssistant != nil && (!shouldSummarize || len(currentAssistant.ToolCalls()) == 0) {
 		a.sendChannelReply(ctx, call, currentAssistant.Content().String(), completedToolCalls)
+	}
+
+	// Report the finished turn's text to the per-turn observer (#397):
+	// the same guard as the channel reply — the error path already
+	// returned, and a summarize cut that queued a continuation reports
+	// when that continuation finishes. Runs before the queue handoff
+	// below so a steer accepted during the final step, which becomes
+	// the handed-off turn, is attributed to its own call's observer
+	// and never replaces this turn's findings.
+	if call.turnText != nil && currentAssistant != nil && (!shouldSummarize || len(currentAssistant.ToolCalls()) == 0) {
+		call.turnText(result.Response.Content.Text())
 	}
 
 	// Release active request before publishing the notification.

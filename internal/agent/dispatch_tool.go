@@ -137,6 +137,62 @@ type dispatchedAgent struct {
 	providerCfg config.ProviderConfig
 }
 
+// dispatchFindings is one dispatched run's turn-text record (#397): the
+// work turn's findings and the replies of steers that arrived as
+// follow-up turns, kept apart so a steer accepted while the final step
+// was streaming cannot replace the findings. The mutex guards both:
+// turn observers fire from the run's turns while the terminal assembly
+// reads the record.
+type dispatchFindings struct {
+	mu       sync.Mutex
+	workText string
+	replies  []string
+}
+
+// setWork records the work turn's text, last write wins: a summarize
+// continuation re-queues the same call, so the continuation's finished
+// text replaces the cut turn's.
+func (f *dispatchFindings) setWork(text string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.workText = text
+	f.mu.Unlock()
+}
+
+// addSteerReply appends one steer turn's reply, in turn order.
+func (f *dispatchFindings) addSteerReply(text string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.replies = append(f.replies, text)
+	f.mu.Unlock()
+}
+
+// work returns the last recorded work-turn text, empty when no work turn
+// finished (a nil receiver is an unrecorded run).
+func (f *dispatchFindings) work() string {
+	if f == nil {
+		return ""
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.workText
+}
+
+// steerReplies returns a copy of the recorded steer replies, nil when
+// none landed (a nil receiver is an unrecorded run).
+func (f *dispatchFindings) steerReplies() []string {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.replies...)
+}
+
 // dispatchRun carries one backgrounded dispatch from the tool call that
 // started it to the goroutine that runs it.
 type dispatchRun struct {
@@ -175,6 +231,12 @@ type dispatchRun struct {
 	// killSettings are the resolved wander-kill thresholds for this
 	// dispatch: nudges-before-kill, todos stall window, hard timeout.
 	killSettings config.TodoEnforcementSettings
+	// findings records the run's work-turn text and steer replies
+	// (#397): a pointer, because the dispatchRun value is copied into
+	// the background run and both copies must name the same record.
+	// Nil where a run is driven without the record (tests that assemble
+	// only); the accessors are nil-safe.
+	findings *dispatchFindings
 }
 
 // registerLiveDispatch records a running dispatch (#371). The map is
@@ -295,7 +357,7 @@ func (r dispatchRun) call(c *coordinator) SessionAgentCall {
 	if r.model.ModelCfg.MaxTokens != 0 {
 		maxTokens = r.model.ModelCfg.MaxTokens
 	}
-	return SessionAgentCall{
+	call := SessionAgentCall{
 		SessionID:        r.sessionID,
 		ContentWidth:     r.contentWidth,
 		Prompt:           r.prompt,
@@ -309,6 +371,11 @@ func (r dispatchRun) call(c *coordinator) SessionAgentCall {
 		NonInteractive:   true,
 		OnAuthRefresh:    c.makeAuthRefreshCallback(r.providerCfg),
 	}
+	// The work-turn observer (#397): every turn the run drives — the
+	// served turn and the direct turn alike — reports its finished text
+	// into the run's findings.
+	call.turnText = r.findings.setWork
+	return call
 }
 
 // dispatchTool builds the DispatchAgent tool (#64): provision a clean
@@ -481,6 +548,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				kill:            kill,
 				killSettings:    killSettings,
 				cancel:          rootCancel,
+				findings:        &dispatchFindings{},
 			}
 
 			// Stand up the dispatch's in-process A2A server (#70) and stamp
@@ -641,7 +709,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// shaping, and the target is dropped the moment the run returns so a
 	// finished dispatch refuses instead of running another turn.
 	if injectable, ok := run.agent.(injectableAgent); ok {
-		c.registerDispatchRun(run.sessionID, injectable, call)
+		c.registerDispatchRun(run.sessionID, injectable, call, run.findings)
 		defer c.unregisterDispatchRun(run.sessionID)
 	}
 
@@ -808,7 +876,9 @@ type dispatchNaturalOutcome struct {
 	// completed reports whether the run finished its turn naturally —
 	// false for failed, canceled, and runs that never started a turn.
 	completed bool
-	// findings is the run's final assistant text.
+	// findings is the run's final assistant text. A steer's follow-up
+	// turn text may arrive here as the last turn's; assembleDispatchResult
+	// prefers the run's findings record over it (#397).
 	findings string
 	// runErr is the run's error; nil when the turn ran to a natural end
 	// or was stopped by the loop-detection stop condition.
@@ -1090,6 +1160,17 @@ func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRu
 	default:
 		terminal.Status = dispatch.StatusCompleted
 		terminal.KeyFindings = natural.findings
+		// The work-turn findings reader (#397): on both paths the result
+		// carried here is the last turn's — a steer accepted while the
+		// final step was streaming runs as the follow-up turn, and its
+		// reply would replace the work's report. The run's record keeps
+		// the work turn's text apart; when it holds nothing (a run
+		// driven without the record, or no finished turn) the reader's
+		// text stands, exactly as before.
+		if work := run.findings.work(); work != "" {
+			terminal.KeyFindings = work
+		}
+		terminal.SteerReplies = run.findings.steerReplies()
 		diff, diffErr := natural.diff(ctx)
 		switch {
 		case diffErr != nil:
