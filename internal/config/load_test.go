@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/env"
+	"github.com/charmbracelet/crush/internal/gittest"
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,8 +26,13 @@ import (
 
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	restore, err := gittest.Setup()
+	if err != nil {
+		panic(fmt.Sprintf("hermetic git env: %v", err))
+	}
 
 	exitVal := m.Run()
+	restore()
 	os.Exit(exitVal)
 }
 
