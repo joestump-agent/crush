@@ -26,12 +26,17 @@ import (
 	"github.com/charmbracelet/crush/internal/workspace"
 )
 
-// sessionsTreeWorkspace serves a fixed parent/child session layout.
+// sessionsTreeWorkspace serves a fixed parent/child session layout and
+// counts every child-session probe so tests can pin that construction
+// fetches nothing (#409).
 type sessionsTreeWorkspace struct {
 	workspace.Workspace
 
 	parents  []session.Session
 	children map[string][]session.Session
+
+	listChildCalls    int
+	listAllChildCalls int
 }
 
 func (w *sessionsTreeWorkspace) ListSessions(context.Context) ([]session.Session, error) {
@@ -39,7 +44,13 @@ func (w *sessionsTreeWorkspace) ListSessions(context.Context) ([]session.Session
 }
 
 func (w *sessionsTreeWorkspace) ListChildSessions(_ context.Context, parentID string) ([]session.Session, error) {
+	w.listChildCalls++
 	return w.children[parentID], nil
+}
+
+func (w *sessionsTreeWorkspace) ListAllChildSessions(context.Context) ([]session.Session, error) {
+	w.listAllChildCalls++
+	return w.flatChildren(), nil
 }
 
 func (w *sessionsTreeWorkspace) ParseAgentToolSessionID(sessionID string) (string, string, bool) {
@@ -49,6 +60,16 @@ func (w *sessionsTreeWorkspace) ParseAgentToolSessionID(sessionID string) (strin
 		}
 	}
 	return "", "", false
+}
+
+// flatChildren returns every child session in one slice, parent order
+// stable, the shape ListAllChildSessions hands back for SetChildren.
+func (w *sessionsTreeWorkspace) flatChildren() []session.Session {
+	var all []session.Session
+	for _, parent := range w.parents {
+		all = append(all, w.children[parent.ID]...)
+	}
+	return all
 }
 
 func newSessionsTreeDialog(t *testing.T, ws *sessionsTreeWorkspace) *Session {
@@ -81,14 +102,24 @@ func treeTestWorkspace() *sessionsTreeWorkspace {
 
 // TestSessionsTreeNestsInspectableChildren pins the tree: only
 // agent-tool task sessions nest under a parent, the parent row advertises
-// the count, and parents without children stay plain rows.
+// the count, and parents without children stay plain rows. Construction
+// itself fetches no children (#409): the batch arrives via SetChildren.
 func TestSessionsTreeNestsInspectableChildren(t *testing.T) {
 	ws := treeTestWorkspace()
 	dialog := newSessionsTreeDialog(t, ws)
 
+	require.Zero(t, ws.listChildCalls,
+		"NewSessions must not fetch children per parent anymore (#409)")
+	require.Zero(t, ws.listAllChildCalls,
+		"NewSessions must not run the batch fetch either; the model's command does")
+	require.False(t, dialog.childrenLoaded)
+
+	dialog.SetChildren(ws.flatChildren())
+
 	require.Len(t, dialog.children["p1"], 1,
 		"only the agent-tool task session is nestable; title sessions are excluded")
 	require.Empty(t, dialog.children["p2"])
+	require.True(t, dialog.childrenLoaded)
 
 	items := dialog.list.FilteredItems()
 	require.Len(t, items, 2)
@@ -110,6 +141,7 @@ func TestSessionsTreeNestsInspectableChildren(t *testing.T) {
 func TestSessionsTreeSubMenu(t *testing.T) {
 	ws := treeTestWorkspace()
 	dialog := newSessionsTreeDialog(t, ws)
+	dialog.SetChildren(ws.flatChildren())
 
 	// Enter on a parent with children still opens the parent: a session
 	// that ran sub-agents must stay one keypress away.
@@ -162,6 +194,7 @@ func TestSessionsTreeSubMenu(t *testing.T) {
 func TestSessionsTreeRenameDeleteGuardedAtTopLevel(t *testing.T) {
 	ws := treeTestWorkspace()
 	dialog := newSessionsTreeDialog(t, ws)
+	dialog.SetChildren(ws.flatChildren())
 
 	dialog.list.SetSelected(0)
 	dialog.HandleMsg(ctrlKey(t, ']'))
@@ -179,6 +212,56 @@ func TestSessionsTreeRenameDeleteGuardedAtTopLevel(t *testing.T) {
 	require.False(t, dialog.inSubMenu())
 	dialog.HandleMsg(ctrlKey(t, 'r'))
 	require.True(t, dialog.sessionsMode == sessionsModeUpdating)
+}
+
+// TestSessionsTreeReportsLoadingBeforeChildrenLand pins the in-flight
+// behavior (#409): ctrl+] before the batch lands reports instead of
+// pushing an empty sub-menu, and the same chord pushes once the batch
+// has been applied.
+func TestSessionsTreeReportsLoadingBeforeChildrenLand(t *testing.T) {
+	ws := treeTestWorkspace()
+	dialog := newSessionsTreeDialog(t, ws)
+
+	dialog.list.SetSelected(0)
+	action := dialog.HandleMsg(ctrlKey(t, ']'))
+	loading, ok := action.(ActionCmd)
+	require.True(t, ok, "ctrl+] before the batch lands must report Loading")
+	require.NotNil(t, loading.Cmd)
+	require.False(t, dialog.inSubMenu())
+
+	dialog.SetChildren(ws.flatChildren())
+	require.Nil(t, dialog.HandleMsg(ctrlKey(t, ']')),
+		"once the batch lands, ctrl+] pushes the sub-menu again")
+	require.True(t, dialog.inSubMenu())
+}
+
+// TestSessionsTreeFilterSurvivesSetChildren pins that the batch landing
+// mid-filter (#409) refreshes the visible row's count without resetting
+// the filter text, the selection or the matched subset.
+func TestSessionsTreeFilterSurvivesSetChildren(t *testing.T) {
+	ws := treeTestWorkspace()
+	dialog := newSessionsTreeDialog(t, ws)
+
+	for _, r := range "one" {
+		dialog.HandleMsg(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	require.Equal(t, "one", dialog.input.Value())
+	items := dialog.list.FilteredItems()
+	require.Len(t, items, 1, "the filter matches Parent One only")
+	matched, ok := items[0].(*SessionItem)
+	require.True(t, ok)
+	require.Zero(t, matched.agentCount, "the batch has not landed yet")
+	selected := dialog.list.Selected()
+
+	dialog.SetChildren(ws.flatChildren())
+
+	require.Equal(t, "one", dialog.input.Value(), "the filter text survives")
+	require.Equal(t, selected, dialog.list.Selected(), "the selection survives")
+	items = dialog.list.FilteredItems()
+	require.Len(t, items, 1)
+	matched, ok = items[0].(*SessionItem)
+	require.True(t, ok)
+	require.Equal(t, 1, matched.agentCount, "the visible row picked up its count")
 }
 
 func ctrlKey(t *testing.T, r rune) tea.KeyPressMsg {
@@ -201,6 +284,7 @@ func TestSessionsTreeKeepsInfoColumn(t *testing.T) {
 	}
 	ws.children["p1"] = kids
 	dialog := newSessionsTreeDialog(t, ws)
+	dialog.SetChildren(ws.flatChildren())
 
 	scr := uv.NewScreenBuffer(120, 40)
 	dialog.Draw(scr, image.Rect(0, 0, 120, 40))
@@ -218,6 +302,7 @@ func TestSessionsTreeKeepsInfoColumn(t *testing.T) {
 func TestSessionsTreeHelpShowsAgentsWhenRelevant(t *testing.T) {
 	ws := treeTestWorkspace()
 	dialog := newSessionsTreeDialog(t, ws)
+	dialog.SetChildren(ws.flatChildren())
 
 	dialog.list.SetSelected(0)
 	help := dialog.ShortHelp()

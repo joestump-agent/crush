@@ -136,6 +136,21 @@ func (s *SessionItem) SetHideInfo(v bool) {
 	}
 }
 
+// SetAgentCount refreshes the row's sub-agent count in place (#409):
+// the count lands after the row was built, so it invalidates the render
+// caches instead of replacing the item, keeping the filter, selection
+// and scroll state intact.
+func (s *SessionItem) SetAgentCount(n int) {
+	if s.agentCount == n {
+		return
+	}
+	s.agentCount = n
+	s.cache = nil
+	if s.Versioned != nil {
+		s.Bump()
+	}
+}
+
 // Render returns the string representation of the session item.
 func (s *SessionItem) Render(width int) string {
 	info := s.InfoText()
