@@ -52,6 +52,10 @@ type DispatchToolMessageItem struct {
 	// session loses the live steer log; the durable record remains the
 	// terminal result's findings.
 	steers []dispatchSteer
+	// now supplies the wall clock for a running dispatch's elapsed time;
+	// nil means time.Now. Tests pin it so elapsed assertions stay
+	// deterministic (#428).
+	now func() time.Time
 }
 
 // dispatchSteer is one injected message and the agent's answer so far.
@@ -299,7 +303,11 @@ func (d *DispatchToolMessageItem) elapsed() (time.Duration, bool) {
 		return 0, false
 	}
 	if end.IsZero() {
-		end = time.Now()
+		now := d.now
+		if now == nil {
+			now = time.Now
+		}
+		end = now()
 	}
 	return end.Sub(start), true
 }

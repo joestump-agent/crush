@@ -18,6 +18,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// fixedTestTime is a pinned wall clock so elapsed assertions stay
+// deterministic (#428).
+var fixedTestTime = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+
 // newDispatchItem builds a dispatch agent block around one tool call,
 // with or without a persisted tool result.
 func newDispatchItem(t *testing.T, result *message.ToolResult) *DispatchToolMessageItem {
@@ -76,12 +80,15 @@ func TestDispatchCardRendersLiveSnapshot(t *testing.T) {
 	t.Parallel()
 
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	// Pin the clock 30s past the snapshot's start so the elapsed
+	// assertion is deterministic (#428).
+	item.now = func() time.Time { return fixedTestTime.Add(30 * time.Second) }
 	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
 		Entry: dispatch.Entry{
 			ID:        "dispatch-1",
 			SessionID: "msg$$call-dispatch-1",
 			Status:    dispatch.StatusRunning,
-			StartedAt: time.Now().Add(-30 * time.Second),
+			StartedAt: fixedTestTime,
 		},
 		CurrentTodo:      "wiring up form validation",
 		TodoCompleted:    1,
@@ -126,7 +133,7 @@ func TestDispatchCardRendersQueuedState(t *testing.T) {
 func TestDispatchCardCompletionIsDurable(t *testing.T) {
 	t.Parallel()
 
-	started := time.Now().Add(-2 * time.Minute)
+	started := fixedTestTime
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
 	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
 		Entry: dispatch.Entry{
@@ -434,6 +441,26 @@ func TestDispatchStateLabelCanceledVsKilled(t *testing.T) {
 	}
 }
 
+// formatDispatchElapsed truncates to whole units: seconds under a
+// minute, %02d seconds under an hour, %02d minutes at an hour and up,
+// and clamps negative durations to zero (#428).
+func TestFormatDispatchElapsed(t *testing.T) {
+	tests := []struct {
+		in   time.Duration
+		want string
+	}{
+		{0, "0s"},
+		{59900 * time.Millisecond, "59s"},
+		{time.Minute, "1m00s"},
+		{134 * time.Second, "2m14s"},
+		{time.Hour + 4*time.Minute + 30*time.Second, "1h04m"},
+		{-time.Second, "0s"},
+	}
+	for _, tt := range tests {
+		require.Equal(t, tt.want, formatDispatchElapsed(tt.in), "in %v", tt.in)
+	}
+}
+
 // A killed card whose terminal payload carries the user-cancel reason
 // renders "canceled" in the status line (#373); the other kills keep
 // "killed".
@@ -449,12 +476,13 @@ func TestDispatchCardCanceledLabel(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+			item.now = func() time.Time { return fixedTestTime.Add(30 * time.Second) }
 			item.SetDispatchSnapshot(dispatch.TodoSnapshot{
 				Entry: dispatch.Entry{
 					ID:        "dispatch-1",
 					SessionID: "msg$$call-dispatch-1",
 					Status:    dispatch.StatusKilled,
-					StartedAt: time.Now().Add(-30 * time.Second),
+					StartedAt: fixedTestTime,
 					Result: &dispatch.DispatchResult{
 						Status:       dispatch.StatusKilled,
 						KilledReason: tt.killedReason,
