@@ -2,6 +2,7 @@ package a2a
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -122,6 +123,26 @@ func statusUpdate(t *testing.T, ev a2aspec.Event) *a2aspec.TaskStatusUpdateEvent
 	sue, ok := ev.(*a2aspec.TaskStatusUpdateEvent)
 	require.True(t, ok, "event is %T, want *TaskStatusUpdateEvent", ev)
 	return sue
+}
+
+// Status timestamps are UTC on the wire (TCK DM-SERIAL-003): the SDK
+// constructor stamps a local-zone time.Now, and the executor's
+// statusEvent normalizes every status it yields so the serialized
+// timestamp carries a Z suffix wherever the host runs.
+func TestStatusEventTimestampIsUTC(t *testing.T) {
+	ev := statusEvent(newExecCtx(a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("hi"))), a2aspec.TaskStateWorking, nil)
+	require.NotNil(t, ev.Status.Timestamp)
+	require.Equal(t, time.UTC, ev.Status.Timestamp.Location())
+	data, err := json.Marshal(ev)
+	require.NoError(t, err)
+	var wire struct {
+		Status struct {
+			Timestamp string `json:"timestamp"`
+		} `json:"status"`
+	}
+	require.NoError(t, json.Unmarshal(data, &wire))
+	require.True(t, strings.HasSuffix(wire.Status.Timestamp, "Z"),
+		"timestamp %q must end with the Z suffix", wire.Status.Timestamp)
 }
 
 func statusMessageText(t *testing.T, ev a2aspec.Event) string {

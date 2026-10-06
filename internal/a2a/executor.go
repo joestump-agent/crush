@@ -242,12 +242,12 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		// started"; Failed is reserved for work that began and broke.
 		prompt := messageText(execCtx.Message)
 		if prompt == "" {
-			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateRejected,
+			yield(statusEvent(execCtx, a2aspec.TaskStateRejected,
 				agentMessage(execCtx, "message has no text to run")), nil)
 			return
 		}
 
-		if !yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateWorking, nil), nil) {
+		if !yield(statusEvent(execCtx, a2aspec.TaskStateWorking, nil), nil) {
 			return
 		}
 
@@ -273,13 +273,13 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 				e.endedByExecutorHas(string(execCtx.TaskID)) || ctx.Err() != nil {
 				return
 			}
-			ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled,
+			ev := statusEvent(execCtx, a2aspec.TaskStateCanceled,
 				agentMessage(execCtx, e.canceledStatusText()))
 			e.attachUsage(ctx, ev, binding.SessionID, traceID)
 			yield(ev, nil)
 			return
 		case err != nil:
-			ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
+			ev := statusEvent(execCtx, a2aspec.TaskStateFailed,
 				agentMessage(execCtx, err.Error()))
 			e.attachUsage(ctx, ev, binding.SessionID, traceID)
 			yield(ev, nil)
@@ -290,7 +290,7 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			// active turn) or a cancel landed during dispatch. No turn ran
 			// on behalf of this task, so completing it would misreport;
 			// fail it and let the caller retry against an idle session.
-			ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
+			ev := statusEvent(execCtx, a2aspec.TaskStateFailed,
 				agentMessage(execCtx, "agent session did not start a turn (busy or canceled)"))
 			e.attachUsage(ctx, ev, binding.SessionID, traceID)
 			yield(ev, nil)
@@ -325,7 +325,7 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			}
 		}
 
-		ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted,
+		ev := statusEvent(execCtx, a2aspec.TaskStateCompleted,
 			agentMessage(execCtx, result.Response.Content.Text()))
 		e.attachUsage(ctx, ev, binding.SessionID, traceID)
 		yield(ev, nil)
@@ -353,6 +353,20 @@ func (e *Executor) resolve(contextID string) (ContextBinding, bool) {
 // already unbound — sub-agent sessions are not continuable.
 func noAgentForContextText(contextID string) string {
 	return fmt.Sprintf("no running agent for context %s; task sessions are not continuable", contextID)
+}
+
+// statusEvent builds a status-update event with a UTC timestamp: the SDK
+// stamps [a2aspec.NewStatusUpdateEvent] with time.Now() in the server's
+// local zone, and the wire format requires ISO 8601 timestamps with a Z
+// suffix (the TCK's DM-SERIAL-003). A submitted task carries no timestamp
+// and needs no normalization.
+func statusEvent(execCtx *a2asrv.ExecutorContext, state a2aspec.TaskState, msg *a2aspec.Message) *a2aspec.TaskStatusUpdateEvent {
+	ev := a2aspec.NewStatusUpdateEvent(execCtx, state, msg)
+	if ev.Status.Timestamp != nil {
+		utc := ev.Status.Timestamp.UTC()
+		ev.Status.Timestamp = &utc
+	}
+	return ev
 }
 
 // runWithTodos invokes the binding's runner while streaming the run's todo
@@ -518,7 +532,7 @@ func todoStatusUpdate(execCtx *a2asrv.ExecutorContext, snap dispatch.TodoSnapsho
 	if text == "" {
 		text = fmt.Sprintf("%d/%d completed", snap.TodoCompleted, snap.TodoTotal)
 	}
-	ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateWorking, agentMessage(execCtx, text))
+	ev := statusEvent(execCtx, a2aspec.TaskStateWorking, agentMessage(execCtx, text))
 	if encoded, err := Encode(TodoExt, todoProgress(snap)); err != nil {
 		// The text still carries the progress; only the structured
 		// checklist is lost.
@@ -614,7 +628,7 @@ func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) 
 		if text == "" {
 			text = e.canceledStatusText()
 		}
-		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled, agentMessage(execCtx, text)), nil)
+		yield(statusEvent(execCtx, a2aspec.TaskStateCanceled, agentMessage(execCtx, text)), nil)
 	}
 }
 

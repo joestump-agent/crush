@@ -1,0 +1,58 @@
+name: a2a-tck
+
+# Runs the a2a Technology Compatibility Kit (pinned upstream commit,
+# checked out into ./a2a-tck) against the harness from internal/a2a/tck.
+# scripts/run_tck.sh gates on the documented-deviation list in
+# internal/a2a/doc.go: any failure outside the list, or an expected
+# failure that now passes, fails the job. Reports are always uploaded
+# for inspection.
+#
+# @joestump-agent 10/06/2026 - Added the TCK workflow for #363.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "internal/a2a/**"
+      - "scripts/run_tck.sh"
+      - ".github/workflows/a2a-tck.yml"
+  pull_request:
+    paths:
+      - "internal/a2a/**"
+      - "scripts/run_tck.sh"
+      - ".github/workflows/a2a-tck.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a2a-tck-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Check out the pinned a2a TCK
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: a2aproject/a2a-tck
+          ref: 263b9cfaf16a554bdfb166a7ba5b67716e946349
+          path: a2a-tck
+          persist-credentials: false
+      - name: Run the TCK
+        run: ./scripts/run_tck.sh "$GITHUB_WORKSPACE/a2a-tck"
+      - name: Upload TCK reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: a2a-tck-reports
+          path: a2a-tck/reports/
