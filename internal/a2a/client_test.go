@@ -145,10 +145,14 @@ func TestStreamDispatchTodoEventOnWire(t *testing.T) {
 
 	// The raw wire under the factory's unix transport (#346): the
 	// default transport cannot dial the per-process host's fake URL
-	// host, so the client dials exactly the way production does.
+	// host, so the client dials exactly the way production does — the
+	// auth interceptor (#357) and its session id included, since the
+	// host rejects calls without the bearer token.
 	client, err := a2aclient.NewFromCard(t.Context(), server.Card,
-		a2aclient.WithJSONRPCTransport(factory.dispatchHTTPClient()))
+		a2aclient.WithJSONRPCTransport(factory.dispatchHTTPClient()),
+		a2aclient.WithCallInterceptors(&a2aclient.AuthInterceptor{Service: factory.creds}))
 	require.NoError(t, err)
+	ctx := factory.dispatchAuthContext(t.Context(), server.Endpoint)
 
 	req := &a2aspec.SendMessageRequest{
 		Message: a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("fix the bug")),
@@ -156,7 +160,7 @@ func TestStreamDispatchTodoEventOnWire(t *testing.T) {
 	evsCh := make(chan []a2aspec.Event, 1)
 	go func() {
 		var evs []a2aspec.Event
-		for ev, err := range client.SendStreamingMessage(t.Context(), req) {
+		for ev, err := range client.SendStreamingMessage(ctx, req) {
 			require.NoError(t, err, "unexpected error from the dispatch stream")
 			evs = append(evs, ev)
 		}
@@ -720,20 +724,23 @@ func resumeTestParams() ServerParams {
 // task ID reaches OnTask exactly once, and tasks/get answers that ID
 // with the stored task afterwards.
 func TestStreamDispatchResumesAfterDrop(t *testing.T) {
-	serverFactory := NewServerFactory(t.TempDir())
-	server, err := serverFactory.StartServer(t.Context(), resumeTestParams())
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), resumeTestParams())
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = serverFactory.Close(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 	controlFactory := NewServerFactory(t.TempDir())
 	control, err := controlFactory.StartServer(t.Context(), resumeTestParams())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = controlFactory.Close(context.Background()) })
 
+	// The cut transport wraps the host's own dialer and is injected
+	// after start (same package): one factory serves and dispatches, so
+	// the dispatch authenticates with the host's token (#357).
 	onTask := make(chan string, 2)
-	cutFactory := NewServerFactory(t.TempDir(), WithHTTPClient(&http.Client{
-		Transport: &cuttingTransport{base: unixDialClient(serverFactory).Transport},
-	}))
-	outcome, err := cutFactory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+	factory.httpClient = &http.Client{
+		Transport: &cuttingTransport{base: unixDialClient(factory).Transport},
+	}
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		Prompt:   "fix the bug",
@@ -764,7 +771,7 @@ func TestStreamDispatchResumesAfterDrop(t *testing.T) {
 	taskID := <-onTask
 	require.NotEmpty(t, taskID)
 
-	status, err := cutFactory.GetDispatchTask(t.Context(), agent.GetDispatchTaskParams{
+	status, err := factory.GetDispatchTask(t.Context(), agent.GetDispatchTaskParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
 		TaskID:   taskID,
@@ -781,8 +788,8 @@ func TestStreamDispatchResumesAfterDrop(t *testing.T) {
 // terminal status, the text, and the artifacts into the outcome.
 func TestStreamDispatchRecoversViaGetTask(t *testing.T) {
 	runner := &fakeRunner{result: textResult("finished while cut"), delay: 100 * time.Millisecond}
-	serverFactory := NewServerFactory(t.TempDir())
-	server, err := serverFactory.StartServer(t.Context(), ServerParams{
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
 		DispatchID: "gettask-task",
 		Runner:     runner,
 		SessionID:  "dispatch-session",
@@ -791,12 +798,15 @@ func TestStreamDispatchRecoversViaGetTask(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = serverFactory.Close(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
+	// The cut transport wraps the host's own dialer and is injected
+	// after start (same package): one factory serves and dispatches, so
+	// the dispatch authenticates with the host's token (#357).
 	onTask := make(chan string, 2)
-	factory := NewServerFactory(t.TempDir(), WithHTTPClient(&http.Client{
-		Transport: &cuttingTransport{base: unixDialClient(serverFactory).Transport},
-	}))
+	factory.httpClient = &http.Client{
+		Transport: &cuttingTransport{base: unixDialClient(factory).Transport},
+	}
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
@@ -816,20 +826,23 @@ func TestStreamDispatchRecoversViaGetTask(t *testing.T) {
 // plus the exhaustion reason, after the full backoff ladder ran. The
 // coordinator's cancel-before-teardown (#344) reaps the run from there.
 func TestStreamDispatchGivesUpAfterRetries(t *testing.T) {
-	serverFactory := NewServerFactory(t.TempDir())
-	server, err := serverFactory.StartServer(t.Context(), ServerParams{
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
 		DispatchID: "retry-task",
 		Runner:     &fakeRunner{result: textResult("never seen"), delay: 2 * time.Second},
 		SessionID:  "dispatch-session",
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = serverFactory.Close(context.Background()) })
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
+	// The severed transport wraps the host's own dialer and is injected
+	// after start (same package): one factory serves and dispatches, so
+	// the dispatch authenticates with the host's token (#357).
 	onTask := make(chan string, 2)
 	start := time.Now()
-	factory := NewServerFactory(t.TempDir(), WithHTTPClient(&http.Client{
-		Transport: &cuttingTransport{base: unixDialClient(serverFactory).Transport, failAfterCut: true},
-	}))
+	factory.httpClient = &http.Client{
+		Transport: &cuttingTransport{base: unixDialClient(factory).Transport, failAfterCut: true},
+	}
 	_, err = factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
 		Endpoint: server.Endpoint,
 		Card:     server.Card,
@@ -844,4 +857,57 @@ func TestStreamDispatchGivesUpAfterRetries(t *testing.T) {
 		"the 250ms, 1s, 4s backoff ladder must run before giving up")
 	require.Less(t, elapsed, 15*time.Second, "the give-up must not hang past the ladder")
 	require.Len(t, onTask, 1, "the task ID was still reported before the resume began")
+}
+
+// capturingTransport records the Authorization headers every request
+// carries, then dials through the wrapped transport.
+type capturingTransport struct {
+	inner http.RoundTripper
+
+	mu   sync.Mutex
+	auth [][]string
+}
+
+func (c *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.mu.Lock()
+	c.auth = append(c.auth, req.Header.Values(bearerAuthorizationHeader))
+	c.mu.Unlock()
+	return c.inner.RoundTrip(req)
+}
+
+// StreamDispatch authenticates its calls (#357): every request the
+// dispatch client sends carries the host's bearer token — observed on
+// the raw wire, not inferred from the run succeeding.
+func TestStreamDispatchAttachesBearerToken(t *testing.T) {
+	runner := &fakeRunner{result: textResult("done")}
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	// The injection seam is set after start (same package): the capture
+	// wraps the transport the production client would use, dialing the
+	// now-bound socket.
+	captured := &capturingTransport{inner: unixDialClient(factory).Transport}
+	factory.httpClient = &http.Client{Transport: captured}
+
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "fix the bug",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+
+	captured.mu.Lock()
+	defer captured.mu.Unlock()
+	require.NotEmpty(t, captured.auth, "the dispatch stream must have sent requests")
+	for _, auth := range captured.auth {
+		require.Equal(t, []string{"Bearer " + factory.authToken()}, auth,
+			"every dispatched call must carry exactly the host's token")
+	}
 }

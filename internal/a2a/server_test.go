@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -98,7 +100,7 @@ func TestServerServesTaskLifecycle(t *testing.T) {
 
 	// A JSON-RPC message/send runs the dispatched agent and completes the
 	// task with its text output.
-	resp, err = postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "run the task"))
+	resp, err = postJSONRPCAuthed(t, factory, client, server.Endpoint, sendMessageBody(t, "run the task"))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -157,7 +159,7 @@ func TestServerFactoryImplementsStarterSeam(t *testing.T) {
 	require.Equal(t, "tester", typed.Name)
 
 	client := unixDialClient(factory)
-	resp, err := postJSONRPC(t, client, endpoint, sendMessageBody(t, "run the task"))
+	resp, err := postJSONRPCAuthed(t, factory, client, endpoint, sendMessageBody(t, "run the task"))
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -344,7 +346,7 @@ func TestHostRoutesTwoDispatches(t *testing.T) {
 
 	client := unixDialClient(factory)
 	drive := func(server *Server, runner *fakeRunner, prompt string) error {
-		resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, prompt))
+		resp, err := postJSONRPCAuthed(t, factory, client, server.Endpoint, sendMessageBody(t, prompt))
 		if err != nil {
 			return err
 		}
@@ -402,7 +404,7 @@ func TestHostLongDataDirFallsBack(t *testing.T) {
 		"the socket must fall back to the per-user temp dir, got %s", factory.socketPath())
 
 	client := unixDialClient(factory)
-	resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "run the task"))
+	resp, err := postJSONRPCAuthed(t, factory, client, server.Endpoint, sendMessageBody(t, "run the task"))
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -432,10 +434,200 @@ func TestHostReplacesStaleSocket(t *testing.T) {
 	require.Equal(t, stale, factory.socketPath())
 
 	client := unixDialClient(factory)
-	resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "run the task"))
+	resp, err := postJSONRPCAuthed(t, factory, client, server.Endpoint, sendMessageBody(t, "run the task"))
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// A call without the host's bearer token never reaches the runner
+// (#357): no header, a malformed header, an empty credential and a
+// wrong token all come back as the JSON-RPC UNAUTHENTICATED error.
+func TestHostRejectsUnauthenticated(t *testing.T) {
+	runner := &fakeRunner{result: textResult("done")}
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	client := unixDialClient(factory)
+	for name, authorization := range map[string]string{
+		"no token":     "",
+		"wrong token":  "Bearer not-the-token",
+		"wrong scheme": "Basic " + factory.authToken(),
+		"empty bearer": "Bearer ",
+	} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.Endpoint, bytes.NewReader(sendMessageBody(t, "run the task")))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		if authorization != "" {
+			req.Header.Set(bearerAuthorizationHeader, authorization)
+		}
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		var rpcResp struct {
+			Error *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&rpcResp))
+		_ = resp.Body.Close()
+		require.NotNil(t, rpcResp.Error, "%s must be rejected with a JSON-RPC error", name)
+		require.Equal(t, -31401, rpcResp.Error.Code, "%s must map to UNAUTHENTICATED", name)
+		require.Contains(t, rpcResp.Error.Message, "unauthenticated", "%s must name the reason", name)
+	}
+	require.False(t, runner.ran, "the runner must not see an unauthenticated call")
+}
+
+// The right token runs the dispatch, and tasks/list — authenticated the
+// same way — answers with the dispatch's task (#357): the interceptor
+// marks the call's user, and that is what the task store authorizes
+// against.
+func TestHostAuthenticatesBearerAndServesTasks(t *testing.T) {
+	runner := &fakeRunner{result: textResult("done")}
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	client := unixDialClient(factory)
+	resp, err := postJSONRPCAuthed(t, factory, client, server.Endpoint, sendMessageBody(t, "run the task"))
+	require.NoError(t, err)
+	var rpcResp struct {
+		Result struct {
+			Task *a2aspec.Task `json:"task"`
+		} `json:"result"`
+		Error any `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rpcResp))
+	_ = resp.Body.Close()
+	require.Nil(t, rpcResp.Error, "JSON-RPC error on authenticated SendMessage")
+	require.NotNil(t, rpcResp.Result.Task)
+	require.Equal(t, a2aspec.TaskStateCompleted, rpcResp.Result.Task.Status.State)
+	require.True(t, runner.ran)
+
+	listBody, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "ListTasks",
+		"params":  map[string]any{},
+	})
+	require.NoError(t, err)
+	resp, err = postJSONRPCAuthed(t, factory, client, server.Endpoint, listBody)
+	require.NoError(t, err)
+	var listResp struct {
+		Result struct {
+			Tasks []*a2aspec.Task `json:"tasks"`
+		} `json:"result"`
+		Error any `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&listResp))
+	_ = resp.Body.Close()
+	require.Nil(t, listResp.Error, "JSON-RPC error on authenticated ListTasks")
+	require.Len(t, listResp.Result.Tasks, 1)
+	require.Equal(t, a2aspec.TaskStateCompleted, listResp.Result.Tasks[0].Status.State)
+}
+
+// The host token never reaches the log (#357): a rejected call and an
+// accepted one both run under a captured slog handler — the SDK logs
+// through slog too — and the token appears nowhere in what was written.
+func TestHostTokenNeverLogged(t *testing.T) {
+	runner := &fakeRunner{result: textResult("done")}
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(previous)
+
+	client := unixDialClient(factory)
+	resp, err := postJSONRPC(t, client, server.Endpoint, sendMessageBody(t, "x"))
+	require.NoError(t, err)
+	var rpcResp struct {
+		Error any `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rpcResp))
+	_ = resp.Body.Close()
+	require.NotNil(t, rpcResp.Error)
+
+	resp, err = postJSONRPCAuthed(t, factory, client, server.Endpoint, sendMessageBody(t, "run the task"))
+	require.NoError(t, err)
+	var okResp struct {
+		Error any `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&okResp))
+	_ = resp.Body.Close()
+	require.Nil(t, okResp.Error)
+	require.True(t, runner.ran)
+
+	require.NotContains(t, buf.String(), factory.authToken(),
+		"the host token must never be written to the log")
+}
+
+// The peer-uid half of the auth decision (#357): a pure table test —
+// the rejected-uid case cannot be produced on a live socket from inside
+// the host's own process, so the decision takes the peer as injected.
+func TestAuthorizePeerUID(t *testing.T) {
+	base := authDecision{
+		token:         "right",
+		wantUID:       "1000",
+		peerKnown:     true,
+		peerUID:       "1000",
+		authorization: []string{"Bearer right"},
+	}
+	require.NoError(t, base.authorize())
+	require.Equal(t, "crush:1000", base.userName())
+
+	otherUID := base
+	otherUID.peerUID = "1001"
+	require.ErrorIs(t, otherUID.authorize(), a2aspec.ErrUnauthenticated,
+		"a peer running as another uid must be rejected even with the right token")
+
+	noPeerCredentials := base
+	noPeerCredentials.peerKnown = false
+	require.NoError(t, noPeerCredentials.authorize())
+	require.Equal(t, "crush", noPeerCredentials.userName(),
+		"without peer credentials the identity carries no uid")
+
+	badToken := base
+	badToken.authorization = []string{"Bearer wrong"}
+	require.ErrorIs(t, badToken.authorize(), a2aspec.ErrUnauthenticated)
+
+	missingHeader := base
+	missingHeader.authorization = nil
+	require.ErrorIs(t, missingHeader.authorize(), a2aspec.ErrUnauthenticated)
+
+	duplicateHeader := base
+	duplicateHeader.authorization = []string{"Bearer right", "Bearer right"}
+	require.ErrorIs(t, duplicateHeader.authorize(), a2aspec.ErrUnauthenticated,
+		"an ambiguous Authorization header must not authenticate")
+
+	wrongScheme := base
+	wrongScheme.authorization = []string{"Basic right"}
+	require.ErrorIs(t, wrongScheme.authorize(), a2aspec.ErrUnauthenticated)
+
+	// The token comparison is constant time on the credential, but the
+	// length difference is observable and a token shorter than the
+	// prefix can never match.
+	shortBearer := base
+	shortBearer.authorization = []string{"Bearer "}
+	require.ErrorIs(t, shortBearer.authorize(), a2aspec.ErrUnauthenticated)
 }
 
 // sessionAgentAdapter widens the executor's fake runner to the fuller
@@ -488,6 +680,20 @@ func postJSONRPC(t *testing.T, client *http.Client, url string, body []byte) (*h
 	return client.Do(req)
 }
 
+// postJSONRPCAuthed issues a context-bound JSON POST carrying the host
+// bearer token (#357) — what every request to a live route must
+// present, and what the production dispatch client attaches itself.
+func postJSONRPCAuthed(t *testing.T, factory *ServerFactory, client *http.Client, url string, body []byte) (*http.Response, error) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(bearerAuthorizationHeader, "Bearer "+factory.authToken())
+	return client.Do(req)
+}
+
 // sendMessageBody marshals a JSON-RPC message/send envelope for prompt.
 func sendMessageBody(t *testing.T, prompt string) []byte {
 	t.Helper()
@@ -503,4 +709,16 @@ func sendMessageBody(t *testing.T, prompt string) []byte {
 	})
 	require.NoError(t, err)
 	return body
+}
+
+// servedUserName is the identity the host authenticates a same-process
+// call as (#357): the socket peer's uid where the platform reports peer
+// credentials, bare otherwise (Windows).
+func servedUserName() string {
+	decision := authDecision{
+		wantUID:   strconv.Itoa(os.Getuid()),
+		peerKnown: runtime.GOOS != "windows",
+	}
+	decision.peerUID = decision.wantUID
+	return decision.userName()
 }

@@ -425,7 +425,7 @@ func TestServerPersistsTasksThroughSQLiteStore(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	resp, err := postJSONRPC(t, unixDialClient(factory), server.Endpoint, body)
+	resp, err := postJSONRPCAuthed(t, factory, unixDialClient(factory), server.Endpoint, body)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -448,8 +448,10 @@ func TestServerPersistsTasksThroughSQLiteStore(t *testing.T) {
 	reopened, err := db.Connect(t.Context(), dataDir)
 	require.NoError(t, err)
 
+	// The host authenticates served calls as the socket peer's uid
+	// (#357), and that is the name the task was stored under.
 	store := NewSQLiteStore(reopened, "test-host", &SQLiteStoreConfig{
-		Authenticator: staticAuthenticator(""), // what the served task stored
+		Authenticator: staticAuthenticator(servedUserName()),
 	})
 	stored, err := store.Get(t.Context(), taskID)
 	require.NoError(t, err, "the served task must survive a reopen")
