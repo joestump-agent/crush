@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -689,4 +690,383 @@ func TestWrapTodoGate_LeavesNonMutatingToolsAlone(t *testing.T) {
 	// wrapped.
 	bare := []fantasy.AgentTool{probe, bash}
 	assert.Equal(t, bare, wrapTodoGate(bare, e))
+}
+
+// countingTool is a no-op tool named after a real one, recording its
+// executions so the gate tests can tell a gated call from a run one.
+func countingTool(name string, calls *int) fantasy.AgentTool {
+	return fantasy.NewAgentTool(
+		name,
+		"Counting placeholder.",
+		func(ctx context.Context, params struct{}, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			*calls++
+			return fantasy.NewTextResponse("ok"), nil
+		},
+	)
+}
+
+// fakeMCPToolNoHint is a no-op tool duck-typing an MCP tool the server
+// did not annotate at all.
+type fakeMCPToolNoHint struct {
+	fantasy.AgentTool
+}
+
+func (f *fakeMCPToolNoHint) MCP() string { return "fake-server" }
+
+// fakeMCPTool is a no-op tool duck-typing an annotated MCP tool, so the
+// ladder's classification tests can cover the read-only hint without a
+// server.
+type fakeMCPTool struct {
+	fantasy.AgentTool
+	readOnly bool
+}
+
+func (f *fakeMCPTool) MCP() string { return "fake-server" }
+
+func (f *fakeMCPTool) ReadOnlyHint() bool { return f.readOnly }
+
+// TestIsMutatingCall pins the ladder's mutation classification (#395):
+// the file writers count outright, bash only when the command is not a
+// single read-only utility, MCP tools unless the server marks them
+// read-only, and the readers never.
+func TestIsMutatingCall(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		tool  fantasy.AgentTool
+		input string
+		want  bool
+	}{
+		{"write", mutatingTool(tools.WriteToolName), `{}`, true},
+		{"edit", mutatingTool(tools.EditToolName), `{}`, true},
+		{"multiedit", mutatingTool(tools.MultiEditToolName), `{}`, true},
+		{"download", mutatingTool(tools.DownloadToolName), `{}`, true},
+		{"lsp_rename", mutatingTool(tools.RenameToolName), `{}`, true},
+		{"lsp_replace_symbol", mutatingTool(tools.ReplaceSymbolToolName), `{}`, true},
+		{"bash read-only git status", mutatingTool(tools.BashToolName), `{"command":"git status"}`, false},
+		{"bash read-only ls", mutatingTool(tools.BashToolName), `{"command":"ls -la"}`, false},
+		{"bash mutating rm", mutatingTool(tools.BashToolName), `{"command":"rm x"}`, true},
+		{"bash chained", mutatingTool(tools.BashToolName), `{"command":"git status && rm x"}`, true},
+		{"bash wrapped by timeout", mutatingTool(tools.BashToolName), `{"command":"timeout 5 rm x"}`, true},
+		{"bash empty object input", mutatingTool(tools.BashToolName), `{}`, true},
+		{"bash unparseable input", mutatingTool(tools.BashToolName), `{not json`, true},
+		{"bash empty command", mutatingTool(tools.BashToolName), `{"command":""}`, true},
+		{"mcp without hint", &fakeMCPToolNoHint{mutatingTool("mcp_fake-server_run")}, `{}`, true},
+		{"mcp read-only hint", &fakeMCPTool{AgentTool: mutatingTool("mcp_fake-server_lookup"), readOnly: true}, `{}`, false},
+		{"mcp hint false", &fakeMCPTool{AgentTool: mutatingTool("mcp_fake-server_run"), readOnly: false}, `{}`, true},
+		{"hooked write", newHookedTool(mutatingTool(tools.WriteToolName), nil), `{}`, true},
+		{"hooked mcp without hint", newHookedTool(&fakeMCPToolNoHint{mutatingTool("mcp_fake-server_run")}, nil), `{}`, true},
+		{"hooked mcp read-only hint", newHookedTool(&fakeMCPTool{AgentTool: mutatingTool("mcp_fake-server_lookup"), readOnly: true}, nil), `{}`, false},
+		{"probe reader", probeTool(), `{}`, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, isMutatingCall(tt.tool, tt.input), "isMutatingCall(%q, %q)", tt.tool.Info().Name, tt.input)
+		})
+	}
+}
+
+// TestTodoNudge_ReadOnlyBashDoesNotTripImmediately pins the fix for the
+// over-match: a bash call running a read-only command is a plain tool
+// call, not a mutating one, so a single git status far below the
+// threshold trips no nudge.
+func TestTodoNudge_ReadOnlyBashDoesNotTripImmediately(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: tools.BashToolName, input: `{"command":"git status"}`}}},
+		{toolCalls: []scriptedToolCall{{name: tools.BashToolName, input: `{"command":"ls -la"}`}}},
+		{text: "done"},
+	}}
+	sa := newTodoTestAgent(t, env, model, config.TodoEnforcementSettings{
+		Enabled:        true,
+		NudgeThreshold: 10,
+	}, mutatingTool(tools.BashToolName))
+
+	sess := runWithScript(t, env, sa, model)
+
+	for _, call := range model.promptTexts() {
+		assert.NotContains(t, strings.Join(call, "\n"), todoNudgeMessage)
+	}
+	assert.Empty(t, nudgeMessages(t, env, model, sess.ID, todoNudgeMessage))
+}
+
+// TestTodoNudge_ReadOnlyBashCountsTowardThreshold pins the other half of
+// the bash fix: a read-only command is still a tool call, so it nudges
+// at the threshold like any other call.
+func TestTodoNudge_ReadOnlyBashCountsTowardThreshold(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: tools.BashToolName, input: `{"command":"git status"}`}}},
+		{toolCalls: []scriptedToolCall{{name: tools.BashToolName, input: `{"command":"ls -la"}`}}},
+		{text: "done"},
+	}}
+	sa := newTodoTestAgent(t, env, model, config.TodoEnforcementSettings{
+		Enabled:        true,
+		NudgeThreshold: 2,
+	}, mutatingTool(tools.BashToolName))
+
+	sess := runWithScript(t, env, sa, model)
+
+	prompts := model.promptTexts()
+	require.Len(t, prompts, 3)
+	assert.NotContains(t, strings.Join(prompts[1], "\n"), todoNudgeMessage)
+	assert.Contains(t, strings.Join(prompts[2], "\n"), todoNudgeMessage)
+	require.Len(t, nudgeMessages(t, env, model, sess.ID, todoNudgeMessage), 1)
+}
+
+// TestTodoNudge_MutatingBashTripsImmediately pins the fail-closed side:
+// a bash command that is not a single read-only utility trips the
+// immediate nudge, chained or not.
+func TestTodoNudge_MutatingBashTripsImmediately(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{"chained", `{"command":"git status && rm x"}`},
+		{"wrapped by timeout", `{"command":"timeout 5 rm x"}`},
+		{"unparseable", `{not json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := testEnv(t)
+			model := &scriptedModel{steps: []scriptedStep{
+				{toolCalls: []scriptedToolCall{{name: tools.BashToolName, input: tc.input}}},
+				{text: "done"},
+			}}
+			sa := newTodoTestAgent(t, env, model, config.TodoEnforcementSettings{
+				Enabled:        true,
+				NudgeThreshold: 10,
+			}, mutatingTool(tools.BashToolName))
+
+			sess := runWithScript(t, env, sa, model)
+
+			prompts := model.promptTexts()
+			require.Len(t, prompts, 2)
+			assert.Contains(t, strings.Join(prompts[1], "\n"), todoNudgeMessage)
+			require.Len(t, nudgeMessages(t, env, model, sess.ID, todoNudgeMessage), 1)
+		})
+	}
+}
+
+// TestTodoNudge_MCPReadOnlyHintNoImmediateNudge pins the acceptance for
+// annotated MCP tools: a tool the server marked readOnlyHint is neither
+// a mutating call nor an immediate nudge trigger.
+func TestTodoNudge_MCPReadOnlyHintNoImmediateNudge(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	tool := &fakeMCPTool{AgentTool: mutatingTool("mcp_fake-server_lookup"), readOnly: true}
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: tool.Info().Name, input: `{}`}}},
+		{text: "done"},
+	}}
+	sa := newTodoTestAgent(t, env, model, config.TodoEnforcementSettings{
+		Enabled:        true,
+		NudgeThreshold: 10,
+	}, tool)
+
+	sess := runWithScript(t, env, sa, model)
+
+	prompts := model.promptTexts()
+	require.Len(t, prompts, 2)
+	assert.NotContains(t, strings.Join(prompts[1], "\n"), todoNudgeMessage)
+	assert.Empty(t, nudgeMessages(t, env, model, sess.ID, todoNudgeMessage))
+}
+
+// gateErrorCount counts the persisted tool results carrying the gate's
+// rejection, so the gate tests can assert exactly one gated call.
+func gateErrorCount(t *testing.T, env fakeEnv, sessID string) int {
+	t.Helper()
+	msgs, err := env.messages.List(t.Context(), sessID)
+	require.NoError(t, err)
+	var count int
+	for _, m := range msgs {
+		if m.Role != message.Tool {
+			continue
+		}
+		for _, tr := range m.ToolResults() {
+			if tr.IsError && strings.Contains(tr.Content, "hard gate") {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// TestTodoHardGate_RejectsNewlyClassifiedMutatingTools pins the fix for
+// the under-match: with the gate on and no todo list, each of the file
+// writers the ladder now classifies (lsp_rename, lsp_replace_symbol,
+// download) and an MCP tool without a read-only hint is rejected with
+// the gate's reason and never executed.
+func TestTodoHardGate_RejectsNewlyClassifiedMutatingTools(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		make func(calls *int) fantasy.AgentTool
+	}{
+		{"lsp_rename", func(calls *int) fantasy.AgentTool { return countingTool(tools.RenameToolName, calls) }},
+		{"lsp_replace_symbol", func(calls *int) fantasy.AgentTool { return countingTool(tools.ReplaceSymbolToolName, calls) }},
+		{"download", func(calls *int) fantasy.AgentTool { return countingTool(tools.DownloadToolName, calls) }},
+		{"mcp without hint", func(calls *int) fantasy.AgentTool {
+			return &fakeMCPToolNoHint{countingTool("mcp_fake-server_run", calls)}
+		}},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := testEnv(t)
+			var calls int
+			tool := tc.make(&calls)
+			model := &scriptedModel{steps: []scriptedStep{
+				{toolCalls: []scriptedToolCall{{name: tool.Info().Name, input: `{}`}}},
+				{text: "done"},
+			}}
+			sa := newTodoTestAgent(t, env, model, config.TodoEnforcementSettings{
+				Enabled:        true,
+				NudgeThreshold: 10,
+				HardGate:       true,
+			}, tool)
+
+			sess, err := env.sessions.Create(t.Context(), "session")
+			require.NoError(t, err)
+			_, err = sa.Run(t.Context(), SessionAgentCall{
+				SessionID: sess.ID,
+				Prompt:    "do the work",
+			})
+			require.NoError(t, err)
+
+			assert.Equal(t, 0, calls, "the gated tool must not run without a todo list")
+			assert.Equal(t, 1, gateErrorCount(t, env, sess.ID), "the gated call must return the gate's error")
+		})
+	}
+}
+
+// TestTodoHardGate_MCPReadOnlyHintNotGated pins the other side of the
+// MCP classification: a tool the server annotated readOnlyHint is never
+// wrapped, so it runs even with the gate on and no todo list.
+func TestTodoHardGate_MCPReadOnlyHintNotGated(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	var calls int
+	tool := &fakeMCPTool{AgentTool: countingTool("mcp_fake-server_lookup", &calls), readOnly: true}
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: tool.Info().Name, input: `{}`}}},
+		{text: "done"},
+	}}
+	sa := newTodoTestAgent(t, env, model, config.TodoEnforcementSettings{
+		Enabled:        true,
+		NudgeThreshold: 10,
+		HardGate:       true,
+	}, tool)
+
+	sess := runWithScript(t, env, sa, model)
+
+	assert.Equal(t, 1, calls, "a read-only MCP tool must run with the gate on")
+	assert.Equal(t, 0, gateErrorCount(t, env, sess.ID))
+}
+
+// TestTodoHardGate_ReadOnlyBashPasses pins the gate's bash carve-out:
+// with the gate on and no todo list, a read-only command runs and a
+// mutating one is gated.
+func TestTodoHardGate_ReadOnlyBashPasses(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	var commands []string
+	bash := fantasy.NewAgentTool(
+		tools.BashToolName,
+		"Run a command.",
+		func(ctx context.Context, params struct{}, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			var p struct {
+				Command string `json:"command"`
+			}
+			if err := json.Unmarshal([]byte(call.Input), &p); err == nil {
+				commands = append(commands, p.Command)
+			}
+			return fantasy.NewTextResponse("ran"), nil
+		},
+	)
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: tools.BashToolName, input: `{"command":"git status"}`}}},
+		{toolCalls: []scriptedToolCall{{name: tools.BashToolName, input: `{"command":"rm x"}`}}},
+		{text: "done"},
+	}}
+	sa := newTodoTestAgent(t, env, model, config.TodoEnforcementSettings{
+		Enabled:        true,
+		NudgeThreshold: 10,
+		HardGate:       true,
+	}, bash)
+
+	sess := runWithScript(t, env, sa, model)
+
+	assert.Equal(t, []string{"git status"}, commands, "the read-only command must run, the mutating one must be gated")
+	assert.Equal(t, 1, gateErrorCount(t, env, sess.ID), "the mutating call must return the gate's error")
+}
+
+// TestWrapTodoGate_WrapsMutatingTools pins the widened wrap set: the
+// file writers, bash, and MCP tools without a read-only hint are
+// wrapped; MCP tools with the hint and the readers are not.
+func TestWrapTodoGate_WrapsMutatingTools(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	write := mutatingTool(tools.WriteToolName)
+	download := mutatingTool(tools.DownloadToolName)
+	rename := mutatingTool(tools.RenameToolName)
+	bash := mutatingTool(tools.BashToolName)
+	mcpNoHint := &fakeMCPToolNoHint{mutatingTool("mcp_fake-server_write")}
+	mcpHint := &fakeMCPTool{AgentTool: mutatingTool("mcp_fake-server_read"), readOnly: true}
+	probe := probeTool()
+	e := newTodoEnforcement(config.TodoEnforcementSettings{
+		Enabled:  false,
+		HardGate: true,
+	}, env.sessions)
+	todos := tools.NewTodosTool(env.sessions)
+
+	wrapped := wrapTodoGate([]fantasy.AgentTool{write, download, rename, bash, mcpNoHint, mcpHint, probe, todos}, e)
+
+	assert.NotSame(t, write, wrapped[0], "write must be wrapped")
+	assert.NotSame(t, download, wrapped[1], "download must be wrapped")
+	assert.NotSame(t, rename, wrapped[2], "lsp_rename must be wrapped")
+	assert.NotSame(t, bash, wrapped[3], "bash must be wrapped")
+	assert.NotSame(t, mcpNoHint, wrapped[4], "an MCP tool without a read-only hint must be wrapped")
+	assert.Same(t, mcpHint, wrapped[5], "a read-only-hint MCP tool must not be wrapped")
+	assert.Same(t, probe, wrapped[6], "readers must not be wrapped")
+	assert.Same(t, todos, wrapped[7], "the todos tool must not be wrapped")
+
+	_, ok := wrapped[0].(*todoGateTool)
+	assert.True(t, ok)
+}
+
+// TestWrapTodoGate_ClassifiesThroughHookWrapper pins classification
+// through the agent's own wrappers: the tools reach the gate already
+// wrapped with the hook runner, so the wrap decision must unwrap them —
+// a hooked MCP tool without a read-only hint is gated, a hooked
+// read-only MCP tool and a hooked reader are not.
+func TestWrapTodoGate_ClassifiesThroughHookWrapper(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	mcpNoHint := newHookedTool(&fakeMCPToolNoHint{mutatingTool("mcp_fake-server_write")}, nil)
+	mcpHint := newHookedTool(&fakeMCPTool{AgentTool: mutatingTool("mcp_fake-server_read"), readOnly: true}, nil)
+	probe := newHookedTool(probeTool(), nil)
+	e := newTodoEnforcement(config.TodoEnforcementSettings{
+		Enabled:  false,
+		HardGate: true,
+	}, env.sessions)
+	todos := tools.NewTodosTool(env.sessions)
+
+	wrapped := wrapTodoGate([]fantasy.AgentTool{mcpNoHint, mcpHint, probe, todos}, e)
+
+	assert.NotSame(t, mcpNoHint, wrapped[0], "a hooked MCP tool without a read-only hint must be wrapped")
+	assert.Same(t, mcpHint, wrapped[1], "a hooked read-only MCP tool must not be wrapped")
+	assert.Same(t, probe, wrapped[2], "a hooked reader must not be wrapped")
+	assert.Same(t, todos, wrapped[3], "the todos tool must not be wrapped")
+
+	gate, ok := wrapped[0].(*todoGateTool)
+	require.True(t, ok)
+	assert.Same(t, mcpNoHint, gate.inner, "the gate must wrap the hooked tool the model calls")
 }
