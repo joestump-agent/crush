@@ -2,8 +2,11 @@ package chat
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/dispatch"
@@ -11,6 +14,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/anim"
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/exp/golden"
 	"github.com/stretchr/testify/require"
 )
 
@@ -461,4 +465,103 @@ func TestDispatchCardCanceledLabel(t *testing.T) {
 			require.Contains(t, out, tt.want)
 		})
 	}
+}
+
+// newSteerCard builds a live running dispatch card with one steer,
+// optionally in its expanded state (#411).
+func newSteerCard(t *testing.T, steerText string, expanded bool) *DispatchToolMessageItem {
+	t.Helper()
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
+		Entry: dispatch.Entry{
+			ID:        "dispatch-1",
+			SessionID: "msg$$call-dispatch-1",
+			Status:    dispatch.StatusRunning,
+		},
+	})
+	item.AddSteer(steerText)
+	if expanded {
+		item.ToggleExpanded()
+	}
+	return item
+}
+
+// noSpace keeps only the non-space runes so wrap positions cannot hide
+// text: if the whole steer survives wrapping, this comparison holds.
+func noSpace(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// Steer lines are width-bound (#411): across render widths and steer
+// shapes, every line of the card stays inside the width, the whole steer
+// text is visible across the wrapped lines, and a short steer stays on
+// one line. Collapsed cards fold steer newlines into spaces; expanded
+// cards keep them.
+func TestDispatchCardSteerWidthBound(t *testing.T) {
+	t.Parallel()
+
+	shapes := []struct {
+		name string
+		text string
+	}{
+		{"short", "stop writing Rust"},
+		{"medium", "stop writing Rust and use Go"},
+		{"long", "refactor the streaming answer path so that token deltas never re-render the markdown body and the steer conversation stays readable"},
+		{"multiline", "first line of the steer\nsecond line of the steer\nthird line of the steer"},
+		{"widerunes", "日本語の長いステアテキストは幅の広いランダムで正しく折り返されなければならない"},
+		{"longword", "unbreakablylongwordwithnospaceatallthatgoesonandonandonandonandon"},
+	}
+	for _, expanded := range []bool{false, true} {
+		for _, width := range []int{40, 60, 100} {
+			for _, shape := range shapes {
+				t.Run(fmt.Sprintf("w%03d/exp=%v/%s", width, expanded, shape.name), func(t *testing.T) {
+					t.Parallel()
+
+					item := newSteerCard(t, shape.text, expanded)
+					out := ansi.Strip(item.Render(width))
+
+					var widest int
+					var shortOnOneLine bool
+					for line := range strings.SplitSeq(out, "\n") {
+						widest = max(widest, ansi.StringWidth(line))
+						if strings.Contains(line, shape.text) {
+							shortOnOneLine = true
+						}
+					}
+					require.LessOrEqual(t, widest, width, "card at width %d:\n%s", width, out)
+
+					// Nothing is truncated: the whole steer text is
+					// present, wrap positions aside.
+					want := noSpace(shape.text)
+					if !expanded {
+						want = noSpace(strings.ReplaceAll(shape.text, "\n", " "))
+					}
+					require.Contains(t, noSpace(out), want, "card at width %d:\n%s", width, out)
+
+					if shape.name == "short" {
+						require.True(t, shortOnOneLine, "short steer must stay on one line:\n%s", out)
+					}
+				})
+			}
+		}
+	}
+}
+
+// A long steer at width 60 pins the exact wrap shape (#411): the steer
+// line breaks at the card edge, continuation lines indent under the
+// text, and the answer follows. Regenerate the golden file with
+// `go test ./internal/ui/chat -update`.
+func TestDispatchCardSteerWidthGolden(t *testing.T) {
+	t.Parallel()
+
+	item := newSteerCard(t,
+		"refactor the streaming answer path so that token deltas never re-render the markdown body", false)
+	item.UpdateSteerAnswer("assistant-1", "on it, splitting the render pass")
+
+	golden.RequireEqual(t, []byte(ansi.Strip(item.Render(60))))
 }

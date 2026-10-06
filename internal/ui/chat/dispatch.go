@@ -461,7 +461,7 @@ func (r *DispatchToolRenderContext) RenderTool(sty *styles.Styles, width int, op
 	if activity := d.activityLine(sty, remainingWidth); activity != "" {
 		header = lipgloss.JoinVertical(lipgloss.Left, header, activity)
 	}
-	if convo := d.renderSteers(sty, remainingWidth); convo != "" {
+	if convo := d.renderSteers(sty, remainingWidth, opts.ExpandedContent); convo != "" {
 		header = lipgloss.JoinVertical(lipgloss.Left, header, convo)
 	}
 
@@ -561,15 +561,29 @@ func (d *DispatchToolMessageItem) activityLine(sty *styles.Styles, width int) st
 // not markdown — the answer streams token by token and a glamour
 // re-render per delta would cost more than the line is worth; the full
 // reply is in the terminal record's findings once the run completes.
-func (d *DispatchToolMessageItem) renderSteers(sty *styles.Styles, width int) string {
+// The steer text wraps to the available width with continuation lines
+// indented under the text, so a long steer stays inside the card (#411);
+// a collapsed item folds newlines into spaces, the same way the Task
+// prompt line does.
+func (d *DispatchToolMessageItem) renderSteers(sty *styles.Styles, width int, expanded bool) string {
 	if len(d.steers) == 0 {
 		return ""
 	}
+	prefix := sty.Tool.TodoInProgressIcon.Render(styles.ArrowRightIcon + " ")
+	indent := strings.Repeat(" ", lipgloss.Width(prefix))
+	available := max(width-lipgloss.Width(prefix), 1)
 	var sections []string
 	for _, steer := range d.steers {
-		q := sty.Tool.TodoInProgressIcon.Render(styles.ArrowRightIcon+" ") +
-			sty.Tool.TodoJustStarted.Render(steer.Text)
-		sections = append(sections, q)
+		text := steer.Text
+		if !expanded {
+			text = strings.ReplaceAll(text, "\n", " ")
+		}
+		wrapped := ansi.Hardwrap(ansi.Wordwrap(text, available, ""), available, true)
+		lines := strings.Split(wrapped, "\n")
+		for i := 1; i < len(lines); i++ {
+			lines[i] = indent + lines[i]
+		}
+		sections = append(sections, prefix+sty.Tool.TodoJustStarted.Render(strings.Join(lines, "\n")))
 		if steer.Response != "" {
 			sections = append(sections, toolOutputPlainContent(sty, steer.Response, width, true))
 		}

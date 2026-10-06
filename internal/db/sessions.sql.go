@@ -202,7 +202,7 @@ const listChildSessions = `-- name: ListChildSessions :many
 SELECT id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at, summary_message_id, todos, channel
 FROM sessions
 WHERE parent_session_id = ?
-ORDER BY updated_at ASC
+ORDER BY created_at ASC, rowid ASC
 `
 
 func (q *Queries) ListChildSessions(ctx context.Context, parentSessionID sql.NullString) ([]Session, error) {

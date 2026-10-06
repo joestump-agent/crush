@@ -338,6 +338,104 @@ func TestInspectCyclesLiveAgents(t *testing.T) {
 	require.Equal(t, inspectParentID, m.session.ID)
 }
 
+// TestInspectFirstCycleLandsOnFirstAgent pins the outside-ring entry
+// (#416): a session that is not in the live ring (a finished agent
+// block, or a task session picked in the sessions picker) enters
+// inspect mode at ring position -1, so the first ctrl+] shows the
+// first live agent instead of skipping it, and the placeholder claims
+// no ring position until the view actually lands in the ring.
+func TestInspectFirstCycleLandsOnFirstAgent(t *testing.T) {
+	const (
+		childA = "msg-1$$call-1"
+		childB = "msg-1$$call-2"
+		childC = "msg-2$$call-1"
+		done   = "done-1"
+	)
+	setup := func(t *testing.T) (*UI, *inspectWorkspace) {
+		t.Helper()
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		addChild(ws, childA, inspectParentID, "Agent A", inspectChildMessages()...)
+		addChild(ws, childB, inspectParentID, "Agent B", inspectChildMessages()...)
+		addChild(ws, childC, inspectParentID, "Agent C", inspectChildMessages()...)
+		addChild(ws, done, inspectParentID, "Finished Agent", inspectChildMessages()...)
+
+		// Three live agent blocks: the ring is [A, B, C].
+		addAgentBlock(t, m, inspectMessageID, inspectCallID)
+		addAgentBlock(t, m, inspectMessageID, inspectCall2ID)
+		addAgentBlock(t, m, "msg-2", inspectCallID)
+		return m, ws
+	}
+
+	t.Run("entered outside the ring, the first ctrl+] shows the first live agent", func(t *testing.T) {
+		m, _ := setup(t)
+		m.textarea.SetWidth(100)
+
+		runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: done}))
+		require.True(t, m.isInspecting())
+		require.Equal(t, done, m.inspectingSessionID())
+		require.Equal(t, []string{childA, childB, childC}, m.inspectRing,
+			"the ring captures the live agents at entry")
+		require.Equal(t, -1, m.inspectRingPos,
+			"a viewed session outside the ring must sit at ring position -1")
+
+		// No position while the viewed session is outside the ring.
+		require.NotContains(t, m.inspectPlaceholder(), "/3")
+
+		runInspectCmds(m, m.handleInspectDrill())
+		require.Equal(t, childA, m.inspectingSessionID(),
+			"the first ctrl+] must land on the first live agent")
+		require.Contains(t, m.inspectPlaceholder(), " (1/3)",
+			"the placeholder shows the ring position once the view is in the ring")
+
+		runInspectCmds(m, m.handleInspectDrill())
+		require.Equal(t, childB, m.inspectingSessionID(),
+			"the second ctrl+] must land on the second live agent")
+
+		runInspectCmds(m, m.handleInspectDrill())
+		require.Equal(t, childC, m.inspectingSessionID(),
+			"the third ctrl+] must land on the third live agent")
+
+		runInspectCmds(m, m.handleInspectDrill())
+		require.Equal(t, childA, m.inspectingSessionID(),
+			"cycling wraps around the entry ring")
+	})
+
+	t.Run("entered on a session in the ring, the first ctrl+] advances past it", func(t *testing.T) {
+		m, _ := setup(t)
+
+		runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: childB}))
+		require.Equal(t, 1, m.inspectRingPos,
+			"entry on a ring session must keep that session's position")
+		require.Equal(t, childB, m.inspectingSessionID())
+
+		runInspectCmds(m, m.handleInspectDrill())
+		require.Equal(t, childC, m.inspectingSessionID(),
+			"the first ctrl+] must advance past the entered session")
+	})
+}
+
+// TestInspectSingleEntryRingFromOutside pins the degenerate ring (#416):
+// a ring with one live agent, entered from a session outside it, reaches
+// that agent on the first ctrl+].
+func TestInspectSingleEntryRingFromOutside(t *testing.T) {
+	const done = "done-2"
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+	addChild(ws, done, inspectParentID, "Finished Agent", inspectChildMessages()...)
+
+	addAgentBlock(t, m, inspectMessageID, inspectCallID)
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: done}))
+	require.Equal(t, []string{inspectChildID}, m.inspectRing)
+	require.Equal(t, -1, m.inspectRingPos)
+
+	runInspectCmds(m, m.handleInspectDrill())
+	require.Equal(t, inspectChildID, m.inspectingSessionID(),
+		"the single ring entry must be reachable on the first ctrl+]")
+}
+
 // TestInspectLiveFollowsChild pins live-follow: messages published by
 // the viewed child session append to the chat while inspecting.
 func TestInspectLiveFollowsChild(t *testing.T) {

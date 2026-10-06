@@ -141,7 +141,7 @@ func (c *controllerV1) endpoints() []apigen.Endpoint {
 		apigen.Get("/v1/workspaces/{id}/sessions/{sid}/children").
 			Summary("List child sessions").
 			Description("Lists the sessions whose parent is the given session, "+
-				"oldest update first (sub-agent task sessions, #314).").
+				"oldest first (creation order): the sub-agent task sessions (#314).").
 			Tags("sessions").
 			PathParam("id", "Workspace ID").
 			PathParam("sid", "Session ID").

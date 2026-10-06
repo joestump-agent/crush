@@ -429,3 +429,62 @@ func TestDeleteSessionWithoutChildren(t *testing.T) {
 		t.Fatal("no DeletedEvent published for a childless session")
 	}
 }
+
+// TestListChildrenOrdersByCreation pins #417: children of the same parent
+// are listed in creation (insertion) order, not by updated_at — a
+// whole-seconds timestamp that shifts whenever a working agent is saved
+// or gets a new message.
+//
+// Not parallel: the other pool tests share the global db pool; Release
+// only this test's entry.
+func TestListChildrenOrdersByCreation(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Cleanup(func() {
+		require.NoError(t, db.Release(dataDir))
+	})
+
+	conn, err := db.Connect(t.Context(), dataDir)
+	require.NoError(t, err)
+	sessions := NewService(db.New(conn), conn)
+	ctx := t.Context()
+
+	parent, err := sessions.Create(ctx, "parent")
+	require.NoError(t, err)
+
+	// Insert three children with the same created_at through raw SQL,
+	// in an order whose IDs sort differently: m$$c, m$$a, m$$b. rowid
+	// is insertion order, so the expected listing is c, a, b — not the
+	// lexical a, b, c.
+	for _, id := range []string{"m$$c", "m$$a", "m$$b"} {
+		_, err := conn.ExecContext(ctx,
+			`INSERT INTO sessions (id, parent_session_id, title, updated_at, created_at)
+			 VALUES (?, ?, 'child', 2000, 2000)`, id, parent.ID)
+		require.NoError(t, err)
+	}
+
+	listed, err := sessions.ListChildren(ctx, parent.ID)
+	require.NoError(t, err)
+	require.Equal(t, []string{"m$$c", "m$$a", "m$$b"}, ids(listed),
+		"same created_at must come back in insertion order")
+
+	// Saving the first child bumps its updated_at through the AFTER
+	// UPDATE trigger; its position must not move.
+	first := listed[0]
+	first.Title = "touched"
+	saved, err := sessions.Save(ctx, first)
+	require.NoError(t, err)
+	require.Equal(t, "m$$c", saved.ID)
+
+	refetched, err := sessions.ListChildren(ctx, parent.ID)
+	require.NoError(t, err)
+	require.Equal(t, []string{"m$$c", "m$$a", "m$$b"}, ids(refetched),
+		"updating a child must not change its position")
+}
+
+func ids(sessions []Session) []string {
+	out := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		out = append(out, s.ID)
+	}
+	return out
+}

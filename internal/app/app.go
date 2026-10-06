@@ -806,14 +806,14 @@ func (app *App) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapsho
 	return app.AgentCoordinator.DispatchByHandle(sessionID, handle)
 }
 
-// DeliverAgentMessageByHandle routes an editor @handle message to the
-// running dispatched agent's injection queue (#312/#313). A handle
-// another session dispatched refuses (#399).
-func (app *App) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+// DeliverAgentMessageByHandle routes an editor @handle message and its
+// attachments (#414) to the running dispatched agent's injection queue
+// (#312/#313). A handle another session dispatched refuses (#399).
+func (app *App) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	if app.AgentCoordinator == nil {
 		return errors.New("no agent coordinator")
 	}
-	return app.AgentCoordinator.DeliverAgentMessageByHandle(ctx, sessionID, handle, text)
+	return app.AgentCoordinator.DeliverAgentMessageByHandle(ctx, sessionID, handle, text, attachments)
 }
 
 // CancelDispatch stops one dispatched agent on demand (#373): the ref

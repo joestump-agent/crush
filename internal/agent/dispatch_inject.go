@@ -189,7 +189,7 @@ func (c *coordinator) messageAgentTool() fantasy.AgentTool {
 					Text:          params.Message,
 				})
 			case params.Handle != "":
-				err = c.DeliverAgentMessageByHandle(ctx, tools.GetSessionFromContext(ctx), dispatch.HandleSlug(params.Handle), params.Message)
+				err = c.DeliverAgentMessageByHandle(ctx, tools.GetSessionFromContext(ctx), dispatch.HandleSlug(params.Handle), params.Message, nil)
 			default:
 				err = errors.New("session id or handle is required")
 			}

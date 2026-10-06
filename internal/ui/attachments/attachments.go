@@ -39,6 +39,10 @@ type Attachments struct {
 func (m *Attachments) List() []message.Attachment { return m.list }
 func (m *Attachments) Reset()                     { m.list = nil }
 
+// Set replaces the chip list wholesale. It restores the attachments a
+// refused submit took from the editor before delivery failed (#414).
+func (m *Attachments) Set(list []message.Attachment) { m.list = list }
+
 // RemoveByFilePath removes the first attachment whose FilePath matches path.
 // Used when an atomic backspace deletes a @file mention from the prompt so
 // the corresponding attachment chip is removed alongside it.
