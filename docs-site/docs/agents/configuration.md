@@ -186,15 +186,14 @@ on the base revision, a revision the main agent chooses, is read or executed
 | Diff in the result | Per-file stat plus the diff, cut at 250 lines |
 | Nudges per run | 2 |
 | Tool-loop detection | More than 5 identical tool calls and results in the last 10 steps |
-| A2A server | One host per process on a unix socket, `<data dir>/a2a/<pid>.sock` (socket `0600`, directory `0700`), JSON-RPC, no authentication ([#346](https://github.com/joestump-agent/crush/issues/346)) |
+| A2A server | One host per process on a unix socket, `<data dir>/a2a/<pid>.sock` (socket `0600`, directory `0700`), JSON-RPC, bearer-authenticated with a per-process token ([#346](https://github.com/joestump-agent/crush/issues/346), [#357](https://github.com/joestump-agent/crush/issues/357)) |
 | A2A client timeout | No total timeout; per-phase bounds only: 10 s dial, 10 s TLS handshake, 30 s response headers ([#344](https://github.com/joestump-agent/crush/issues/344)) |
 | A2A server shutdown | 5 seconds |
 | Cleanup when Crush exits | A sweep that force-removes every `crush-dispatch-*` worktree and branch, with a 30-second timeout. Whether it finishes depends on how Crush exits; see [troubleshooting](/agents/troubleshooting) |
 | Inspect keys | <kbd>ctrl+]</kbd> and <kbd>ctrl+[</kbd> |
 
 :::info[Planned]
-- A TCP listener with TLS becomes opt-in ([#358](https://github.com/joestump-agent/crush/issues/358));
-  authentication arrives with `securitySchemes` ([#357](https://github.com/joestump-agent/crush/issues/357)).
+- A TCP listener with TLS becomes opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)).
 - `apply_dispatch` and `dismiss_dispatch` will record your decision about a
   workspace explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)). Exit and startup already keep decided and
   work-producing workspaces and remove only the rest ([#367](https://github.com/joestump-agent/crush/issues/367)).

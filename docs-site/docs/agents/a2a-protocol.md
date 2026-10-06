@@ -349,15 +349,22 @@ A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/c
   question tool, and permission prompts use an in-process bridge
   ([#352](https://github.com/joestump-agent/crush/issues/352), [#353](https://github.com/joestump-agent/crush/issues/353)).
 - **Durable task state.** A restart loses every task ([#354](https://github.com/joestump-agent/crush/issues/354)).
-- **Authentication** of any kind ([#357](https://github.com/joestump-agent/crush/issues/357)).
 
 ## Security model
 
-:::warning[Unauthenticated by design, reach-restricted today]
-The served surface carries no authentication yet
-([#357](https://github.com/joestump-agent/crush/issues/357)). The reach
-restriction is the socket, not a credential:
+:::info[Bearer-authenticated, socket-reachable]
+Every served call must carry the host's bearer token, declared on the
+card as a `crush-bearer` HTTP bearer `securitySchemes` entry
+([#357](https://github.com/joestump-agent/crush/issues/357)). The dispatch
+client attaches it automatically; anything else is rejected with the
+JSON-RPC unauthenticated error before the handler runs. The reach
+restriction is the socket, layered under the credential:
 
+- **The credential.** Each host mints 32 bytes of `crypto/rand` at bind
+  time and holds it only in memory — never persisted, never logged. The
+  check is constant-time. Where the platform reports socket peer
+  credentials, the peer must also be the host's own OS user, and tasks
+  are stored under that identity.
 - **Who can reach it.** Only processes running as the same OS user: the
   socket is `0600` inside a `0700` directory under the data directory
   (a per-user temp dir when the path would overflow the socket length
@@ -367,10 +374,10 @@ restriction is the socket, not a credential:
   bodies including the CORS-simple `text/plain` POST (`415`), and a
   `Host` other than the internal `crush-a2a` label (`400`), so a web
   page cannot fold a prompt into a running dispatch.
-- **What a caller can do.** A same-user process can still `SendMessage`
-  a write-capable agent with the dispatch's permission policy; with yolo
-  on, that includes unprompted `bash`. Auth lands with
-  [#357](https://github.com/joestump-agent/crush/issues/357).
+
+A same-user process can no longer steer a dispatch: without the token,
+which only the host process holds, every call is rejected. TCP with
+mutual TLS remains planned ([#358](https://github.com/joestump-agent/crush/issues/358)).
 
 To turn dispatch off, run `permissions deny dispatch_agent`.
 :::
