@@ -404,3 +404,288 @@ func TestMessageAgentToolDeliversAndRefuses(t *testing.T) {
 	require.True(t, resp.IsError)
 	require.Contains(t, resp.Content, "session id or handle is required")
 }
+
+// refusingDispatchAgent is a fake dispatched agent that mirrors the real
+// sessionAgent.EnqueueWhenBusy busy-window contract (#426). The existing
+// gatedDispatchAgent accepts every enqueue, so it can never reach
+// DeliverAgentMessage's refusal branch — the window where the injection
+// target is still registered but the run no longer takes messages. This
+// fake refuses until Run passes startGate (the moment the real run sets
+// the session busy), accepts only while the run is active, and refuses
+// again once Run returns.
+//
+// alwaysRefuse short-circuits EnqueueWhenBusy to false for the whole run:
+// the dispatch stays running (the target stays registered) while every
+// enqueue is refused, which is exactly the "the run ended between the
+// registry lookup and the enqueue" race the refusal branch exists to
+// catch.
+type refusingDispatchAgent struct {
+	SessionAgent
+	model  Model
+	result *fantasy.AgentResult
+
+	startGate    chan struct{}
+	gate         chan struct{}
+	entered      chan struct{}
+	busyCh       chan struct{}
+	alwaysRefuse bool
+
+	startOnce sync.Once
+	gateOnce  sync.Once
+	busyOnce  sync.Once
+	enterOnce sync.Once
+	mu        sync.Mutex
+	busy      bool
+	queued    []SessionAgentCall
+	lastCall  *SessionAgentCall
+	canceled  []string
+
+	cancelCh   chan struct{}
+	cancelOnce sync.Once
+}
+
+func newRefusingDispatchAgent() *refusingDispatchAgent {
+	return &refusingDispatchAgent{
+		model:     dispatchTestModel(),
+		startGate: make(chan struct{}),
+		gate:      make(chan struct{}),
+		entered:   make(chan struct{}),
+		busyCh:    make(chan struct{}),
+		cancelCh:  make(chan struct{}),
+		result: &fantasy.AgentResult{
+			Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}},
+		},
+	}
+}
+
+// newAlwaysRefusingDispatchAgent builds a refusingDispatchAgent whose
+// EnqueueWhenBusy refuses for the whole run, whatever its busy state.
+func newAlwaysRefusingDispatchAgent() *refusingDispatchAgent {
+	f := newRefusingDispatchAgent()
+	f.alwaysRefuse = true
+	return f
+}
+
+// Run models the real run's busy window: it signals entry, then parks in
+// the startup window (registered, not yet busy) until startGate passes;
+// passing startGate marks the session busy (models activeRequests.Set);
+// it then parks in the active run until gate is released, and returns
+// with the session no longer busy.
+func (f *refusingDispatchAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
+	f.mu.Lock()
+	callCopy := call
+	f.lastCall = &callCopy
+	f.mu.Unlock()
+	f.enterOnce.Do(func() { close(f.entered) })
+	select {
+	case <-f.startGate:
+	case <-f.cancelCh:
+		return nil, context.Canceled
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	f.busyOnce.Do(func() {
+		f.mu.Lock()
+		f.busy = true
+		f.mu.Unlock()
+		close(f.busyCh)
+	})
+	select {
+	case <-f.gate:
+	case <-f.cancelCh:
+		return nil, context.Canceled
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	f.mu.Lock()
+	f.busy = false
+	f.mu.Unlock()
+	return f.result, nil
+}
+
+// EnqueueWhenBusy is the delivery primitive under test (#426): it records
+// a call and reports true only while the run is busy — and never at all
+// when alwaysRefuse is set. Recording only on the accept path is what
+// pins the "queued exactly once" invariant.
+func (f *refusingDispatchAgent) EnqueueWhenBusy(call SessionAgentCall) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.alwaysRefuse || !f.busy {
+		return false
+	}
+	f.queued = append(f.queued, call)
+	return true
+}
+
+// IsSessionBusy reports the run's busy state, so the coordinator's
+// post-cancel wait and the tests' busy assertions see the model.
+func (f *refusingDispatchAgent) IsSessionBusy(string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.busy
+}
+
+// Cancel records the cancel and un-parks a Run parked on a gate,
+// mirroring a real agent whose active request aborts on Cancel.
+func (f *refusingDispatchAgent) Cancel(sessionID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.canceled = append(f.canceled, sessionID)
+	f.cancelOnce.Do(func() { close(f.cancelCh) })
+}
+
+func (f *refusingDispatchAgent) Model() Model     { return f.model }
+func (f *refusingDispatchAgent) WaitReady() error { return nil }
+
+// waitRunning blocks until the dispatched run has entered Run, which is
+// after runDispatch registered the injection target.
+func (f *refusingDispatchAgent) waitRunning(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dispatch run never started")
+	}
+}
+
+// waitBusy blocks until Run has passed startGate and marked the session
+// busy — the point after which EnqueueWhenBusy accepts.
+func (f *refusingDispatchAgent) waitBusy(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.busyCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("dispatch run never became busy")
+	}
+}
+
+// releaseStart opens startGate so a run parked in the startup window
+// marks the session busy.
+func (f *refusingDispatchAgent) releaseStart() {
+	f.startOnce.Do(func() { close(f.startGate) })
+}
+
+// release opens the run gate so a parked run can finish.
+func (f *refusingDispatchAgent) release() {
+	f.gateOnce.Do(func() { close(f.gate) })
+}
+
+// releaseAll opens every gate, for cleanup: a run parked on either the
+// start gate or the run gate is unblocked.
+func (f *refusingDispatchAgent) releaseAll() {
+	f.releaseStart()
+	f.release()
+}
+
+// injected returns a copy of the calls EnqueueWhenBusy accepted.
+func (f *refusingDispatchAgent) injected() []SessionAgentCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]SessionAgentCall(nil), f.queued...)
+}
+
+// newRefusingInjectionEnv is newInjectionEnv for a refusingDispatchAgent:
+// the dispatch stays running until the test releases its gates.
+func newRefusingInjectionEnv(t *testing.T, agent *refusingDispatchAgent) (*coordinator, fakeEnv) {
+	t.Helper()
+	env := testEnv(t)
+	initGitRepo(t, env.workingDir)
+	c := newDispatchTestCoordinator(t, env)
+	reapDispatchRuns(t, c, agent.releaseAll)
+	c.dispatchAgentBuilder = func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error) {
+		return &dispatchedAgent{
+			agent:       agent,
+			model:       agent.model,
+			providerCfg: config.ProviderConfig{ID: "test-provider"},
+		}, nil
+	}
+	return c, env
+}
+
+// TestDeliverAgentMessageRefusalBranch covers DeliverAgentMessage's
+// refusal branch (#426): the injection target is still registered — the
+// dispatch is running — but the agent refuses the enqueue, the "the run
+// ended between the registry lookup and the enqueue" race. The delivery
+// must error, naming the session, and queue nothing; the message_agent
+// tool surfaces the same refusal as a tool error, never a "delivered"
+// success.
+func TestDeliverAgentMessageRefusalBranch(t *testing.T) {
+	agent := newAlwaysRefusingDispatchAgent()
+	c, _ := newRefusingInjectionEnv(t, agent)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
+	agent.waitRunning(t)
+
+	// The target is registered (the dispatch is running) yet the agent
+	// refuses every enqueue: DeliverAgentMessage must take the refusal
+	// branch, naming the session, and queue nothing.
+	err := c.DeliverAgentMessage(t.Context(), AgentMessage{SessionID: handle.SessionID, Text: "steer me"})
+	require.Error(t, err)
+	require.ErrorContains(t, err, handle.SessionID)
+	// Invariant: DeliverAgentMessage returns nil if and only if the
+	// message was queued. It erred, so nothing is queued.
+	require.Empty(t, agent.injected(), "a refused delivery must not queue the message")
+
+	// The model-facing front door surfaces the same refusal as a tool
+	// error, not a "delivered" success.
+	resp := runToolAsSession(t, c.messageAgentTool(), MessageAgentToolName, MessageAgentParams{
+		SessionID: handle.SessionID,
+		Message:   "steer me",
+	}, "dispatch-parent-session")
+	require.True(t, resp.IsError, "the refusal must surface as a tool error, got: %s", resp.Content)
+	require.NotContains(t, resp.Content, "Message delivered")
+	require.Empty(t, agent.injected(), "the tool's refused delivery must not queue the message")
+}
+
+// TestDeliverAgentMessageStartupWindow covers the startup window (#426):
+// the injection target is registered before Run marks the session busy,
+// so a delivery that lands before the run is busy is refused (nothing
+// queued), and one that lands after is accepted (queued exactly once).
+// Synchronization is by gates only — startGate models the moment Run sets
+// the session busy, busyCh signals it — no sleeps.
+func TestDeliverAgentMessageStartupWindow(t *testing.T) {
+	agent := newRefusingDispatchAgent()
+	c, _ := newRefusingInjectionEnv(t, agent)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
+	agent.waitRunning(t)
+	// Run is entered but has not passed startGate: the injection target
+	// is registered, yet the session is not busy.
+	require.False(t, agent.IsSessionBusy(handle.SessionID), "the run is parked before it is busy")
+
+	// deliver pins the #426 invariant at every step: DeliverAgentMessage
+	// returns nil if and only if the message was queued (and exactly one
+	// copy of it).
+	deliver := func(text string) error {
+		before := len(agent.injected())
+		err := c.DeliverAgentMessage(t.Context(), AgentMessage{SessionID: handle.SessionID, Text: text})
+		after := len(agent.injected())
+		if err == nil {
+			require.Equal(t, before+1, after, "a nil error must mean exactly one queued message")
+		} else {
+			require.Equal(t, before, after, "an error must mean nothing was queued")
+		}
+		return err
+	}
+
+	// Before the run is busy: refused, nothing queued. The branch's
+	// current wording ("no longer running; dispatch a new agent instead")
+	// is misleading here — the agent is starting, not finished — so this
+	// test pins the behavior, not the wording.
+	require.Error(t, deliver("early steer"))
+	require.Empty(t, agent.injected(), "a pre-busy delivery must not queue")
+
+	// Release startGate: Run marks the session busy and parks in the
+	// active run.
+	agent.releaseStart()
+	agent.waitBusy(t)
+	require.True(t, agent.IsSessionBusy(handle.SessionID), "the run is busy after startGate")
+
+	// Now busy: accepted, queued exactly once.
+	require.NoError(t, deliver("on-time steer"))
+	injected := agent.injected()
+	require.Len(t, injected, 1)
+	require.Equal(t, "on-time steer", injected[0].Prompt)
+}
