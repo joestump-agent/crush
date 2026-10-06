@@ -1,10 +1,15 @@
 package dispatch
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -23,6 +28,53 @@ func releaseLease(t *testing.T, p *GitWorktreeProvider, id string) {
 	p.mu.Unlock()
 	require.NotNil(t, rel, "workspace %s has no lease to release", id)
 	rel()
+}
+
+// leaseHelperEnv marks a test binary re-executed as a lease holder,
+// and leaseHelperPathEnv names the lock file it holds.
+const (
+	leaseHelperEnv     = "GO_DISPATCH_LEASE_HELPER"
+	leaseHelperPathEnv = "GO_DISPATCH_LEASE_PATH"
+)
+
+// TestLeaseHelperProcess is the re-executed child of holdLeaseElsewhere:
+// it takes the lease named in the environment and holds it until the
+// parent kills it.
+func TestLeaseHelperProcess(t *testing.T) {
+	if os.Getenv(leaseHelperEnv) != "1" {
+		t.Skip("lease-holder child of holdLeaseElsewhere")
+	}
+	release, err := lock.TryFile(os.Getenv(leaseHelperPathEnv))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lease holder child: %v\n", err)
+		os.Exit(3)
+	}
+	defer release()
+	fmt.Println("locked")
+	time.Sleep(10 * time.Minute)
+}
+
+// holdLeaseElsewhere holds the lease on path from a child process for
+// the duration of the test, killing it at cleanup. A lease held in
+// this process does not do: on darwin, flock is per-process, so a
+// probe from the same process takes the lock without contention and
+// reports the owner dead.
+func holdLeaseElsewhere(t *testing.T, path string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLeaseHelperProcess$")
+	cmd.Env = append(os.Environ(), leaseHelperEnv+"=1", leaseHelperPathEnv+"="+path)
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	require.NoError(t, err, "lease holder child did not start: %q", line)
+	require.Equal(t, "locked", strings.TrimSpace(line))
+
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
 }
 
 // scanTestEnv builds a repository and a provider whose worktrees live
@@ -61,6 +113,8 @@ func TestScanWorkspaces(t *testing.T) {
 	require.NoError(t, env.p.SetDisposition(dead.ID, DispositionDismissed))
 	require.NoError(t, env.p.SetDisposition(alive.ID, DispositionApplied))
 
+	releaseLease(t, env.p, alive.ID)
+	holdLeaseElsewhere(t, env.p.leasePath(alive.Branch))
 	releaseLease(t, env.p, dead.ID)
 	releaseLease(t, env.p, deadChanges.ID)
 	releaseLease(t, env.p, noLock.ID)
@@ -189,6 +243,8 @@ func TestWorkspacePrunerRefusesLiveAndUnprovable(t *testing.T) {
 	noLock := provisionEntry(t, env.p, ProvisionOptions{})
 	releaseLease(t, env.p, noLock.ID)
 	require.NoError(t, os.Remove(env.p.leasePath(noLock.Branch)))
+	releaseLease(t, env.p, alive.ID)
+	holdLeaseElsewhere(t, env.p.leasePath(alive.Branch))
 
 	pruner, err := NewWorkspacePruner(env.repo, env.dir)
 	require.NoError(t, err)
@@ -224,10 +280,9 @@ func TestWorkspacePrunerRechecksLeaseAtRemoval(t *testing.T) {
 	require.Len(t, infos, 1)
 	require.False(t, infos[0].OwnerAlive)
 
-	// The owner comes back: the free lease is taken again.
-	release, err := lock.TryFile(env.p.leasePath(entry.Branch))
-	require.NoError(t, err)
-	defer release()
+	// The owner comes back: the free lease is taken again, by another
+	// process.
+	holdLeaseElsewhere(t, env.p.leasePath(entry.Branch))
 
 	pruner, err := NewWorkspacePruner(env.repo, env.dir)
 	require.NoError(t, err)
