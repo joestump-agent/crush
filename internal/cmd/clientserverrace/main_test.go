@@ -2,31 +2,31 @@ package clientserverrace_test
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/crush/internal/cmd"
 )
 
-// The binary under test is resolved once, in TestMain, before any test
-// runs (#429). go test's -timeout alarm starts inside m.Run, so a slow
-// build here no longer eats the race test's own budget. CI goes further
-// and builds the binary in a workflow step, handing it over through
-// CRUSH_RACE_TEST_BIN, because cmd/go still kills the whole test binary
-// at -timeout plus one minute however long TestMain takes.
+// The race test needs a real crush binary, and the test binary already is
+// one: it links the whole CLI through internal/cmd. A child started with
+// runAsCrushEnv set runs crush instead of the tests, and the client starts
+// its detached server by re-executing os.Executable() with the same
+// environment, so the server is this binary too. That replaces a separate
+// `go build` of the CLI, which took minutes on a cold macOS runner inside
+// go test's timeout (#429), and needs no CI step and no go toolchain.
 
 const (
-	// binEnv names a prebuilt crush binary to test instead of building
-	// one. The CI workflow sets it on non-Windows runners.
-	binEnv = "CRUSH_RACE_TEST_BIN"
+	// runAsCrushEnv makes TestMain run the crush CLI instead of the tests.
+	runAsCrushEnv = "CRUSH_RACE_RUN_AS_CRUSH"
 	// orphanAgeEnv overrides how old an abandoned run directory must be
 	// before TestMain reaps it, so the reaping can be exercised by hand
 	// without waiting half an hour.
@@ -34,28 +34,27 @@ const (
 	// defaultOrphanAge is longer than any live run of this package, so a
 	// concurrent run's server is never touched.
 	defaultOrphanAge = 30 * time.Minute
-	// buildTimeout bounds the local build. cmd/go kills the test binary
-	// at -timeout plus one minute (eleven minutes by default), so a
-	// genuinely stuck build fails here, with the build output, first.
-	buildTimeout = 10 * time.Minute
 	// runDirPrefix is the os.MkdirTemp prefix of each race test run.
 	runDirPrefix = "crush-race-"
 )
 
 var (
-	// crushBin is the binary under test, set by TestMain.
+	// crushBin is this test binary, which runs as crush under
+	// runAsCrushEnv; set by TestMain.
 	crushBin string
-	// crushBinErr is why there is no binary; the race test reports it.
+	// crushBinErr is why it couldn't be located; the race test reports it.
 	crushBinErr error
-	// errNoGo means there is neither a prebuilt binary nor a go tool to
-	// build one; the race test skips rather than fails.
-	errNoGo = errors.New("'go' not available on PATH")
 )
 
 func TestMain(m *testing.M) {
+	// Before flag.Parse: a child's arguments are crush's, not go test's.
+	if os.Getenv(runAsCrushEnv) == "1" {
+		cmd.Execute()
+		os.Exit(0)
+	}
 	flag.Parse()
 	// The race test skips in -short mode and on Windows, so neither pays
-	// for a build or a reap.
+	// for a reap.
 	if testing.Short() || runtime.GOOS == "windows" {
 		m.Run()
 		return
@@ -63,73 +62,8 @@ func TestMain(m *testing.M) {
 	reapOrphans("/tmp/"+runDirPrefix+"*", orphanAge(), func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "clientserverrace: "+format+"\n", args...)
 	})
-	bin, cleanup, err := prepareBinary()
-	defer cleanup()
-	crushBin, crushBinErr = bin, err
+	crushBin, crushBinErr = os.Executable()
 	m.Run()
-}
-
-// prepareBinary returns the crush binary to test and a cleanup that
-// removes anything it built: the prebuilt binary named by
-// CRUSH_RACE_TEST_BIN when set, otherwise a fresh CGO_ENABLED=0 build.
-func prepareBinary() (string, func(), error) {
-	noop := func() {}
-	if p := os.Getenv(binEnv); p != "" {
-		abs, err := filepath.Abs(p)
-		if err != nil {
-			return "", noop, fmt.Errorf("%s=%s: %w", binEnv, p, err)
-		}
-		if _, err := os.Stat(abs); err != nil {
-			return "", noop, fmt.Errorf("%s=%s: %w", binEnv, p, err)
-		}
-		fmt.Fprintf(os.Stderr, "clientserverrace: using prebuilt crush binary %s\n", abs)
-		return abs, noop, nil
-	}
-	if _, err := exec.LookPath("go"); err != nil {
-		return "", noop, errNoGo
-	}
-	root, err := repoRoot()
-	if err != nil {
-		return "", noop, err
-	}
-	binDir, err := os.MkdirTemp("", "crush-race-bin-")
-	if err != nil {
-		return "", noop, fmt.Errorf("mkdtemp bin: %w", err)
-	}
-	cleanup := func() { _ = os.RemoveAll(binDir) }
-	binPath := filepath.Join(binDir, "crush")
-
-	ctx, cancel := context.WithTimeout(context.Background(), buildTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, ".")
-	cmd.Dir = root
-	// Match the project's standard build flags. CGO_ENABLED=0 keeps the
-	// binary statically linked and avoids surprising the test on hosts
-	// without a C toolchain.
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", cleanup, fmt.Errorf("go build crush: %w\n%s", err, out)
-	}
-	return binPath, cleanup, nil
-}
-
-// repoRoot walks up from the working directory to the directory holding
-// go.mod. Walking up by a fixed count is fragile across reorganisations.
-func repoRoot() (string, error) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Errorf("getwd: %w", err)
-	}
-	for dir := cwd; ; {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", fmt.Errorf("could not find go.mod walking up from %s", cwd)
-		}
-		dir = parent
-	}
 }
 
 // orphanAge is the reap threshold: CRUSH_RACE_ORPHAN_AGE when it parses

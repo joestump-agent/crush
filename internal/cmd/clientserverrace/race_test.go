@@ -3,13 +3,12 @@
 // docs/notes/2026-05-11-client-server-socket-init-race.md (item F5).
 //
 // It lives in its own directory so it can build even if other test
-// files in internal/cmd are temporarily broken — this test only needs
-// the binary, not the cmd package.
+// files in internal/cmd are temporarily broken: it needs the cmd
+// package's code, which its test binary runs as crush, not its tests.
 package clientserverrace_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -51,10 +50,7 @@ func TestClientServerSpawnRace(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping unix-socket specific race test on windows")
 	}
-	// TestMain resolved the binary before any test started (#429).
-	if errors.Is(crushBinErr, errNoGo) {
-		t.Skip("skipping: " + errNoGo.Error())
-	}
+	// The test binary runs as crush in the children (#429).
 	if crushBinErr != nil {
 		t.Fatalf("no crush binary to test: %v", crushBinErr)
 	}
@@ -88,6 +84,7 @@ func TestClientServerSpawnRace(t *testing.T) {
 
 	env := append(
 		os.Environ(),
+		runAsCrushEnv+"=1",
 		"CRUSH_CLIENT_SERVER=1",
 		"XDG_CACHE_HOME="+cacheHome,
 		"XDG_DATA_HOME="+dataHome,
