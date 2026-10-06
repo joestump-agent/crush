@@ -387,8 +387,11 @@ type UI struct {
 	// inspectDispatchTargets marks which ring members are dispatch blocks
 	// (vs plain agent tools), so ctrl+x only offers a cancel for them.
 	// inspectSeq numbers inspect transitions so a child load that lands
-	// after a later one is dropped. inspectPending is a task session
-	// picked from the sessions dialog, waiting for its parent to load.
+	// after a later one is dropped. inspectWindow holds the transition
+	// whose snapshot is in flight: its target session and the message
+	// events buffered for it until the snapshot lands (#406).
+	// inspectPending is a task session picked from the sessions dialog,
+	// waiting for its parent to load.
 	inspecting             *session.Session
 	inspectScroll          [2]int
 	inspectFollow          bool
@@ -396,6 +399,7 @@ type UI struct {
 	inspectRingPos         int
 	inspectDispatchTargets map[string]bool
 	inspectSeq             int
+	inspectWindow          *inspectWindow
 	inspectPending         *session.Session
 
 	// onboarding state
@@ -484,8 +488,13 @@ type UI struct {
 	// in-flight fetch captures it at dispatch and its result is discarded
 	// if the generation has moved on (see workspace_cache.go).
 	promptQueueGen uint64
-	sidebarScroll  int
-	pillsView      string
+	// sessionsChildrenGen is bumped every time the sessions picker is
+	// opened; the child-session batch fetched for it (#409) captures the
+	// generation at dispatch and is dropped if the picker was closed or
+	// reopened before the batch landed.
+	sessionsChildrenGen uint64
+	sidebarScroll       int
+	pillsView           string
 
 	// cronTasks holds the scheduled tasks for the current session,
 	// refreshed on session load and after cron tool results.
@@ -947,6 +956,10 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.dispatchPromptQueueRefresh(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case sessionChildrenLoadedMsg:
+		if cmd := m.applySessionChildren(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case loadSessionMsg:
 		if m.forceCompactMode {
 			m.isCompact = true
@@ -1037,6 +1050,13 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case inspectRestoreMsg:
 		// Inspect mode exit (#314): the parent transcript came back.
 		if cmd := m.handleInspectRestore(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
+	case inspectFetchFailedMsg:
+		// Inspect transition fetch failed (#406): close the pending
+		// window so later events apply normally.
+		if cmd := m.handleInspectFetchFailed(msg); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 
@@ -1158,6 +1178,43 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pubsub.Event[message.Message]:
 		// Check if this is a child session message for an agent tool.
 		if m.session == nil {
+			break
+		}
+		if m.inspectWindow != nil && msg.Payload.SessionID == m.inspectWindow.sessionID {
+			// An inspect transition's snapshot is in flight (#406):
+			// buffer the target's events and replay them when it lands,
+			// so nothing races the transcript swap. Each kind keeps its
+			// usual live feed while the window is open.
+			switch {
+			case msg.Payload.SessionID == m.session.ID:
+				// Exit window: the chat still shows the child, so parent
+				// events stay off screen until the restore lands. Busy
+				// and queue state still refresh.
+				if msg.Type == pubsub.CreatedEvent {
+					m.invalidateBusyCaches()
+					m.invalidatePromptQueue()
+					if cmd := m.dispatchBusyRefresh(); cmd != nil {
+						cmds = append(cmds, cmd)
+					}
+					if cmd := m.dispatchPromptQueueRefresh(); cmd != nil {
+						cmds = append(cmds, cmd)
+					}
+				}
+			case m.isInspecting() && msg.Payload.SessionID == m.inspectingSessionID():
+				// Reloading the viewed child (a wrap in the cycle):
+				// keep painting live.
+				if cmd := m.handleInspectChildMessage(msg); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			default:
+				// Entering, or cycling to another child: the chat shows
+				// the parent or the previous child; the target's events
+				// feed the parent's agent blocks as usual.
+				if cmd := m.handleChildSessionMessage(msg); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+			m.inspectWindow.events = append(m.inspectWindow.events, msg)
 			break
 		}
 		if msg.Payload.SessionID != m.session.ID {
@@ -3436,7 +3493,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 	}
 
 	// Handle cancel key when agent is busy.
-	if key.Matches(msg, m.keyMap.Chat.Cancel) {
+	if key.Matches(msg, m.keyMap.Chat.Cancel) && !m.isInspecting() {
 		if m.isAgentBusy() {
 			if cmd := m.cancelAgent(); cmd != nil {
 				cmds = append(cmds, cmd)
@@ -4269,7 +4326,7 @@ func (m *UI) ShortHelp() []key.Binding {
 		binds = append(binds, k.Quit)
 	case uiChat:
 		// Show cancel binding if agent is busy.
-		if m.isAgentBusy() {
+		if m.isAgentBusy() && !m.isInspecting() {
 			cancelBinding := k.Chat.Cancel
 			if m.isCanceling {
 				cancelBinding.SetHelp("esc", "press again to cancel")
@@ -4382,7 +4439,7 @@ func (m *UI) FullHelp() [][]key.Binding {
 			})
 	case uiChat:
 		// Show cancel binding if agent is busy.
-		if m.isAgentBusy() {
+		if m.isAgentBusy() && !m.isInspecting() {
 			cancelBinding := k.Chat.Cancel
 			if m.isCanceling {
 				cancelBinding.SetHelp("esc", "press again to cancel")
@@ -6798,9 +6855,23 @@ func (m *UI) openSkillsDialog() {
 	m.dialog.OpenDialog(skillsDialog)
 }
 
+// sessionChildrenLoadedMsg delivers the sessions picker's sub-agent tree
+// fetched off the Update loop (#409): one ListAllChildSessions round trip
+// per picker open instead of N ListChildSessions calls inside the
+// constructor. gen is the picker generation captured at dispatch; a batch
+// whose generation no longer matches was fetched for a picker that was
+// closed or reopened and is dropped.
+type sessionChildrenLoadedMsg struct {
+	gen      uint64
+	children []session.Session
+	err      error
+}
+
 // openSessionsDialog opens the sessions dialog. If the dialog is already open,
 // it brings it to the front. Otherwise, it will list all the sessions and open
-// the dialog.
+// the dialog, returning a command that fetches the sub-agent tree in one
+// batch (#409) so opening the picker makes no child-session fetch on the
+// Update goroutine.
 func (m *UI) openSessionsDialog() tea.Cmd {
 	if m.dialog.ContainsDialog(dialog.SessionsID) {
 		// Bring to front
@@ -6819,6 +6890,41 @@ func (m *UI) openSessionsDialog() tea.Cmd {
 	}
 
 	m.dialog.OpenDialog(dialog)
+
+	// Capture the workspace and the generation as locals: the command
+	// runs off-thread and must never touch model state; the result is
+	// applied by applySessionChildren on the Update goroutine.
+	m.sessionsChildrenGen++
+	gen := m.sessionsChildrenGen
+	ws := m.com.Workspace
+	return func() tea.Msg {
+		// Bounded: a wedged server (client/server mode) must not leave the
+		// batch in flight for the lifetime of the picker.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		children, err := ws.ListAllChildSessions(ctx)
+		return sessionChildrenLoadedMsg{gen: gen, children: children, err: err}
+	}
+}
+
+// applySessionChildren hands a fetched sub-agent batch to the open
+// sessions picker (#409). A batch for a picker that was closed or since
+// reopened (generation moved on) is dropped. A failed fetch still lands,
+// as an empty tree plus one warning, so the picker never sits on
+// "Loading" waiting for a batch that is never coming.
+func (m *UI) applySessionChildren(msg sessionChildrenLoadedMsg) tea.Cmd {
+	if msg.gen != m.sessionsChildrenGen || !m.dialog.ContainsDialog(dialog.SessionsID) {
+		return nil
+	}
+	sessionsDialog, ok := m.dialog.Dialog(dialog.SessionsID).(*dialog.Session)
+	if !ok {
+		return nil
+	}
+	if msg.err != nil {
+		sessionsDialog.SetChildren(nil)
+		return util.ReportWarn(fmt.Sprintf("Couldn't load sub-agent sessions: %v", msg.err))
+	}
+	sessionsDialog.SetChildren(msg.children)
 	return nil
 }
 

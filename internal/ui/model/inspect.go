@@ -4,11 +4,12 @@ package model
 // transcript (reasoning, tool calls, results) in the normal chat window
 // while the parent stays the active session. ctrl+] enters from an agent
 // block (or opens the live-agents cycle when no block is focused) and
-// cycles live agents; ctrl+[ returns to the chat with the scroll position
-// preserved. Esc is untouched wherever the terminal can tell it apart from
-// ctrl+[ (see escIsInspectBack). Viewed ≠ active: nothing in this file ever
-// assigns m.session, so prompts typed while inspecting land in the parent
-// and a task session can never become the active/continuable session.
+// cycles live agents; esc or ctrl+[ returns to the chat with the scroll
+// position preserved, on every terminal (#404). Esc never cancels the
+// parent from inspect mode: leave inspect mode first to cancel. Viewed ≠
+// active: nothing in this file ever assigns m.session, so prompts typed
+// while inspecting land in the parent and a task session can never become
+// the active/continuable session.
 
 import (
 	"context"
@@ -52,13 +53,35 @@ type inspectSessionLoadedMsg struct {
 }
 
 // inspectRestoreMsg carries the parent transcript to restore on exit,
-// plus the scroll state captured on entry.
+// plus the scroll state captured on entry. seq is the exit transition
+// the fetch started under; a later transition makes it stale.
 type inspectRestoreMsg struct {
+	seq        int
 	sessionID  string
 	messages   []message.Message
 	scrollIdx  int
 	scrollLine int
 	follow     bool
+}
+
+// inspectWindow holds one in-flight inspect transition: the seq it was
+// issued under, the session whose snapshot will paint the chat, and the
+// message events published while the fetch ran. Buffering the target's
+// events closes the enter/exit snapshot race (#406): nothing is painted
+// into a transcript the snapshot is about to replace, and events the
+// snapshot cannot contain are replayed on top of it.
+type inspectWindow struct {
+	seq       int
+	sessionID string
+	events    []pubsub.Event[message.Message]
+}
+
+// inspectFetchFailedMsg reports a failed inspect transition fetch. seq
+// matches it against the pending window, so a superseded failure can
+// never clear a live one.
+type inspectFetchFailedMsg struct {
+	seq int
+	err error
 }
 
 // isInspecting reports whether the UI is currently viewing a sub-agent
@@ -79,16 +102,18 @@ func (m *UI) inspectingSessionID() string {
 // clearInspectState drops the inspect state. Called whenever the active
 // session changes underneath inspect mode (session switch, new session)
 // or the view leaves, so it never claims to inspect a session it is not
-// showing. Bumping inspectSeq drops any child load still in flight. The
-// chat's read-only flag goes off with it (#407): every transcript rebuilt
-// after a clear is the parent's — or the landing screen's — and must be
-// interactive again.
+// showing. Bumping inspectSeq drops any child load still in flight, and
+// with it the transition's buffered events. The chat's read-only flag
+// goes off with it (#407): every transcript rebuilt after a clear is
+// the parent's — or the landing screen's — and must be interactive
+// again.
 func (m *UI) clearInspectState() {
 	m.inspecting = nil
 	m.inspectRing = nil
 	m.inspectRingPos = 0
 	m.inspectDispatchTargets = nil
 	m.inspectSeq++
+	m.inspectWindow = nil
 	m.chat.SetA2UIReadOnly(false)
 }
 
@@ -194,20 +219,28 @@ func (m *UI) takeInspectPending(loadedID string) *session.Session {
 	return pending
 }
 
-// handleInspectKeys routes ctrl+], ctrl+[ and ctrl+x (#314, #373). It
-// runs after the dialog routing in handleKeyPressMsg, so open dialogs
-// keep their keys, and before every other handler, so the bindings work
-// from both editor and chat focus. ctrl+] drills in, ctrl+[ leaves
-// inspect mode, and ctrl+x cancels the dispatch being viewed (or the
-// selected live dispatch card in the chat). Esc and every other key
-// fall through untouched, except where Esc is ctrl+[ (escIsInspectBack).
+// handleInspectKeys routes ctrl+], esc/ctrl+[ and ctrl+x (#314, #373,
+// #404). It runs after the dialog routing in handleKeyPressMsg, so open
+// dialogs keep their keys, and before every other handler, so the
+// bindings work from both editor and chat focus. ctrl+] drills in, esc
+// or ctrl+[ leaves inspect mode on every terminal, and ctrl+x cancels
+// the dispatch being viewed (or the selected live dispatch card in the
+// chat). Esc means "back" only inside inspect mode; outside it falls
+// through untouched and keeps its chat-cancel meaning, as does every
+// other key.
 func (m *UI) handleInspectKeys(msg tea.KeyPressMsg) (handled bool, cmd tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keyMap.InspectDrill):
 		return true, m.handleInspectDrill()
-	case key.Matches(msg, m.keyMap.InspectBack), m.escIsInspectBack(msg):
+	case key.Matches(msg, m.keyMap.InspectBack):
 		if !m.isInspecting() {
 			return false, nil
+		}
+		// Leaving from the editor drops any @ completion popup open over
+		// the input: its own close key is esc, which this press no longer
+		// reaches.
+		if m.completionsOpen {
+			m.closeCompletions()
 		}
 		return true, m.exitInspect()
 	case key.Matches(msg, m.keyMap.CancelAgent):
@@ -217,16 +250,6 @@ func (m *UI) handleInspectKeys(msg tea.KeyPressMsg) (handled bool, cmd tea.Cmd) 
 		return false, nil
 	}
 	return false, nil
-}
-
-// escIsInspectBack reports whether an esc press is really ctrl+[. A
-// terminal without key disambiguation sends the same byte for both, so
-// there ctrl+[ only ever arrives as esc; read as esc it reaches the
-// cancel handler, and a second press would cancel the parent's run.
-// Terminals that tell the two apart keep esc's own meaning.
-func (m *UI) escIsInspectBack(msg tea.KeyPressMsg) bool {
-	return msg.Code == tea.KeyEscape && msg.Mod == 0 &&
-		!m.keyenh.SupportsKeyDisambiguation()
 }
 
 // handleInspectDrill implements ctrl+]: while inspecting, cycle to the
@@ -285,35 +308,42 @@ func (m *UI) cycleInspectAgent() tea.Cmd {
 
 // loadInspectSession fetches a child session and its transcript
 // off-thread and returns a command delivering inspectSessionLoadedMsg.
-// Each call supersedes the loads before it: only the latest one lands,
-// so rapid cycling settles on the last press and the ring position
-// always names the session on screen.
+// Each call opens a transition window targeting sessionID: events
+// published for it while the fetch runs are buffered and replayed when
+// the snapshot lands, closing the entry race (#406). Each call
+// supersedes the loads before it: only the latest one lands, so rapid
+// cycling settles on the last press and the ring position always names
+// the session on screen.
 func (m *UI) loadInspectSession(sessionID string) tea.Cmd {
 	m.inspectSeq++
 	seq := m.inspectSeq
+	m.inspectWindow = &inspectWindow{seq: seq, sessionID: sessionID}
 	ws := m.com.Workspace
 	return func() tea.Msg {
 		sess, err := ws.GetSession(context.Background(), sessionID)
 		if err != nil {
-			return util.NewErrorMsg(err)
+			return inspectFetchFailedMsg{seq: seq, err: err}
 		}
 		msgs, err := ws.ListMessages(context.Background(), sessionID)
 		if err != nil {
-			return util.NewErrorMsg(err)
+			return inspectFetchFailedMsg{seq: seq, err: err}
 		}
 		return inspectSessionLoadedMsg{seq: seq, sess: &sess, messages: msgs}
 	}
 }
 
-// handleInspectLoaded swaps the chat over to the child transcript. The
-// active session, sidebar, prompt queue, prompt history, and every other
-// active-session concern keep pointing at the parent: this handler only
-// touches the chat view.
+// handleInspectLoaded swaps the chat over to the child transcript, then
+// replays the events buffered while the fetch ran on top of it (#406).
+// The active session, sidebar, prompt queue, prompt history, and every
+// other active-session concern keep pointing at the parent: this
+// handler only touches the chat view.
 func (m *UI) handleInspectLoaded(msg inspectSessionLoadedMsg) tea.Cmd {
-	if msg.seq != m.inspectSeq {
+	if m.inspectWindow == nil || msg.seq != m.inspectWindow.seq {
 		// Superseded by a later cycle, ctrl+[, or session switch.
 		return nil
 	}
+	buffer := m.inspectWindow.events
+	m.inspectWindow = nil
 	m.inspecting = msg.sess
 
 	// Liveness comes from the ring captured off the parent's blocks at
@@ -330,6 +360,11 @@ func (m *UI) handleInspectLoaded(msg inspectSessionLoadedMsg) tea.Cmd {
 		// gates the animation clock on the parent's busy state.
 		m.chat.SetAnimationsAllowed(true)
 	}
+	for _, event := range buffer {
+		if replayed := m.upsertSessionMessage(event); replayed != nil {
+			cmd = tea.Batch(cmd, replayed)
+		}
+	}
 	// Start at the end of the transcript and follow the stream: a live
 	// child keeps the view pinned to the bottom as messages land.
 	m.chat.ScrollToBottom()
@@ -341,18 +376,25 @@ func (m *UI) handleInspectLoaded(msg inspectSessionLoadedMsg) tea.Cmd {
 // exitInspect leaves inspect mode: it reloads the parent transcript
 // off-thread (the parent may have streamed messages while its blocks
 // were not on screen) and restores the scroll state captured on entry.
-// Clearing the inspect state drops any child load still in flight.
+// Clearing the inspect state drops any child load still in flight; a
+// fresh window then buffers parent events until the restore lands, so
+// nothing is painted into the child transcript it is about to replace
+// (#406).
 func (m *UI) exitInspect() tea.Cmd {
 	m.clearInspectState()
 	scroll, follow := m.inspectScroll, m.inspectFollow
 	parentID := m.currentSessionID()
+	m.inspectSeq++
+	seq := m.inspectSeq
+	m.inspectWindow = &inspectWindow{seq: seq, sessionID: parentID}
 	ws := m.com.Workspace
 	return func() tea.Msg {
 		msgs, err := ws.ListMessages(context.Background(), parentID)
 		if err != nil {
-			return util.NewErrorMsg(err)
+			return inspectFetchFailedMsg{seq: seq, err: err}
 		}
 		return inspectRestoreMsg{
+			seq:        seq,
 			sessionID:  parentID,
 			messages:   msgs,
 			scrollIdx:  scroll[0],
@@ -362,17 +404,28 @@ func (m *UI) exitInspect() tea.Cmd {
 	}
 }
 
-// handleInspectRestore swaps the parent transcript back in and restores
-// the captured scroll state: a parent that was following the stream
-// comes back at the bottom, still following; otherwise the captured
-// position, clamped to whatever the reloaded transcript can honor. A
-// restore that lands after a re-entry, or after the active session
-// changed, would paint the wrong transcript and is dropped.
+// handleInspectRestore swaps the parent transcript back in, replays
+// the parent events buffered while the fetch ran on top of it (#406),
+// and restores the captured scroll state: a parent that was following
+// the stream comes back at the bottom, still following; otherwise the
+// captured position, clamped to whatever the reloaded transcript can
+// honor. A restore that lands after a re-entry, or after the active
+// session changed, would paint the wrong transcript and is dropped.
 func (m *UI) handleInspectRestore(msg inspectRestoreMsg) tea.Cmd {
 	if m.isInspecting() || msg.sessionID != m.currentSessionID() {
 		return nil
 	}
+	if m.inspectWindow == nil || msg.seq != m.inspectWindow.seq {
+		return nil
+	}
+	buffer := m.inspectWindow.events
+	m.inspectWindow = nil
 	cmds := []tea.Cmd{m.setSessionMessages(msg.messages)}
+	for _, event := range buffer {
+		if cmd := m.upsertSessionMessage(event); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
 	if msg.follow {
 		cmds = append(cmds, m.chat.ScrollToBottom())
 	} else {
@@ -400,6 +453,42 @@ func (m *UI) handleInspectChildMessage(event pubsub.Event[message.Message]) tea.
 	return nil
 }
 
+// upsertSessionMessage applies one message event buffered during an
+// inspect transition on top of the snapshot that just landed (#406): a
+// create for a message the snapshot already carries updates it, an
+// update for one it never saw appends it, and a delete removes it. It
+// reuses the live session-message pipeline so replayed messages render
+// exactly like streamed ones.
+func (m *UI) upsertSessionMessage(event pubsub.Event[message.Message]) tea.Cmd {
+	present := m.chat.MessageItem(event.Payload.ID) != nil
+	switch event.Type {
+	case pubsub.CreatedEvent:
+		if present {
+			return m.updateSessionMessage(event.Payload)
+		}
+		return m.appendSessionMessage(event.Payload)
+	case pubsub.UpdatedEvent:
+		if present {
+			return m.updateSessionMessage(event.Payload)
+		}
+		return m.appendSessionMessage(event.Payload)
+	case pubsub.DeletedEvent:
+		m.chat.RemoveMessage(event.Payload.ID)
+	}
+	return nil
+}
+
+// handleInspectFetchFailed closes the pending transition window on a
+// failed fetch, so later events apply normally and the next drill-in
+// starts clean. A superseded failure is dropped with its transition.
+func (m *UI) handleInspectFetchFailed(msg inspectFetchFailedMsg) tea.Cmd {
+	if m.inspectWindow == nil || msg.seq != m.inspectWindow.seq {
+		return nil
+	}
+	m.inspectWindow = nil
+	return util.ReportError(msg.err)
+}
+
 // inspectPlaceholder renders the editor placeholder shown while
 // inspecting: a persistent reminder of what is on screen, where prompts
 // land, and how to leave. The title is what gets truncated, so the way
@@ -414,7 +503,7 @@ func (m *UI) inspectPlaceholder() string {
 		pos = fmt.Sprintf(" (%d/%d)", m.inspectRingPos+1, len(m.inspectRing))
 	}
 	const prefix = "Inspecting "
-	suffix := pos + " · ctrl+[ returns · prompts go to the parent"
+	suffix := pos + " · esc returns · prompts go to the parent"
 	width := m.textarea.Width() - 1
 	if width <= 0 {
 		width = inspectPlaceholderWidth

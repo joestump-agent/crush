@@ -403,3 +403,38 @@ func TestOption_TodoDispatchUnknownKey(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unknown key")
 }
+
+func TestOption_DispatchMaxConcurrent(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	script := `option dispatch-max-concurrent 3`
+	path := filepath.Join(dir, "crushrc")
+
+	jsonBytes, err := LoadShellConfig(t.Context(), path, []byte(script))
+	require.NoError(t, err)
+
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(jsonBytes, &result))
+
+	opts := result["options"].(map[string]any)
+	dispatch := opts["dispatch"].(map[string]any)
+	require.Equal(t, float64(3), dispatch["max_concurrent"])
+}
+
+func TestOption_DispatchMaxConcurrentInvalid(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "crushrc")
+
+	for _, script := range []string{
+		"option dispatch-max-concurrent 0",
+		"option dispatch-max-concurrent -1",
+		"option dispatch-max-concurrent soon",
+	} {
+		_, err := LoadShellConfig(t.Context(), path, []byte(script))
+		require.Error(t, err, "script: %s", script)
+		require.Contains(t, err.Error(), "dispatch-max-concurrent", "script: %s", script)
+	}
+}

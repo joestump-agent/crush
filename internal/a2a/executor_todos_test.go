@@ -178,14 +178,24 @@ func TestExecuteTodoHappyPath(t *testing.T) {
 
 		first := statusUpdate(t, evs[2])
 		require.Equal(t, "reading the code", statusMessageText(t, evs[2]))
-		require.Equal(t, []any{
-			map[string]any{"content": "read the code", "status": string(session.TodoStatusInProgress), "active_form": "reading the code"},
-			map[string]any{"content": "write the fix", "status": string(session.TodoStatusPending), "active_form": ""},
-		}, first.Meta()[todoMetadataKey])
+		progress, err := Decode[agent.TodoProgress](first.Meta(), TodoExt)
+		require.NoError(t, err)
+		require.Equal(t, agent.TodoProgress{
+			Current:   "reading the code",
+			Completed: 0,
+			Total:     2,
+			Todos: []agent.TodoItem{
+				{Content: "read the code", Status: string(session.TodoStatusInProgress), ActiveForm: "reading the code"},
+				{Content: "write the fix", Status: string(session.TodoStatusPending), ActiveForm: ""},
+			},
+		}, progress)
 
 		second := statusUpdate(t, evs[3])
 		require.Equal(t, "writing the fix", statusMessageText(t, evs[3]))
-		require.Len(t, second.Meta()[todoMetadataKey], 2)
+		secondProgress, err := Decode[*agent.TodoProgress](second.Meta(), TodoExt)
+		require.NoError(t, err)
+		require.Len(t, secondProgress.Todos, 2)
+		require.Equal(t, string(session.TodoStatusCompleted), secondProgress.Todos[0].Status)
 
 		// The subscription ended with the run.
 		require.Eventually(t, source.subscriptionCanceled, 5*time.Second, 10*time.Millisecond)

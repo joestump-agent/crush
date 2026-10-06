@@ -67,6 +67,9 @@ func BuildAgentCard(p CardParams) *a2aspec.AgentCard {
 		Capabilities: a2aspec.AgentCapabilities{
 			// Dispatched agents stream todo/progress updates over SSE.
 			Streaming: true,
+			// Declared A2A extensions (#359): the metadata the
+			// TaskStatusUpdateEvents carry, with their schemas.
+			Extensions: cardExtensions(),
 		},
 		DefaultInputModes:  defaultInputModes,
 		DefaultOutputModes: defaultOutputModes,

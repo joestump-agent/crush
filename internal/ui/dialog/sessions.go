@@ -42,8 +42,14 @@ type Session struct {
 	sessions           []session.Session
 	// children maps a parent session ID to its inspectable sub-agent
 	// task sessions (#314). They nest under their parent through the
-	// same sub-menu pattern the commands dialog uses.
+	// same sub-menu pattern the commands dialog uses. It starts empty:
+	// the batch is fetched off the Update loop (#409) and applied by
+	// SetChildren once it lands.
 	children map[string][]session.Session
+	// childrenLoaded reports whether the child-session batch has
+	// landed. Until it has, ctrl+] reports "Loading" instead of
+	// "no sub-agent sessions" — empty means unknown, not none.
+	childrenLoaded bool
 
 	// menuStack / breadcrumb implement the sub-menu: one level per
 	// entered parent, mirroring dialog/commands.go.
@@ -90,22 +96,10 @@ func NewSessions(com *common.Common, selectedSessionID string) (*Session, error)
 		return nil, err
 	}
 
-	// Fetch the inspectable sub-agent children of every session (#314)
-	// so parents can offer a nested sub-menu. Only agent-tool task
-	// sessions qualify: their IDs carry the "messageID$$toolCallID"
-	// shape, which excludes the title-generation helper sessions.
+	// Sub-agent children are fetched in one batch off the Update loop
+	// (#409) and applied by SetChildren when the model receives the
+	// result, so opening the picker stays synchronous-fetch free.
 	s.children = make(map[string][]session.Session)
-	for _, sess := range sessions {
-		kids, err := com.Workspace.ListChildSessions(context.TODO(), sess.ID)
-		if err != nil {
-			continue
-		}
-		for _, kid := range kids {
-			if _, _, ok := com.Workspace.ParseAgentToolSessionID(kid.ID); ok {
-				s.children[sess.ID] = append(s.children[sess.ID], kid)
-			}
-		}
-	}
 
 	s.sessions = sessions
 	for i, sess := range sessions {
@@ -260,6 +254,11 @@ func (s *Session) HandleMsg(msg tea.Msg) Action {
 				// task sessions are one chord away (#314).
 				if item := s.list.SelectedItem(); item != nil {
 					sessionItem := item.(*SessionItem)
+					if !s.childrenLoaded {
+						// The batch is still in flight (#409): empty
+						// means unknown, not none.
+						return ActionCmd{util.ReportInfo("Loading sub-agent sessions…")}
+					}
 					if len(s.children[sessionItem.Session.ID]) == 0 {
 						return ActionCmd{util.ReportInfo("No sub-agent sessions to inspect")}
 					}
@@ -334,6 +333,41 @@ func (s *Session) rebuildItems() {
 // under the given session (#314).
 func (s *Session) childCount(id string) int {
 	return len(s.children[id])
+}
+
+// ChildrenLoaded reports whether the child-session batch has landed
+// (#409). Until it has, ctrl+] reports "Loading" rather than offering an
+// empty sub-menu.
+func (s *Session) ChildrenLoaded() bool {
+	return s.childrenLoaded
+}
+
+// SetChildren applies the child-session batch fetched off the Update
+// loop (#409). It groups the sessions by their parent, keeps only
+// inspectable agent-tool task sessions (IDs carrying the
+// "messageID$$toolCallID" shape, which excludes the title-generation
+// helper sessions — the same filter the constructor applied before
+// #409), and refreshes the row counts in place so the filter text,
+// selection and scroll all survive the batch landing.
+func (s *Session) SetChildren(all []session.Session) {
+	byParent := make(map[string][]session.Session)
+	for _, kid := range all {
+		if _, _, ok := s.com.Workspace.ParseAgentToolSessionID(kid.ID); ok {
+			byParent[kid.ParentSessionID] = append(byParent[kid.ParentSessionID], kid)
+		}
+	}
+	s.children = byParent
+	s.childrenLoaded = true
+
+	for _, item := range s.list.Items() {
+		if si, ok := item.(*SessionItem); ok && !si.child {
+			si.SetAgentCount(len(s.children[si.Session.ID]))
+		}
+	}
+	// A sub-menu open before the batch landed snapshots the parent
+	// rows; they are the same pointers, so counts on the snapshot
+	// refresh with the walk above. Nothing else to do: the FilterableList
+	// re-derives its visible items from the same pointers each frame.
 }
 
 // inSubMenu reports whether the dialog is currently inside a sub-menu.

@@ -50,6 +50,33 @@ func TestBuildAgentCard(t *testing.T) {
 	require.NotEmpty(t, first.Tags, "A2A requires a non-empty tags list")
 }
 
+// The card declares the registry's extensions (#359): one entry per
+// registered extension, optional, with the JSON Schema discoverable in the
+// params so third-party clients can negotiate and validate the metadata.
+func TestBuildAgentCardDeclaresExtensions(t *testing.T) {
+	t.Parallel()
+
+	card := BuildAgentCard(CardParams{
+		Agent:    config.Agent{Name: "worker"},
+		Endpoint: "http://127.0.0.1:9000",
+	})
+
+	require.Len(t, card.Capabilities.Extensions, len(Registered()))
+	byURI := make(map[string]a2aspec.AgentExtension, len(card.Capabilities.Extensions))
+	for _, ext := range card.Capabilities.Extensions {
+		byURI[ext.URI] = ext
+	}
+	todoExt, ok := byURI[TodoExtensionURI]
+	require.True(t, ok, "the todos/v1 extension is declared on the card")
+	require.False(t, todoExt.Required)
+	require.Equal(t, TodoExt.Description, todoExt.Description)
+	require.Contains(t, todoExt.Params, "schema")
+	schema, ok := todoExt.Params["schema"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "#/$defs/TodoProgress", schema["$ref"], "the schema describes the TodoProgress object")
+	require.Contains(t, schema, "$defs")
+}
+
 func TestBuildAgentCardDefaultTransport(t *testing.T) {
 	t.Parallel()
 

@@ -11,12 +11,14 @@ package model
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 
@@ -54,15 +56,19 @@ type inspectWorkspace struct {
 	sessions map[string]session.Session
 	messages map[string][]message.Message
 
-	getSessions  []string
-	listMessages []string
-	agentRuns    []string
+	getSessions      []string
+	listMessages     []string
+	agentRuns        []string
+	agentCancels     []string
+	agentClearQueues []string
+	listFailures     map[string]bool
 }
 
 func newInspectWorkspace() *inspectWorkspace {
 	return &inspectWorkspace{
-		sessions: map[string]session.Session{},
-		messages: map[string][]message.Message{},
+		sessions:     map[string]session.Session{},
+		messages:     map[string][]message.Message{},
+		listFailures: map[string]bool{},
 	}
 }
 
@@ -77,6 +83,9 @@ func (w *inspectWorkspace) GetSession(_ context.Context, id string) (session.Ses
 
 func (w *inspectWorkspace) ListMessages(_ context.Context, id string) ([]message.Message, error) {
 	w.listMessages = append(w.listMessages, id)
+	if w.listFailures[id] {
+		return nil, fmt.Errorf("list %q failed", id)
+	}
 	return w.messages[id], nil
 }
 
@@ -101,6 +110,14 @@ func (w *inspectWorkspace) SetCurrentSession(context.Context, string) error { re
 func (w *inspectWorkspace) AgentRun(_ context.Context, sessionID, _ string, _ ...message.Attachment) error {
 	w.agentRuns = append(w.agentRuns, sessionID)
 	return nil
+}
+
+func (w *inspectWorkspace) AgentCancel(sessionID string) {
+	w.agentCancels = append(w.agentCancels, sessionID)
+}
+
+func (w *inspectWorkspace) AgentClearQueue(sessionID string) {
+	w.agentClearQueues = append(w.agentClearQueues, sessionID)
 }
 
 func (w *inspectWorkspace) AgentIsReady() bool                               { return true }
@@ -180,7 +197,7 @@ func runInspectCmds(m *UI, cmd tea.Cmd) {
 		for _, c := range msg {
 			runInspectCmds(m, c)
 		}
-	case inspectSessionLoadedMsg, inspectRestoreMsg, loadSessionMsg:
+	case inspectSessionLoadedMsg, inspectRestoreMsg, inspectFetchFailedMsg, loadSessionMsg:
 		_, next := m.Update(msg)
 		runInspectCmds(m, next)
 	}
@@ -491,8 +508,8 @@ func TestSessionSwitchClearsInspect(t *testing.T) {
 	require.Equal(t, next.ID, m.session.ID)
 }
 
-// TestInspectKeyBindings pins the binding surface: ctrl+] and ctrl+[ are
-// bound, and Esc is not part of inspect mode's bindings.
+// TestInspectKeyBindings pins the binding surface: ctrl+] drills in,
+// esc and ctrl+[ go back, and esc is not part of the drill-in binding.
 func TestInspectKeyBindings(t *testing.T) {
 	km := DefaultKeyMap()
 	require.True(t, matchesCtrl(km.InspectDrill, ']'))
@@ -500,8 +517,9 @@ func TestInspectKeyBindings(t *testing.T) {
 	require.False(t, matchesCtrl(km.InspectDrill, '['))
 	require.False(t, matchesCtrl(km.InspectBack, ']'))
 	require.False(t, key.Matches(tea.KeyPressMsg{Code: tea.KeyEscape}, km.InspectDrill),
-		"esc must stay out of inspect mode's bindings")
-	require.False(t, key.Matches(tea.KeyPressMsg{Code: tea.KeyEscape}, km.InspectBack))
+		"esc must stay out of inspect mode's drill-in binding")
+	require.True(t, key.Matches(tea.KeyPressMsg{Code: tea.KeyEscape}, km.InspectBack),
+		"esc is the back key on every terminal")
 }
 
 func matchesCtrl(b key.Binding, r rune) bool {
@@ -512,31 +530,161 @@ func parentMessageID(i int) string {
 	return "p" + strconv.Itoa(i)
 }
 
-// TestInspectEscIsBackOnLegacyTerminals pins ctrl+[ on terminals without
-// key disambiguation, which send it as the same byte as esc: while
-// inspecting, that esc must leave inspect mode instead of reaching the
-// cancel handler, where a second press cancels the parent's run. A
-// terminal that tells the two keys apart keeps esc's own meaning.
-func TestInspectEscIsBackOnLegacyTerminals(t *testing.T) {
+// TestInspectEscAlwaysLeaves pins the #404 decision: esc and ctrl+[
+// leave inspect mode on one press, on every terminal, whatever the
+// terminal reports for key disambiguation and whatever the parent's
+// queue holds, and the press that leaves never cancels or clears the
+// parent.
+func TestInspectEscAlwaysLeaves(t *testing.T) {
+	sequences := []struct {
+		name string
+		raw  string
+	}{
+		{"legacy esc", "\x1b"},
+		{"kitty esc", "\x1b[27u"},
+		{"kitty ctrl+[", "\x1b[91;5u"},
+		{"otherkeys ctrl+[", "\x1b[27;5;91~"},
+	}
+	keyMsg := func(t *testing.T, raw string) tea.KeyPressMsg {
+		t.Helper()
+		var decoder uv.EventDecoder
+		n, ev := decoder.Decode([]byte(raw))
+		require.Equal(t, len(raw), n, "decoding %q", raw)
+		kpe, ok := ev.(uv.KeyPressEvent)
+		require.True(t, ok, "decoding %q must yield a key press", raw)
+		return tea.KeyPressMsg(kpe)
+	}
+	setup := func(t *testing.T, flags, promptQueue int) (*UI, *inspectWorkspace) {
+		t.Helper()
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		m.keyenh = tea.KeyboardEnhancementsMsg{Flags: flags}
+		m.agentReady = true
+		m.agentBusyCache.val = true
+		m.promptQueue = promptQueue
+		addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+		runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+		require.True(t, m.isInspecting())
+		return m, ws
+	}
+
+	for _, flags := range []int{0, 1} {
+		for _, promptQueue := range []int{0, 2} {
+			for _, seq := range sequences {
+				t.Run(fmt.Sprintf("flags=%d queue=%d %s", flags, promptQueue, seq.name), func(t *testing.T) {
+					m, ws := setup(t, flags, promptQueue)
+
+					_, cmd := m.Update(keyMsg(t, seq.raw))
+					runInspectCmds(m, cmd)
+					require.False(t, m.isInspecting(),
+						"one press of %s must leave inspect mode", seq.name)
+					require.Empty(t, ws.agentCancels, "a back press must never cancel the parent")
+					require.Empty(t, ws.agentClearQueues, "a back press must never clear the parent's queue")
+					require.False(t, m.isCanceling, "a back press must not arm the parent's cancel")
+				})
+			}
+		}
+	}
+
+	t.Run("alt+esc never cancels the parent from inspect mode", func(t *testing.T) {
+		m, ws := setup(t, 0, 2)
+
+		for i := 0; i < 3; i++ {
+			_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape, Mod: tea.ModAlt})
+			runInspectCmds(m, cmd)
+		}
+		require.True(t, m.isInspecting(), "alt+esc is not the back key")
+		require.Empty(t, ws.agentCancels, "alt+esc must never cancel the parent")
+		require.Empty(t, ws.agentClearQueues, "alt+esc must never clear the parent's queue")
+		require.False(t, m.isCanceling, "alt+esc must not arm the parent's cancel")
+	})
+
+	t.Run("outside inspect mode esc still arms the cancel", func(t *testing.T) {
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		m.agentReady = true
+		m.agentBusyCache.val = true
+
+		_, cmd := m.Update(keyMsg(t, "\x1b"))
+		runInspectCmds(m, cmd)
+		require.False(t, m.isInspecting())
+		require.True(t, m.isCanceling, "outside inspect mode the first esc must arm the cancel")
+		require.Empty(t, ws.agentCancels, "arming is not canceling")
+	})
+}
+
+// escCloseDialog is the minimal dialog that closes on esc, for pinning
+// key routing order.
+type escCloseDialog struct{ closed bool }
+
+func (d *escCloseDialog) ID() string { return "test-esc-close" }
+
+func (d *escCloseDialog) HandleMsg(msg tea.Msg) dialog.Action {
+	if msg, ok := msg.(tea.KeyPressMsg); ok && key.Matches(msg, dialog.CloseKey) {
+		d.closed = true
+		return dialog.ActionClose{}
+	}
+	return nil
+}
+
+func (d *escCloseDialog) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor { return nil }
+
+// TestDialogKeepsEscOverInspect pins the routing order (#404): an open
+// dialog receives esc before inspect mode does, so closing the dialog
+// leaves the inspect view in place.
+func TestDialogKeepsEscOverInspect(t *testing.T) {
 	ws := newInspectWorkspace()
 	m := newInspectUI(t, ws)
 	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
-
 	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
 	require.True(t, m.isInspecting())
+
+	d := &escCloseDialog{}
+	m.dialog.OpenDialog(d)
+	require.True(t, m.dialog.HasDialogs())
 
 	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	runInspectCmds(m, cmd)
-	require.False(t, m.isInspecting(),
-		"ctrl+[ arrives as esc on a legacy terminal and must leave inspect mode")
-	require.False(t, m.isCanceling, "the back press must not arm the parent's cancel")
+	require.True(t, d.closed, "the open dialog must take esc first")
+	require.False(t, m.dialog.HasDialogs())
+	require.True(t, m.isInspecting(), "closing the dialog must not leave inspect mode")
+	require.False(t, m.isCanceling)
+}
 
-	m.keyenh = tea.KeyboardEnhancementsMsg{Flags: 1}
+// TestInspectHidesEscCancelHelp pins the help bar (#404): while
+// inspecting, the esc cancel/clear-queue entry is hidden even when the
+// parent is busy, and it comes back once inspect mode is left.
+func TestInspectHidesEscCancelHelp(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	m.agentReady = true
+	m.agentBusyCache.val = true
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
 	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
 	require.True(t, m.isInspecting())
-	handled, _ := m.handleInspectKeys(tea.KeyPressMsg{Code: tea.KeyEscape})
-	require.False(t, handled, "with key disambiguation esc is not ctrl+[")
-	require.True(t, m.isInspecting())
+
+	require.NotContains(t, m.ShortHelp(), m.keyMap.Chat.Cancel,
+		"the esc cancel entry must be hidden while inspecting")
+	require.False(t, fullHelpHasBinding(m, m.keyMap.Chat.Cancel),
+		"the esc cancel entry must be hidden from the full help while inspecting")
+
+	runInspectCmds(m, m.exitInspect())
+	require.False(t, m.isInspecting())
+	require.Contains(t, m.ShortHelp(), m.keyMap.Chat.Cancel,
+		"the esc cancel entry returns once inspect mode is left")
+	require.True(t, fullHelpHasBinding(m, m.keyMap.Chat.Cancel),
+		"the esc cancel entry returns to the full help once inspect mode is left")
+}
+
+func fullHelpHasBinding(m *UI, b key.Binding) bool {
+	for _, row := range m.FullHelp() {
+		for _, got := range row {
+			if reflect.DeepEqual(got, b) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestInspectStaleLoadsAreDropped pins the async ordering of inspect
@@ -675,7 +823,7 @@ func TestPickerTaskSessionOpensUnderItsParent(t *testing.T) {
 }
 
 // TestInspectPlaceholderKeepsTheWayBack pins the editor hint: a long
-// child title is what gets truncated, never the ctrl+[ hint.
+// child title is what gets truncated, never the esc hint.
 func TestInspectPlaceholderKeepsTheWayBack(t *testing.T) {
 	ws := newInspectWorkspace()
 	m := newInspectUI(t, ws)
@@ -685,7 +833,7 @@ func TestInspectPlaceholderKeepsTheWayBack(t *testing.T) {
 
 	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
 	placeholder := m.inspectPlaceholder()
-	require.Contains(t, placeholder, "ctrl+[ returns")
+	require.Contains(t, placeholder, "esc returns")
 	require.LessOrEqual(t, ansi.StringWidth(placeholder), m.textarea.Width())
 }
 
@@ -740,4 +888,196 @@ func TestInitialTopLevelSessionLoadsActive(t *testing.T) {
 	require.Equal(t, otherID, m.session.ID, "a top-level session loads as active")
 	require.Equal(t, uiChat, m.state)
 	require.False(t, m.isInspecting())
+}
+
+// TestInspectExitBuffersLateParentCreate pins the exit half of the
+// snapshot race (#406): a parent message created after the exit's
+// snapshot read and before the restore lands must not paint into the
+// child transcript still on screen, and must survive the restore.
+func TestInspectExitBuffersLateParentCreate(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+	addParentTranscript(t, m, ws, 3)
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	require.True(t, m.isInspecting())
+
+	_, exit := m.handleInspectKeys(tea.KeyPressMsg{Code: '[', Mod: tea.ModCtrl})
+	restore, ok := exit().(inspectRestoreMsg)
+	require.True(t, ok)
+
+	late := message.Message{ID: "late", SessionID: inspectParentID, Role: message.User}
+	m.Update(pubsub.Event[message.Message]{Type: pubsub.CreatedEvent, Payload: late})
+	require.Nil(t, m.chat.MessageItem("late"),
+		"a parent message created during the exit window must not paint into the child view")
+
+	_, next := m.Update(restore)
+	runInspectCmds(m, next)
+	require.False(t, m.isInspecting())
+	require.NotNil(t, m.chat.MessageItem("late"),
+		"a parent message created after the snapshot read must survive the restore")
+	require.Equal(t, 4, m.chat.Len(),
+		"the restored transcript must hold the snapshot plus the late message exactly once")
+
+	m.Update(pubsub.Event[message.Message]{Type: pubsub.UpdatedEvent, Payload: late})
+	require.Equal(t, 4, m.chat.Len(), "a later update must not duplicate the late message")
+}
+
+// TestInspectExitReplaysUpdateForUnknownMessage pins the update-only
+// interleaving (#406): an UpdatedEvent for a message the restored
+// snapshot never carried appends it instead of dropping it.
+func TestInspectExitReplaysUpdateForUnknownMessage(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+	addParentTranscript(t, m, ws, 3)
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	_, exit := m.handleInspectKeys(tea.KeyPressMsg{Code: '[', Mod: tea.ModCtrl})
+	restore, ok := exit().(inspectRestoreMsg)
+	require.True(t, ok)
+
+	upd := message.Message{ID: "p9", SessionID: inspectParentID, Role: message.User}
+	m.Update(pubsub.Event[message.Message]{Type: pubsub.UpdatedEvent, Payload: upd})
+	require.Nil(t, m.chat.MessageItem("p9"))
+
+	_, next := m.Update(restore)
+	runInspectCmds(m, next)
+	require.NotNil(t, m.chat.MessageItem("p9"),
+		"an update for a message the snapshot missed must append it")
+	require.Equal(t, 4, m.chat.Len())
+}
+
+// TestInspectEntryBuffersLateChildCreate pins the entry half of the
+// snapshot race (#406): a child message created after the load's
+// snapshot read and before it lands is replayed onto the inspected view.
+func TestInspectEntryBuffersLateChildCreate(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+
+	load := m.enterInspect(agentBlockRef{sessionID: inspectChildID})
+	loaded, ok := load().(inspectSessionLoadedMsg)
+	require.True(t, ok)
+
+	clate := message.Message{ID: "clate", SessionID: inspectChildID, Role: message.User}
+	m.Update(pubsub.Event[message.Message]{Type: pubsub.CreatedEvent, Payload: clate})
+	require.Nil(t, m.chat.MessageItem("clate"),
+		"a child message created before the load lands must not paint yet")
+	require.False(t, m.isInspecting())
+
+	_, next := m.Update(loaded)
+	runInspectCmds(m, next)
+	require.True(t, m.isInspecting())
+	require.NotNil(t, m.chat.MessageItem("clate"),
+		"the late child message must be replayed onto the loaded transcript")
+	require.NotNil(t, m.chat.MessageItem("c1"))
+	require.Equal(t, 3, m.chat.Len(),
+		"the inspected view must hold the snapshot plus the late message exactly once")
+}
+
+// TestInspectReplayRendersSnapshotMessagesOnce pins the dedup rule
+// (#406): a message that is both in the snapshot and in the buffer
+// renders exactly once.
+func TestInspectReplayRendersSnapshotMessagesOnce(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+
+	load := m.enterInspect(agentBlockRef{sessionID: inspectChildID})
+	loaded, ok := load().(inspectSessionLoadedMsg)
+	require.True(t, ok)
+
+	c1 := message.Message{ID: "c1", SessionID: inspectChildID, Role: message.User}
+	m.Update(pubsub.Event[message.Message]{Type: pubsub.CreatedEvent, Payload: c1})
+
+	_, next := m.Update(loaded)
+	runInspectCmds(m, next)
+	require.True(t, m.isInspecting())
+	require.NotNil(t, m.chat.MessageItem("c1"))
+	require.Equal(t, 2, m.chat.Len(),
+		"a message both in the snapshot and the buffer must render exactly once")
+}
+
+// TestInspectSupersededTransitionDiscardsBuffer pins the supersession
+// rule (#406): a transition replaced by a later one drops its buffered
+// events and its snapshot, and the later transition owns the chat.
+func TestInspectSupersededTransitionDiscardsBuffer(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+	addParentTranscript(t, m, ws, 3)
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	require.True(t, m.isInspecting())
+
+	_, exit := m.handleInspectKeys(tea.KeyPressMsg{Code: '[', Mod: tea.ModCtrl})
+	staleRestore, ok := exit().(inspectRestoreMsg)
+	require.True(t, ok)
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	require.True(t, m.isInspecting(), "re-entering supersedes the exit window")
+
+	late := message.Message{ID: "late", SessionID: inspectParentID, Role: message.User}
+	m.Update(pubsub.Event[message.Message]{Type: pubsub.CreatedEvent, Payload: late})
+	require.Nil(t, m.chat.MessageItem("late"),
+		"parent events must not paint into the re-entered child view")
+
+	_, next := m.Update(staleRestore)
+	runInspectCmds(m, next)
+	require.True(t, m.isInspecting(), "a restore superseded by re-entry must be dropped")
+	require.Nil(t, m.chat.MessageItem(parentMessageID(0)),
+		"the superseded restore must not swap the parent transcript in")
+	require.NotNil(t, m.chat.MessageItem("c1"), "the child view stays")
+}
+
+// TestInspectFailedFetchClearsPendingWindow pins the failure rule
+// (#406): a failed fetch closes the pending window, so later events
+// apply normally and the next transition starts clean.
+func TestInspectFailedFetchClearsPendingWindow(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+	addParentTranscript(t, m, ws, 3)
+
+	load := m.enterInspect(agentBlockRef{sessionID: "missing$$call"})
+	failed, ok := load().(inspectFetchFailedMsg)
+	require.True(t, ok)
+	_, next := m.Update(failed)
+	runInspectCmds(m, next)
+	require.Nil(t, m.inspectWindow, "a failed fetch must clear the pending window")
+
+	after := message.Message{ID: "after", SessionID: inspectParentID, Role: message.User}
+	m.Update(pubsub.Event[message.Message]{Type: pubsub.CreatedEvent, Payload: after})
+	require.NotNil(t, m.chat.MessageItem("after"),
+		"events must apply normally once the window is closed")
+}
+
+// TestInspectFailedExitClearsPendingWindow pins the same rule for the
+// exit transition: a failed restore fetch clears the window, and a
+// later exit still restores the parent transcript.
+func TestInspectFailedExitClearsPendingWindow(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+	addParentTranscript(t, m, ws, 3)
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	_, exit := m.handleInspectKeys(tea.KeyPressMsg{Code: '[', Mod: tea.ModCtrl})
+	ws.listFailures[inspectParentID] = true
+	failed, ok := exit().(inspectFetchFailedMsg)
+	require.True(t, ok)
+	_, next := m.Update(failed)
+	runInspectCmds(m, next)
+	require.Nil(t, m.inspectWindow, "a failed restore fetch must clear the pending window")
+
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	require.True(t, m.isInspecting(), "a failed exit must not block the next drill-in")
+	_, exit2 := m.handleInspectKeys(tea.KeyPressMsg{Code: '[', Mod: tea.ModCtrl})
+	delete(ws.listFailures, inspectParentID)
+	runInspectCmds(m, exit2)
+	require.False(t, m.isInspecting())
+	require.NotNil(t, m.chat.MessageItem(parentMessageID(0)),
+		"a later exit must restore the parent transcript")
 }

@@ -279,6 +279,10 @@ type coordinator struct {
 	// sessionAgent.CancelAll's own bound; tests shorten them.
 	dispatchShutdownWait     time.Duration
 	dispatchShutdownRootWait time.Duration
+	// dispatchSlots counts the dispatch slots currently held (#390):
+	// setups in flight plus live dispatches, capped by the resolved
+	// dispatch.max_concurrent. Guarded by dispatchMu.
+	dispatchSlots int
 	// dispatchCtx is the NewCoordinator context the collector's
 	// subscriptions run on; nil-safe (tests construct the coordinator
 	// struct directly) — dispatchWorkspaceProvider falls back to

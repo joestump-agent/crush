@@ -88,6 +88,14 @@ func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
 	require.Equal(t, "done, two files changed", outcome.Text)
 	require.Contains(t, outcome.Diff, "+++ b/x")
 	require.Equal(t, 2, outcome.WorkingEvents, "the SSE stream carried the initial Working plus exactly one todo progress event")
+
+	// The typed todo progress (#359) rode the wire under the declared
+	// todos/v1 extension and decoded onto the outcome.
+	require.NotNil(t, outcome.TodoProgress)
+	require.Equal(t, "wiring form validation", outcome.TodoProgress.Current)
+	require.Equal(t, 1, outcome.TodoProgress.Total)
+	require.Len(t, outcome.TodoProgress.Todos, 1)
+	require.Equal(t, "wiring form validation", outcome.TodoProgress.Todos[0].Content)
 }
 
 // A dispatch with no todo source carries exactly the executor's initial
@@ -112,10 +120,10 @@ func TestStreamDispatchWithoutTodosSingleWorking(t *testing.T) {
 }
 
 // The todo progress event survives the wire as the client receives it
-// (#425): exactly one Working TaskStatusUpdateEvent carries the
-// structured snapshot under the "todos" metadata key, its message is the
-// in-progress todo's active form, and the metadata decodes to the
-// JSON-shaped values after the round trip.
+// (#425): exactly one Working TaskStatusUpdateEvent carries the typed
+// progress under the declared todos/v1 extension's URI, its message is
+// the in-progress todo's active form, and the metadata decodes onto the
+// outcome.
 func TestStreamDispatchTodoEventOnWire(t *testing.T) {
 	runner := newPacedRunner("done")
 	source := newPipeTodoSource()
@@ -164,7 +172,7 @@ func TestStreamDispatchTodoEventOnWire(t *testing.T) {
 		switch e := ev.(type) {
 		case *a2aspec.TaskStatusUpdateEvent:
 			terminal = e.Status.State
-			if e.Status.State == a2aspec.TaskStateWorking && e.Meta()[todoMetadataKey] != nil {
+			if e.Status.State == a2aspec.TaskStateWorking && e.Meta()[TodoExt.URI] != nil {
 				todoUpdates = append(todoUpdates, e)
 			}
 		case *a2aspec.Task:
@@ -172,12 +180,71 @@ func TestStreamDispatchTodoEventOnWire(t *testing.T) {
 		}
 	}
 	require.Equal(t, a2aspec.TaskStateCompleted, terminal)
-	require.Len(t, todoUpdates, 1, "exactly one Working event carries the todo metadata")
+	require.Len(t, todoUpdates, 1, "exactly one Working event carries the typed todo progress")
 	todo := todoUpdates[0]
 	require.Equal(t, "wiring form validation", statusMessageText(t, todo))
-	require.Equal(t, []any{
-		map[string]any{"content": "wiring form validation", "status": string(session.TodoStatusInProgress), "active_form": "wiring form validation"},
-	}, todo.Meta()[todoMetadataKey])
+	// The typed payload decodes onto the outcome through the same path
+	// the client takes.
+	decoder := newMetadataDecoder(server.Card)
+	var outcome agent.DispatchTransportOutcome
+	decoder.apply(&outcome, todo)
+	require.NotNil(t, outcome.TodoProgress)
+	require.Equal(t, "wiring form validation", outcome.TodoProgress.Current)
+	require.Equal(t, 1, outcome.TodoProgress.Total)
+	require.Len(t, outcome.TodoProgress.Todos, 1)
+	require.Equal(t, "wiring form validation", outcome.TodoProgress.Todos[0].Content)
+}
+
+// The stream-side metadata decoder (#359): registered and declared keys
+// decode; unknown keys, and declared keys whose value does not fit the
+// extension's type, are logged and dropped without failing the stream.
+func TestMetadataDecoderDropsUndecodable(t *testing.T) {
+	t.Parallel()
+
+	card := BuildAgentCard(CardParams{
+		Agent:    config.Agent{Name: "worker"},
+		Endpoint: "http://127.0.0.1:9000",
+	})
+	decoder := newMetadataDecoder(card)
+
+	outcome := agent.DispatchTransportOutcome{}
+	// An unknown metadata key (the pre-extension "todos" shape) is dropped.
+	decoder.apply(&outcome, &a2aspec.TaskStatusUpdateEvent{
+		Status:   a2aspec.TaskStatus{State: a2aspec.TaskStateWorking},
+		Metadata: map[string]any{"todos": []any{map[string]any{"content": "old shape"}}},
+	})
+	// A declared key with a malformed value is dropped.
+	decoder.apply(&outcome, &a2aspec.TaskStatusUpdateEvent{
+		Status:   a2aspec.TaskStatus{State: a2aspec.TaskStateWorking},
+		Metadata: map[string]any{TodoExtensionURI: []any{"garbage"}},
+	})
+	require.Nil(t, outcome.TodoProgress)
+
+	// A well-formed value decodes onto the outcome.
+	encoded, err := Encode(TodoExt, agent.TodoProgress{Current: "wiring", Total: 1})
+	require.NoError(t, err)
+	decoder.apply(&outcome, &a2aspec.TaskStatusUpdateEvent{
+		Status:   a2aspec.TaskStatus{State: a2aspec.TaskStateWorking},
+		Metadata: map[string]any{TodoExtensionURI: encoded},
+	})
+	require.NotNil(t, outcome.TodoProgress)
+	require.Equal(t, "wiring", outcome.TodoProgress.Current)
+}
+
+// The activation request covers exactly the card-declared extensions this
+// process has registered.
+func TestMetadataDecoderActivatedURIs(t *testing.T) {
+	t.Parallel()
+
+	decoder := newMetadataDecoder(&a2aspec.AgentCard{
+		Capabilities: a2aspec.AgentCapabilities{
+			Extensions: []a2aspec.AgentExtension{
+				{URI: TodoExtensionURI},
+				{URI: "https://crush.charm.land/ext/unknown-to-us/v1"},
+			},
+		},
+	})
+	require.Equal(t, []string{TodoExtensionURI}, decoder.activatedURIs())
 }
 
 // A failed run maps to the failed outcome with the failure text from the
