@@ -68,6 +68,13 @@ func (m *Tool) MCPToolName() string {
 	return m.tool.Name
 }
 
+// ReadOnlyHint reports whether the MCP server annotated this tool as
+// read-only. The todo enforcement ladder uses it to decide whether the
+// tool counts as mutating (#395).
+func (m *Tool) ReadOnlyHint() bool {
+	return m.tool != nil && m.tool.Annotations != nil && m.tool.Annotations.ReadOnlyHint
+}
+
 func (m *Tool) Info() fantasy.ToolInfo {
 	parameters := make(map[string]any)
 	required := make([]string, 0)
