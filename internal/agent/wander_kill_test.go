@@ -346,6 +346,11 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 	env := testEnv(t)
 	initGitRepo(t, env.workingDir)
 	c := newDispatchTestCoordinator(t, env)
+	// Join every spawned dispatch goroutine — the delivery turn a
+	// completed run fires rides the spawn seam (#422) — before the
+	// TempDir removal: an unjoined turn keeps writing after the
+	// directory is gone, and on macOS the cleanup races it.
+	reapDispatchRuns(t, c)
 
 	// The delivery run resolves the main agent's models from the config
 	// store; register the offline test provider the fake main agent

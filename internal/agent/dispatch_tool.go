@@ -1314,9 +1314,12 @@ func (c *coordinator) flushPendingResults(parentSessionID string) {
 		prompt.WriteString("\n\n")
 	}
 
-	go func() {
+	c.startDispatchRun(func() {
 		// Detached: the flush caller (a dispatch goroutine or a run-end
-		// hook) must not block on the delivery turn. WithoutCancel: the
+		// hook) must not block on the delivery turn. Riding the spawn seam
+		// (#422) keeps it a plain goroutine in production while letting a
+		// test's reaper join it, so no delivery turn races the test's
+		// TempDir removal. WithoutCancel: the
 		// dispatch goroutine's context ends when deliverDispatchResult
 		// returns, and the delivered turn must outlive it. The hidden
 		// marker keeps the injected prompt out of the chat UI — the
@@ -1356,7 +1359,7 @@ func (c *coordinator) flushPendingResults(parentSessionID string) {
 				c.flushPendingResults(parentSessionID)
 			})
 		}
-	}()
+	})
 }
 
 // dispatchRegistry returns the coordinator's dispatch registry,
