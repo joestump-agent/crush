@@ -108,27 +108,17 @@ both the editor and the chat; an open dialog keeps its own keys.
 | <kbd>ctrl+]</kbd> | On a focused agent block, open that agent's transcript. With no block focused, open the first live agent. While inspecting, cycle to the next live agent |
 | <kbd>ctrl+[</kbd> | Return to the chat, with the scroll position restored |
 | <kbd>ctrl+x</kbd> | Cancel the selected live dispatch card, or the dispatch you are inspecting. Runs end killed with reason "canceled by user"; the workspace is kept. Shown in the <kbd>ctrl+g</kbd> help only while a live dispatch is targeted |
-| <kbd>esc</kbd> | Depends on the terminal — see the warning below |
+| <kbd>esc</kbd> | Return to the chat (same as <kbd>ctrl+[</kbd>) |
 | <kbd>ctrl+]</kbd> in the session picker | Open the selected session's sub-agent list. See [Sessions](/features/sessions#sub-agent-sessions) |
 
 A live agent's transcript follows its stream. Prompts you type while
 inspecting go to the parent session, never to the agent — to steer a running
 agent, start the prompt with its `@handle`. The cycle covers the agents that
 were live when you entered; agents dispatched later join on your next entry.
-
-:::warning[Known issue]
-Whether <kbd>esc</kbd> leaves inspect mode depends on the terminal. A terminal
-that cannot tell <kbd>ctrl+[</kbd> from <kbd>esc</kbd> — macOS Terminal.app,
-or tmux and screen by default — sends the same byte for both, so there
-<kbd>esc</kbd> returns to the chat. A terminal that supports the kitty keyboard
-protocol, such as Ghostty, kitty, or WezTerm, keeps <kbd>esc</kbd>'s chat
-meaning while you inspect: if the parent is busy, it clears queued prompts,
-and two presses cancel the parent's turn. Leave with <kbd>ctrl+[</kbd>.
-Tracked as [#404](https://github.com/joestump-agent/crush/issues/404).
-
-The inspect keys are also missing from the <kbd>ctrl+g</kbd> help. Tracked as
-[#412](https://github.com/joestump-agent/crush/issues/412).
-:::
+The drill and back keys appear in the status-bar help and the <kbd>ctrl+g</kbd>
+help whenever they apply: <kbd>ctrl+]</kbd> while an agent block is selected,
+and <kbd>esc</kbd> (plus <kbd>ctrl+]</kbd> "next agent" when several agents are
+live) while inspecting.
 
 ## Initialization prompt
 

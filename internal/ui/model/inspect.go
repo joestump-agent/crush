@@ -180,6 +180,19 @@ func (m *UI) liveDispatchSessionIDs() map[string]bool {
 	return ids
 }
 
+// selectedAgentBlock reports whether the chat's currently selected item
+// is a drill-in target: a dispatch block or a plain agent-tool block. It
+// type-checks only the selected item — the help views are rebuilt on
+// every render, so they must never walk the transcript (#412).
+func (m *UI) selectedAgentBlock() bool {
+	switch m.chat.ItemAt(m.chat.Selected()).(type) {
+	case *chat.DispatchToolMessageItem, *chat.AgentToolMessageItem:
+		return true
+	default:
+		return false
+	}
+}
+
 // agentBlockAt reports whether the chat item at the given index is a
 // drill-in target.
 func (m *UI) agentBlockAt(index int) (agentBlockRef, bool) {
