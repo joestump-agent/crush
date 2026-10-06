@@ -155,8 +155,7 @@ dispatched agents get `dispatch_agent` or `message_agent`. See
 [Architecture](/agents/architecture) and [A2A protocol](/agents/a2a-protocol).
 
 :::info[Planned]
-A2A becomes the runtime contract: one execution path through the A2A client
-([#347](https://github.com/joestump-agent/crush/issues/347)), TCP plus TLS as an opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)), and later the other agents too ([#392](https://github.com/joestump-agent/crush/issues/392)).
+TCP plus TLS as an opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)), and later the other agents too ([#392](https://github.com/joestump-agent/crush/issues/392)).
 :::
 
 :::info[Partially shipped]

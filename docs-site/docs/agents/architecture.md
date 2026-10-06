@@ -128,10 +128,10 @@ on the registry entry. That stamp is the whole discovery mechanism: an
 in-memory lookup, with no directory and no network hop. The wire format
 is on [A2A protocol](./a2a-protocol.md).
 
-**Direct-run fallback.** If the server fails to start, the failure is
-logged at warn level and the dispatch proceeds without it. The run then
-calls `SessionAgent.Run` directly instead of going through the client.
-Tests that wire no factory always take this path.
+**One execution path.** Every dispatch is driven through the A2A client;
+there is no direct-run fallback. A host start failure fails the dispatch
+with a `start A2A server: …` tool error and removes its registry entry
+and workspace, so nothing runs unserved.
 
 :::warning[Known gap]
 The served surface is unauthenticated until `securitySchemes` lands
@@ -202,8 +202,8 @@ When the turn ends, the client maps the terminal task state onto a
 `DispatchResult`. `completed` keeps the agent's final text as
 `key_findings`, and the diff artifact is condensed into `diff_summary`: a
 per-file stat plus the diff, cut at 250 lines. `failed`, `rejected` and
-`canceled` all become `failed`. The direct path builds the same result
-from the run, and is where `killed` with a `killed_reason` comes from.
+`canceled` all become `failed`. The result is built the same way for
+every dispatch, and is where `killed` with a `killed_reason` comes from.
 
 Then, in this order, the coordinator:
 
