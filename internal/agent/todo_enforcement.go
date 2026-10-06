@@ -50,6 +50,24 @@ const todoNudgeMessage = "You have made tool calls without recording a todo list
 // continued ignoring escalates (wander kill, #316).
 const todoEscalatingNudgeMessage = "You are still working without a todo list after being reminded. Call the todos tool immediately, before any further tool calls. Ignoring this again will escalate."
 
+// unwrapTool peels the wrappers the agent wraps its tools in, so
+// classification sees the tool itself: the hook runner's decorator and
+// the hard gate's. Both forward Info(), so the name survives unwrapping;
+// only the duck-typed MCP checks need the inner tool, and a wrapper
+// hides them (a hooked MCP tool would classify as a reader).
+func unwrapTool(tool fantasy.AgentTool) fantasy.AgentTool {
+	for {
+		switch t := tool.(type) {
+		case *hookedTool:
+			tool = t.inner
+		case *todoGateTool:
+			tool = t.inner
+		default:
+			return tool
+		}
+	}
+}
+
 // isMutatingCall reports whether a call to tool with its raw JSON input
 // mutates state. It is the ladder's single classification, used by both
 // rungs: the nudge counter trips on a mutating call regardless of the
@@ -59,6 +77,7 @@ const todoEscalatingNudgeMessage = "You are still working without a todo list af
 // it counts unless its server marked it read-only; everything else, the
 // readers, counts read-only. Unparseable input fails closed.
 func isMutatingCall(tool fantasy.AgentTool, input string) bool {
+	tool = unwrapTool(tool)
 	switch tool.Info().Name {
 	case tools.WriteToolName, tools.EditToolName, tools.MultiEditToolName,
 		tools.DownloadToolName, tools.RenameToolName, tools.ReplaceSymbolToolName:

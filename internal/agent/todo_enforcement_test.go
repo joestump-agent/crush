@@ -755,6 +755,9 @@ func TestIsMutatingCall(t *testing.T) {
 		{"mcp without hint", &fakeMCPToolNoHint{mutatingTool("mcp_fake-server_run")}, `{}`, true},
 		{"mcp read-only hint", &fakeMCPTool{AgentTool: mutatingTool("mcp_fake-server_lookup"), readOnly: true}, `{}`, false},
 		{"mcp hint false", &fakeMCPTool{AgentTool: mutatingTool("mcp_fake-server_run"), readOnly: false}, `{}`, true},
+		{"hooked write", newHookedTool(mutatingTool(tools.WriteToolName), nil), `{}`, true},
+		{"hooked mcp without hint", newHookedTool(&fakeMCPToolNoHint{mutatingTool("mcp_fake-server_run")}, nil), `{}`, true},
+		{"hooked mcp read-only hint", newHookedTool(&fakeMCPTool{AgentTool: mutatingTool("mcp_fake-server_lookup"), readOnly: true}, nil), `{}`, false},
 		{"probe reader", probeTool(), `{}`, false},
 	}
 
@@ -1037,4 +1040,33 @@ func TestWrapTodoGate_WrapsMutatingTools(t *testing.T) {
 
 	_, ok := wrapped[0].(*todoGateTool)
 	assert.True(t, ok)
+}
+
+// TestWrapTodoGate_ClassifiesThroughHookWrapper pins classification
+// through the agent's own wrappers: the tools reach the gate already
+// wrapped with the hook runner, so the wrap decision must unwrap them —
+// a hooked MCP tool without a read-only hint is gated, a hooked
+// read-only MCP tool and a hooked reader are not.
+func TestWrapTodoGate_ClassifiesThroughHookWrapper(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	mcpNoHint := newHookedTool(&fakeMCPToolNoHint{mutatingTool("mcp_fake-server_write")}, nil)
+	mcpHint := newHookedTool(&fakeMCPTool{AgentTool: mutatingTool("mcp_fake-server_read"), readOnly: true}, nil)
+	probe := newHookedTool(probeTool(), nil)
+	e := newTodoEnforcement(config.TodoEnforcementSettings{
+		Enabled:  false,
+		HardGate: true,
+	}, env.sessions)
+	todos := tools.NewTodosTool(env.sessions)
+
+	wrapped := wrapTodoGate([]fantasy.AgentTool{mcpNoHint, mcpHint, probe, todos}, e)
+
+	assert.NotSame(t, mcpNoHint, wrapped[0], "a hooked MCP tool without a read-only hint must be wrapped")
+	assert.Same(t, mcpHint, wrapped[1], "a hooked read-only MCP tool must not be wrapped")
+	assert.Same(t, probe, wrapped[2], "a hooked reader must not be wrapped")
+	assert.Same(t, todos, wrapped[3], "the todos tool must not be wrapped")
+
+	gate, ok := wrapped[0].(*todoGateTool)
+	require.True(t, ok)
+	assert.Same(t, mcpNoHint, gate.inner, "the gate must wrap the hooked tool the model calls")
 }
