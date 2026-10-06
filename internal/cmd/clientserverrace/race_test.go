@@ -9,6 +9,7 @@ package clientserverrace_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -50,17 +51,20 @@ func TestClientServerSpawnRace(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping unix-socket specific race test on windows")
 	}
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("skipping: 'go' not available on PATH")
+	// TestMain resolved the binary before any test started (#429).
+	if errors.Is(crushBinErr, errNoGo) {
+		t.Skip("skipping: " + errNoGo.Error())
 	}
-
-	repoRoot := repoRootFromTest(t)
-	bin := buildCrushBinary(t, repoRoot)
+	if crushBinErr != nil {
+		t.Fatalf("no crush binary to test: %v", crushBinErr)
+	}
+	bin := crushBin
 
 	// Use /tmp directly so the unix socket path stays under the
 	// 104-char sockaddr_un limit on darwin. t.TempDir() can return a
-	// path inside /var/folders/... that is too long.
-	runDir, err := os.MkdirTemp("/tmp", "crush-race-")
+	// path inside /var/folders/... that is too long. TestMain reaps
+	// these directories when a killed run leaves one behind.
+	runDir, err := os.MkdirTemp("/tmp", runDirPrefix)
 	if err != nil {
 		t.Fatalf("mkdtemp: %v", err)
 	}
@@ -259,111 +263,9 @@ func pingHealth(socketPath string) error {
 	return nil
 }
 
-// repoRootFromTest walks up from this test file's directory to find
-// the repo root (the directory containing go.mod). Walking up by a
-// fixed count is fragile across reorganisations.
-func repoRootFromTest(t *testing.T) string {
-	t.Helper()
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	dir := cwd
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			t.Fatalf("could not find go.mod walking up from %s", cwd)
-		}
-		dir = parent
-	}
-}
-
-// buildCrushBinary builds the crush binary once at the start of the
-// test and returns the absolute path. Subsequent t.Cleanup removes
-// the built artefact.
-func buildCrushBinary(t *testing.T, repoRoot string) string {
-	t.Helper()
-
-	binDir, err := os.MkdirTemp("", "crush-race-bin-")
-	if err != nil {
-		t.Fatalf("mkdtemp bin: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(binDir) })
-
-	binPath := filepath.Join(binDir, "crush")
-
-	// Budget for the build below. On the macos-latest CI runner the
-	// CGO_ENABLED=0 build of the full binary takes 4-6 minutes from a
-	// cold cache (it is a different build flavor from the workflow's
-	// "go build -race ./..." step, so it cannot reuse that cache).
-	// 9 minutes leaves headroom over the observed worst case while
-	// keeping the whole package under go test's default 10-minute
-	// per-package timeout, so a genuinely stuck build fails with this
-	// clear message instead of a "test timed out" goroutine dump.
-	ctx, cancel := context.WithTimeout(context.Background(), 9*time.Minute)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, ".")
-	cmd.Dir = repoRoot
-	// Match the project's standard build flags. CGO_ENABLED=0 keeps
-	// the binary statically linked and avoids surprising the test on
-	// hosts without a C toolchain.
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("go build crush: %v\n%s", err, out)
-	}
-	return binPath
-}
-
 // shutdownServer best-effort terminates any crush server bound to
-// socketPath by POSTing to /v1/control. We don't import the project's
-// own client package to keep this test free of internal API churn.
+// socketPath, logging through t.
 func shutdownServer(t *testing.T, socketPath string) {
 	t.Helper()
-	if _, err := os.Stat(socketPath); err != nil {
-		return
-	}
-
-	tr := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", socketPath)
-		},
-	}
-	hc := &http.Client{Transport: tr, Timeout: 5 * time.Second}
-	defer tr.CloseIdleConnections()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	body := strings.NewReader(`{"command":"shutdown"}`)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"http://crush.local/v1/control", body)
-	if err != nil {
-		t.Logf("shutdown: build request: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := hc.Do(req)
-	if err != nil {
-		// Server may already be gone — not an error.
-		t.Logf("shutdown: %v (probably already exited)", err)
-		return
-	}
-	_ = resp.Body.Close()
-
-	// Wait briefly for the socket to disappear so the next test
-	// using the same path doesn't race.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(socketPath); err != nil {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	shutdownSocket(socketPath, t.Logf)
 }
