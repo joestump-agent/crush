@@ -13,6 +13,7 @@ import (
 	"time"
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/agent"
@@ -33,35 +34,50 @@ func (f *fakeTodoSource) SubscribeSessionTodos(ctx context.Context, sessionID st
 }
 
 // The client half of the protocol boundary (#71): StreamDispatch drives a
-// served dispatch over the loopback wire — prompt out, SSE events back —
+// served dispatch over the loopback wire, prompt out and SSE events back,
 // and returns the terminal outcome with the agent's text, the artifact
-// diff, and the observed Working progress count.
+// diff, and the observed Working progress count. The paced runner holds
+// the run open while exactly one todo snapshot crosses the wire, so the
+// count is the initial Working plus that one todo event, and a bare
+// Working status with the todo bridge broken cannot pass (#425).
 func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
-	runner := &fakeRunner{result: textResult("done, two files changed")}
+	runner := newPacedRunner("done, two files changed")
+	source := newPipeTodoSource()
 	server, err := StartServer(t.Context(), ServerParams{
 		Runner:    runner,
 		SessionID: "dispatch-session",
 		Diff: func(ctx context.Context) (string, error) {
 			return "--- a/x\n+++ b/x\n@@\n+changed", nil
 		},
-		Todos: &fakeTodoSource{snapshot: dispatch.TodoSnapshot{
-			CurrentTodo:   "wiring form validation",
-			TodoCompleted: 0,
-			TodoTotal:     1,
-			Todos:         []session.Todo{{Content: "wiring form validation", Status: session.TodoStatusInProgress}},
-		}},
-		Call: agent.SessionAgentCall{NonInteractive: true, MaxOutputTokens: 512},
+		Todos: source,
+		Call:  agent.SessionAgentCall{NonInteractive: true, MaxOutputTokens: 512},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = server.Stop(context.Background()) })
 
 	factory := NewServerFactory()
-	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
-	})
-	require.NoError(t, err)
+	var outcome agent.DispatchTransportOutcome
+	streamErr := make(chan error, 1)
+	go func() {
+		var err error
+		outcome, err = factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+			Endpoint: server.Endpoint,
+			Card:     server.Card,
+			Prompt:   "fix the bug",
+		})
+		streamErr <- err
+	}()
+
+	// The subscription exists once the run has started, and the send is
+	// unbuffered: it returns only when the executor has taken the
+	// snapshot and yielded the todo Working event.
+	<-runner.started
+	source.ch <- todoSnapshot(runTodos(
+		session.Todo{Content: "wiring form validation", Status: session.TodoStatusInProgress, ActiveForm: "wiring form validation"},
+	))
+	close(runner.release)
+	require.NoError(t, <-streamErr)
+
 	// The call template flowed through the wire (#71): the served turn
 	// carries the dispatch's shaping, not a minimal test call.
 	require.True(t, runner.gotCall.NonInteractive)
@@ -71,10 +87,107 @@ func TestStreamDispatchCompletedWithArtifactAndProgress(t *testing.T) {
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
 	require.Equal(t, "done, two files changed", outcome.Text)
 	require.Contains(t, outcome.Diff, "+++ b/x")
-	require.Greater(t, outcome.WorkingEvents, 0, "the SSE stream carried Working progress events")
+	require.Equal(t, 2, outcome.WorkingEvents, "the SSE stream carried the initial Working plus exactly one todo progress event")
 
 	// The typed todo progress (#359) rode the wire under the declared
 	// todos/v1 extension and decoded onto the outcome.
+	require.NotNil(t, outcome.TodoProgress)
+	require.Equal(t, "wiring form validation", outcome.TodoProgress.Current)
+	require.Equal(t, 1, outcome.TodoProgress.Total)
+	require.Len(t, outcome.TodoProgress.Todos, 1)
+	require.Equal(t, "wiring form validation", outcome.TodoProgress.Todos[0].Content)
+}
+
+// A dispatch with no todo source carries exactly the executor's initial
+// Working status across the wire, nothing more: the control half of
+// #425's count.
+func TestStreamDispatchWithoutTodosSingleWorking(t *testing.T) {
+	server, err := StartServer(t.Context(), ServerParams{
+		Runner:    &fakeRunner{result: textResult("done")},
+		SessionID: "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+
+	outcome, err := NewServerFactory().StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		Prompt:   "fix the bug",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Equal(t, 1, outcome.WorkingEvents, "only the initial Working status crosses the wire without a todo source")
+}
+
+// The todo progress event survives the wire as the client receives it
+// (#425): exactly one Working TaskStatusUpdateEvent carries the typed
+// progress under the declared todos/v1 extension's URI, its message is
+// the in-progress todo's active form, and the metadata decodes onto the
+// outcome.
+func TestStreamDispatchTodoEventOnWire(t *testing.T) {
+	runner := newPacedRunner("done")
+	source := newPipeTodoSource()
+	server, err := StartServer(t.Context(), ServerParams{
+		Runner:    runner,
+		SessionID: "dispatch-session",
+		Todos:     source,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+
+	client, err := a2aclient.NewFromCard(t.Context(), server.Card)
+	require.NoError(t, err)
+
+	req := &a2aspec.SendMessageRequest{
+		Message: a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("fix the bug")),
+	}
+	evsCh := make(chan []a2aspec.Event, 1)
+	go func() {
+		var evs []a2aspec.Event
+		for ev, err := range client.SendStreamingMessage(t.Context(), req) {
+			require.NoError(t, err, "unexpected error from the dispatch stream")
+			evs = append(evs, ev)
+		}
+		evsCh <- evs
+	}()
+
+	// One snapshot while the run is in flight, then the terminal
+	// outcome: the same pacing as the StreamDispatch test.
+	<-runner.started
+	source.ch <- todoSnapshot(runTodos(
+		session.Todo{Content: "wiring form validation", Status: session.TodoStatusInProgress, ActiveForm: "wiring form validation"},
+	))
+	close(runner.release)
+
+	var evs []a2aspec.Event
+	select {
+	case evs = <-evsCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the stream to end")
+	}
+
+	var todoUpdates []*a2aspec.TaskStatusUpdateEvent
+	var terminal a2aspec.TaskState
+	for _, ev := range evs {
+		switch e := ev.(type) {
+		case *a2aspec.TaskStatusUpdateEvent:
+			terminal = e.Status.State
+			if e.Status.State == a2aspec.TaskStateWorking && e.Meta()[TodoExt.URI] != nil {
+				todoUpdates = append(todoUpdates, e)
+			}
+		case *a2aspec.Task:
+			terminal = e.Status.State
+		}
+	}
+	require.Equal(t, a2aspec.TaskStateCompleted, terminal)
+	require.Len(t, todoUpdates, 1, "exactly one Working event carries the typed todo progress")
+	todo := todoUpdates[0]
+	require.Equal(t, "wiring form validation", statusMessageText(t, todo))
+	// The typed payload decodes onto the outcome through the same path
+	// the client takes.
+	decoder := newMetadataDecoder(server.Card)
+	var outcome agent.DispatchTransportOutcome
+	decoder.apply(&outcome, todo)
 	require.NotNil(t, outcome.TodoProgress)
 	require.Equal(t, "wiring form validation", outcome.TodoProgress.Current)
 	require.Equal(t, 1, outcome.TodoProgress.Total)
