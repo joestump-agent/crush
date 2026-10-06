@@ -91,6 +91,20 @@ func newScanTestEnv(t *testing.T) scanTestEnv {
 	dir := filepath.Join(t.TempDir(), "worktrees")
 	p, err := NewGitWorktreeProvider(repo, dir, NewAgentRegistry())
 	require.NoError(t, err)
+	// Release any lease a test left behind: an open lock fd keeps the
+	// lock file undeletable, which fails TempDir cleanup on windows.
+	t.Cleanup(func() {
+		p.mu.Lock()
+		rels := make([]func(), 0, len(p.leases))
+		for _, rel := range p.leases {
+			rels = append(rels, rel)
+		}
+		p.leases = make(map[string]func())
+		p.mu.Unlock()
+		for _, rel := range rels {
+			rel()
+		}
+	})
 	return scanTestEnv{repo: repo, dir: dir, p: p}
 }
 
