@@ -140,8 +140,8 @@ func DefaultKeyMap() KeyMap {
 			key.WithHelp("ctrl+]", "inspect agent"),
 		),
 		InspectBack: key.NewBinding(
-			key.WithKeys("ctrl+["),
-			key.WithHelp("ctrl+[", "back to chat"),
+			key.WithKeys("esc", "ctrl+["),
+			key.WithHelp("esc", "back to chat"),
 		),
 		CancelAgent: key.NewBinding(
 			key.WithKeys("ctrl+x"),
