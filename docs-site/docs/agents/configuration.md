@@ -187,8 +187,9 @@ on the base revision, a revision the main agent chooses, is read or executed
 :::info[Planned]
 - A TCP listener with TLS becomes opt-in ([#358](https://github.com/joestump-agent/crush/issues/358));
   authentication arrives with `securitySchemes` ([#357](https://github.com/joestump-agent/crush/issues/357)).
-- Worktrees are preserved until you apply or dismiss them explicitly
-  ([#368](https://github.com/joestump-agent/crush/issues/368)), and are never discarded at exit ([#367](https://github.com/joestump-agent/crush/issues/367)).
+- `apply_dispatch` and `dismiss_dispatch` will record your decision about a
+  workspace explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)). Exit and startup already keep decided and
+  work-producing workspaces and remove only the rest ([#367](https://github.com/joestump-agent/crush/issues/367)).
 :::
 
 ## Turning dispatch off

@@ -993,6 +993,19 @@ func (app *App) Shutdown() {
 		app.AgentCoordinator.CancelAll()
 	}
 
+	// Release dispatch workspaces synchronously while the app is still
+	// alive (#367): decided and workless workspaces go now, completed or
+	// killed work with commits stays for salvage. Optional on the
+	// coordinator so test doubles without dispatch support keep working;
+	// ReleaseDispatches applies its own dispatchSweepTimeout bound.
+	if app.AgentCoordinator != nil {
+		if releaser, ok := app.AgentCoordinator.(interface {
+			ReleaseDispatches(ctx context.Context)
+		}); ok {
+			releaser.ReleaseDispatches(context.Background())
+		}
+	}
+
 	// Shared shutdown context for all timeout-bounded cleanup.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

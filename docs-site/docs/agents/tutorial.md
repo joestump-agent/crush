@@ -211,15 +211,16 @@ git branch -D crush-dispatch-<id>
 ```
 
 :::warning[Known issue]
-**Merge before you quit.** When Crush exits, it deletes every
-`crush-dispatch-*` worktree and branch, reviewed or not, including other Crush
-instances' worktrees in the same directory ([#367](https://github.com/joestump-agent/crush/issues/367), [#365](https://github.com/joestump-agent/crush/issues/365)). To keep work you
-haven't merged, commit it in the worktree as above and copy the branch to a
-name without the prefix: `git branch keep/lexer-tests crush-dispatch-<id>`.
+Crush cannot record your decision about a dispatch yet ([#368](https://github.com/joestump-agent/crush/issues/368)),
+so cleanup is still by hand: commit work in the worktree as above and copy the
+branch to a name without the prefix, `git branch keep/lexer-tests crush-dispatch-<id>`,
+then remove the worktree. Quitting is safe: exit already keeps any dispatch
+with commits or uncommitted changes ([#367](https://github.com/joestump-agent/crush/issues/367)).
 :::
 
 :::info[Planned]
-Workspaces will survive exit until you apply or dismiss them ([#367](https://github.com/joestump-agent/crush/issues/367), [#368](https://github.com/joestump-agent/crush/issues/368)),
+`apply_dispatch` and `dismiss_dispatch` will record your decision about a
+workspace directly ([#368](https://github.com/joestump-agent/crush/issues/368)),
 and `crush dispatch list` and `crush dispatch prune` will manage them from the
 shell ([#369](https://github.com/joestump-agent/crush/issues/369)).
 :::

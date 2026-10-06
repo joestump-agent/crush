@@ -139,8 +139,14 @@ func (m *UI) agentBlocks() []agentBlockRef {
 				continue
 			}
 			sid := m.com.Workspace.CreateAgentToolSessionID(block.MessageID(), block.ToolCall().ID)
-			live := block.Status() == chat.ToolStatusRunning ||
-				block.Status() == chat.ToolStatusAwaitingPermission
+			// Live only while the result has not arrived: the status
+			// field stays Running after the result lands (the result path
+			// never calls SetStatus), so a finished agent would ride the
+			// ring and the "(n/N)" counter forever. A canceled block is
+			// never live (#405).
+			live := !block.HasResult() &&
+				(block.Status() == chat.ToolStatusRunning ||
+					block.Status() == chat.ToolStatusAwaitingPermission)
 			refs = append(refs, agentBlockRef{sessionID: sid, index: i, live: live})
 		}
 	}
@@ -172,6 +178,19 @@ func (m *UI) liveDispatchSessionIDs() map[string]bool {
 		}
 	}
 	return ids
+}
+
+// selectedAgentBlock reports whether the chat's currently selected item
+// is a drill-in target: a dispatch block or a plain agent-tool block. It
+// type-checks only the selected item — the help views are rebuilt on
+// every render, so they must never walk the transcript (#412).
+func (m *UI) selectedAgentBlock() bool {
+	switch m.chat.ItemAt(m.chat.Selected()).(type) {
+	case *chat.DispatchToolMessageItem, *chat.AgentToolMessageItem:
+		return true
+	default:
+		return false
+	}
 }
 
 // agentBlockAt reports whether the chat item at the given index is a

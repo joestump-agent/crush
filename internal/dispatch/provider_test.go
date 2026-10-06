@@ -965,3 +965,146 @@ func TestGitEnvScrubbed(t *testing.T) {
 	require.Empty(t, strings.TrimSpace(gitIn(t, decoy, "status", "--porcelain")),
 		"decoy repository was modified")
 }
+
+// ReleaseUnworked is the selective exit cleanup (#367): entries that
+// never produced work are removed with their branches; entries with
+// work — committed or just uncommitted — stay on disk for salvage and
+// stay registered.
+func TestReleaseSelectivity(t *testing.T) {
+	ctx := t.Context()
+	tests := []struct {
+		name     string
+		work     func(t *testing.T, entry Entry)
+		wantKept bool
+	}{
+		{
+			name: "with uncommitted changes is kept",
+			work: func(t *testing.T, entry Entry) {
+				write(t, filepath.Join(entry.Path, "wip.txt"), "wip")
+			},
+			wantKept: true,
+		},
+		{
+			name: "with a commit is kept",
+			work: func(t *testing.T, entry Entry) {
+				write(t, filepath.Join(entry.Path, "done.txt"), "done")
+				gitIn(t, entry.Path, "add", "-A")
+				commitIn(t, entry.Path, "dispatched work")
+			},
+			wantKept: true,
+		},
+		{
+			name:     "clean is removed",
+			wantKept: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newTestRepo(t)
+			ws, err := newProvider(t, repo)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+
+			entry := provisionEntry(t, ws, ProvisionOptions{})
+			if tt.work != nil {
+				tt.work(t, entry)
+			}
+
+			require.NoError(t, ws.ReleaseUnworked(ctx))
+
+			if tt.wantKept {
+				require.DirExists(t, entry.Path)
+				require.True(t, branchExists(t, repo, entry.Branch))
+				got, ok := ws.reg.Get(entry.ID)
+				require.True(t, ok, "kept entry stays registered so Release can still decide it")
+				require.Equal(t, entry.ID, got.ID)
+			} else {
+				_, err := os.Stat(entry.Path)
+				require.True(t, os.IsNotExist(err), "released workspace directory survived")
+				require.False(t, branchExists(t, repo, entry.Branch), "released branch survived")
+				_, ok := ws.reg.Get(entry.ID)
+				require.False(t, ok, "released entry stayed registered")
+			}
+		})
+	}
+}
+
+// Startup reconciliation (#367): after a crash — leases released,
+// registry gone, owner markers on disk — a fresh provider removes a
+// dead owner's workless workspace and keeps a dead owner's workspace
+// that produced work.
+func TestStartupReconciliation(t *testing.T) {
+	repo := newTestRepo(t)
+
+	ws, err := newProvider(t, repo)
+	require.NoError(t, err)
+
+	kept := provisionEntry(t, ws, ProvisionOptions{})
+	write(t, filepath.Join(kept.Path, "salvage.txt"), "salvage")
+	gitIn(t, kept.Path, "add", "-A")
+	commitIn(t, kept.Path, "dispatched work")
+
+	empty := provisionEntry(t, ws, ProvisionOptions{})
+
+	// The crash: every lease released, nothing else cleaned up.
+	dropLeases(ws)
+
+	// Stray marker files with unusable names must be skipped, not fed
+	// into cleanup (#367): a name that is not a plain dispatch branch
+	// name never names a workspace.
+	stray := filepath.Join(ws.worktreesDir, "zz.owner.json")
+	write(t, stray, "{}")
+	traversal := filepath.Join(ws.worktreesDir, BranchPrefix+"..owner.json")
+	write(t, traversal, "{}")
+
+	fresh, err := newProvider(t, repo)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fresh.Sweep(context.Background()) })
+
+	require.FileExists(t, stray, "a stray marker is left alone")
+	require.FileExists(t, traversal, "a traversal-shaped marker is left alone")
+
+	_, err = os.Stat(kept.Path)
+	require.NoError(t, err, "crashed run's workspace with work must survive startup reconciliation")
+	require.True(t, branchExists(t, repo, kept.Branch))
+
+	_, err = os.Stat(empty.Path)
+	require.True(t, os.IsNotExist(err), "crashed run's workless workspace must be reconciled away")
+	require.False(t, branchExists(t, repo, empty.Branch))
+}
+
+// A marker replaced by a symlink pointing outside the worktrees
+// directory must be ignored, not followed (#367): startup
+// reconciliation reads markers through an os.Root, which refuses the
+// escape instead of reading whatever the link names, so the workspace
+// the marker claims to describe stays untouched.
+func TestStartupReconciliationIgnoresEscapingMarkerSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks requires privileges on windows")
+	}
+	repo := newTestRepo(t)
+
+	ws, err := newProvider(t, repo)
+	require.NoError(t, err)
+
+	victim := provisionEntry(t, ws, ProvisionOptions{})
+	dropLeases(ws)
+
+	// A plausible-looking marker outside the worktrees directory: the
+	// real marker copied verbatim, so it would reconcile the workless
+	// workspace away if the link were followed.
+	marker, err := os.ReadFile(filepath.Join(ws.worktreesDir, victim.Branch+ownerMarkerSuffix))
+	require.NoError(t, err)
+	outside := filepath.Join(t.TempDir(), "outside.owner.json")
+	write(t, outside, string(marker))
+	markerPath := filepath.Join(ws.worktreesDir, victim.Branch+ownerMarkerSuffix)
+	require.NoError(t, os.Remove(markerPath))
+	require.NoError(t, os.Symlink(outside, markerPath))
+
+	fresh, err := newProvider(t, repo)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fresh.Sweep(context.Background()) })
+
+	require.DirExists(t, victim.Path, "an escaping marker symlink must not reconcile the workspace away")
+	require.True(t, branchExists(t, repo, victim.Branch))
+}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -150,14 +151,19 @@ func NewGitWorktreeProvider(repoRoot, worktreesDir string, reg *AgentRegistry) (
 		return nil, fmt.Errorf("prune stale worktrees: %w", err)
 	}
 
-	return &GitWorktreeProvider{
+	p := &GitWorktreeProvider{
 		repoRoot:     root,
 		worktreesDir: dir,
 		commonDir:    commonDir,
 		reg:          reg,
 		instanceID:   uuid.New().String(),
 		leases:       make(map[string]func()),
-	}, nil
+	}
+	// Startup reconciliation (#367): a dead owner's workspace that
+	// never produced work is removed; everything else is kept for
+	// salvage.
+	p.reconcileStartup(context.Background())
+	return p, nil
 }
 
 // provisionLocks serializes the worktree add step per repository:
@@ -290,7 +296,7 @@ func (p *GitWorktreeProvider) Provision(ctx context.Context, id string, opts Pro
 		p.removeEntry(ctx, Entry{Path: path, Branch: branch}, nil)
 		return Placement{}, fmt.Errorf("take ownership lease: %w", err)
 	}
-	if err := p.writeOwnerMarker(branch); err != nil {
+	if err := p.writeOwnerMarker(branch, baseSHA); err != nil {
 		release()
 		p.removeEntry(ctx, Entry{Path: path, Branch: branch}, nil)
 		return Placement{}, fmt.Errorf("write owner marker: %w", err)
@@ -334,23 +340,32 @@ func (p *GitWorktreeProvider) leasePath(branch string) string {
 // ownerPath is the human-readable owner marker for branch. It carries
 // no authority: the lock file is what ownership is proven with.
 func (p *GitWorktreeProvider) ownerPath(branch string) string {
-	return filepath.Join(p.worktreesDir, branch+".owner.json")
+	return filepath.Join(p.worktreesDir, branch+ownerMarkerSuffix)
 }
+
+// ownerMarkerSuffix is the filename suffix of an owner marker next to
+// its workspace directory.
+const ownerMarkerSuffix = ".owner.json"
 
 // ownerMarker records who holds a workspace's lease.
 type ownerMarker struct {
 	InstanceID string    `json:"instance_id"`
 	PID        int       `json:"pid"`
 	CreatedAt  time.Time `json:"created_at"`
+	// BaseSHA is the commit the workspace's branch was cut from,
+	// recorded so startup reconciliation can tell a workless leftover
+	// from salvageable work (#367).
+	BaseSHA string `json:"base_sha"`
 }
 
 // writeOwnerMarker atomically records this provider instance as the
-// owner of branch.
-func (p *GitWorktreeProvider) writeOwnerMarker(branch string) error {
+// owner of branch, with the base SHA the workspace was cut from.
+func (p *GitWorktreeProvider) writeOwnerMarker(branch, baseSHA string) error {
 	data, err := json.Marshal(ownerMarker{
 		InstanceID: p.instanceID,
 		PID:        os.Getpid(),
 		CreatedAt:  time.Now().UTC(),
+		BaseSHA:    baseSHA,
 	})
 	if err != nil {
 		return err
@@ -547,6 +562,157 @@ func (p *GitWorktreeProvider) Sweep(ctx context.Context) error {
 			if err := p.removeEntry(ctx, entry, release); err != nil {
 				errs = append(errs, err)
 			}
+		}
+	}
+	if err := runGit(ctx, p.repoRoot, nil, "worktree", "prune"); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// reconcileStartup applies the worktrees directory's owner markers at
+// construction (#367): a dead owner's workspace that never produced
+// work — no commits ahead of its recorded base and a clean tree — is
+// removed. Everything else is kept: pending work from a crashed run
+// stays on disk for salvage, and a live owner's entries are never
+// touched. Failures are logged and left for a later reconciliation or
+// cleanup; startup never fails because leftovers could not be removed.
+func (p *GitWorktreeProvider) reconcileStartup(ctx context.Context) {
+	// Marker access goes through os.Root: every open is confined to the
+	// worktrees directory itself, so neither the directory the path
+	// derives from nor a hostile or symlinked marker name can address a
+	// file outside — the root rejects traversal and escapes instead of
+	// trusting string validation.
+	root, err := os.OpenRoot(p.worktreesDir)
+	if err != nil {
+		slog.Debug("Skipping dispatch startup reconciliation", "worktrees_dir", p.worktreesDir, "error", err)
+		return
+	}
+	defer root.Close()
+	markers, err := fs.Glob(root.FS(), "*"+ownerMarkerSuffix)
+	if err != nil {
+		return
+	}
+	for _, name := range markers {
+		branch := strings.TrimSuffix(name, ownerMarkerSuffix)
+		// A marker's file name is the only thing naming the workspace it
+		// describes, and that name feeds every path below, so refuse
+		// anything that is not a plain dispatch branch name: a stray or
+		// malicious file in the worktrees directory cannot point cleanup
+		// outside it.
+		if !strings.HasPrefix(branch, BranchPrefix) || strings.ContainsAny(branch, `/\`) || strings.Contains(branch, "..") {
+			slog.Debug("Skipping dispatch owner marker with unusable name", "name", name)
+			continue
+		}
+		// Confined to the worktrees directory by the os.Root above: a
+		// marker whose name escapes it — directly or through a symlink —
+		// fails here instead of being read.
+		data, err := root.ReadFile(name)
+		if err != nil {
+			slog.Debug("Skipping unreadable dispatch owner marker", "name", name, "error", err)
+			continue
+		}
+		var m ownerMarker
+		if err := json.Unmarshal(data, &m); err != nil {
+			slog.Debug("Skipping malformed dispatch owner marker", "name", name, "error", err)
+			continue
+		}
+
+		// Take the lease: a contended lease belongs to a live process,
+		// whose entries are never touched; a free lease means the owner
+		// died and the cleanup is ours to apply.
+		// The name is validated to BranchPrefix with no separators or
+		// traversal above, so leasePath stays inside worktreesDir.
+		release, err := lock.TryFile(p.leasePath(branch))
+		if err != nil {
+			continue
+		}
+		entry := Entry{
+			Path:    filepath.Join(p.worktreesDir, branch),
+			Branch:  branch,
+			BaseSHA: m.BaseSHA,
+		}
+		if p.hasWork(ctx, entry) {
+			release()
+			continue
+		}
+		if err := p.removeEntry(ctx, entry, release); err != nil {
+			slog.Debug("Startup reconciliation left a dispatch workspace in place", "branch", branch, "error", err)
+		}
+	}
+	_ = runGit(ctx, p.repoRoot, nil, "worktree", "prune")
+}
+
+// hasWork reports whether the workspace produced work a human might
+// want (#367): commits on its branch ahead of the recorded base, or
+// uncommitted changes on disk. An unknown base, a branch that no longer
+// resolves, or a git probe error count as work — the fail-safe is to
+// keep the workspace, never to discard it.
+func (p *GitWorktreeProvider) hasWork(ctx context.Context, entry Entry) bool {
+	if entry.BaseSHA == "" {
+		return true
+	}
+	out, err := gitOutput(ctx, p.repoRoot, nil, "rev-list", "--count", entry.BaseSHA+".."+entry.Branch)
+	if err != nil {
+		return true
+	}
+	if strings.TrimSpace(string(out)) != "0" {
+		return true
+	}
+	if entry.Path != "" {
+		out, err = gitOutput(ctx, entry.Path, nil, "status", "--porcelain")
+		if err != nil {
+			return true
+		}
+		if strings.TrimSpace(string(out)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// ReleaseUnworked is the selective exit cleanup (#367): registered
+// entries that never produced work are removed with their branches;
+// entries with work — committed or just uncommitted — stay on disk for
+// salvage and stay registered. A git probe error or an unknown base
+// keeps the workspace: the fail-safe is never to discard work a human
+// might want. The orphan pass is not part of exit — Sweep owns it —
+// and a stubborn entry stays registered so a later ReleaseUnworked or
+// Release can retry it. The errors are joined and returned.
+func (p *GitWorktreeProvider) ReleaseUnworked(ctx context.Context) error {
+	candidates := p.reg.List()
+
+	// The disposability probe runs git commands, so it happens outside
+	// the registry and lease locks, like every other git work here; the
+	// removal is then claimed, re-checking that the entry survived the
+	// probe.
+	var doomed []Entry
+	for _, entry := range candidates {
+		if p.hasWork(ctx, entry) {
+			continue
+		}
+		if !p.reg.Remove(entry.ID) {
+			continue
+		}
+		doomed = append(doomed, entry)
+	}
+
+	var errs []error
+	for _, entry := range doomed {
+		p.mu.Lock()
+		release := p.leases[entry.ID]
+		delete(p.leases, entry.ID)
+		p.mu.Unlock()
+		if err := p.removeEntry(ctx, entry, release); err != nil {
+			errs = append(errs, err)
+			// The removal failed, so the entry and its lease stay
+			// registered for a later ReleaseUnworked or Release to retry.
+			p.reg.Register(entry)
+			p.mu.Lock()
+			if release != nil {
+				p.leases[entry.ID] = release
+			}
+			p.mu.Unlock()
 		}
 	}
 	if err := runGit(ctx, p.repoRoot, nil, "worktree", "prune"); err != nil {

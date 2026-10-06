@@ -34,6 +34,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/dialog"
 	"github.com/charmbracelet/crush/internal/ui/textarea"
+	"github.com/charmbracelet/crush/internal/ui/util"
 	"github.com/charmbracelet/crush/internal/workspace"
 )
 
@@ -232,6 +233,37 @@ func addAgentBlock(t *testing.T, m *UI, messageID, toolCallID string) {
 			},
 		},
 	})
+}
+
+// deliverAgentResult delivers the tool result for the named call the way
+// the live event path does: a Tool-role message created in the parent
+// session, which routes to SetResult on the existing block.
+func deliverAgentResult(t *testing.T, m *UI, toolCallID, content string) {
+	t.Helper()
+	m.Update(pubsub.Event[message.Message]{
+		Type: pubsub.CreatedEvent,
+		Payload: message.Message{
+			ID:        "toolresult-" + toolCallID,
+			SessionID: inspectParentID,
+			Role:      message.Tool,
+			Parts: []message.ContentPart{
+				message.ToolResult{ToolCallID: toolCallID, Name: agent.AgentToolName, Content: content},
+			},
+		},
+	})
+}
+
+// requireBlockLive asserts the inspect liveness recorded for the block
+// whose child session has the given ID.
+func requireBlockLive(t *testing.T, m *UI, sessionID string, live bool, msgAndArgs ...any) {
+	t.Helper()
+	for _, ref := range m.agentBlocks() {
+		if ref.sessionID == sessionID {
+			require.Equal(t, live, ref.live, append([]any{"block %s liveness", sessionID}, msgAndArgs...)...)
+			return
+		}
+	}
+	t.Fatalf("no agent block for session %q", sessionID)
 }
 
 // TestInspectSubmitGoesToActiveSession pins the split invariant (#314):
@@ -888,6 +920,140 @@ func TestInitialTopLevelSessionLoadsActive(t *testing.T) {
 	require.Equal(t, otherID, m.session.ID, "a top-level session loads as active")
 	require.Equal(t, uiChat, m.state)
 	require.False(t, m.isInspecting())
+}
+
+// TestFinishedAgentBlockIsNotLive pins #405: an agent-tool block whose
+// result arrived is not live, on either path that can deliver a result:
+// the live event stream, or a transcript loaded from history.
+func TestFinishedAgentBlockIsNotLive(t *testing.T) {
+	t.Run("live result event", func(t *testing.T) {
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+		addAgentBlock(t, m, inspectMessageID, inspectCallID)
+		requireBlockLive(t, m, inspectChildID, true)
+
+		deliverAgentResult(t, m, inspectCallID, "done")
+
+		requireBlockLive(t, m, inspectChildID, false,
+			"a finished block must drop out of the live set")
+		require.Empty(t, m.liveAgentSessionIDs(),
+			"no live agents remain once the result lands")
+
+		// ctrl+] with nothing selected must now report instead of
+		// opening the oldest, long-finished block.
+		m.chat.SetSelected(-1)
+		cmd := m.handleInspectDrill()
+		require.NotNil(t, cmd)
+		info, ok := cmd().(util.InfoMsg)
+		require.True(t, ok, "the report is an info toast")
+		require.Equal(t, "No live sub-agents to inspect", info.Msg)
+	})
+
+	t.Run("history transcript", func(t *testing.T) {
+		ws := newInspectWorkspace()
+		m := newInspectUI(t, ws)
+		addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+		runInspectCmds(m, m.setSessionMessages([]message.Message{
+			{
+				ID:        inspectMessageID,
+				SessionID: inspectParentID,
+				Role:      message.Assistant,
+				Parts: []message.ContentPart{
+					message.ToolCall{
+						ID:    inspectCallID,
+						Name:  agent.AgentToolName,
+						Input: `{"prompt":"do things"}`,
+					},
+				},
+			},
+			{
+				ID:        "toolresult-" + inspectCallID,
+				SessionID: inspectParentID,
+				Role:      message.Tool,
+				Parts: []message.ContentPart{
+					message.ToolResult{ToolCallID: inspectCallID, Name: agent.AgentToolName, Content: "done"},
+				},
+			},
+		}))
+
+		requireBlockLive(t, m, inspectChildID, false,
+			"a block rebuilt from a loaded transcript is finished too")
+	})
+}
+
+// TestCanceledAgentBlockIsNotLive pins that a block from a canceled turn
+// is never live, whether or not a result ever arrived.
+func TestCanceledAgentBlockIsNotLive(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+	runInspectCmds(m, m.setSessionMessages([]message.Message{
+		{
+			ID:        inspectMessageID,
+			SessionID: inspectParentID,
+			Role:      message.Assistant,
+			Parts: []message.ContentPart{
+				message.ToolCall{
+					ID:    inspectCallID,
+					Name:  agent.AgentToolName,
+					Input: `{"prompt":"do things"}`,
+				},
+				message.Finish{Reason: message.FinishReasonCanceled},
+			},
+		},
+	}))
+
+	requireBlockLive(t, m, inspectChildID, false, "a canceled block is never live")
+}
+
+// TestCtrlDrillSkipsFinishedBlocks pins the selection path: with one
+// finished and one running agent block and nothing selected, ctrl+]
+// opens the running one and the ring holds only it.
+func TestCtrlDrillSkipsFinishedBlocks(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+	addChild(ws, inspectChild2ID, inspectParentID, "Agent B", inspectChildMessages()...)
+
+	addAgentBlock(t, m, inspectMessageID, inspectCallID)
+	addAgentBlock(t, m, inspectMessageID, inspectCall2ID)
+	deliverAgentResult(t, m, inspectCallID, "done")
+
+	m.chat.SetSelected(-1)
+	runInspectCmds(m, m.handleInspectDrill())
+
+	require.True(t, m.isInspecting())
+	require.Equal(t, inspectChild2ID, m.inspectingSessionID(),
+		"the running block must be the one inspected")
+	require.Equal(t, []string{inspectChild2ID}, m.inspectRing,
+		"the finished block must not ride the ring")
+}
+
+// TestFocusedFinishedBlockStillOpens pins that a finished block drops
+// out of the live ring, but focusing it and pressing ctrl+] still opens
+// its read-only transcript.
+func TestFocusedFinishedBlockStillOpens(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Agent A", inspectChildMessages()...)
+	addAgentBlock(t, m, inspectMessageID, inspectCallID)
+	deliverAgentResult(t, m, inspectCallID, "done")
+
+	idx := -1
+	for _, ref := range m.agentBlocks() {
+		if ref.sessionID == inspectChildID {
+			idx = ref.index
+		}
+	}
+	require.NotEqual(t, -1, idx, "the finished block is still a drill-in target")
+	m.chat.SetSelected(idx)
+
+	runInspectCmds(m, m.handleInspectDrill())
+
+	require.True(t, m.isInspecting())
+	require.Equal(t, inspectChildID, m.inspectingSessionID(),
+		"focusing a finished block must still open its transcript")
 }
 
 // TestInspectExitBuffersLateParentCreate pins the exit half of the

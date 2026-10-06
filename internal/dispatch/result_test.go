@@ -220,6 +220,12 @@ func TestDispatchResultTerminalMessage(t *testing.T) {
 	// reviews and decides.
 	require.Contains(t, msg, "Review the diff and decide whether to merge or dismiss")
 	require.Contains(t, msg, "never merges itself")
+	// #367: the workspace survives exit — it stays until the human
+	// applies or dismisses, and uncommitted changes count as work, so
+	// no worktree-removal instruction goes to the model.
+	require.Contains(t, msg, "applied or dismissed")
+	require.Contains(t, msg, "uncommitted changes count as part of the work")
+	require.NotContains(t, msg, "git worktree remove")
 	require.Contains(t, msg, `"key_findings": "fixed the bug"`)
 	require.Contains(t, msg, `"diff_summary": "a.go | +2 -1"`)
 }
