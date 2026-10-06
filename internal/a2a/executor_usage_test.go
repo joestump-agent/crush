@@ -67,7 +67,7 @@ func TestExecuteAttachesUsageToTerminalStates(t *testing.T) {
 
 	t.Run("completed", func(t *testing.T) {
 		t.Parallel()
-		exec := NewExecutor(&fakeRunner{result: textResult("done")}, "sess-1", WithUsage(usage))
+		exec := newBoundExecutor(&fakeRunner{result: textResult("done")}, WithUsage(usage))
 		got, ok := terminalUsage(t, executedTerminal(t, exec))
 		require.True(t, ok, "the terminal Completed status carries usage metadata")
 		require.Equal(t, fixedUsage, got)
@@ -75,7 +75,7 @@ func TestExecuteAttachesUsageToTerminalStates(t *testing.T) {
 
 	t.Run("run failed", func(t *testing.T) {
 		t.Parallel()
-		exec := NewExecutor(&fakeRunner{err: errors.New("provider exploded")}, "sess-1", WithUsage(usage))
+		exec := newBoundExecutor(&fakeRunner{err: errors.New("provider exploded")}, WithUsage(usage))
 		terminal := executedTerminal(t, exec)
 		require.Equal(t, a2aspec.TaskStateFailed, terminal.Status.State)
 		got, ok := terminalUsage(t, terminal)
@@ -85,7 +85,7 @@ func TestExecuteAttachesUsageToTerminalStates(t *testing.T) {
 
 	t.Run("no turn ran", func(t *testing.T) {
 		t.Parallel()
-		exec := NewExecutor(&fakeRunner{}, "sess-1", WithUsage(usage))
+		exec := newBoundExecutor(&fakeRunner{}, WithUsage(usage))
 		terminal := executedTerminal(t, exec)
 		require.Equal(t, a2aspec.TaskStateFailed, terminal.Status.State)
 		got, ok := terminalUsage(t, terminal)
@@ -96,7 +96,7 @@ func TestExecuteAttachesUsageToTerminalStates(t *testing.T) {
 	t.Run("out of band cancel", func(t *testing.T) {
 		t.Parallel()
 		runner := &fakeRunner{err: context.Canceled}
-		exec := NewExecutor(runner, "sess-1",
+		exec := newBoundExecutor(runner,
 			WithUsage(usage),
 			WithCancelReason(func() string { return "wander kill: hard timeout" }))
 		terminal := executedTerminal(t, exec)
@@ -109,7 +109,7 @@ func TestExecuteAttachesUsageToTerminalStates(t *testing.T) {
 	t.Run("own cancel carries none", func(t *testing.T) {
 		t.Parallel()
 		runner := &blockingCancelRunner{started: make(chan struct{}), kill: make(chan struct{})}
-		exec := NewExecutor(runner, "sess-1", WithUsage(usage))
+		exec := newBoundExecutor(runner, WithUsage(usage))
 		msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
 		evsCh := make(chan struct{}, 1)
 		go func() {
@@ -138,7 +138,7 @@ func TestExecuteUsageFailureShipsNoMetadata(t *testing.T) {
 
 	t.Run("closure errors", func(t *testing.T) {
 		t.Parallel()
-		exec := NewExecutor(&fakeRunner{result: textResult("done")}, "sess-1", WithUsage(
+		exec := newBoundExecutor(&fakeRunner{result: textResult("done")}, WithUsage(
 			func(context.Context) (agent.Usage, error) {
 				return agent.Usage{}, errors.New("session row gone")
 			}))
@@ -148,7 +148,7 @@ func TestExecuteUsageFailureShipsNoMetadata(t *testing.T) {
 
 	t.Run("no usage wired", func(t *testing.T) {
 		t.Parallel()
-		exec := NewExecutor(&fakeRunner{result: textResult("done")}, "sess-1")
+		exec := newBoundExecutor(&fakeRunner{result: textResult("done")})
 		_, ok := terminalUsage(t, executedTerminal(t, exec))
 		require.False(t, ok, "no usage func means no usage metadata")
 	})
@@ -170,6 +170,7 @@ func TestStreamDispatchCarriesUsageAndTraceparent(t *testing.T) {
 		DispatchID:  "dispatch-usage",
 		Runner:      &fakeRunner{result: textResult("done")},
 		SessionID:   "dispatch-session",
+		ContextID:   "dispatch-session",
 		Name:        "tester",
 		Description: "serves usage",
 		Usage: func(context.Context) (agent.Usage, error) {
@@ -181,9 +182,10 @@ func TestStreamDispatchCarriesUsageAndTraceparent(t *testing.T) {
 
 	ctx := agent.WithTraceparent(t.Context(), tp)
 	outcome, err := factory.StreamDispatch(ctx, agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
@@ -206,6 +208,7 @@ func TestStreamDispatchWithoutUsage(t *testing.T) {
 		DispatchID:  "dispatch-plain",
 		Runner:      &fakeRunner{result: textResult("done")},
 		SessionID:   "dispatch-session",
+		ContextID:   "dispatch-session",
 		Name:        "tester",
 		Description: "serves no usage",
 	})
@@ -213,9 +216,10 @@ func TestStreamDispatchWithoutUsage(t *testing.T) {
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
-		Endpoint: server.Endpoint,
-		Card:     server.Card,
-		Prompt:   "fix the bug",
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "fix the bug",
+		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)

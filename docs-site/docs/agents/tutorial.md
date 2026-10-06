@@ -218,11 +218,13 @@ then remove the worktree. Quitting is safe: exit already keeps any dispatch
 with commits or uncommitted changes ([#367](https://github.com/joestump-agent/crush/issues/367)).
 :::
 
+From the shell, `crush dispatch list` shows every workspace and `crush
+dispatch prune` removes decided ones, or every dead owner's with
+`--all-dead`; `--dry-run` previews ([#369](https://github.com/joestump-agent/crush/issues/369)).
+
 :::info[Planned]
 `apply_dispatch` and `dismiss_dispatch` will record your decision about a
-workspace directly ([#368](https://github.com/joestump-agent/crush/issues/368)),
-and `crush dispatch list` and `crush dispatch prune` will manage them from the
-shell ([#369](https://github.com/joestump-agent/crush/issues/369)).
+workspace directly ([#368](https://github.com/joestump-agent/crush/issues/368)).
 :::
 
 ## Revisit later

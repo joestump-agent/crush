@@ -596,6 +596,13 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				c.removeDispatch(ctx, reg, provider, entry, toolchain)
 				return fantasy.NewTextErrorResponse("assign dispatch handle: registry entry vanished"), nil
 			}
+			// Stamp the identity onto the owner marker too (#369): the
+			// registry dies with the process, the marker outlives it,
+			// and list and salvage tooling read the marker. Best-effort:
+			// a failed stamp costs a blank column, not a dispatch.
+			if err := provider.UpdateOwnerIdentity(entry.ID, assignedHandle, params.Role); err != nil {
+				slog.Warn("Failed to stamp dispatch handle on owner marker", "dispatch_id", entry.ID, "error", err)
+			}
 
 			run := dispatchRun{
 				reg:             reg,
