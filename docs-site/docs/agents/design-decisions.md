@@ -49,7 +49,7 @@ current behaviour. What ships today is on
 | 2026-10-02 | Wander kill is deterministic and configurable, and workspace state is preserved for salvage. | Interaction | Shipped ([#316](https://github.com/joestump-agent/crush/issues/316)); scope revised 2026-10-04 |
 | 2026-10-04 | **A2A is the runtime contract.** One path through the A2A client, and no direct-run fallback. | Both | Planned: [#347](https://github.com/joestump-agent/crush/issues/347) |
 | 2026-10-04 | **Transport.** One host per Crush process on a 0600 unix socket. TCP is opt-in and requires TLS and auth. | A2A PRD | Shipped ([#346](https://github.com/joestump-agent/crush/issues/346)); TCP planned: [#358](https://github.com/joestump-agent/crush/issues/358), [#357](https://github.com/joestump-agent/crush/issues/357) |
-| 2026-10-04 | **Agent definitions.** Built-ins stay backwards compatible but can be overridden, extended, or replaced by an external card. crushrc first. | Both | Planned: [#333](https://github.com/joestump-agent/crush/issues/333), [#431](https://github.com/joestump-agent/crush/issues/431), [#434](https://github.com/joestump-agent/crush/issues/434) |
+| 2026-10-04 | **Agent definitions.** Built-ins stay backwards compatible but can be overridden, extended, or replaced by an external card. crushrc first. | Both | Data model shipped in `crush.json`: [#333](https://github.com/joestump-agent/crush/issues/333). Planned: [#431](https://github.com/joestump-agent/crush/issues/431), [#434](https://github.com/joestump-agent/crush/issues/434) |
 | 2026-10-04 | **Extensions.** Metadata is allowed but must be declared on the card and statically typed. | A2A PRD | Shipped ([#359](https://github.com/joestump-agent/crush/issues/359)) |
 | 2026-10-04 | **Kill is `tasks/cancel` with a reason.** Exactly one terminal event per task. | A2A PRD | Planned: [#342](https://github.com/joestump-agent/crush/issues/342), [#348](https://github.com/joestump-agent/crush/issues/348) |
 | 2026-10-04 | **Kill scope.** Nudges apply to agents that have the todos tool. Kill applies only to dispatched agents. | Both | Planned: [#393](https://github.com/joestump-agent/crush/issues/393), [#394](https://github.com/joestump-agent/crush/issues/394) |
@@ -100,7 +100,10 @@ runtime spec — lets users override built-ins field by field and add their
 own. The built-ins are `coder`, `plan`, `task`, and a new `worker` for
 dispatch. A `runtime: a2a` definition swaps in an external agent behind the
 same client, and its artifacts are always treated as untrusted. crushrc is
-the primary format, with JSON kept for compatibility.
+the primary format, with JSON kept for compatibility. The `crush.json` data
+model and its validation are live as of
+[#333](https://github.com/joestump-agent/crush/issues/333); the runtime reads
+them from #432 on.
 Tracking: [#333](https://github.com/joestump-agent/crush/issues/333), [#431](https://github.com/joestump-agent/crush/issues/431), [#432](https://github.com/joestump-agent/crush/issues/432), [#433](https://github.com/joestump-agent/crush/issues/433), [#434](https://github.com/joestump-agent/crush/issues/434).
 
 ### Extensions are declared and statically typed

@@ -1440,16 +1440,27 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	// old publish-then-SetupAgents window. s.SetupAgents reads the live
 	// pointer, so run setup directly on cfg instead.
 	var setupErr error
-	if !cfg.IsConfigured() {
-		slog.Warn("No providers configured after reload")
-	} else {
-		resolved, resolveErr := resolveSelectedModels(cfg, providers)
-		if resolveErr != nil {
-			setupErr = fmt.Errorf("failed to configure selected models during reload: %w", resolveErr)
+	// A bad agents block rolls the reload back the same way a failed
+	// model resolution does: nothing from the new config is published.
+	if err := cfg.ValidateAgents(); err != nil {
+		setupErr = fmt.Errorf("invalid agent definitions: %w", err)
+	}
+	if setupErr == nil {
+		if !cfg.IsConfigured() {
+			slog.Warn("No providers configured after reload")
 		} else {
-			cfg.Models[SelectedModelTypeLarge] = resolved.Large
-			cfg.Models[SelectedModelTypeSmall] = resolved.Small
-			cfg.SetupAgents()
+			resolved, resolveErr := resolveSelectedModels(cfg, providers)
+			if resolveErr != nil {
+				setupErr = fmt.Errorf("failed to configure selected models during reload: %w", resolveErr)
+			} else {
+				cfg.Models[SelectedModelTypeLarge] = resolved.Large
+				cfg.Models[SelectedModelTypeSmall] = resolved.Small
+				if err := cfg.ValidateAgentModelRefs(); err != nil {
+					setupErr = fmt.Errorf("invalid agent definitions: %w", err)
+				} else {
+					cfg.SetupAgents()
+				}
+			}
 		}
 	}
 

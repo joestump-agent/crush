@@ -98,6 +98,12 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 		return nil, fmt.Errorf("invalid dispatch configuration: %w", err)
 	}
 
+	// Validate the agent definitions structurally after all merging, so
+	// a bad agents block fails the load the same way a bad hook does.
+	if err := cfg.ValidateAgents(); err != nil {
+		return nil, fmt.Errorf("invalid agent definitions: %w", err)
+	}
+
 	if !isInsideWorktree() {
 		const depth = 2
 		const items = 100
@@ -175,6 +181,11 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 		}); err != nil {
 			return nil, fmt.Errorf("failed to update preferred small model: %w", err)
 		}
+	}
+	// Model pins are validated once the catalog is known, just before
+	// the agents are resolved from their definitions.
+	if err := store.Config().ValidateAgentModelRefs(); err != nil {
+		return nil, fmt.Errorf("invalid agent definitions: %w", err)
 	}
 	store.SetupAgents()
 
