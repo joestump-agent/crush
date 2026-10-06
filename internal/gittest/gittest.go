@@ -49,12 +49,23 @@ const (
 //	GIT_COMMITTER_NAME      testName
 //	GIT_COMMITTER_EMAIL     testEmail
 //	GIT_CEILING_DIRECTORIES the resolved os.TempDir()
+//	GIT_CONFIG_COUNT        2, setting maintenance.auto=false and
+//	                        gc.auto=0
 //
 // GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM keep the developer's
 // global and system config out, including commit.gpgsign,
 // diff.external and color.ui. The ceiling keeps git from walking
 // past the temp tree to a repository the test never intended,
 // including a TMPDIR that sits inside one.
+//
+// The config pins turn off automatic maintenance. Since git 2.47,
+// commands such as commit run `git maintenance run --auto --detach`,
+// a background process that outlives the command and writes lock
+// files under .git. A test that finishes quickly could then have
+// t.TempDir's RemoveAll fail with "unlinkat .git: directory not
+// empty", seen on loaded macOS CI runners. Environment config sits
+// above repository config, so the pins hold for every repository a
+// test creates.
 func Setup() (func(), error) {
 	original := os.Environ()
 
@@ -72,6 +83,11 @@ func Setup() (func(), error) {
 		"GIT_COMMITTER_NAME":      testName,
 		"GIT_COMMITTER_EMAIL":     testEmail,
 		"GIT_CEILING_DIRECTORIES": tempDir,
+		"GIT_CONFIG_COUNT":        "2",
+		"GIT_CONFIG_KEY_0":        "maintenance.auto",
+		"GIT_CONFIG_VALUE_0":      "false",
+		"GIT_CONFIG_KEY_1":        "gc.auto",
+		"GIT_CONFIG_VALUE_1":      "0",
 	}
 
 	// GIT_EXEC_PATH is the one inherited variable we keep: without
