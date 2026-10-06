@@ -67,8 +67,9 @@ type DispatchAgentParams struct {
 	Role string `json:"role,omitempty" description:"One-line role label for the dispatched agent (e.g. \"tester\", \"docs writer\"), shown in the @ completions and used to derive its handle"`
 }
 
-// dispatchSweepTimeout bounds the session-end sweep: it runs git commands
-// against every workspace, and a wedged worktree must not hang shutdown.
+// dispatchSweepTimeout bounds the session-end ReleaseDispatches: it runs
+// git commands against every workspace, and a wedged worktree must not
+// hang shutdown.
 const dispatchSweepTimeout = 30 * time.Second
 
 // dispatchAgentOptions configures the dispatched-agent constructor.
@@ -1455,17 +1456,39 @@ func (c *coordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, b
 	return collector.Snapshot(sessionID)
 }
 
-// sweepDispatchOnDone is the session-end backstop (#63's Sweep): when the
-// coordinator's context ends — app shutdown — every workspace dispatch
-// created is torn down, in-flight runs included (their runs fail against
-// a removed workspace; wander kill in #316 owns deterministic
-// cancellation of live runs).
+// ReleaseDispatches is the synchronous session-end cleanup (#367): it
+// releases this session's dispatch workspaces that are safe to remove —
+// the ones that never produced work — and leaves completed or killed
+// work with commits or uncommitted changes on disk for salvage. It is
+// called from App.Shutdown on the live coordinator context, bounded by
+// dispatchSweepTimeout so a wedged worktree cannot hang shutdown.
+func (c *coordinator) ReleaseDispatches(ctx context.Context) {
+	c.dispatchMu.Lock()
+	provider := c.dispatchProvider
+	c.dispatchMu.Unlock()
+	if provider == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, dispatchSweepTimeout)
+	defer cancel()
+	if err := provider.ReleaseUnworked(ctx); err != nil {
+		slog.Error("Dispatch workspace release failed", "error", err)
+	}
+}
+
+// sweepDispatchOnDone is the session-end backstop for the synchronous
+// ReleaseDispatches App.Shutdown runs: when the coordinator's context
+// ends without it — a crash path — the same selective release still
+// runs. A workspace with salvageable work stays on disk; only workless
+// ones are removed. In-flight runs fail against a removed workspace;
+// wander kill in #316 owns deterministic cancellation of live runs.
 func (c *coordinator) sweepDispatchOnDone(ctx context.Context) {
 	<-ctx.Done()
 	c.sweepDispatch()
 }
 
-// sweepDispatch sweeps the dispatch worktree provider if one exists.
+// sweepDispatch runs the session-end release on a fresh, bounded
+// context: the coordinator's own is already done.
 func (c *coordinator) sweepDispatch() {
 	c.dispatchMu.Lock()
 	provider := c.dispatchProvider
@@ -1473,11 +1496,10 @@ func (c *coordinator) sweepDispatch() {
 	if provider == nil {
 		return
 	}
-	// A fresh, bounded context: the coordinator's own is already done.
 	ctx, cancel := context.WithTimeout(context.Background(), dispatchSweepTimeout)
 	defer cancel()
-	if err := provider.Sweep(ctx); err != nil {
-		slog.Error("Dispatch workspace sweep failed", "error", err)
+	if err := provider.ReleaseUnworked(ctx); err != nil {
+		slog.Error("Dispatch workspace release failed", "error", err)
 	}
 }
 

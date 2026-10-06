@@ -526,6 +526,14 @@ func TestRunDispatchRecordsTerminalStatus(t *testing.T) {
 	}
 }
 
+// branchExists reports whether the repo at dir currently has the branch.
+func branchExists(t *testing.T, dir, branch string) bool {
+	t.Helper()
+	out, err := exec.CommandContext(t.Context(), "git", "-C", dir, "branch", "--list", branch).CombinedOutput()
+	require.NoError(t, err, "git branch --list %s: %s", branch, out)
+	return strings.TrimSpace(string(out)) != ""
+}
+
 // A dispatched run's background jobs die with the run (#385): the fake
 // agent starts a job tagged with the dispatch session, and runDispatch
 // kills it before the terminal result is assembled, so the salvage diff
@@ -616,8 +624,65 @@ func TestRunDispatchKillsBackgroundJobsOnKill(t *testing.T) {
 	require.False(t, ok, "background job %s survived the killed run", jobID)
 }
 
-// The session-end backstop: when the coordinator's context ends, every
-// workspace dispatch created is swept away.
+// ReleaseDispatches is the synchronous session-end cleanup (#367): a
+// completed dispatch whose workspace holds work the human might want —
+// even just uncommitted changes — survives it, and a pending workspace
+// that never produced work is removed.
+func TestReleaseDispatchesKeepsWork(t *testing.T) {
+	agent := &dispatchTestAgent{
+		model:  dispatchTestModel(),
+		result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
+	}
+	c, env := newDispatchToolEnv(t, agent)
+	tool := c.dispatchTool()
+
+	// Each dispatch keys its task session off the tool-call and message
+	// IDs, so both must be unique per dispatch.
+	dispatchOnce := func(messageID string) dispatch.DispatchResult {
+		t.Helper()
+		input, err := json.Marshal(DispatchAgentParams{Prompt: "do work"})
+		require.NoError(t, err)
+		ctx := context.WithValue(context.Background(), tools.SessionIDContextKey, "dispatch-parent-session")
+		ctx = context.WithValue(ctx, tools.MessageIDContextKey, messageID)
+		ctx = context.WithValue(ctx, tools.ContentWidthContextKey, 80)
+		resp, err := tool.Run(ctx, fantasy.ToolCall{
+			ID:    "dispatch-tool-call-" + messageID,
+			Name:  DispatchAgentToolName,
+			Input: string(input),
+		})
+		require.NoError(t, err)
+		return decodeDispatchHandle(t, resp)
+	}
+	withWork := dispatchOnce("release-with-work")
+	empty := dispatchOnce("release-empty")
+
+	for _, handle := range []dispatch.DispatchResult{withWork, empty} {
+		require.Eventually(t, func() bool {
+			entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
+			return ok && entry.Status == dispatch.StatusCompleted
+		}, 10*time.Second, 50*time.Millisecond)
+	}
+
+	// Uncommitted changes count as work (#367): no commit needed.
+	require.NoError(t, os.WriteFile(filepath.Join(withWork.WorkspacePath, "salvage.txt"), []byte("keep"), 0o644))
+
+	c.ReleaseDispatches(context.Background())
+
+	_, err := os.Stat(withWork.WorkspacePath)
+	require.NoError(t, err, "completed workspace with work must survive release")
+	require.True(t, branchExists(t, env.workingDir, withWork.Branch), "branch of kept workspace must survive")
+	entry, ok := c.dispatchRegistry().Get(withWork.DispatchID)
+	require.True(t, ok, "kept workspace stays registered so it can still be removed")
+	require.Equal(t, dispatch.StatusCompleted, entry.Status)
+
+	_, err = os.Stat(empty.WorkspacePath)
+	require.True(t, os.IsNotExist(err), "workless workspace must be released")
+	require.False(t, branchExists(t, env.workingDir, empty.Branch), "branch of released workspace must be gone")
+	require.Len(t, c.dispatchRegistry().List(), 1, "only the kept workspace stays registered")
+}
+
+// The session-end backstop: when the coordinator's context ends, a
+// workless workspace is released (#367) — one with work stays on disk.
 func TestSweepDispatchOnCoordinatorEnd(t *testing.T) {
 	agent := &dispatchTestAgent{
 		model:  dispatchTestModel(),

@@ -168,19 +168,22 @@ Every dispatch creates a worktree at
 
 ### Worktrees disappeared after quitting
 
-What happens at exit depends on how Crush ends:
+Crush keeps dispatch work at exit ([#367](https://github.com/joestump-agent/crush/issues/367), [#365](https://github.com/joestump-agent/crush/issues/365)): a graceful shutdown removes only
+dispatches you applied or dismissed and ones that produced no work, a crash
+removes nothing — the next launch reconciles the same way — and work with
+commits or uncommitted changes stays on disk and on its branch either way.
+Only this process's own workspaces are ever touched; other Crush instances'
+live worktrees are left alone.
 
 | How Crush ends | Dispatch worktrees and branches |
 | --- | --- |
-| <kbd>ctrl+c</kbd> in the TUI, or `SIGTERM` | The cleanup sweep races the process exit. Usually everything is left behind; sometimes some is removed |
-| `SIGINT` (`kill -INT`, or <kbd>ctrl+c</kbd> in `crush run`) | The sweep runs. Every `crush-dispatch-*` worktree under `.crush/worktrees` is force-removed and its branch deleted with `git branch -D`. That includes completed but unreviewed work, killed work, and **other Crush instances' live worktrees** in the same directory ([#367](https://github.com/joestump-agent/crush/issues/367), [#365](https://github.com/joestump-agent/crush/issues/365)) |
-| Crash, `SIGKILL`, `SIGHUP` | Nothing is removed |
+| <kbd>ctrl+c</kbd> in the TUI, or `SIGTERM` | Released synchronously at shutdown: decided and workless workspaces are removed with their branches; work is kept for salvage ([#367](https://github.com/joestump-agent/crush/issues/367)) |
+| `SIGINT` (`kill -INT`, or <kbd>ctrl+c</kbd> in `crush run`) | Nothing is removed; the next launch reconciles ([#367](https://github.com/joestump-agent/crush/issues/367), [#365](https://github.com/joestump-agent/crush/issues/365)) |
+| Crash, `SIGKILL`, `SIGHUP` | Nothing is removed; the next launch reconciles |
 
-Merge or copy out anything you want to keep before you quit. Don't run two
-Crush instances that dispatch from the same directory.
-
-Committed work on a deleted branch usually survives as unreachable commits
-until git garbage-collects them:
+If work you wanted is gone anyway — removed by hand, or by an older Crush —
+committed work usually survives as unreachable commits until git
+garbage-collects them:
 
 ```bash
 git fsck --unreachable --no-reflogs | grep commit
@@ -190,9 +193,9 @@ git branch rescue-<id> <sha>      # once you've found it with git show <sha>
 Uncommitted changes in a removed worktree are gone.
 
 :::info[Planned]
-Worktrees are preserved for salvage and never discarded at exit ([#367](https://github.com/joestump-agent/crush/issues/367)). The
-sweep only touches this process's own workspaces ([#365](https://github.com/joestump-agent/crush/issues/365)). You apply or
-dismiss each dispatch explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)).
+You'll apply or dismiss each dispatch explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)) and manage
+workspaces from the shell with `crush dispatch list` and `crush dispatch
+prune` ([#369](https://github.com/joestump-agent/crush/issues/369)).
 :::
 
 ### Orphan worktrees and `crush-dispatch-*` branches pile up

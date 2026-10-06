@@ -54,17 +54,30 @@ func newDispatchTestCoordinatorAt(t *testing.T, env fakeEnv, workingDir, dataDir
 		// test instead of leaking a Background subscription.
 		dispatchCtx: t.Context(),
 	}
-	// The session-end backstop (#63's Sweep), run as a cleanup: a
+	// The session-end cleanup (#63's Sweep), run as a cleanup: a
 	// dispatch's workspace outlives its background run — runDispatch
 	// never releases it — so the worktree provider's ownership-lease
-	// file stays open until something sweeps. t.TempDir()'s cleanup
+	// file stays open until something releases it. t.TempDir()'s cleanup
 	// fails the test on Windows when it cannot delete an open file, so
-	// the sweep must run before that removal. Registered after testEnv's
+	// the release must run before that removal. Registered after testEnv's
 	// cleanups and before reapDispatchRuns' registration, it runs after
 	// the reaper has waited out every run (LIFO) and before the
-	// directory goes away (#422). Sweep is idempotent, so a test that
-	// swept or released explicitly is unaffected.
-	t.Cleanup(c.sweepDispatch)
+	// directory goes away (#422). Teardown wants the full Sweep, not the
+	// selective exit release: only a test's assertions decide what
+	// survives, and teardown must close every lease, salvageable work
+	// included. Sweep is idempotent, so a test that swept or released
+	// explicitly is unaffected.
+	t.Cleanup(func() {
+		c.dispatchMu.Lock()
+		provider := c.dispatchProvider
+		c.dispatchMu.Unlock()
+		if provider == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), dispatchSweepTimeout)
+		defer cancel()
+		_ = provider.Sweep(ctx)
+	})
 	return c
 }
 

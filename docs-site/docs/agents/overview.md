@@ -129,20 +129,18 @@ The main agent may act on the result right away, merging included, subject to
 your permission prompts. Tell it up front if you want to review first. The
 dispatched session's cost is added to the parent session's.
 
-:::warning[Known issue]
-**Quitting Crush deletes dispatch work.** On exit, Crush force-removes every
-`crush-dispatch-*` worktree under `.crush/worktrees` and deletes its branch
-with `git branch -D`. That includes unmerged results, killed runs, and other
-Crush instances' worktrees in the same directory. Depending on how you quit,
-removal may be partial ([#367](https://github.com/joestump-agent/crush/issues/367), [#365](https://github.com/joestump-agent/crush/issues/365)). Merge what you want before quitting,
-and don't run two dispatching instances in one directory.
+:::info
+**Quitting keeps dispatch work.** At exit, Crush releases only dispatches
+you applied or dismissed and ones that produced no work; anything with
+commits or uncommitted changes stays on disk and on its branch, and only
+this process's own workspaces are touched ([#367](https://github.com/joestump-agent/crush/issues/367), [#365](https://github.com/joestump-agent/crush/issues/365)). A crash removes
+nothing; the next launch reconciles the same way.
 :::
 
 :::info[Planned]
-Workspaces will be preserved for salvage, never discarded at exit ([#367](https://github.com/joestump-agent/crush/issues/367)).
-You'll apply or dismiss them explicitly with `apply_dispatch` and
-`dismiss_dispatch` ([#368](https://github.com/joestump-agent/crush/issues/368)), and manage them from the shell with
-`crush dispatch list` and `crush dispatch prune` ([#369](https://github.com/joestump-agent/crush/issues/369)).
+You'll record your decision about a workspace explicitly with
+`apply_dispatch` and `dismiss_dispatch` ([#368](https://github.com/joestump-agent/crush/issues/368)), and manage them from the
+shell with `crush dispatch list` and `crush dispatch prune` ([#369](https://github.com/joestump-agent/crush/issues/369)).
 :::
 
 ## Under the hood: A2A

@@ -243,10 +243,14 @@ shutdown. Its endpoint and card are cleared from the registry. The
 toolchain then closes, which stops the permission bridge and the scoped
 LSP clients. The worktree and branch stay so they can be reviewed.
 
-When Crush exits, a sweep with a 30-second budget force-removes every
-registry entry. It then removes every `crush-dispatch-*` directory left
-under `.crush/worktrees`, and deletes each branch with `git branch -D`.
-Completed and killed work goes too.
+When Crush exits, `App.Shutdown` releases this instance's dispatch
+workspaces synchronously, bounded by a 30-second budget ([#367](https://github.com/joestump-agent/crush/issues/367)):
+dispatches the human decided about — applied or dismissed — and ones that
+never produced work are removed with their branches. Completed and killed
+dispatches with commits or uncommitted changes stay on disk and on their
+branch for salvage, and the next launch reconciles the owner markers a
+crashed run left behind the same way ([#367](https://github.com/joestump-agent/crush/issues/367)). A live instance's
+workspaces are never touched ([#365](https://github.com/joestump-agent/crush/issues/365)).
 
 Shutdown itself runs before that sweep: every live dispatch is canceled
 with the "crush exited" kill reason, and the exit waits (bounded) for
@@ -254,10 +258,9 @@ each dispatched run to record its terminal state, so agents stop before
 messages flush and the database closes.
 
 :::warning[Known issue]
-The exit sweep discards unreviewed and killed work, contradicting the
-"workspace is preserved" message the main agent receives ([#367](https://github.com/joestump-agent/crush/issues/367)). It also
-removes worktrees that belong to another Crush instance in the same
-repository ([#365](https://github.com/joestump-agent/crush/issues/365)).
+Shutdown does not cancel running dispatches before release
+([#372](https://github.com/joestump-agent/crush/issues/372)), so a dispatch still running at exit loses its workspace if
+it produced no work.
 :::
 
 ## Where this is going
