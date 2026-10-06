@@ -384,16 +384,19 @@ type UI struct {
 	// parent chat state captured on entry and restored on exit.
 	// inspectRing enumerates the live agent blocks (in transcript order)
 	// at the moment inspect mode was entered; ctrl+] cycles it.
+	// inspectDispatchTargets marks which ring members are dispatch blocks
+	// (vs plain agent tools), so ctrl+x only offers a cancel for them.
 	// inspectSeq numbers inspect transitions so a child load that lands
 	// after a later one is dropped. inspectPending is a task session
 	// picked from the sessions dialog, waiting for its parent to load.
-	inspecting     *session.Session
-	inspectScroll  [2]int
-	inspectFollow  bool
-	inspectRing    []string
-	inspectRingPos int
-	inspectSeq     int
-	inspectPending *session.Session
+	inspecting             *session.Session
+	inspectScroll          [2]int
+	inspectFollow          bool
+	inspectRing            []string
+	inspectRingPos         int
+	inspectDispatchTargets map[string]bool
+	inspectSeq             int
+	inspectPending         *session.Session
 
 	// onboarding state
 	onboarding struct {
@@ -718,7 +721,17 @@ func (m *UI) loadInitialSession() tea.Cmd {
 		// Only load if we're in landing state (i.e., fully configured)
 		return nil
 	case m.initialSessionID != "":
-		return m.loadSession(m.initialSessionID)
+		return func() tea.Msg {
+			sess, err := m.com.Workspace.GetSession(context.Background(), m.initialSessionID)
+			if err != nil {
+				return util.ReportError(err)
+			}
+			// Route through the picker handler (#413): a task session
+			// loads its parent as the active session and opens in the
+			// read-only inspect view; a top-level session loads as
+			// active, as before.
+			return m.handleSelectSession(sess)()
+		}
 	case m.continueLastSession:
 		return func() tea.Msg {
 			sessions, err := m.com.Workspace.ListSessions(context.Background())
@@ -1890,6 +1903,14 @@ func (m *UI) loadNestedToolCalls(items []chat.MessageItem) {
 		}
 		nestedToolResultMap := chat.BuildToolResultMap(nestedMsgPtrs)
 
+		// A dispatch block rebuilds its steer log from the persisted
+		// child transcript (#410): Steer-marked user messages are steers,
+		// so the record survives reloads, session switches, and inspect
+		// round-trips.
+		if dispatchBlock, ok := nestedContainer.(*chat.DispatchToolMessageItem); ok {
+			dispatchBlock.RebuildSteers(nestedMsgs)
+		}
+
 		// Extract nested tool items.
 		var nestedTools []chat.ToolMessageItem
 		for _, nestedMsg := range nestedMsgPtrs {
@@ -2114,6 +2135,16 @@ func (m *UI) updateSessionMessage(msg message.Message) tea.Cmd {
 		}
 	}
 
+	// A Tool-role update can carry results the card has never seen —
+	// the dispatch terminal record stamped after the fact (#410) — so
+	// apply them like the created path does, or a client/server card
+	// would spin forever on a finished dispatch.
+	for _, tr := range msg.ToolResults() {
+		if toolItem, ok := m.chat.MessageItem(tr.ToolCallID).(chat.ToolMessageItem); ok && toolItem != nil {
+			toolItem.SetResult(&tr)
+		}
+	}
+
 	m.chat.AppendMessages(items...)
 	if m.chat.Follow() {
 		m.chat.ScrollToBottom()
@@ -2233,11 +2264,14 @@ func (m *UI) feedDispatchConversation(block *chat.DispatchToolMessageItem, event
 	msg := event.Payload
 	switch msg.Role {
 	case message.User:
-		text := msg.Content().Text
-		if text == "" || block.IsInitialDispatchPrompt(text) {
+		// Only Steer-marked messages are steers (#410): the dispatch's
+		// initial prompt and persisted todo nudges are plain user
+		// messages and must never appear on the card.
+		content := msg.Content()
+		if !content.Steer || content.Text == "" {
 			return
 		}
-		block.AddSteer(text)
+		block.AddSteer(content.Text)
 	case message.Assistant:
 		text := msg.Content().Text
 		if text == "" {
@@ -3494,7 +3528,10 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 					break
 				}
 
-				// Otherwise, send the message
+				// Otherwise, send the message. Keep the raw editor value
+				// around: a leading @handle that is refused or fails to
+				// deliver restores the pre-submit state (#414).
+				savedValue := value
 				m.textarea.Reset()
 				if cmd := m.handleTextareaHeightChange(prevHeight); cmd != nil {
 					cmds = append(cmds, cmd)
@@ -3521,6 +3558,8 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				}
 
 				attachments := m.attachments.List()
+				savedMentionAttachments := m.mentionAttachments
+				savedDiscardedMentions := m.discardedMentions
 				m.attachments.Reset()
 				m.resetMentionTracking()
 				if len(value) == 0 && !message.ContainsTextAttachment(attachments) {
@@ -3537,9 +3576,22 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 
 				// A prompt that opens with a live agent's @handle routes to
 				// that agent's injection queue instead of starting a parent
-				// turn (#313). The editor was already reset above, exactly
-				// like a sent prompt.
-				if cmd, handled := m.routeLeadingAgentHandle(value); handled {
+				// turn (#313), the editor's attachments included (#414). A
+				// steer that is refused or fails to deliver restores the
+				// editor's pre-submit state: the typed text, the chips and
+				// the mention tracking, with the warning or error still
+				// shown.
+				if cmd, handled, delivered := m.routeLeadingAgentHandle(value, attachments); handled {
+					if !delivered {
+						restoredHeight := m.textarea.Height()
+						m.textarea.SetValue(savedValue)
+						if cmd := m.handleTextareaHeightChange(restoredHeight); cmd != nil {
+							cmds = append(cmds, cmd)
+						}
+						m.attachments.Set(attachments)
+						m.mentionAttachments = savedMentionAttachments
+						m.discardedMentions = savedDiscardedMentions
+					}
 					return tea.Batch(cmd, m.loadPromptHistory())
 				}
 
@@ -4353,6 +4405,12 @@ func (m *UI) FullHelp() [][]key.Binding {
 			if hasSession {
 				mainBinds = append(mainBinds, k.Chat.NewSession, k.Chat.EndFollow)
 			}
+		}
+		if sid := m.focusedLiveDispatchSessionID(); sid != "" {
+			// A live dispatch is targeted: advertise the cancel binding
+			// (#373). It rides the inspect handler, so unlike the rows
+			// above it also works while the sidebar is focused.
+			mainBinds = append(mainBinds, k.CancelAgent)
 		}
 
 		binds = append(binds, mainBinds)
@@ -6140,10 +6198,20 @@ func (m *UI) sendMessageInternal(content string, hidden bool, attachments ...mes
 // prompt path a typed message uses (sendMessage → AgentRun, which enqueues
 // behind a running turn).
 //
+// While a sub-agent transcript is being inspected (#407) the click is
+// refused outright: the parent never asked the question, so the surface is
+// left live and nothing is sent anywhere.
+//
 // The retire lookup may miss — e.g. the message content was rescanned and
 // the surface rebuilt without an ID — in which case the submission still
 // goes out with just the button identity rather than being dropped.
 func (m *UI) handleA2UIButtonClicked(clicked a2uievent.ButtonClicked) tea.Cmd {
+	// A surface in an inspected transcript is read-only (#407): the click
+	// must not retire the surface, start a parent turn, or round-trip to
+	// an MCP server.
+	if m.isInspecting() {
+		return util.ReportInfo("This form belongs to a sub-agent transcript and is read-only")
+	}
 	// A cancel/dismiss button only ever dismisses the surface locally —
 	// it never starts an agent turn nor round-trips to an MCP server.
 	// Checked first, before any provenance branch.

@@ -42,7 +42,10 @@ func (s *stubCoordinator) BeginAccepted(sessionID string) *agent.AcceptedRun {
 }
 func (s *stubCoordinator) Cancel(string) {}
 func (s *stubCoordinator) CancelAll()    {}
-func (s *stubCoordinator) IsBusy() bool  { return false }
+func (s *stubCoordinator) CancelDispatch(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *stubCoordinator) IsBusy() bool { return false }
 func (s *stubCoordinator) IsSessionBusy(id string) bool {
 	return s.busy[id]
 }
@@ -55,6 +58,7 @@ func (s *stubCoordinator) Summarize(context.Context, string) error {
 }
 func (s *stubCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (s *stubCoordinator) UpdateModels(context.Context) error            { return nil }
+func (s *stubCoordinator) SetInteractive(context.Context, bool) error    { return nil }
 func (s *stubCoordinator) SetMainAgent(string) error                     { return nil }
 func (s *stubCoordinator) GenerateTitle(context.Context, string, string) {}
 
@@ -357,6 +361,6 @@ func (s *stubCoordinator) DispatchByHandle(sessionID, handle string) (dispatch.T
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (s *stubCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+func (s *stubCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	return errors.New("not implemented")
 }

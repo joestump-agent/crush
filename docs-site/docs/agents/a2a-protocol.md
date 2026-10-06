@@ -106,15 +106,16 @@ unless `Content-Type` parses to `application/json`, and `400` unless the
 ## Methods
 
 The SDK's default request handler serves the whole A2A method set. Crush's
-client calls exactly one of them.
+client calls three of them: the dispatch itself, and — when a stream
+drops mid-run — the two resume methods.
 
 | Method | Crush calls it | What the server does |
 | --- | --- | --- |
 | `SendStreamingMessage` | Yes, once per dispatch | Runs the turn and streams the events below. |
 | `SendMessage` | No | Runs the turn and returns the final result in one response. |
-| `GetTask`, `ListTasks` | No | Answer from the per-server in-memory store. |
-| `CancelTask` | No | Calls the agent's `Cancel` and emits `TASK_STATE_CANCELED`. |
-| `SubscribeToTask` | No | Re-attaches to a task's stream. The client does not keep the task ID. |
+| `GetTask`, `ListTasks` | `GetTask` on resume | Answer from the per-server in-memory store. |
+| `CancelTask` | Yes — wander kills and user cancels | Calls the agent's `Cancel` and emits `TASK_STATE_CANCELED`, the request's reason as the status message. |
+| `SubscribeToTask` | On resume | Re-attaches to a live task's stream. |
 | Push-notification config methods | No | Return "push notifications not supported". |
 | `GetExtendedAgentCard` | No | Returns "extended card not configured". |
 
@@ -220,8 +221,7 @@ rides the result.
 | Message has no text | `TASK_STATE_REJECTED`, "message has no text to run". Crush's client refuses an empty prompt before sending, so only another client can hit this. |
 | Run returns an error | `TASK_STATE_FAILED` with the error text. |
 | Agent was busy, or a cancel landed at start | `TASK_STATE_FAILED`, "agent session did not start a turn (busy or canceled)". The prompt is still queued on the session, and the running agent reads it. |
-| `CancelTask` | `TASK_STATE_CANCELED`, with no message. |
-| Cancel from inside Crush (wander kill, todo ladder) | Nothing. The stream stays open ([#342](https://github.com/joestump-agent/crush/issues/342)). |
+| `CancelTask` | `TASK_STATE_CANCELED`, the request's reason as the status message. |
 
 ### How the client maps the outcome
 
@@ -229,13 +229,58 @@ rides the result.
 | --- | --- |
 | `TASK_STATE_COMPLETED` | `completed`. `key_findings` is the message text. `diff_summary` comes from the `diff` artifact: `(no changes)` when it is empty, `(diff unavailable: …)` when the result artifact carries a `diff_error`. |
 | `TASK_STATE_FAILED`, `TASK_STATE_REJECTED` | `failed`. `error` is the message text. |
-| `TASK_STATE_CANCELED` | `failed`, with `error` "dispatch canceled: …". |
-| Stream error before a terminal state | `failed`, with `error` "a2a: dispatch stream: …". |
+| `TASK_STATE_CANCELED` | A status message that is a kill reason (#316) maps through the kill assembly: `killed`, with that reason. Anything else is `failed`, with `error` "dispatch canceled: …". |
+| Stream error the resume cannot recover | `failed`, with `error` "a2a: dispatch stream: …". |
 | Stream ends with no terminal state | `failed`, with "…ended without a terminal state". |
+
+### Dropped streams
+
+The stream's first event names the task, and the coordinator records that
+ID on the dispatch registry entry. When the connection drops before a
+terminal state, the task is still running — or already finished — on the
+server, so the client resumes instead of failing the dispatch
+([#349](https://github.com/joestump-agent/crush/issues/349)):
+
+- Up to three attempts, 250ms, 1s and 4s apart. Each calls
+  `SubscribeToTask`, which replays the stored task snapshot — the
+  authoritative state of the artifacts received before the cut, so a
+  partial diff can never double — and then the live events.
+- When the execution has already ended, `SubscribeToTask` answers
+  "task not found" and the client calls `GetTask` instead: a terminal
+  state folds and lands; a non-terminal one retries.
+- A terminal state wins wherever it comes from, and the replayed
+  snapshot never counts as progress, so a Working event is never
+  counted twice.
+- When every attempt is exhausted the dispatch fails with the original
+  stream error, and the orphaned run is canceled before teardown
+  ([#344](https://github.com/joestump-agent/crush/issues/344)).
 
 A terminal `task` snapshot is accepted when no terminal status event
 arrived. `Working` events are counted, not re-published: the agent block
 renders from the in-process todo collector.
+
+### Kills
+
+Every kill — the wander watchdog's hard timeout and stall kill, the todo
+ladder's kill rung, and the user's cancel — records its reason on the
+run's kill state, then sends one `CancelTask` carrying it
+([#348](https://github.com/joestump-agent/crush/issues/348)):
+
+- The reason rides the request's metadata under `crush.dispatch.cancel_reason`.
+- The send is asynchronous: the SDK resolves a `tasks/cancel` only when
+  the run ends, so the kill site returns to its loop immediately and the
+  canceler's events land on the execution's own queue.
+- The executor decodes the metadata and puts the reason on the terminal
+  `TASK_STATE_CANCELED` status message — it reaches the parent on the
+  live stream and lands in the task store, so an out-of-process kill
+  reads the same as an in-process one.
+- The parent maps a `TASK_STATE_CANCELED` whose status message is a kill
+  reason onto `killed` through the kill assembly (#343).
+- The direct in-process cancel remains as the fallback for the paths no
+  `tasks/cancel` can serve: an unserved dispatch, a kill that lands
+  before the stream has named the task ID, or a cancel that errors
+  (#430). First reason wins; a late kill after natural completion is
+  discarded.
 
 :::warning[Known issue]
 A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/crush/issues/345)).
@@ -249,10 +294,6 @@ A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/c
 - **Follow-up messages.** A second message to a busy dispatch is queued and
   run, but its task reports `TASK_STATE_FAILED`. Steering uses the
   in-process injection queue instead ([#351](https://github.com/joestump-agent/crush/issues/351)).
-- **Cancel callers.** Nothing in Crush calls `CancelTask`. Kills cancel the
-  agent directly ([#348](https://github.com/joestump-agent/crush/issues/348)).
-- **Resume.** The client does not record the task ID, so a dropped stream
-  cannot be resumed with `SubscribeToTask` ([#349](https://github.com/joestump-agent/crush/issues/349)).
 - **`input-required` and `auth-required`.** Dispatched agents have no
   question tool, and permission prompts use an in-process bridge
   ([#352](https://github.com/joestump-agent/crush/issues/352), [#353](https://github.com/joestump-agent/crush/issues/353)).
@@ -297,8 +338,6 @@ and stage 3 comes after. The reasoning is in
 | [#347](https://github.com/joestump-agent/crush/issues/347) | Delete the direct-run fallback; a server start failure fails the dispatch. | 2 |
 | [#350](https://github.com/joestump-agent/crush/issues/350) | `contextId` maps to the Crush session, `taskId` to one run. | 2 |
 | [#351](https://github.com/joestump-agent/crush/issues/351) | Steering is an A2A message on the running context, completed once consumed. | 2 |
-| [#348](https://github.com/joestump-agent/crush/issues/348) | Wander kills and user cancels go through `CancelTask` with a reason; the executor puts it on `TASK_STATE_CANCELED`. | 2 |
-| [#349](https://github.com/joestump-agent/crush/issues/349) | Keep the task ID; `GetTask` for status; resume dropped streams with `SubscribeToTask`. | 2 |
 | [#354](https://github.com/joestump-agent/crush/issues/354) | A durable SQLite implementation of the SDK's task store. | 2 |
 | [#355](https://github.com/joestump-agent/crush/issues/355) | Wire the durable store; on startup, fail orphaned tasks and deliver undelivered results. | 2 |
 | [#357](https://github.com/joestump-agent/crush/issues/357) | `securitySchemes` on the card; auth interceptors on server and client. | 2 |

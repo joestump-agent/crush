@@ -993,6 +993,15 @@ func MaybePrependStdin(prompt string) (string, error) {
 // support.
 func resolveWorkspaceSessionID(ctx context.Context, ws workspace.Workspace, id string) (session.Session, error) {
 	if sess, err := ws.GetSession(ctx, id); err == nil {
+		// A child session only opens as the active session when it is
+		// an agent-tool task session, which the TUI routes into inspect
+		// mode under its parent. Any other child (e.g. a title session)
+		// is refused before the TUI starts (#413).
+		if sess.ParentSessionID != "" {
+			if _, _, ok := ws.ParseAgentToolSessionID(sess.ID); !ok {
+				return session.Session{}, fmt.Errorf("cannot open a child session: %s", sess.ID)
+			}
+		}
 		return sess, nil
 	}
 

@@ -8,12 +8,12 @@ import (
 
 // forkOnlyRoutes are the v1 routes this fork carries that upstream does
 // not. They exist because the fork adds behavior upstream lacks: model
-// discovery reload, skills reload, the A2UI MCP round-trip, and MCP
-// reconnect.
+// discovery reload, skills reload, the A2UI MCP round-trip, MCP
+// reconnect, and the child-sessions listings (#314, #408).
 //
 // The sync from upstream replaced the hand-written mux.HandleFunc list
 // with the declarative registry in endpoints.go, which meant porting
-// these four by hand. A route silently dropped in that port is invisible
+// these six by hand. A route silently dropped in that port is invisible
 // at compile time and only shows up as a 404 from a client that used to
 // work, so pin them by method+path.
 var forkOnlyRoutes = []struct {
@@ -25,6 +25,7 @@ var forkOnlyRoutes = []struct {
 	{"POST", "/v1/workspaces/{id}/mcp/call-tool"},
 	{"POST", "/v1/workspaces/{id}/mcp/reconnect"},
 	{"GET", "/v1/workspaces/{id}/child-sessions"},
+	{"GET", "/v1/workspaces/{id}/sessions/{sid}/children"},
 }
 
 // TestEndpoints_ForkRoutesRegistered asserts every fork-only route is

@@ -71,12 +71,17 @@ uncommitted changes. Commit before you dispatch.
 A killed or canceled run resolves to **failed** with its reason; there is no
 fixed deadline that ends a running dispatch.
 
-### I can't stop a single dispatched agent
+### Stopping a single dispatched agent
 
-There is no per-dispatch cancel ([#373](https://github.com/joestump-agent/crush/issues/373)). Pressing <kbd>esc</kbd> twice
-cancels only the main agent's turn, and dispatched agents keep going. You can
-ask an agent to stop with `@handle stop and report`, but that is a message it
-may ignore. Quitting Crush ends every dispatched run; read
+Select the agent's block in the chat — or drill into it with
+<kbd>ctrl+]</kbd> — and press <kbd>ctrl+x</kbd>
+([#373](https://github.com/joestump-agent/crush/issues/373)). Asking the main
+agent to "cancel @tester" works too: it calls `cancel_dispatch`. The run ends
+killed with reason "canceled by user", the card shows **canceled**, and the
+workspace and branch remain so you can review the work or dispatch a fresh
+agent against it. A steer (`@handle stop and report`) is still the gentler
+lever — the agent can wrap up on its own. <kbd>esc</kbd> twice cancels only
+the main agent's turn, and quitting Crush ends every dispatched run; read
 [Worktrees disappeared](#worktrees-disappeared-after-quitting) first.
 
 ### Dispatched tests never report back
@@ -149,16 +154,11 @@ worktree with git directly. The agent's actual work is unaffected.
 
 | What was ignored | Why | Fix |
 | --- | --- | --- |
-| A gitignored or uncommitted `.crushrc`, `crush.json`, skill or context file | The agent loads config from its worktree, a checkout of committed files | Commit it, or move it to your global config |
+| A `.crushrc` or `crush.json` committed on the base revision | The dispatched agent reuses the launch directory's config and never reads the worktree's own config files ([#374](https://github.com/joestump-agent/crush/issues/374)) | Put it in the launch directory, or your global config |
 | A `PreToolUse` hook | Hooks fire on the `dispatch_agent` call, not inside the dispatched agent ([#377](https://github.com/joestump-agent/crush/issues/377)) | Gate dispatch itself with a hook on `^dispatch_agent$` |
 | `permissions deny bash` (or `edit`, `write`…) | Dispatched agents always get `bash`, `edit`, `multiedit`, `write` and `todos` ([#376](https://github.com/joestump-agent/crush/issues/376)) | Deny `dispatch_agent` itself |
 | Turning yolo off with <kbd>ctrl+y</kbd> | Dispatched agents follow the `--yolo` startup flag ([#378](https://github.com/joestump-agent/crush/issues/378)) | Restart without `--yolo` |
 
-:::warning[Known issue]
-A `crushrc` committed on the base revision is **executed** when the dispatched
-agent loads its config, before any prompt ([#374](https://github.com/joestump-agent/crush/issues/374)). Only dispatch in
-repositories whose branches you trust.
-:::
 
 ## Worktrees and branches
 

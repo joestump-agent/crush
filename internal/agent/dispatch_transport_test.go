@@ -83,9 +83,15 @@ func (f *runnerTransport) StreamDispatch(ctx context.Context, _ DispatchTranspor
 type gatedServingTransport struct {
 	fakeServerStarter
 
-	gate    chan struct{}
-	outcome DispatchTransportOutcome
-	err     error
+	gate     chan struct{}
+	gateOnce sync.Once
+	outcome  DispatchTransportOutcome
+	err      error
+
+	// taskID, when set, is reported through the stream params' OnTask
+	// before the gate opens — the first-event stamp the coordinator
+	// records on the registry entry (#349).
+	taskID string
 
 	mu       sync.Mutex
 	streamed []DispatchTransportParams
@@ -95,10 +101,19 @@ func newGatedServingTransport(outcome DispatchTransportOutcome) *gatedServingTra
 	return &gatedServingTransport{gate: make(chan struct{}), outcome: outcome}
 }
 
+// release opens the gate exactly once, idempotently, as
+// gatedDispatchAgent.release does (#422).
+func (f *gatedServingTransport) release() {
+	f.gateOnce.Do(func() { close(f.gate) })
+}
+
 func (f *gatedServingTransport) StreamDispatch(ctx context.Context, p DispatchTransportParams) (DispatchTransportOutcome, error) {
 	f.mu.Lock()
 	f.streamed = append(f.streamed, p)
 	f.mu.Unlock()
+	if f.taskID != "" && p.OnTask != nil {
+		p.OnTask(f.taskID)
+	}
 	select {
 	case <-f.gate:
 	case <-ctx.Done():
@@ -155,8 +170,7 @@ func TestDispatchRunsOverTransportSeam(t *testing.T) {
 		Handle: "tester",
 	}))
 
-	ws, _ := c.dispatchWorkspace()
-	entry, ok := ws.Get(handle.DispatchID)
+	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.NotEmpty(t, entry.Endpoint, "the dispatch must be served for the transport to drive it")
 
@@ -176,16 +190,16 @@ func TestDispatchRunsOverTransportSeam(t *testing.T) {
 	require.NoError(t, c.DeliverAgentMessage(t.Context(), AgentMessage{SessionID: handle.SessionID, Text: "stop writing Rust"}))
 	require.Len(t, agent.injected(), 1)
 
-	close(transport.gate)
+	transport.release()
 	// Wait for terminal AND the teardown's endpoint clear — the terminal
 	// status is stamped just before the run's defers tear the server
 	// down, so both are the run's completion signal here.
 	require.Eventually(t, func() bool {
-		e, ok := ws.Get(handle.DispatchID)
+		e, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && e.Status.IsTerminal() && e.Endpoint == "" && e.AgentCard == nil
 	}, 10*time.Second, 50*time.Millisecond)
 
-	e, ok := ws.Get(handle.DispatchID)
+	e, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusCompleted, e.Status)
 	require.NotNil(t, e.Result)
@@ -195,6 +209,48 @@ func TestDispatchRunsOverTransportSeam(t *testing.T) {
 	// The server is torn down with the run.
 	require.Empty(t, e.Endpoint)
 	require.Nil(t, e.AgentCard)
+}
+
+// The served task's ID lands on the registry entry from the stream's
+// first event onward (#349): stamped mid-run, while the stream is
+// still open, and kept after the terminal teardown clears the endpoint
+// and card, so the run stays recoverable through tasks/resubscribe and
+// tasks/get.
+func TestDispatchStreamStampsRegistryTaskID(t *testing.T) {
+	agent := newGatedDispatchAgent()
+	c, _ := newInjectionEnv(t, agent)
+	transport := newGatedServingTransport(DispatchTransportOutcome{
+		Status: transportStatusCompleted,
+		Text:   "done, all fixed",
+	})
+	transport.taskID = "task-123"
+	c.SetDispatchServerStarter(transport)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{
+		Prompt: "fix the bug",
+		Branch: "main",
+		Handle: "tester",
+	}))
+
+	require.Eventually(t, func() bool {
+		e, ok := c.dispatchRegistry().Get(handle.DispatchID)
+		return ok && e.TaskID == "task-123"
+	}, 10*time.Second, 20*time.Millisecond, "the task ID must stamp the entry mid-run")
+
+	transport.release()
+	// Wait for terminal AND the teardown's endpoint clear — the status
+	// is stamped just before the run's defers tear the server down, so
+	// both together are the completion signal here.
+	require.Eventually(t, func() bool {
+		e, ok := c.dispatchRegistry().Get(handle.DispatchID)
+		return ok && e.Status.IsTerminal() && e.Endpoint == "" && e.AgentCard == nil
+	}, 10*time.Second, 50*time.Millisecond)
+
+	e, ok := c.dispatchRegistry().Get(handle.DispatchID)
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusCompleted, e.Status)
+	require.Equal(t, "task-123", e.TaskID, "the task ID survives the terminal teardown")
 }
 
 // A transport failure before any terminal state fails the dispatch with
@@ -209,14 +265,13 @@ func TestDispatchTransportStreamErrorFails(t *testing.T) {
 
 	decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
 	transport.waitStreamed(t)
-	close(transport.gate)
+	transport.release()
 
-	ws, _ := c.dispatchWorkspace()
 	require.Eventually(t, func() bool {
-		entries := ws.List()
+		entries := c.dispatchRegistry().List()
 		return len(entries) > 0 && entries[0].Status == dispatch.StatusFailed
 	}, 10*time.Second, 50*time.Millisecond)
-	entries := ws.List()
+	entries := c.dispatchRegistry().List()
 	require.Contains(t, entries[0].Result.Error, "connection reset")
 	// No fallback double-run.
 	require.False(t, agent.ranOnce())
@@ -237,14 +292,13 @@ func TestDispatchTransportStreamErrorCancelsRun(t *testing.T) {
 
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
 	transport.waitStreamed(t)
-	close(transport.gate)
+	transport.release()
 
-	ws, _ := c.dispatchWorkspace()
 	require.Eventually(t, func() bool {
-		entries := ws.List()
+		entries := c.dispatchRegistry().List()
 		return len(entries) > 0 && entries[0].Status == dispatch.StatusFailed
 	}, 10*time.Second, 50*time.Millisecond)
-	entries := ws.List()
+	entries := c.dispatchRegistry().List()
 	require.Contains(t, entries[0].Result.Error, "SSE stream error")
 	// The orphaned run was canceled with the dispatch's session id —
 	// before the failed outcome was recorded.
@@ -266,7 +320,7 @@ func TestServedButNotTransportedRunsDirectly(t *testing.T) {
 	agent.waitRunning(t)
 	require.True(t, agent.ranOnce(), "a served dispatch without a transport runs directly")
 
-	close(agent.gate)
+	agent.release()
 }
 
 // assembleFromTransport runs the transported outcome through the same
@@ -288,16 +342,17 @@ func TestDispatchFromTransportOutcome(t *testing.T) {
 	t.Parallel()
 
 	repo := newTestRepoForTransport(t)
-	ws, err := dispatch.NewWorkspace(repo, filepath.Join(repo, "worktrees"))
+	reg := dispatch.NewAgentRegistry()
+	ws, err := dispatch.NewGitWorktreeProvider(repo, filepath.Join(repo, "worktrees"), reg)
 	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
+	entry := provisionProviderEntry(t, ws, reg, dispatch.ProvisionOptions{})
 	run := dispatchRun{
-		workspace: ws,
+		reg:       reg,
+		provider:  ws,
 		entry:     entry,
 		sessionID: "session-x",
 	}
-	ws.SetHandle(entry.ID, "tester")
+	reg.SetHandle(entry.ID, "tester")
 
 	completed := assembleFromTransport(t, run, DispatchTransportOutcome{
 		Status: transportStatusCompleted,
@@ -537,7 +592,7 @@ func TestDispatchParityAcrossPaths(t *testing.T) {
 				sc.build(t, f)
 
 				w := sc.check(t, f)
-				entry, ok := f.ws.Get(f.entry.ID)
+				entry, ok := f.reg.Get(f.entry.ID)
 				require.True(t, ok)
 				require.NotNil(t, entry.Result)
 				require.Equal(t, w.status, entry.Result.Status, "both paths must report the same status")
@@ -547,4 +602,52 @@ func TestDispatchParityAcrossPaths(t *testing.T) {
 			})
 		}
 	}
+}
+
+// The final-step window on the transport path (#397): the served turn
+// runs on the same agent the injection queue addresses, so a steer
+// accepted while the final step is streaming runs as the follow-up
+// turn and the wire's terminal status carries its reply — the run's
+// findings record keeps the work's report on the parent-side result.
+func TestTransportFinalStepSteerKeepsDispatchFindings(t *testing.T) {
+	t.Parallel()
+
+	env := testEnv(t)
+	initGitRepo(t, env.workingDir)
+	model := newGatedFinalTextModel()
+	c := newFinalStepDispatchEnv(t, env, model, nil)
+	transport := &runnerTransport{}
+	c.SetDispatchServerStarter(transport)
+	tool := c.dispatchTool()
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{
+		Prompt: "find the bugs",
+		Branch: "main",
+		Handle: "transport",
+	}))
+
+	// The served turn is streaming its final answer: the stream runs
+	// inside the transport's StreamDispatch, against the same agent the
+	// queue addresses.
+	select {
+	case <-model.midText:
+	case <-time.After(10 * time.Second):
+		t.Fatal("work turn never reached its final text step")
+	}
+	require.NoError(t, c.DeliverAgentMessage(t.Context(), AgentMessage{
+		SessionID: handle.SessionID,
+		Text:      "stop, that is not the issue",
+	}))
+
+	// Release the stream; the steer runs as the follow-up turn.
+	close(model.gate)
+
+	e := waitDispatchTerminal(t, c, handle.DispatchID)
+	require.Equal(t, dispatch.StatusCompleted, e.Status)
+	require.NotNil(t, e.Result)
+	// The wire's Completed status carried the steer's reply; the
+	// findings record must win over it.
+	require.Equal(t, "ORIGINAL FINDINGS: fixed 3 bugs; all verified.", e.Result.KeyFindings)
+	require.Equal(t, []string{"ack, noted"}, e.Result.SteerReplies)
+	require.Equal(t, 2, model.callsCount(), "the work turn plus the steer's follow-up turn")
 }

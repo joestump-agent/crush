@@ -11,6 +11,8 @@ import (
 
 type Querier interface {
 	AddSessionCost(ctx context.Context, arg AddSessionCostParams) error
+	CountA2ATasks(ctx context.Context, arg CountA2ATasksParams) (int64, error)
+	CreateA2ATask(ctx context.Context, arg CreateA2ATaskParams) error
 	CreateFile(ctx context.Context, arg CreateFileParams) (File, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
@@ -19,6 +21,7 @@ type Querier interface {
 	DeleteSession(ctx context.Context, id string) error
 	DeleteSessionFiles(ctx context.Context, sessionID string) error
 	DeleteSessionMessages(ctx context.Context, sessionID string) error
+	GetA2ATask(ctx context.Context, id string) (A2aTask, error)
 	GetAverageResponseTime(ctx context.Context) (int64, error)
 	GetFile(ctx context.Context, id string) (File, error)
 	GetFileByPathAndSession(ctx context.Context, arg GetFileByPathAndSessionParams) (File, error)
@@ -35,6 +38,7 @@ type Querier interface {
 	GetUsageByDayOfWeek(ctx context.Context) ([]GetUsageByDayOfWeekRow, error)
 	GetUsageByHour(ctx context.Context) ([]GetUsageByHourRow, error)
 	GetUsageByModel(ctx context.Context) ([]GetUsageByModelRow, error)
+	ListA2ATasks(ctx context.Context, arg ListA2ATasksParams) ([]A2aTask, error)
 	ListAllChildSessions(ctx context.Context) ([]Session, error)
 	// Backs prompt history when no session is open. Needs
 	// idx_messages_role_created_at to seek rather than scan the table.
@@ -56,6 +60,8 @@ type Querier interface {
 	RecordFileRead(ctx context.Context, arg RecordFileReadParams) error
 	RenameSession(ctx context.Context, arg RenameSessionParams) error
 	SetSessionChannel(ctx context.Context, arg SetSessionChannelParams) (Session, error)
+	UpdateA2ATask(ctx context.Context, arg UpdateA2ATaskParams) (int64, error)
+	UpdateA2ATaskIfVersion(ctx context.Context, arg UpdateA2ATaskIfVersionParams) (int64, error)
 	UpdateMessage(ctx context.Context, arg UpdateMessageParams) error
 	UpdateSession(ctx context.Context, arg UpdateSessionParams) (Session, error)
 	UpdateSessionTitleAndUsage(ctx context.Context, arg UpdateSessionTitleAndUsageParams) error

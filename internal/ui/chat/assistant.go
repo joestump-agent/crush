@@ -262,6 +262,11 @@ type AssistantMessageItem struct {
 	// rather than index so the mark survives streaming rebuilds of the
 	// models.
 	a2uiRetired map[string]bool
+	// a2uiReadOnly renders every surface in this message in its retired
+	// state: no focus, no keys, retired style (#407). Set while the
+	// message is part of an inspected transcript, where its forms must
+	// not act on the session being viewed.
+	a2uiReadOnly bool
 	// a2uiSrcHash fingerprints the scanned source the surfaces were
 	// built from, so streaming deltas rebuild them while pure re-renders
 	// (width changes, key events) reuse the same models and keep their

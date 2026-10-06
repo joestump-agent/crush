@@ -7,15 +7,18 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/scheduler"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,7 +41,7 @@ func newDispatchTestCoordinatorAt(t *testing.T, env fakeEnv, workingDir, dataDir
 	require.NoError(t, err)
 	cfg.SetupAgents()
 
-	return &coordinator{
+	c := &coordinator{
 		cfg:         cfg,
 		sessions:    env.sessions,
 		messages:    env.messages,
@@ -51,6 +54,98 @@ func newDispatchTestCoordinatorAt(t *testing.T, env fakeEnv, workingDir, dataDir
 		// test instead of leaking a Background subscription.
 		dispatchCtx: t.Context(),
 	}
+	// The session-end backstop (#63's Sweep), run as a cleanup: a
+	// dispatch's workspace outlives its background run — runDispatch
+	// never releases it — so the worktree provider's ownership-lease
+	// file stays open until something sweeps. t.TempDir()'s cleanup
+	// fails the test on Windows when it cannot delete an open file, so
+	// the sweep must run before that removal. Registered after testEnv's
+	// cleanups and before reapDispatchRuns' registration, it runs after
+	// the reaper has waited out every run (LIFO) and before the
+	// directory goes away (#422). Sweep is idempotent, so a test that
+	// swept or released explicitly is unaffected.
+	t.Cleanup(c.sweepDispatch)
+	return c
+}
+
+// reapDispatchRuns installs the spawn seam (#422): every runDispatch the
+// coordinator starts is tracked in a WaitGroup, and a t.Cleanup releases
+// the given gates, then waits up to 10s for every run to finish. A run
+// that is still going then fails the test instead of deleting the
+// working directory out from under a concurrent test process. It is
+// registered after testEnv's cleanups, so it runs first (LIFO) and the
+// directory is still on disk while it waits. The WaitGroup lives in this
+// closure, never on the coordinator: Go 1.27 panics on a WaitGroup Add
+// racing a Wait (readiness.go, #298).
+func reapDispatchRuns(t *testing.T, c *coordinator, gates ...func()) {
+	t.Helper()
+	var wg sync.WaitGroup
+	c.spawnDispatch = func(f func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f()
+		}()
+	}
+	t.Cleanup(func() {
+		for _, release := range gates {
+			release()
+		}
+		finished := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(finished)
+		}()
+		select {
+		case <-finished:
+		case <-time.After(10 * time.Second):
+			t.Error("timed out waiting for a dispatched run to finish")
+		}
+	})
+}
+
+// provisionDispatchEntry provisions a workspace through the
+// coordinator's git worktree provider and registers its entry, the same
+// two steps the dispatch tool performs. It returns the registered entry
+// and the provider, for tests that drive Sweep or Release directly.
+func provisionDispatchEntry(t *testing.T, c *coordinator, base string) (dispatch.Entry, *dispatch.GitWorktreeProvider) {
+	t.Helper()
+	provider, err := c.dispatchWorkspaceProvider()
+	require.NoError(t, err)
+	entry := provisionProviderEntry(t, provider, c.dispatchRegistry(), dispatch.ProvisionOptions{Base: base})
+	return entry, provider
+}
+
+// provisionProviderEntry provisions a workspace on provider and
+// registers the entry in reg, for tests that drive a provider they
+// built themselves.
+func provisionProviderEntry(t *testing.T, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, opts dispatch.ProvisionOptions) dispatch.Entry {
+	t.Helper()
+	id := uuid.NewString()
+	placement, err := provider.Provision(t.Context(), id, opts)
+	require.NoError(t, err)
+	entry := dispatch.Entry{
+		ID:      id,
+		Path:    placement.Path,
+		Branch:  placement.Branch,
+		Base:    placement.Base,
+		BaseSHA: placement.BaseSHA,
+		Status:  dispatch.StatusProvisioned,
+	}
+	reg.Register(entry)
+	// Release the workspace at test end: a provisioned workspace
+	// outlives everything the test does with it, and its
+	// ownership-lease file stays open until something releases it.
+	// t.TempDir()'s cleanup fails the test on Windows when it cannot
+	// delete an open file, so the lease must close before that removal
+	// (#422). Release is idempotent, so tests that drive Release or
+	// Sweep themselves are unaffected.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = provider.Release(ctx, entry)
+	})
+	return entry
 }
 
 func runTool(t *testing.T, tool fantasy.AgentTool, name string, params any) fantasy.ToolResponse {
@@ -131,6 +226,185 @@ func TestBuildDispatchToolchainRootsToolsAtWorkspaceDir(t *testing.T) {
 	})
 	require.NotContains(t, bashResp.Content, "User denied permission")
 	require.FileExists(t, filepath.Join(workspace, "marker.txt"))
+}
+
+// A dispatched agent's file tools refuse any path that resolves outside
+// the workspace (#379): absolute paths, .. escapes, and symlinks inside
+// the workspace that point out. Refusal happens in the tool, before any
+// permission check, so it holds in yolo mode too (env.permissions skips
+// prompts here).
+func TestDispatchedFileToolsContained(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	workspace := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "inside.txt"), []byte("inside"), 0o644))
+
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "parent_owned.go")
+	require.NoError(t, os.WriteFile(outsideFile, []byte("package main"), 0o644))
+
+	agentCfg := c.cfg.Config().Agents[config.AgentTask]
+	agentCfg.AllowedTools = []string{
+		tools.ViewToolName,
+		tools.GlobToolName,
+		tools.GrepToolName,
+		tools.LSToolName,
+		tools.DownloadToolName,
+	}
+	c.cfg.Config().Agents[config.AgentTask] = agentCfg
+
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+
+	byName := toolsByName(tc)
+	write := byName[tools.WriteToolName]
+
+	resp := runToolAsSession(t, write, tools.WriteToolName, map[string]any{
+		"file_path": outsideFile,
+		"content":   "hacked",
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+	require.Contains(t, resp.Content, "outside the dispatch workspace")
+	content, err := os.ReadFile(outsideFile)
+	require.NoError(t, err)
+	require.Equal(t, "package main", string(content), "outside file was modified")
+
+	resp = runToolAsSession(t, write, tools.WriteToolName, map[string]any{
+		"file_path": "../../escape.go",
+		"content":   "hacked",
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	resp = runToolAsSession(t, write, tools.WriteToolName, map[string]any{
+		"file_path": "new.txt",
+		"content":   "written inside",
+	}, sess.ID)
+	require.False(t, resp.IsError, resp.Content)
+	require.FileExists(t, filepath.Join(workspace, "new.txt"))
+
+	resp = runToolAsSession(t, byName[tools.EditToolName], tools.EditToolName, map[string]any{
+		"file_path":  outsideFile,
+		"old_string": "package main",
+		"new_string": "package hacked",
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	viewResp := runToolAsSession(t, byName[tools.ViewToolName], tools.ViewToolName, map[string]any{
+		"file_path": "inside.txt",
+	}, sess.ID)
+	require.False(t, viewResp.IsError, viewResp.Content)
+
+	resp = runToolAsSession(t, byName[tools.EditToolName], tools.EditToolName, map[string]any{
+		"file_path":  "inside.txt",
+		"old_string": "inside",
+		"new_string": "edited",
+	}, sess.ID)
+	require.False(t, resp.IsError, resp.Content)
+
+	resp = runToolAsSession(t, byName[tools.MultiEditToolName], tools.MultiEditToolName, map[string]any{
+		"file_path": outsideFile,
+		"edits": []map[string]string{{
+			"old_string": "package main",
+			"new_string": "package hacked",
+		}},
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	// The download tool refuses before it touches the network.
+	resp = runToolAsSession(t, byName[tools.DownloadToolName], tools.DownloadToolName, map[string]any{
+		"url":       "https://example.com/evil.txt",
+		"file_path": "../outside_download.txt",
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	resp = runToolAsSession(t, byName[tools.GrepToolName], tools.GrepToolName, map[string]any{
+		"pattern": "package",
+		"path":    outsideDir,
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+	require.Contains(t, resp.Content, "outside the dispatch workspace")
+
+	resp = runToolAsSession(t, byName[tools.GlobToolName], tools.GlobToolName, map[string]any{
+		"pattern": "**/*.go",
+		"path":    outsideDir,
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	resp = runToolAsSession(t, byName[tools.LSToolName], tools.LSToolName, map[string]any{
+		"path": outsideDir,
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+}
+
+// A view through a symlink inside the workspace that points outside is
+// refused: containment resolves symlinks, so the escape is caught even
+// though the path text stays inside.
+func TestDispatchedViewRefusesSymlinkEscape(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	workspace := t.TempDir()
+	outsideFile := filepath.Join(t.TempDir(), "parent_owned.go")
+	require.NoError(t, os.WriteFile(outsideFile, []byte("package main"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "inside.txt"), []byte("inside"), 0o644))
+
+	if err := os.Symlink(outsideFile, filepath.Join(workspace, "escape-link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	agentCfg := c.cfg.Config().Agents[config.AgentTask]
+	agentCfg.AllowedTools = []string{tools.ViewToolName}
+	c.cfg.Config().Agents[config.AgentTask] = agentCfg
+
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
+	require.NoError(t, err)
+	defer tc.Close(t.Context())
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+
+	byName := toolsByName(tc)
+
+	resp := runToolAsSession(t, byName[tools.ViewToolName], tools.ViewToolName, map[string]any{
+		"file_path": "escape-link",
+	}, sess.ID)
+	require.True(t, resp.IsError, resp.Content)
+
+	resp = runToolAsSession(t, byName[tools.ViewToolName], tools.ViewToolName, map[string]any{
+		"file_path": "inside.txt",
+	}, sess.ID)
+	require.False(t, resp.IsError, resp.Content)
+	require.Contains(t, resp.Content, "inside")
+}
+
+// The main agent's tools are untouched: no containment root rides its
+// context, so buildTools' write handles an absolute path outside the
+// working directory exactly as before.
+func TestMainAgentWriteOutsideWorkingDirUnchanged(t *testing.T) {
+	env := testEnv(t)
+	c := newDispatchTestCoordinator(t, env)
+
+	agentCfg := c.cfg.Config().Agents[config.AgentCoder]
+	agentCfg.AllowedTools = []string{tools.WriteToolName}
+	built, err := c.buildTools(t.Context(), agentCfg, false)
+	require.NoError(t, err)
+	require.Len(t, built, 1)
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+
+	outsideFile := filepath.Join(t.TempDir(), "absolute.go")
+	resp := runToolAsSession(t, built[0], tools.WriteToolName, map[string]any{
+		"file_path": outsideFile,
+		"content":   "package main",
+	}, sess.ID)
+	require.False(t, resp.IsError, resp.Content)
+	require.FileExists(t, outsideFile)
 }
 
 // The default (non-dispatch) toolchain is unchanged: buildTools roots

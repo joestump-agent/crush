@@ -76,7 +76,10 @@ func (s *runCoordinator) BeginAccepted(sessionID string) *agent.AcceptedRun {
 }
 func (s *runCoordinator) Cancel(string) {}
 func (s *runCoordinator) CancelAll()    {}
-func (s *runCoordinator) IsBusy() bool  { return s.busy }
+func (s *runCoordinator) CancelDispatch(context.Context, string) error {
+	return errors.New("not implemented")
+}
+func (s *runCoordinator) IsBusy() bool { return s.busy }
 func (s *runCoordinator) IsSessionBusy(string) bool {
 	return false
 }
@@ -89,6 +92,7 @@ func (s *runCoordinator) Summarize(context.Context, string) error {
 }
 func (s *runCoordinator) Model() agent.Model                            { return agent.Model{} }
 func (s *runCoordinator) UpdateModels(context.Context) error            { return nil }
+func (s *runCoordinator) SetInteractive(context.Context, bool) error    { return nil }
 func (s *runCoordinator) GenerateTitle(context.Context, string, string) {}
 func (s *runCoordinator) SetMainAgent(agentName string) error {
 	s.lastMainAgentSet.Store(agentName)
@@ -254,6 +258,6 @@ func (s *runCoordinator) DispatchByHandle(sessionID, handle string) (dispatch.To
 	return dispatch.TodoSnapshot{}, false
 }
 
-func (s *runCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error {
+func (s *runCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	return errors.New("not implemented")
 }

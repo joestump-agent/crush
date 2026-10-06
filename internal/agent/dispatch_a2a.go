@@ -93,6 +93,59 @@ type DispatchTransportParams struct {
 	Endpoint string
 	Card     any
 	Prompt   string
+	// OnTask, when set, receives the served task's ID once the stream's
+	// first event names it (#349): the task outlives a dropped stream,
+	// and with the ID the coordinator can stamp the registry entry so
+	// the run stays recoverable (tasks/resubscribe, tasks/get) and
+	// answerable after the fact. Called at most once. Nil-safe.
+	OnTask func(taskID string)
+}
+
+// GetDispatchTaskParams is one A2A task query (#349): the served
+// dispatch's endpoint and card, plus the task ID the transport reported
+// through DispatchTransportParams.OnTask. Card is the registry entry's
+// opaque AgentCard — the transport owns its concrete type.
+type GetDispatchTaskParams struct {
+	Endpoint string
+	Card     any
+	TaskID   string
+}
+
+// DispatchCancelParams is one A2A task cancel (#348): the served
+// dispatch's endpoint, card, and task ID, plus the reason the run is
+// being killed. The reason rides the request as declared metadata and
+// comes back on the terminal Canceled status message. Card is the
+// registry entry's opaque AgentCard — the transport owns its concrete
+// type.
+type DispatchCancelParams struct {
+	Endpoint string
+	Card     any
+	TaskID   string
+	Reason   string
+}
+
+// DispatchCanceler is the cancel half of the A2A client seam (#348):
+// route one dispatched run's kill through the protocol's tasks/cancel,
+// carrying the kill reason, instead of the in-process SessionAgent
+// cancel an out-of-process agent (#72/#73) could never see. Implemented
+// by the same a2a factory that streams and serves the dispatch;
+// coordinators assert to it and fall back to the direct cancel when the
+// wired starter does not implement it.
+type DispatchCanceler interface {
+	// CancelDispatch sends one tasks/cancel for the served dispatch.
+	// It returns once the server accepted the cancel; the run's actual
+	// termination is observed on the stream, not here.
+	CancelDispatch(ctx context.Context, params DispatchCancelParams) error
+}
+
+// DispatchTaskStatus is the observed state of one dispatched task
+// (#349). Status is "working" while the task is still in flight and
+// otherwise the terminal outcome vocabulary — "completed", "failed",
+// "canceled", the same tokens DispatchTransportOutcome.Status carries.
+// Text is the task status' message when one arrived.
+type DispatchTaskStatus struct {
+	Status string
+	Text   string
 }
 
 // DispatchTransportOutcome is the terminal outcome of one A2A-driven
@@ -128,7 +181,10 @@ const (
 // semantics: completed carries its findings and diff, failed and
 // canceled become a run error carrying the transport's text — parity
 // with the direct path, where a canceled run records failed; StatusKilled
-// is reserved for wander kill (#316). A loop stop arrives as the kill
+// is reserved for wander kill (#316) — the in-process kill state is the
+// first witness, and a terminal Canceled whose status message is a kill
+// reason (#348, a kill this process never recorded) maps through the
+// same kill assembly. A loop stop arrives as the kill
 // state's tool-loop reason, recorded in-process by the served agent's
 // observer. The diff comes from the wire only (#361): a capture error
 // arrives as the outcome's DiffError and maps onto the same "(diff
@@ -156,11 +212,29 @@ func dispatchNaturalOutcomeFromTransport(outcome DispatchTransportOutcome) dispa
 		natural.completed = true
 		natural.findings = outcome.Text
 	case transportStatusCanceled:
+		if isKillReason(outcome.Text) {
+			natural.killReason = outcome.Text
+		}
 		natural.runErr = fmt.Errorf("dispatch canceled: %s", cmp.Or(outcome.Text, "no reason given"))
 	default:
 		natural.runErr = errors.New(cmp.Or(outcome.Text, "dispatch failed without a reason"))
 	}
 	return natural
+}
+
+// isKillReason reports whether text is one of the kill reasons
+// (#316) a terminal Canceled status can carry over the wire (#348).
+func isKillReason(text string) bool {
+	switch text {
+	case dispatch.ReasonIgnoredNudges,
+		dispatch.ReasonStalledTodos,
+		dispatch.ReasonToolLoop,
+		dispatch.ReasonHardTimeout,
+		dispatch.ReasonCanceled,
+		dispatch.ReasonShutdown:
+		return true
+	}
+	return false
 }
 
 // runDispatchOverTransport drives one dispatch through the A2A client
@@ -176,7 +250,7 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 	if !ok || transport == nil {
 		return dispatch.DispatchResult{}, false
 	}
-	entry, ok := run.workspace.Get(run.entry.ID)
+	entry, ok := run.reg.Get(run.entry.ID)
 	if !ok || entry.Endpoint == "" || entry.AgentCard == nil {
 		return dispatch.DispatchResult{}, false
 	}
@@ -184,6 +258,12 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 		Endpoint: entry.Endpoint,
 		Card:     entry.AgentCard,
 		Prompt:   run.prompt,
+		// The served task outlives a dropped stream (#349): stamp the
+		// task ID the moment the stream names it, so the run stays
+		// recoverable and answerable through the registry.
+		OnTask: func(taskID string) {
+			run.reg.SetTaskID(run.entry.ID, taskID)
+		},
 	})
 	if err != nil {
 		slog.Error("Dispatch A2A stream failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)
@@ -258,17 +338,23 @@ func (c *coordinator) dispatchServerStarter() DispatchServerStarter {
 // dispatch itself does not depend on being served, and Phase 1 has no
 // A2A client in the loop yet (#71 adds it); failing the dispatch over a
 // loopback server would trade working dispatches for protocol purity.
-func (c *coordinator) startDispatchServer(ctx context.Context, workspace *dispatch.Workspace, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string) (stop func()) {
+func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string) (stop func()) {
 	starter := c.dispatchServerStarter()
 	if starter == nil {
 		return nil
 	}
 
 	endpoint, card, stop, err := starter.StartDispatchServer(ctx, DispatchServerParams{
-		DispatchID:        entryID,
-		SessionID:         sessionID,
-		Runner:            runner,
-		Diff:              func(ctx context.Context) (string, error) { return workspace.Diff(ctx, entryID) },
+		DispatchID: entryID,
+		SessionID:  sessionID,
+		Runner:     runner,
+		Diff: func(ctx context.Context) (string, error) {
+			entry, ok := reg.Get(entryID)
+			if !ok {
+				return "", fmt.Errorf("unknown dispatch %q", entryID)
+			}
+			return provider.Diff(ctx, entry)
+		},
 		Todos:             c.dispatchCollector,
 		Name:              handle,
 		Description:       role,
@@ -281,7 +367,7 @@ func (c *coordinator) startDispatchServer(ctx context.Context, workspace *dispat
 		slog.Warn("Dispatch A2A server failed to start", "dispatch_id", entryID, "error", err)
 		return nil
 	}
-	workspace.SetEndpoint(entryID, endpoint, card)
+	reg.SetEndpoint(entryID, endpoint, card)
 	slog.Debug("Dispatch A2A server started", "dispatch_id", entryID, "endpoint", endpoint)
 	return stop
 }
@@ -310,9 +396,9 @@ func resolvedSkills(store *config.ConfigStore, requested []string) []*skills.Ski
 // registry entry's endpoint and card: a finished dispatch serves
 // nothing, and discovery must not hand out a dead endpoint (#70's
 // teardown half).
-func (c *coordinator) stopDispatchServer(workspace *dispatch.Workspace, entryID string, stop func()) {
+func (c *coordinator) stopDispatchServer(reg *dispatch.AgentRegistry, entryID string, stop func()) {
 	if stop != nil {
 		stop()
 	}
-	workspace.SetEndpoint(entryID, "", nil)
+	reg.SetEndpoint(entryID, "", nil)
 }

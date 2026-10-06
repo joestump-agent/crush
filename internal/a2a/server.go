@@ -18,6 +18,7 @@ import (
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/config"
@@ -66,7 +67,7 @@ type ServerParams struct {
 	// Required.
 	SessionID string
 	// Diff collects the completion artifact. Optional; the a2a.GitDiff
-	// or dispatch.Workspace.Diff contracts both fit.
+	// or dispatch.WorkspaceProvider.Diff contracts both fit.
 	Diff DiffFunc
 	// Todos streams per-session progress as TaskStatusUpdateEvents
 	// (#174). Optional; the production source is the dispatch
@@ -97,6 +98,11 @@ type ServerParams struct {
 	// the production value is the dispatch run's kill reason. A nil func
 	// or an empty string falls back to "canceled".
 	CancelReason func() string
+	// TaskStore persists served tasks durably (#354) instead of the
+	// SDK's in-process default, so task state survives a restart.
+	// Optional; the production store arrives with #355. nil keeps
+	// today's in-memory behavior.
+	TaskStore taskstore.Store
 }
 
 // Server is one dispatched agent's slice of the process-wide A2A host
@@ -229,12 +235,18 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	if p.InactivityTimeout > 0 {
 		handlerOpts = append(handlerOpts, a2asrv.WithAgentInactivityTimeout(p.InactivityTimeout+time.Minute))
 	}
-	handler := a2asrv.NewJSONRPCHandler(a2asrv.NewHandler(executor, handlerOpts...))
+	if p.TaskStore != nil {
+		handlerOpts = append(handlerOpts, a2asrv.WithTaskStore(p.TaskStore))
+	}
+	handler := a2asrv.NewHandler(executor, handlerOpts...)
+	mux := http.NewServeMux()
+	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
+	mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
 
 	if err := f.ensureHost(ctx); err != nil {
 		return nil, err
 	}
-	if err := f.register(p.DispatchID, handler); err != nil {
+	if err := f.register(p.DispatchID, mux); err != nil {
 		return nil, err
 	}
 	return &Server{Endpoint: endpoint, Card: card, factory: f, id: p.DispatchID}, nil
@@ -467,6 +479,13 @@ func (f *ServerFactory) socketPath() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.sockPath
+}
+
+// SocketPath is socketPath's exported form: a caller customizing its
+// own dispatch client through WithHTTPClient (#344) dials this path to
+// stay on the host's socket instead of the endpoint's routing label.
+func (f *ServerFactory) SocketPath() string {
+	return f.socketPath()
 }
 
 // Resolve returns the AgentCard and endpoint a dispatch registry entry

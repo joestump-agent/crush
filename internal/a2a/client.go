@@ -2,6 +2,7 @@ package a2a
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -25,7 +26,16 @@ const (
 	DispatchStatusFailed = "failed"
 	// DispatchStatusCanceled maps TaskStateCanceled.
 	DispatchStatusCanceled = "canceled"
+	// DispatchStatusWorking maps every non-terminal task state: the task
+	// is still in flight (#349).
+	DispatchStatusWorking = "working"
 )
+
+// dispatchResumeBackoff is the pause before each resubscribe attempt
+// (#349): the stream just cut, so a first beat gives a flapping
+// connection a moment to settle, and the growth keeps a wedged server
+// from being polled into a hole.
+var dispatchResumeBackoff = []time.Duration{250 * time.Millisecond, time.Second, 4 * time.Second}
 
 // newDispatchClient builds the A2A client for one dispatch: in-memory
 // discovery from the dispatch's registered card, with the JSON-RPC
@@ -75,14 +85,36 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 	}
 
 	var outcome agent.DispatchTransportOutcome
+	var taskID a2aspec.TaskID
 	for ev, err := range client.SendStreamingMessage(ctx, req) {
 		if err != nil {
 			// A stream error after a terminal state is the transport
-			// winding down; before one, it is the dispatch's failure.
-			if outcome.Status == "" {
+			// winding down. Before one, the task is still live server
+			// side — and once the stream has named the task (#349),
+			// the run is recoverable through resubscribe plus
+			// tasks/get; without the ID there is nothing to resume
+			// and the error stands.
+			if outcome.Status != "" {
+				return outcome, nil
+			}
+			if taskID == "" {
 				return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch stream: %w", err)
 			}
+			if rerr := resumeDispatchStream(ctx, client, string(taskID), &outcome); rerr != nil {
+				return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch stream: %w (resume: %w)", err, rerr)
+			}
 			return outcome, nil
+		}
+		// The first event names the served task (#349): hand the ID to
+		// the caller before anything else, so the registry entry
+		// carries it from the first event onward.
+		if taskID == "" {
+			if id := ev.TaskInfo().TaskID; id != "" {
+				taskID = id
+				if p.OnTask != nil {
+					p.OnTask(string(id))
+				}
+			}
 		}
 		switch e := ev.(type) {
 		case *a2aspec.TaskStatusUpdateEvent:
@@ -90,17 +122,101 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 		case *a2aspec.TaskArtifactUpdateEvent:
 			applyArtifactUpdate(&outcome, e)
 		case *a2aspec.Task:
-			// The task snapshot may carry the terminal state directly
-			// (a consumer that missed the status event); fold it in.
-			if isTerminalTaskState(e.Status.State) && outcome.Status == "" {
-				applyTaskSnapshot(&outcome, e)
-			}
+			foldTaskSnapshot(&outcome, e)
 		}
 	}
 	if outcome.Status == "" {
 		return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch stream ended without a terminal state")
 	}
 	return outcome, nil
+}
+
+// resumeDispatchStream recovers a dispatch whose SSE stream dropped
+// before a terminal state (#349): the task is still running — or
+// already finished — server side, and resubscribe plus tasks/get bring
+// the run home. Up to three attempts, the backoff before each:
+// SubscribeToTask replays the stored task snapshot and then the live
+// events; when the execution has already ended the server answers
+// ErrTaskNotFound and GetTask returns the stored task instead. The
+// caller's stream error stands only when every attempt is exhausted —
+// after that, the coordinator's cancel-before-teardown (#344) reaps
+// the run.
+func resumeDispatchStream(ctx context.Context, client *a2aclient.Client, taskID string, outcome *agent.DispatchTransportOutcome) error {
+	var lastErr error
+	for _, delay := range dispatchResumeBackoff {
+		// A terminal state from a prior attempt — the stream may have
+		// cut right after naming one — already ended the run.
+		if outcome.Status != "" {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		err := consumeResubscription(ctx, client, taskID, outcome)
+		switch {
+		case err == nil:
+			return nil
+		case !errors.Is(err, a2aspec.ErrTaskNotFound):
+			// The resubscribe itself failed — the connection is
+			// still flapping, or the replay cut again. Try once
+			// more after the next backoff.
+			lastErr = err
+			continue
+		}
+		// The execution has ended server side: tasks/get returns the
+		// stored task with its status and artifacts. A terminal state
+		// folds and lands; a non-terminal one means the task is live
+		// without an execution — retry the subscription instead.
+		task, gerr := client.GetTask(ctx, &a2aspec.GetTaskRequest{ID: a2aspec.TaskID(taskID)})
+		if gerr != nil {
+			lastErr = gerr
+			continue
+		}
+		foldTaskSnapshot(outcome, task)
+		if outcome.Status != "" {
+			return nil
+		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("resume attempts exhausted for task %s: %w", taskID, lastErr)
+	}
+	return fmt.Errorf("resume attempts exhausted for task %s without a terminal state", taskID)
+}
+
+// consumeResubscription subscribes to the task's event stream and folds
+// what arrives into the outcome (#349). The replay opens with the
+// stored task snapshot — authoritative for the artifacts received
+// before the cut — and then only newer events. Nil only when a
+// terminal state landed; the error wraps a2a.ErrTaskNotFound when the
+// server has no active execution for the task.
+func consumeResubscription(ctx context.Context, client *a2aclient.Client, taskID string, outcome *agent.DispatchTransportOutcome) error {
+	req := &a2aspec.SubscribeToTaskRequest{ID: a2aspec.TaskID(taskID)}
+	for ev, err := range client.SubscribeToTask(ctx, req) {
+		if err != nil {
+			return fmt.Errorf("a2a: resubscribe task %s: %w", taskID, err)
+		}
+		foldEvent(outcome, ev)
+	}
+	if outcome.Status == "" {
+		return fmt.Errorf("a2a: resubscribed stream for task %s ended without a terminal state", taskID)
+	}
+	return nil
+}
+
+// foldEvent folds one stream or replay event into the outcome. Both
+// the initial stream and a resubscription's replay carry the same
+// event vocabulary, so they share one folder.
+func foldEvent(outcome *agent.DispatchTransportOutcome, ev a2aspec.Event) {
+	switch e := ev.(type) {
+	case *a2aspec.TaskStatusUpdateEvent:
+		applyStatusUpdate(outcome, e)
+	case *a2aspec.TaskArtifactUpdateEvent:
+		applyArtifactUpdate(outcome, e)
+	case *a2aspec.Task:
+		foldTaskSnapshot(outcome, e)
+	}
 }
 
 // applyStatusUpdate folds one status update into the outcome: Working
@@ -121,7 +237,9 @@ func applyStatusUpdate(outcome *agent.DispatchTransportOutcome, ev *a2aspec.Task
 	}
 }
 
-// applyTaskSnapshot folds a terminal task snapshot into the outcome.
+// applyTaskSnapshot folds a terminal task snapshot's state and status
+// message into the outcome. Call it through foldTaskSnapshot, which
+// guards the terminal-wins rule and folds the snapshot's artifacts.
 func applyTaskSnapshot(outcome *agent.DispatchTransportOutcome, task *a2aspec.Task) {
 	switch task.Status.State {
 	case a2aspec.TaskStateCompleted:
@@ -136,18 +254,50 @@ func applyTaskSnapshot(outcome *agent.DispatchTransportOutcome, task *a2aspec.Ta
 	}
 }
 
-// applyArtifactUpdate folds one artifact update into the outcome (#361):
-// the named diff artifact reassembles by artifact ID — capped at
-// maxReassembledDiffBytes, anything past the cap marks the outcome
-// truncated — and the dispatch-result artifact decodes into the outcome's
-// typed fields. Unrecognized artifacts are ignored.
+// foldTaskSnapshot folds a task snapshot — a resubscription's replay
+// opener or a tasks/get answer (#349) — into the outcome. The snapshot
+// is the server's authoritative accumulated state, so the
+// wire-accumulated artifacts reset before its artifacts fold: an
+// already-received partial diff must never double. The replayed
+// snapshot itself never counts as progress, and a terminal state folds
+// only when the outcome has none — once a terminal state is applied,
+// it wins.
+func foldTaskSnapshot(outcome *agent.DispatchTransportOutcome, task *a2aspec.Task) {
+	if task == nil {
+		return
+	}
+	outcome.Diff = ""
+	outcome.DiffError = ""
+	outcome.DiffTruncated = false
+	for _, art := range task.Artifacts {
+		applyArtifact(outcome, art)
+	}
+	if isTerminalTaskState(task.Status.State) && outcome.Status == "" {
+		applyTaskSnapshot(outcome, task)
+	}
+}
+
+// applyArtifactUpdate folds one artifact update event into the outcome
+// (#361): the named diff artifact reassembles by artifact ID — capped
+// at maxReassembledDiffBytes, anything past the cap marks the outcome
+// truncated — and the dispatch-result artifact decodes into the
+// outcome's typed fields. Unrecognized artifacts are ignored.
 func applyArtifactUpdate(outcome *agent.DispatchTransportOutcome, ev *a2aspec.TaskArtifactUpdateEvent) {
 	if ev == nil || ev.Artifact == nil {
 		return
 	}
-	switch ev.Artifact.ID {
+	applyArtifact(outcome, ev.Artifact)
+}
+
+// applyArtifact folds one artifact — an update event's payload or one
+// of a task snapshot's stored artifacts — into the outcome.
+func applyArtifact(outcome *agent.DispatchTransportOutcome, art *a2aspec.Artifact) {
+	if art == nil {
+		return
+	}
+	switch art.ID {
 	case DiffArtifactID:
-		for _, part := range ev.Artifact.Parts {
+		for _, part := range art.Parts {
 			if part == nil {
 				continue
 			}
@@ -159,7 +309,7 @@ func applyArtifactUpdate(outcome *agent.DispatchTransportOutcome, ev *a2aspec.Ta
 			outcome.Diff += text
 		}
 	case ResultArtifactID:
-		for _, part := range ev.Artifact.Parts {
+		for _, part := range art.Parts {
 			if decoded, ok := decodeDispatchOutcome(part); ok {
 				outcome.DiffError = decoded.DiffError
 			}
@@ -218,5 +368,133 @@ func (f *ServerFactory) dispatchHTTPClient() *http.Client {
 	}
 }
 
-// Compile-time proof the factory also satisfies the transport seam.
-var _ agent.DispatchTransport = (*ServerFactory)(nil)
+// dispatchTaskStateToken maps an A2A task state onto the transport's
+// status vocabulary: the terminal tokens are the outcome's, everything
+// non-terminal reports as working (#349).
+func dispatchTaskStateToken(state a2aspec.TaskState) string {
+	switch state {
+	case a2aspec.TaskStateCompleted:
+		return DispatchStatusCompleted
+	case a2aspec.TaskStateFailed, a2aspec.TaskStateRejected:
+		return DispatchStatusFailed
+	case a2aspec.TaskStateCanceled:
+		return DispatchStatusCanceled
+	default:
+		return DispatchStatusWorking
+	}
+}
+
+// GetDispatchTask answers one task query over the A2A protocol (#349):
+// tasks/get returns the stored task, its status message while the task
+// is still in flight and its terminal status, text, and artifacts once
+// it has finished. It serves surfaces that meet a dispatched run
+// without a live stream (#348, #421). Card is the registry entry's
+// opaque AgentCard; TaskID is the ID StreamDispatch reported through
+// the params' OnTask.
+func (f *ServerFactory) GetDispatchTask(ctx context.Context, p agent.GetDispatchTaskParams) (agent.DispatchTaskStatus, error) {
+	card, ok := p.Card.(*a2aspec.AgentCard)
+	if !ok || card == nil {
+		return agent.DispatchTaskStatus{}, fmt.Errorf("a2a: dispatch %s has no resolvable agent card", p.Endpoint)
+	}
+	if p.TaskID == "" {
+		return agent.DispatchTaskStatus{}, fmt.Errorf("a2a: dispatch %s has no task id", p.Endpoint)
+	}
+	httpClient := f.httpClient
+	if httpClient == nil {
+		httpClient = f.dispatchHTTPClient()
+	}
+	client, err := newDispatchClient(ctx, card, httpClient)
+	if err != nil {
+		return agent.DispatchTaskStatus{}, err
+	}
+	task, err := client.GetTask(ctx, &a2aspec.GetTaskRequest{ID: a2aspec.TaskID(p.TaskID)})
+	if err != nil {
+		return agent.DispatchTaskStatus{}, fmt.Errorf("a2a: get task %s: %w", p.TaskID, err)
+	}
+	return agent.DispatchTaskStatus{
+		Status: dispatchTaskStateToken(task.Status.State),
+		Text:   statusUpdateMessageText(&a2aspec.TaskStatusUpdateEvent{Status: task.Status}),
+	}, nil
+}
+
+// CancelReasonMetadataKey is the metadata key a tasks/cancel request
+// carries its reason under (#348). It rides CancelTaskRequest.Metadata,
+// which the server copies onto the cancel's ExecutorContext, and the
+// executor puts the decoded reason on the terminal Canceled status
+// message. Declared as a single, crush-owned extension key; #359's
+// declared, statically typed metadata will adopt it.
+const CancelReasonMetadataKey = "crush.dispatch.cancel_reason"
+
+// CancelReason is the typed metadata payload a tasks/cancel request
+// carries its kill reason under (#348), keyed by
+// CancelReasonMetadataKey.
+type CancelReason struct {
+	Reason string `json:"reason"`
+}
+
+// cancelReasonFromMetadata decodes the kill reason a cancel request
+// carried (#348). The wire round-trips the typed payload through JSON,
+// so a served executor sees it as a nested map; accept the round-tripped
+// form, a direct payload from an in-process caller, and a bare string.
+func cancelReasonFromMetadata(md map[string]any) string {
+	if md == nil {
+		return ""
+	}
+	switch v := md[CancelReasonMetadataKey].(type) {
+	case string:
+		return v
+	case CancelReason:
+		return v.Reason
+	case *CancelReason:
+		if v != nil {
+			return v.Reason
+		}
+	case map[string]any:
+		if s, ok := v["reason"].(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// CancelDispatch sends one tasks/cancel for a served dispatch (#348):
+// the protocol-native kill the direct SessionAgent cancel can never be
+// for an out-of-process agent (#72/#73). The reason rides the request as
+// declared metadata and lands on the terminal Canceled status message
+// the dispatch's stream, or any tasks/get reader, reports. An error here
+// means the cancel did not land — the caller falls back to the direct
+// cancel.
+func (f *ServerFactory) CancelDispatch(ctx context.Context, p agent.DispatchCancelParams) error {
+	card, ok := p.Card.(*a2aspec.AgentCard)
+	if !ok || card == nil {
+		return fmt.Errorf("a2a: dispatch %s has no resolvable agent card", p.Endpoint)
+	}
+	if p.TaskID == "" {
+		return fmt.Errorf("a2a: dispatch %s has no task id", p.Endpoint)
+	}
+	httpClient := f.httpClient
+	if httpClient == nil {
+		httpClient = f.dispatchHTTPClient()
+	}
+	client, err := newDispatchClient(ctx, card, httpClient)
+	if err != nil {
+		return err
+	}
+	req := &a2aspec.CancelTaskRequest{
+		ID: a2aspec.TaskID(p.TaskID),
+		Metadata: map[string]any{
+			CancelReasonMetadataKey: CancelReason{Reason: p.Reason},
+		},
+	}
+	if _, err := client.CancelTask(ctx, req); err != nil {
+		return fmt.Errorf("a2a: cancel task %s: %w", p.TaskID, err)
+	}
+	return nil
+}
+
+// Compile-time proof the factory also satisfies the transport and
+// cancel seams.
+var (
+	_ agent.DispatchTransport = (*ServerFactory)(nil)
+	_ agent.DispatchCanceler  = (*ServerFactory)(nil)
+)

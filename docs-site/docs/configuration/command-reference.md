@@ -374,6 +374,30 @@ option attribution-trailer-style assisted-by
 option disable-skill crush-config
 ```
 
+### Todo enforcement and dispatch keys
+
+These keys configure the proactive todo enforcement ladder and the
+dispatched-run timeouts, which live under `options.todo_enforcement` in the
+JSON form. Durations accept a Go duration (`5m`) or a bare number of
+seconds; counts and durations accept `off` for zero. A negative value or an
+unparseable one fails the load, naming the key.
+
+| Key | Effect |
+| --- | --- |
+| `todo-nudge true\|false` | Inject a nudge when an agent works without a todo list |
+| `todo-nudge-threshold N` | Tool calls without todo activity before the first nudge (at least 1) |
+| `todo-hard-gate on\|off` | Reject mutating tools until a todo list exists |
+| `todo-kill-after-nudges N\|off` | Nudges a dispatched agent may ignore before it is killed |
+| `dispatch-stall DUR\|off` | Kill a dispatched run whose todos stop updating for this long |
+| `dispatch-timeout DUR\|off` | Kill a dispatched run after this long, whatever its progress |
+
+```bash
+option todo-nudge false
+option todo-kill-after-nudges 3
+option dispatch-stall 5m
+option dispatch-timeout 1h
+```
+
 ### `option reset`
 
 Clears every value previously added to a list option. Values added *after* the

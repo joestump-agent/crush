@@ -1,0 +1,5 @@
+Cancel a single dispatched agent that is still running, on the user's behalf: the agent stops mid-task, its run ends killed with the reason "canceled by user", and the parent receives the killed terminal message with the salvageable diff. The agent's workspace is preserved — nothing is discarded, and cleanup still waits on the re-dispatch-or-dismiss decision.
+
+Address the agent by its @handle (the "handle" from the dispatch handle) or by its dispatch ID (the "dispatch_id" from the same handle). Use it when the user asks to stop one specific dispatched agent — one that is heading the wrong way, is no longer needed, or was dispatched by mistake. Do not use it to stop your own run; that is the user's cancel, not yours.
+
+An unknown or already-finished dispatch refuses cleanly: task sessions are never continuable, so a finished agent needs no cancel — dispatch a new agent with a prompt that includes the follow-up instead. Canceling one dispatched agent never touches the parent session's run or any other dispatched agent.

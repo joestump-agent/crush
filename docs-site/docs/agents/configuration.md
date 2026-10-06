@@ -154,26 +154,18 @@ though those include `bash` and `write` ([#377](https://github.com/joestump-agen
 
 ## Config the dispatched agent reads
 
-A dispatched agent loads config fresh from its worktree, which is a checkout of
-a **committed** revision. It reads:
+A dispatched agent runs with your session's config, viewed from inside its
+worktree. It never loads config from the worktree itself: nothing committed
+on the base revision, a revision the main agent chooses, is read or executed
+([#374](https://github.com/joestump-agent/crush/issues/374)).
 
-- your global config (`~/.config/crush/…`);
-- the project `crushrc`, `crush.json` or `.crush.json` **as committed** on the
-  base revision;
-- context files (`AGENTS.md`, `CRUSH.md`, …) and skills paths, resolved inside
+- Policy (permissions, command allow-lists, LSP servers, skills, MCP) is your
+  session's config: global plus the launch directory's project config,
+  whether committed or not.
+- Context files (`AGENTS.md`, `CRUSH.md`, …) and skills paths, resolved inside
   the worktree.
-
-It does not see gitignored or uncommitted config, local skills or context
-files, so a `.crushrc` you keep out of git does not apply. The data directory
-is shared with your session, so logs and the database stay in one place.
-
-:::warning[Known issue]
-Loading that config **runs** the worktree's `crushrc` as Bash, with your
-environment, before any permission prompt. The main agent chooses the base
-revision, so a `crushrc` on any branch it picks executes on your machine. Its
-`permissions allow` list and command allow-lists also take effect. Only
-dispatch from repositories whose branches you trust. Tracked in [#374](https://github.com/joestump-agent/crush/issues/374).
-:::
+- The data directory is shared with your session, so logs and the database
+  stay in one place.
 
 ## Hard-coded today
 

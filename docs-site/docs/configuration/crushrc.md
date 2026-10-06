@@ -133,7 +133,7 @@ script or pulled in via `source`. Later lines win, exactly like a shell.
 ## The builtins
 
 Entity commands use `add` to create or update and `remove` (aliased `rm`) to
-delete. Booleans accept `true/false/1/0/yes/no` in any case.
+delete. Booleans accept `true/false/1/0/yes/no/on/off` in any case.
 
 | Builtin | Manages |
 | --- | --- |
@@ -148,6 +148,23 @@ delete. Booleans accept `true/false/1/0/yes/no` in any case.
 Every flag for every one of them is in the
 **[config command reference](/configuration/command-reference)**.
 
+## Todo enforcement and dispatch
+
+`option` also sets the [multi-agent todo ladder](/agents/todo-enforcement):
+the nudging, the hard gate, and the dispatched-run timeouts (the JSON form
+keeps them under `options.todo_enforcement`). Durations accept a Go duration
+(`5m`) or a bare number of seconds; `off` means zero, and a negative value
+or an unparseable one fails the load, naming the key.
+
+| Key | Effect |
+| --- | --- |
+| `todo-nudge true\|false` | Inject a nudge when an agent works without a todo list |
+| `todo-nudge-threshold N` | Tool calls without todo activity before the first nudge (at least 1) |
+| `todo-hard-gate on\|off` | Reject mutating tools until a todo list exists |
+| `todo-kill-after-nudges N\|off` | Nudges a dispatched agent may ignore before it is killed |
+| `dispatch-stall DUR\|off` | Kill a dispatched run whose todos stop updating for this long |
+| `dispatch-timeout DUR\|off` | Kill a dispatched run after this long, whatever its progress |
+
 ## Security
 
 Both `crushrc` and `crush.json` are **trusted code**. `crushrc` runs in a full
@@ -158,20 +175,14 @@ appears, with your privileges.
 - Don't `source` files from the internet into your config.
 - Prefer reading secrets from a password manager over pasting them in.
 
-:::warning[Known issue]
-A [dispatched agent](/agents/overview) loads project config from its own
-worktree: the `crushrc` or `crush.json` committed at the revision the worktree
-was cut from — a revision the model chooses. That config runs with your
-privileges like any other, and an uncommitted project config never reaches the
-agent. Only let Crush dispatch in a repository whose branches you trust.
-Tracked as [#374](https://github.com/joestump-agent/crush/issues/374).
-:::
+Dispatched agents follow the same rule in both directions: a dispatch reuses
+the config your session already loaded and never reads or executes the
+worktree's own `crushrc` or `crush.json`, so a branch the model picks cannot
+run code when the dispatch starts ([#374](https://github.com/joestump-agent/crush/issues/374)).
 
 ## What about JSON?
 
 `crush.json` is still fully supported but should be considered deprecated. New
 configuration options are only added to the Bash format. A few keys still
-have no builtin, though — among them `options.todo_enforcement`, the
-[multi-agent todo ladder](/agents/todo-enforcement), which only `crush.json`
-can set today (tracked as [#403](https://github.com/joestump-agent/crush/issues/403)). See
+have no builtin, though — see
 [Legacy JSON config](/configuration/json) for the list.

@@ -89,6 +89,12 @@ type KeyMap struct {
 	// textarea keymaps.
 	InspectDrill key.Binding
 	InspectBack  key.Binding
+
+	// Cancel one dispatched agent (#373). Active only when a live
+	// dispatch block is focused in the chat or while inspecting a live
+	// dispatch; never Esc or ctrl+[, which belong to the cancel and
+	// inspect interactions.
+	CancelAgent key.Binding
 }
 
 func DefaultKeyMap() KeyMap {
@@ -136,6 +142,10 @@ func DefaultKeyMap() KeyMap {
 		InspectBack: key.NewBinding(
 			key.WithKeys("ctrl+["),
 			key.WithHelp("ctrl+[", "back to chat"),
+		),
+		CancelAgent: key.NewBinding(
+			key.WithKeys("ctrl+x"),
+			key.WithHelp("ctrl+x", "cancel agent"),
 		),
 	}
 

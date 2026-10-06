@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,6 +53,11 @@ func (f *dispatchTestAgent) Model() Model { return f.model }
 
 func (f *dispatchTestAgent) WaitReady() error { return nil }
 
+// IsSessionBusy always reports idle: the delivery flush (#388) consults
+// it before touching pending results, and these fakes never park a
+// session mid-turn.
+func (f *dispatchTestAgent) IsSessionBusy(string) bool { return false }
+
 func dispatchTestModel() Model {
 	return Model{
 		CatwalkCfg: catwalk.Model{ContextWindow: 200000, DefaultMaxTokens: 1024},
@@ -90,6 +96,7 @@ func newDispatchToolEnv(t *testing.T, agent *dispatchTestAgent) (*coordinator, f
 	initGitRepo(t, env.workingDir)
 
 	c := newDispatchTestCoordinator(t, env)
+	reapDispatchRuns(t, c)
 	c.dispatchAgentBuilder = func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error) {
 		return &dispatchedAgent{
 			agent:       agent,
@@ -142,18 +149,18 @@ func TestBuildToolsGatesDispatchOnInteractive(t *testing.T) {
 		{
 			name:        "interactive main agent keeps both",
 			interactive: true,
-			want:        map[string]bool{DispatchAgentToolName: true, MessageAgentToolName: true},
+			want:        map[string]bool{DispatchAgentToolName: true, MessageAgentToolName: true, CancelDispatchToolName: true},
 		},
 		{
 			name:        "non-interactive main agent drops both",
 			interactive: false,
-			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false},
+			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false, CancelDispatchToolName: false},
 		},
 		{
 			name:        "interactive sub-agent still drops both",
 			interactive: true,
 			subAgent:    true,
-			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false},
+			want:        map[string]bool{DispatchAgentToolName: false, MessageAgentToolName: false, CancelDispatchToolName: false},
 		},
 	}
 	for _, tt := range tests {
@@ -246,9 +253,9 @@ func TestDispatchWorktreesLiveUnderDataDirectory(t *testing.T) {
 			// the dispatch holds the lock file, and Windows refuses to
 			// remove a file another process has open. Cleanups run LIFO,
 			// so this lands ahead of testEnv's RemoveAll.
-			ws, werr := c.dispatchWorkspace()
+			provider, werr := c.dispatchWorkspaceProvider()
 			require.NoError(t, werr)
-			t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+			t.Cleanup(func() { _ = provider.Sweep(context.Background()) })
 
 			// The workspace is <dataDir>/worktrees/<repo-key>/<branch>,
 			// under the resolved data directory — never beside the cwd.
@@ -333,9 +340,7 @@ func TestDispatchAgentToolUnknownSkill(t *testing.T) {
 
 	// Nothing was provisioned: no branches, no worktrees directory
 	// entries, no registry entries.
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	require.Empty(t, ws.List())
+	require.Empty(t, c.dispatchRegistry().List())
 }
 
 // A model-supplied branch that git would read as an option is a tool
@@ -350,9 +355,7 @@ func TestDispatchAgentToolRejectsOptionLikeBranch(t *testing.T) {
 	require.Contains(t, resp.Content, "provision dispatch workspace")
 
 	// The rejected branch never became a dispatch.
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	require.Empty(t, ws.List())
+	require.Empty(t, c.dispatchRegistry().List())
 	require.Empty(t, agent.calls)
 }
 
@@ -386,9 +389,7 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 	require.NotEmpty(t, handle.SessionID)
 	require.DirExists(t, handle.WorkspacePath)
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, ok := ws.Get(handle.DispatchID)
+	entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 	require.True(t, ok)
 	require.Equal(t, handle.SessionID, entry.SessionID)
 	require.True(t, strings.HasSuffix(
@@ -399,7 +400,7 @@ func TestDispatchAgentToolReturnsRunningHandleAndRunsInBackground(t *testing.T) 
 	// The background run completes and records the terminal status in
 	// the registry.
 	require.Eventually(t, func() bool {
-		entry, ok := ws.Get(handle.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status == dispatch.StatusCompleted
 	}, 10*time.Second, 50*time.Millisecond)
 
@@ -427,9 +428,7 @@ func TestDispatchAgentToolCleansUpFailedSetup(t *testing.T) {
 	require.True(t, resp.IsError)
 	require.Contains(t, resp.Content, "build dispatched agent")
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	require.Empty(t, ws.List())
+	require.Empty(t, c.dispatchRegistry().List())
 
 	out, err := exec.CommandContext(t.Context(), "git", "-C", env.workingDir, "branch", "--list", dispatch.BranchPrefix+"*").CombinedOutput()
 	require.NoError(t, err)
@@ -472,16 +471,14 @@ func TestRunDispatchRecordsTerminalStatus(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			c, _ := newDispatchToolEnv(t, tt.agent)
-			ws, err := c.dispatchWorkspace()
-			require.NoError(t, err)
-			entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-			require.NoError(t, err)
+			entry, provider := provisionDispatchEntry(t, c, "")
 
 			toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 			require.NoError(t, err)
 
 			c.runDispatch(t.Context(), dispatchRun{
-				workspace:       ws,
+				reg:             c.dispatchRegistry(),
+				provider:        provider,
 				entry:           entry,
 				toolchain:       toolchain,
 				agent:           tt.agent,
@@ -492,7 +489,7 @@ func TestRunDispatchRecordsTerminalStatus(t *testing.T) {
 				parentSessionID: "dispatch-parent-session",
 			})
 
-			got, ok := ws.Get(entry.ID)
+			got, ok := c.dispatchRegistry().Get(entry.ID)
 			require.True(t, ok)
 			require.Equal(t, tt.status, got.Status)
 		})
@@ -516,15 +513,13 @@ func TestRunDispatchKillsBackgroundJobsOnCompletion(t *testing.T) {
 		},
 	}
 	c, env := newDispatchToolEnv(t, agent)
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
+	entry, provider := provisionDispatchEntry(t, c, "")
 	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 	require.NoError(t, err)
 
 	c.runDispatch(t.Context(), dispatchRun{
-		workspace:       ws,
+		reg:             c.dispatchRegistry(),
+		provider:        provider,
 		entry:           entry,
 		toolchain:       toolchain,
 		agent:           agent,
@@ -535,7 +530,7 @@ func TestRunDispatchKillsBackgroundJobsOnCompletion(t *testing.T) {
 		parentSessionID: "dispatch-parent-session",
 	})
 
-	got, ok := ws.Get(entry.ID)
+	got, ok := c.dispatchRegistry().Get(entry.ID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusCompleted, got.Status)
 
@@ -563,15 +558,13 @@ func TestRunDispatchKillsBackgroundJobsOnKill(t *testing.T) {
 		},
 	}
 	c, env := newDispatchToolEnv(t, agent)
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
+	entry, provider := provisionDispatchEntry(t, c, "")
 	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 	require.NoError(t, err)
 
 	c.runDispatch(t.Context(), dispatchRun{
-		workspace:       ws,
+		reg:             c.dispatchRegistry(),
+		provider:        provider,
 		entry:           entry,
 		toolchain:       toolchain,
 		agent:           agent,
@@ -583,7 +576,7 @@ func TestRunDispatchKillsBackgroundJobsOnKill(t *testing.T) {
 		kill:            kill,
 	})
 
-	got, ok := ws.Get(entry.ID)
+	got, ok := c.dispatchRegistry().Get(entry.ID)
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusKilled, got.Status)
 
@@ -609,10 +602,8 @@ func TestSweepDispatchOnCoordinatorEnd(t *testing.T) {
 	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work"})
 	handle := decodeDispatchHandle(t, resp)
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		entry, ok := ws.Get(handle.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(handle.DispatchID)
 		return ok && entry.Status == dispatch.StatusCompleted
 	}, 10*time.Second, 50*time.Millisecond)
 
@@ -625,7 +616,7 @@ func TestSweepDispatchOnCoordinatorEnd(t *testing.T) {
 	// Sweep unregisters an entry only after its removal succeeds, so the
 	// registry can drain a few git invocations behind the directory.
 	require.Eventually(t, func() bool {
-		return len(ws.List()) == 0
+		return len(c.dispatchRegistry().List()) == 0
 	}, 10*time.Second, 50*time.Millisecond)
 }
 
@@ -659,6 +650,19 @@ func TestBuildDispatchedAgent(t *testing.T) {
 	cfg.OverridePreferredModel(config.SelectedModelTypeSmall, config.SelectedModel{Provider: smallProviderID, Model: modelID})
 	cfg.SetupAgents()
 
+	// The dispatched agent sees the context files committed at its
+	// base revision (#386): commit a marker AGENTS.md before
+	// provisioning so the worktree carries it.
+	const projectMarker = "dispatch-project-context-marker-386"
+	require.NoError(t, os.WriteFile(filepath.Join(env.workingDir, "AGENTS.md"), []byte(projectMarker), 0o644))
+	git := func(args ...string) {
+		t.Helper()
+		out, err := exec.CommandContext(t.Context(), "git", append([]string{"-C", env.workingDir}, args...)...).CombinedOutput()
+		require.NoError(t, err, "git %s: %s", strings.Join(args, " "), out)
+	}
+	git("add", "AGENTS.md")
+	git("-c", "commit.gpgsign=false", "commit", "-qm", "add AGENTS.md")
+
 	c := &coordinator{
 		cfg:         cfg,
 		sessions:    env.sessions,
@@ -668,13 +672,17 @@ func TestBuildDispatchedAgent(t *testing.T) {
 		filetracker: *env.filetracker,
 	}
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
+	entry, _ := provisionDispatchEntry(t, c, "")
 	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
 	require.NoError(t, err)
 	defer toolchain.Close(t.Context())
+
+	// The scoped store's user context is what the dispatched agent
+	// renders: point it at a temp file with a second marker (#386).
+	const globalMarker = "dispatch-global-context-marker-386"
+	globalCtxPath := filepath.Join(t.TempDir(), "CRUSH.md")
+	require.NoError(t, os.WriteFile(globalCtxPath, []byte(globalMarker), 0o644))
+	toolchain.Config().Config().Options.GlobalContextPaths = []string{globalCtxPath}
 
 	cases := []struct {
 		name      string
@@ -713,6 +721,28 @@ func TestBuildDispatchedAgent(t *testing.T) {
 	require.Contains(t, rendered, filepath.ToSlash(entry.Path))
 	require.Contains(t, rendered, "Do NOT merge, rebase, push")
 
+	// The worktree's AGENTS.md is rendered under the project context
+	// section, and the user's global context file under the user
+	// context section (#386).
+	require.Contains(t, rendered, "# Project-Specific Context")
+	require.Contains(t, rendered, projectMarker)
+	require.Contains(t, rendered, "# User context")
+	require.Contains(t, rendered, globalMarker)
+
+	// With no context files, the prompt renders as it did before
+	// (#386): no context sections at all.
+	savedContextPaths := toolchain.Config().Config().Options.ContextPaths
+	savedGlobalContextPaths := toolchain.Config().Config().Options.GlobalContextPaths
+	toolchain.Config().Config().Options.ContextPaths = nil
+	toolchain.Config().Config().Options.GlobalContextPaths = nil
+	bare, err := c.buildDispatchedAgent(t.Context(), dispatchAgentOptions{Toolchain: toolchain})
+	require.NoError(t, err)
+	bareRendered := bare.agent.(*sessionAgent).systemPrompt.Get()
+	require.NotContains(t, bareRendered, "# Project-Specific Context")
+	require.NotContains(t, bareRendered, "# User context")
+	toolchain.Config().Config().Options.ContextPaths = savedContextPaths
+	toolchain.Config().Config().Options.GlobalContextPaths = savedGlobalContextPaths
+
 	// The tools are the task agent's read-only set widened with the
 	// dispatch write tools.
 	toolNames := toolNamesOf(dispatched.agent)
@@ -742,16 +772,32 @@ type fakeMainAgent struct {
 	model Model
 	mu    sync.Mutex
 	runs  []SessionAgentCall
+	// busy reports the session busy so a delivery flush parks in the
+	// pending set instead of starting a turn.
+	busy atomic.Bool
+	// failures makes the next N Run calls fail, driving the retry path.
+	failures atomic.Int64
+	cancels  atomic.Int64
+	clears   atomic.Int64
 }
 
 func (f *fakeMainAgent) Run(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
 	f.mu.Lock()
 	f.runs = append(f.runs, call)
 	f.mu.Unlock()
+	if f.failures.Add(-1) >= 0 {
+		return nil, errors.New("delivery boom")
+	}
 	return &fantasy.AgentResult{
 		Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "reviewed"}}},
 	}, nil
 }
+
+func (f *fakeMainAgent) IsSessionBusy(sessionID string) bool { return f.busy.Load() }
+
+func (f *fakeMainAgent) Cancel(sessionID string) { f.cancels.Add(1) }
+
+func (f *fakeMainAgent) ClearQueue(sessionID string) { f.clears.Add(1) }
 
 func (f *fakeMainAgent) runCount() int {
 	f.mu.Lock()
@@ -763,6 +809,12 @@ func (f *fakeMainAgent) lastRun() SessionAgentCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.runs[len(f.runs)-1]
+}
+
+func (f *fakeMainAgent) runsSnapshot() []SessionAgentCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]SessionAgentCall(nil), f.runs...)
 }
 
 func (f *fakeMainAgent) Model() Model                   { return f.model }
@@ -777,17 +829,15 @@ func (f *fakeMainAgent) SetTools(_ []fantasy.AgentTool) {}
 func TestAssembleDispatchResult(t *testing.T) {
 	agent := &dispatchTestAgent{model: dispatchTestModel()}
 	c, _ := newDispatchToolEnv(t, agent)
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	entry, err := ws.Provision(t.Context(), dispatch.ProvisionOptions{})
-	require.NoError(t, err)
+	entry, provider := provisionDispatchEntry(t, c, "")
 
 	// Uncommitted work in the workspace: the work product the diff
 	// summary must surface.
 	require.NoError(t, os.WriteFile(filepath.Join(entry.Path, "new.txt"), []byte("work\n"), 0o644))
 
 	run := dispatchRun{
-		workspace:       ws,
+		reg:             c.dispatchRegistry(),
+		provider:        provider,
 		entry:           entry,
 		sessionID:       "dispatch-child-session",
 		parentSessionID: "dispatch-parent-session",
@@ -797,7 +847,7 @@ func TestAssembleDispatchResult(t *testing.T) {
 		completed: true,
 		findings:  "fixed the bug",
 		diff: func(ctx context.Context) (string, error) {
-			return run.workspace.Diff(ctx, run.entry.ID)
+			return run.provider.Diff(ctx, run.entry)
 		},
 	})
 	require.Equal(t, dispatch.StatusCompleted, completed.Status)
@@ -822,11 +872,11 @@ func TestAssembleDispatchResult(t *testing.T) {
 	require.Contains(t, noTurn.Error, "did not start a turn")
 }
 
-// The terminal payload is delivered to the parent session as a hidden
-// follow-up turn on the main agent (#66): the main agent receives the
-// DispatchResult JSON as its prompt, marked hidden so it does not render
-// as a user message.
-func TestDeliverDispatchResultToParentSession(t *testing.T) {
+// newDeliveryEnv builds the coordinator, fake main agent, and parent
+// session the delivery tests share: config with a provider so c.run's
+// model resolution succeeds, and a coordinator whose main agent is the
+// recording fake.
+func newDeliveryEnv(t *testing.T) (*coordinator, *fakeMainAgent, string) {
 	env := testEnv(t)
 	initGitRepo(t, env.workingDir)
 
@@ -870,6 +920,17 @@ func TestDeliverDispatchResultToParentSession(t *testing.T) {
 
 	parent, err := env.sessions.Create(t.Context(), "parent")
 	require.NoError(t, err)
+	return c, main, parent.ID
+}
+
+// The terminal payload is delivered to the parent session as a hidden
+// follow-up turn on the main agent (#66): the main agent receives the
+// DispatchResult JSON as its prompt, marked hidden so it does not render
+// as a user message. The delivery's RunID is stripped, so the terminal
+// RunComplete it may carry is never mistaken for the dispatch tool
+// call's own (#388).
+func TestDeliverDispatchResultToParentSession(t *testing.T) {
+	c, main, parentID := newDeliveryEnv(t)
 
 	terminal := dispatch.DispatchResult{
 		DispatchID:  "d-deliver",
@@ -879,28 +940,202 @@ func TestDeliverDispatchResultToParentSession(t *testing.T) {
 		KeyFindings: "fixed the bug",
 		DiffSummary: "a.go | +2 -1",
 	}
-	c.deliverDispatchResult(t.Context(), parent.ID, terminal)
+	c.deliverDispatchResult(t.Context(), parentID, terminal)
 
 	require.Eventually(t, func() bool {
 		return main.runCount() == 1
 	}, 10*time.Second, 50*time.Millisecond)
 	run := main.lastRun()
-	require.Equal(t, parent.ID, run.SessionID)
+	require.Equal(t, parentID, run.SessionID)
 	require.True(t, run.HiddenUserMessage)
+	require.Empty(t, run.RunID)
 	require.Contains(t, run.Prompt, `"dispatch_id": "d-deliver"`)
 	require.Contains(t, run.Prompt, `"key_findings": "fixed the bug"`)
 	require.Contains(t, run.Prompt, "Review the diff and decide whether to merge or dismiss")
 }
 
 // Delivery is dropped, not panicked on, when the parent session is gone
-// (deleted, or a `crush run` process that already exited).
+// (deleted, or a `crush run` process that already exited). The main
+// agent is real so the flush reaches the session lookup that drops.
 func TestDeliverDispatchResultDroppedForMissingParent(t *testing.T) {
 	agent := &dispatchTestAgent{model: dispatchTestModel()}
 	c, _ := newDispatchToolEnv(t, agent)
+	c.mainAgent = agent
 	c.deliverDispatchResult(t.Context(), "no-such-parent-session", dispatch.DispatchResult{
 		DispatchID: "d-gone",
 		Status:     dispatch.StatusCompleted,
 	})
+	// The result stays pended only while the parent might come back; a
+	// missing parent must not retry forever.
+	c.dispatchMu.Lock()
+	pended := c.pendingResults["no-such-parent-session"]
+	c.dispatchMu.Unlock()
+	require.Empty(t, pended)
+}
+
+// A result that lands while the parent is busy waits in the pending set,
+// outside the queue the user's Esc tears through (#388): a ClearQueue on
+// the busy parent leaves it intact, and the next idle delivers it.
+func TestDeliverDispatchResultSurvivesClearQueue(t *testing.T) {
+	c, main, parentID := newDeliveryEnv(t)
+	main.busy.Store(true)
+
+	c.deliverDispatchResult(t.Context(), parentID, dispatch.DispatchResult{
+		DispatchID:  "d-clear",
+		Branch:      "crush-dispatch-d-clear",
+		SessionID:   "s-clear",
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "survived the clear",
+	})
+	require.Equal(t, int64(0), main.clears.Load(), "pending must not itself clear anything")
+	c.ClearQueue(parentID)
+	require.Equal(t, int64(1), main.clears.Load())
+
+	main.busy.Store(false)
+	go c.flushPendingResults(parentID)
+
+	require.Eventually(t, func() bool {
+		return main.runCount() == 1
+	}, 10*time.Second, 50*time.Millisecond)
+	run := main.lastRun()
+	require.Equal(t, parentID, run.SessionID)
+	require.True(t, run.HiddenUserMessage)
+	require.Empty(t, run.RunID)
+	require.Contains(t, run.Prompt, `"dispatch_id": "d-clear"`)
+	require.Contains(t, run.Prompt, "Review the diff and decide whether to merge or dismiss")
+
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, 1, main.runCount(), "exactly one delivery turn must run")
+}
+
+// A pending cancel (Cancel on the busy parent) covers queued prompts, not
+// the pending set (#388): the delivery survives and runs on the next idle.
+func TestDeliverDispatchResultSurvivesCancel(t *testing.T) {
+	c, main, parentID := newDeliveryEnv(t)
+	main.busy.Store(true)
+
+	c.deliverDispatchResult(t.Context(), parentID, dispatch.DispatchResult{
+		DispatchID:  "d-cancel",
+		Branch:      "crush-dispatch-d-cancel",
+		SessionID:   "s-cancel",
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "survived the cancel",
+	})
+	require.Equal(t, int64(0), main.cancels.Load(), "pending must not itself cancel anything")
+	c.Cancel(parentID)
+	require.Equal(t, int64(1), main.cancels.Load())
+
+	main.busy.Store(false)
+	go c.flushPendingResults(parentID)
+
+	require.Eventually(t, func() bool {
+		return main.runCount() == 1
+	}, 10*time.Second, 50*time.Millisecond)
+	run := main.lastRun()
+	require.True(t, run.HiddenUserMessage)
+	require.Empty(t, run.RunID)
+	require.Contains(t, run.Prompt, `"dispatch_id": "d-cancel"`)
+
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, 1, main.runCount(), "exactly one delivery turn must run")
+}
+
+// A delivery turn that errors goes back into the pending set and retries
+// (#388): exactly one extra attempt, and the successful one carries the
+// payload.
+func TestDeliverDispatchResultRetriesOnError(t *testing.T) {
+	c, main, parentID := newDeliveryEnv(t)
+	main.failures.Store(1)
+
+	c.deliverDispatchResult(t.Context(), parentID, dispatch.DispatchResult{
+		DispatchID:  "d-retry",
+		Branch:      "crush-dispatch-d-retry",
+		SessionID:   "s-retry",
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "second time lucky",
+	})
+
+	require.Eventually(t, func() bool {
+		return main.runCount() == 2
+	}, 10*time.Second, 50*time.Millisecond)
+	for _, call := range main.runsSnapshot() {
+		require.Empty(t, call.RunID, "every delivery attempt strips the tool call's RunID")
+	}
+	require.Contains(t, main.lastRun().Prompt, `"dispatch_id": "d-retry"`)
+
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, 2, main.runCount(), "the failed attempt must retry exactly once")
+}
+
+// Results that stack up while the parent is busy deliver in one turn,
+// each payload's terminal message in order (#388).
+func TestDeliverDispatchResultBatchesWhileBusy(t *testing.T) {
+	c, main, parentID := newDeliveryEnv(t)
+	main.busy.Store(true)
+
+	c.deliverDispatchResult(t.Context(), parentID, dispatch.DispatchResult{
+		DispatchID: "d-batch-1",
+		Branch:     "crush-dispatch-d-batch-1",
+		SessionID:  "s-batch-1",
+		Status:     dispatch.StatusCompleted,
+	})
+	c.deliverDispatchResult(t.Context(), parentID, dispatch.DispatchResult{
+		DispatchID: "d-batch-2",
+		Branch:     "crush-dispatch-d-batch-2",
+		SessionID:  "s-batch-2",
+		Status:     dispatch.StatusCompleted,
+	})
+	require.Equal(t, 0, main.runCount())
+
+	main.busy.Store(false)
+	go c.flushPendingResults(parentID)
+
+	require.Eventually(t, func() bool {
+		return main.runCount() == 1
+	}, 10*time.Second, 50*time.Millisecond)
+	run := main.lastRun()
+	require.Empty(t, run.RunID)
+	require.Contains(t, run.Prompt, `"dispatch_id": "d-batch-1"`)
+	require.Contains(t, run.Prompt, `"dispatch_id": "d-batch-2"`)
+
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, 1, main.runCount(), "both results must share one delivery turn")
+}
+
+// The queue surfaces never see a queued dispatch delivery (#388): the
+// prompt pill counts only user prompts, Esc's clear and cancel leave the
+// delivery queued, and the step drain neither folds it into the active
+// turn nor drops it under a pending cancel.
+func TestQueueKeepsSystemDeliveriesAcrossClearAndCancel(t *testing.T) {
+	env := testEnv(t)
+	sa := newInjectionSessionAgent(env, &twoStepEchoModel{}, nil)
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+	sa.messageQueue.Set(sess.ID, []SessionAgentCall{
+		{SessionID: sess.ID, Prompt: "user prompt"},
+		{SessionID: sess.ID, Prompt: "dispatch payload", systemDelivery: true},
+	})
+
+	require.Equal(t, 1, sa.QueuedPrompts(sess.ID), "the pill counts prompts, not deliveries")
+	require.Equal(t, []string{"user prompt"}, sa.QueuedPromptsList(sess.ID))
+
+	sa.ClearQueue(sess.ID)
+	kept, _ := sa.messageQueue.Get(sess.ID)
+	require.Len(t, kept, 1, "ClearQueue must keep the delivery")
+	require.True(t, kept[0].systemDelivery)
+
+	sa.Cancel(sess.ID)
+	kept, _ = sa.messageQueue.Get(sess.ID)
+	require.Len(t, kept, 1, "Cancel must keep the delivery")
+
+	sa.cancelMark.Set(sess.ID, 100)
+	fold, canceled := sa.drainQueueForStep(sess.ID)
+	require.Empty(t, fold, "the delivery must never fold into the active turn")
+	require.Empty(t, canceled)
+	kept, _ = sa.messageQueue.Get(sess.ID)
+	require.Len(t, kept, 1, "the delivery must survive a pending cancel in the drain")
+	require.True(t, kept[0].systemDelivery)
 }
 
 // agentSink is a dispatch.TodoSink that records snapshots as history,
@@ -1040,8 +1275,6 @@ func TestDispatchAgentToolRefusedWhenAllWriteToolsDenied(t *testing.T) {
 		}
 	}
 
-	ws, err := c.dispatchWorkspace()
-	require.NoError(t, err)
-	require.Empty(t, ws.List())
+	require.Empty(t, c.dispatchRegistry().List())
 	require.Empty(t, agent.calls)
 }

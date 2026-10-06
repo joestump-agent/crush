@@ -1279,6 +1279,7 @@ func allToolNames() []string {
 		"download",
 		"dispatch_agent",
 		"message_agent",
+		"cancel_dispatch",
 		"edit",
 		"multiedit",
 		"lsp_diagnostics",

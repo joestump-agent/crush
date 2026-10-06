@@ -31,6 +31,7 @@ WHERE id = ? LIMIT 1;
 -- name: GetLastSession :one
 SELECT *
 FROM sessions
+WHERE parent_session_id IS NULL
 ORDER BY updated_at DESC
 LIMIT 1;
 
@@ -44,7 +45,7 @@ ORDER BY updated_at DESC;
 SELECT *
 FROM sessions
 WHERE parent_session_id = ?
-ORDER BY updated_at ASC;
+ORDER BY created_at ASC, rowid ASC;
 
 -- name: ListAllChildSessions :many
 SELECT *

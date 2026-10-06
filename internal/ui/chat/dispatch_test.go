@@ -2,8 +2,11 @@ package chat
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/dispatch"
@@ -11,8 +14,13 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/anim"
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/exp/golden"
 	"github.com/stretchr/testify/require"
 )
+
+// fixedTestTime is a pinned wall clock so elapsed assertions stay
+// deterministic (#428).
+var fixedTestTime = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 
 // newDispatchItem builds a dispatch agent block around one tool call,
 // with or without a persisted tool result.
@@ -72,12 +80,15 @@ func TestDispatchCardRendersLiveSnapshot(t *testing.T) {
 	t.Parallel()
 
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	// Pin the clock 30s past the snapshot's start so the elapsed
+	// assertion is deterministic (#428).
+	item.now = func() time.Time { return fixedTestTime.Add(30 * time.Second) }
 	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
 		Entry: dispatch.Entry{
 			ID:        "dispatch-1",
 			SessionID: "msg$$call-dispatch-1",
 			Status:    dispatch.StatusRunning,
-			StartedAt: time.Now().Add(-30 * time.Second),
+			StartedAt: fixedTestTime,
 		},
 		CurrentTodo:      "wiring up form validation",
 		TodoCompleted:    1,
@@ -122,7 +133,7 @@ func TestDispatchCardRendersQueuedState(t *testing.T) {
 func TestDispatchCardCompletionIsDurable(t *testing.T) {
 	t.Parallel()
 
-	started := time.Now().Add(-2 * time.Minute)
+	started := fixedTestTime
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
 	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
 		Entry: dispatch.Entry{
@@ -175,15 +186,45 @@ func TestDispatchCardFailureShowsError(t *testing.T) {
 }
 
 // A reloaded session renders from the persisted running handle without
-// a live snapshot — and never spins, because nothing will advance the
-// card again.
-func TestDispatchCardStaleHandleIsStatic(t *testing.T) {
+// a live snapshot and without a terminal record (#410) — and never
+// spins, because nothing will advance the card again.
+func TestDispatchCardStaleHandleWithoutTerminalRecordIsStatic(t *testing.T) {
 	t.Parallel()
 
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
 	out := dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), false))
 
 	require.Contains(t, out, "working")
+	require.False(t, item.Spinning())
+	require.Equal(t, "msg$$call-dispatch-1", item.DispatchSessionID())
+}
+
+// A restarted or client/server card has only the persisted tool result:
+// Content still holds the running handle, but the run stamped the
+// terminal DispatchResult into Metadata (#410). The terminal record
+// wins, so the card shows the durable findings instead of "working".
+func TestDispatchCardPrefersTerminalMetadata(t *testing.T) {
+	t.Parallel()
+
+	terminal := dispatch.DispatchResult{
+		DispatchID:  "dispatch-1",
+		Branch:      "crush-dispatch-dispatch-1",
+		SessionID:   "msg$$call-dispatch-1",
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "Added validation and two tests.",
+	}
+	b, err := json.Marshal(terminal)
+	require.NoError(t, err)
+
+	result := runningHandle(t, dispatch.StatusRunning)
+	result.Metadata = string(b)
+
+	item := newDispatchItem(t, result)
+	out := dispatchTestRender(t, item, dispatchToolOpts(result, false))
+
+	require.Contains(t, out, "complete")
+	require.Contains(t, out, "Added validation and two tests.")
+	require.NotContains(t, out, "working")
 	require.False(t, item.Spinning())
 	require.Equal(t, "msg$$call-dispatch-1", item.DispatchSessionID())
 }
@@ -227,8 +268,7 @@ func TestDispatchCardNestedTools(t *testing.T) {
 }
 
 // Mid-run injection (#312): an injected message recorded on the block
-// renders as a steer with the agent's streaming answer beneath it, and
-// the initial dispatch prompt is never mistaken for a steer.
+// renders as a steer with the agent's streaming answer beneath it.
 func TestDispatchCardRendersSteerConversation(t *testing.T) {
 	t.Parallel()
 
@@ -240,11 +280,6 @@ func TestDispatchCardRendersSteerConversation(t *testing.T) {
 			Status:    dispatch.StatusRunning,
 		},
 	})
-
-	// The dispatch's own prompt is not a steer.
-	require.True(t, item.IsInitialDispatchPrompt("implement the login form with validation"))
-	// Any other text before the first steer is not the prompt either.
-	require.False(t, item.IsInitialDispatchPrompt("stop writing Rust"))
 
 	item.AddSteer("stop writing Rust and use Go")
 	item.UpdateSteerAnswer("assistant-1", "understood, switching to Go")
@@ -267,9 +302,63 @@ func TestDispatchCardRendersSteerConversation(t *testing.T) {
 	require.Contains(t, out, "done, go.mod updated")
 
 	require.Len(t, item.Steers(), 2)
-	// After the first steer, nothing is ever treated as the initial
-	// prompt again.
-	require.False(t, item.IsInitialDispatchPrompt("implement the login form with validation"))
+}
+
+// RebuildSteers rebuilds the steer log from the persisted child
+// transcript (#410): Steer-marked user messages become steers — plain
+// user messages (the dispatch's initial prompt, todo nudges) never do —
+// and each assistant message answers the latest steer so far.
+func TestDispatchCardRebuildSteers(t *testing.T) {
+	t.Parallel()
+
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	// Live-recorded state is replaced wholesale by the rebuild.
+	item.AddSteer("stale live steer")
+
+	msg := func(role message.MessageRole, id, text string, steer bool) message.Message {
+		part := message.TextContent{Text: text, Steer: steer}
+		return message.Message{ID: id, Role: role, Parts: []message.ContentPart{part}}
+	}
+
+	msgs := []message.Message{
+		msg(message.User, "child-prompt", "implement the login form with validation", false),
+		msg(message.Assistant, "child-a1", "on it", false),
+		msg(message.User, "nudge-1", "todo reminder", false),
+		msg(message.User, "steer-1", "stop writing Rust and use Go", true),
+		msg(message.Assistant, "child-a2", "switched to Go", false),
+		msg(message.User, "steer-2", "also run the linter", true),
+		msg(message.Assistant, "child-a3", "lint clean", false),
+		msg(message.Assistant, "child-a4", "linter passes everywhere", false),
+	}
+
+	item.RebuildSteers(msgs)
+
+	require.Len(t, item.Steers(), 2)
+	require.Equal(t, "stop writing Rust and use Go", item.Steers()[0].Text)
+	require.Equal(t, "switched to Go", item.Steers()[0].Response)
+	require.Equal(t, "child-a2", item.Steers()[0].ResponseMessageID)
+	// child-a3 and child-a4 both advance the latest steer; the last one
+	// wins, matching the live retarget-latest semantics.
+	require.Equal(t, "also run the linter", item.Steers()[1].Text)
+	require.Equal(t, "linter passes everywhere", item.Steers()[1].Response)
+	require.Equal(t, "child-a4", item.Steers()[1].ResponseMessageID)
+
+	out := dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), true))
+	require.Contains(t, out, "stop writing Rust and use Go")
+	require.Contains(t, out, "linter passes everywhere")
+	// The prompt still renders once, as the card's Task line — but the
+	// unmarked nudge never appears as a steer.
+	require.NotContains(t, out, "todo reminder")
+}
+
+// RebuildSteers with no Steer-marked messages yields an empty steer
+// log: an untouched dispatch rebuilds to a bare card.
+func TestDispatchCardRebuildSteersEmpty(t *testing.T) {
+	t.Parallel()
+
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	item.RebuildSteers([]message.Message{})
+	require.Empty(t, item.Steers())
 }
 
 // Steers survive into the terminal record view: the block keeps the
@@ -326,4 +415,181 @@ func TestDispatchCardShowsHandle(t *testing.T) {
 	})
 	out = dispatchTestRender(t, item, dispatchToolOpts(result, false))
 	require.Contains(t, out, "tester-2", "the live snapshot's handle wins over the persisted one")
+}
+
+// The card label distinguishes a user cancel (#373) from the other kill
+// reasons at a glance: "canceled" only for the user-cancel reason,
+// "killed" for every other kill, and the existing labels otherwise.
+func TestDispatchStateLabelCanceledVsKilled(t *testing.T) {
+	tests := []struct {
+		status       dispatch.Status
+		killedReason string
+		want         string
+	}{
+		{dispatch.StatusProvisioned, "", "queued"},
+		{dispatch.StatusRunning, "", "working"},
+		{dispatch.StatusCompleted, "", "complete"},
+		{dispatch.StatusFailed, "", "failed"},
+		{dispatch.StatusKilled, dispatch.ReasonCanceled, "canceled"},
+		{dispatch.StatusKilled, dispatch.ReasonHardTimeout, "killed"},
+		{dispatch.StatusKilled, dispatch.ReasonStalledTodos, "killed"},
+		{dispatch.StatusKilled, "", "killed"},
+	}
+	for _, tt := range tests {
+		require.Equal(t, tt.want, dispatchStateLabel(tt.status, tt.killedReason),
+			"status %q reason %q", tt.status, tt.killedReason)
+	}
+}
+
+// formatDispatchElapsed truncates to whole units: seconds under a
+// minute, %02d seconds under an hour, %02d minutes at an hour and up,
+// and clamps negative durations to zero (#428).
+func TestFormatDispatchElapsed(t *testing.T) {
+	tests := []struct {
+		in   time.Duration
+		want string
+	}{
+		{0, "0s"},
+		{59900 * time.Millisecond, "59s"},
+		{time.Minute, "1m00s"},
+		{134 * time.Second, "2m14s"},
+		{time.Hour + 4*time.Minute + 30*time.Second, "1h04m"},
+		{-time.Second, "0s"},
+	}
+	for _, tt := range tests {
+		require.Equal(t, tt.want, formatDispatchElapsed(tt.in), "in %v", tt.in)
+	}
+}
+
+// A killed card whose terminal payload carries the user-cancel reason
+// renders "canceled" in the status line (#373); the other kills keep
+// "killed".
+func TestDispatchCardCanceledLabel(t *testing.T) {
+	tests := []struct {
+		name         string
+		killedReason string
+		want         string
+	}{
+		{"user cancel", dispatch.ReasonCanceled, "canceled ·"},
+		{"other kill", dispatch.ReasonHardTimeout, "killed ·"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+			item.now = func() time.Time { return fixedTestTime.Add(30 * time.Second) }
+			item.SetDispatchSnapshot(dispatch.TodoSnapshot{
+				Entry: dispatch.Entry{
+					ID:        "dispatch-1",
+					SessionID: "msg$$call-dispatch-1",
+					Status:    dispatch.StatusKilled,
+					StartedAt: fixedTestTime,
+					Result: &dispatch.DispatchResult{
+						Status:       dispatch.StatusKilled,
+						KilledReason: tt.killedReason,
+					},
+				},
+			})
+			out := dispatchTestRender(t, item, dispatchToolOpts(nil, false))
+			require.Contains(t, out, tt.want)
+		})
+	}
+}
+
+// newSteerCard builds a live running dispatch card with one steer,
+// optionally in its expanded state (#411).
+func newSteerCard(t *testing.T, steerText string, expanded bool) *DispatchToolMessageItem {
+	t.Helper()
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
+		Entry: dispatch.Entry{
+			ID:        "dispatch-1",
+			SessionID: "msg$$call-dispatch-1",
+			Status:    dispatch.StatusRunning,
+		},
+	})
+	item.AddSteer(steerText)
+	if expanded {
+		item.ToggleExpanded()
+	}
+	return item
+}
+
+// noSpace keeps only the non-space runes so wrap positions cannot hide
+// text: if the whole steer survives wrapping, this comparison holds.
+func noSpace(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// Steer lines are width-bound (#411): across render widths and steer
+// shapes, every line of the card stays inside the width, the whole steer
+// text is visible across the wrapped lines, and a short steer stays on
+// one line. Collapsed cards fold steer newlines into spaces; expanded
+// cards keep them.
+func TestDispatchCardSteerWidthBound(t *testing.T) {
+	t.Parallel()
+
+	shapes := []struct {
+		name string
+		text string
+	}{
+		{"short", "stop writing Rust"},
+		{"medium", "stop writing Rust and use Go"},
+		{"long", "refactor the streaming answer path so that token deltas never re-render the markdown body and the steer conversation stays readable"},
+		{"multiline", "first line of the steer\nsecond line of the steer\nthird line of the steer"},
+		{"widerunes", "日本語の長いステアテキストは幅の広いランダムで正しく折り返されなければならない"},
+		{"longword", "unbreakablylongwordwithnospaceatallthatgoesonandonandonandonandon"},
+	}
+	for _, expanded := range []bool{false, true} {
+		for _, width := range []int{40, 60, 100} {
+			for _, shape := range shapes {
+				t.Run(fmt.Sprintf("w%03d/exp=%v/%s", width, expanded, shape.name), func(t *testing.T) {
+					t.Parallel()
+
+					item := newSteerCard(t, shape.text, expanded)
+					out := ansi.Strip(item.Render(width))
+
+					var widest int
+					var shortOnOneLine bool
+					for line := range strings.SplitSeq(out, "\n") {
+						widest = max(widest, ansi.StringWidth(line))
+						if strings.Contains(line, shape.text) {
+							shortOnOneLine = true
+						}
+					}
+					require.LessOrEqual(t, widest, width, "card at width %d:\n%s", width, out)
+
+					// Nothing is truncated: the whole steer text is
+					// present, wrap positions aside.
+					want := noSpace(shape.text)
+					if !expanded {
+						want = noSpace(strings.ReplaceAll(shape.text, "\n", " "))
+					}
+					require.Contains(t, noSpace(out), want, "card at width %d:\n%s", width, out)
+
+					if shape.name == "short" {
+						require.True(t, shortOnOneLine, "short steer must stay on one line:\n%s", out)
+					}
+				})
+			}
+		}
+	}
+}
+
+// A long steer at width 60 pins the exact wrap shape (#411): the steer
+// line breaks at the card edge, continuation lines indent under the
+// text, and the answer follows. Regenerate the golden file with
+// `go test ./internal/ui/chat -update`.
+func TestDispatchCardSteerWidthGolden(t *testing.T) {
+	t.Parallel()
+
+	item := newSteerCard(t,
+		"refactor the streaming answer path so that token deltas never re-render the markdown body", false)
+	item.UpdateSteerAnswer("assistant-1", "on it, splitting the render pass")
+
+	golden.RequireEqual(t, []byte(ansi.Strip(item.Render(60))))
 }

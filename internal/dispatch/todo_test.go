@@ -124,27 +124,25 @@ func TestReduceNoInProgressTodo(t *testing.T) {
 // registry transitions each produce snapshots, and every sink receives
 // the same ones.
 func TestTodoCollectorDualSink(t *testing.T) {
-	ws, err := newWorkspace(t, newTestRepo(t))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+	reg := NewAgentRegistry()
 
 	sessions := pubsub.NewBroker[session.Session]()
 	defer sessions.Shutdown()
 	sinkA, sinkB := newRecordingSink(), newRecordingSink()
-	collector := NewTodoCollector(ws, sessions, sinkA, sinkB)
+	collector := NewTodoCollector(reg, sessions, sinkA, sinkB)
 	collector.Start(t.Context())
 
-	entry, err := ws.Provision(t.Context(), ProvisionOptions{})
-	require.NoError(t, err)
+	entry := Entry{ID: "dispatch-1", Status: StatusProvisioned}
+	reg.Register(entry)
 
 	// The dispatched session is recorded before the run starts; the
 	// registry transition alone must emit a snapshot with the state.
-	ws.SetSession(entry.ID, "msg$$call")
+	reg.SetSession(entry.ID, "msg$$call")
 	snap := sinkA.until(t, func(s TodoSnapshot) bool {
 		return s.Entry.SessionID == "msg$$call" && s.Entry.Status == StatusProvisioned
 	})
 
-	ws.SetStatus(entry.ID, StatusRunning)
+	reg.SetStatus(entry.ID, StatusRunning)
 	snap = sinkA.until(t, func(s TodoSnapshot) bool { return s.Entry.Status == StatusRunning })
 	require.False(t, snap.Entry.StartedAt.IsZero())
 
@@ -173,8 +171,8 @@ func TestTodoCollectorDualSink(t *testing.T) {
 		Status:      StatusCompleted,
 		KeyFindings: "done",
 	}
-	ws.SetResult(entry.ID, terminal)
-	ws.SetStatus(entry.ID, StatusCompleted)
+	reg.SetResult(entry.ID, terminal)
+	reg.SetStatus(entry.ID, StatusCompleted)
 	snap = sinkB.until(t, func(s TodoSnapshot) bool { return s.Entry.Status == StatusCompleted })
 	require.Equal(t, StatusCompleted, snap.Entry.Status)
 	require.False(t, snap.Entry.FinishedAt.IsZero())
@@ -186,14 +184,12 @@ func TestTodoCollectorDualSink(t *testing.T) {
 // Session events for sessions the registry does not know are not
 // dispatched work and must not reach the sinks.
 func TestTodoCollectorIgnoresUnknownSessions(t *testing.T) {
-	ws, err := newWorkspace(t, newTestRepo(t))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+	reg := NewAgentRegistry()
 
 	sessions := pubsub.NewBroker[session.Session]()
 	defer sessions.Shutdown()
 	sink := newRecordingSink()
-	collector := NewTodoCollector(ws, sessions, sink)
+	collector := NewTodoCollector(reg, sessions, sink)
 
 	sessions.Publish(pubsub.UpdatedEvent, session.Session{
 		ID:    "not-a-dispatch",
@@ -210,16 +206,14 @@ func TestTodoCollectorIgnoresUnknownSessions(t *testing.T) {
 // event was a registry transition, composing the entry with the last
 // reduced session state.
 func TestTodoCollectorSnapshotPull(t *testing.T) {
-	ws, err := newWorkspace(t, newTestRepo(t))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+	reg := NewAgentRegistry()
 
 	sessions := pubsub.NewBroker[session.Session]()
-	collector := NewTodoCollector(ws, sessions)
+	collector := NewTodoCollector(reg, sessions)
 
-	entry, err := ws.Provision(t.Context(), ProvisionOptions{})
-	require.NoError(t, err)
-	ws.SetSession(entry.ID, "msg$$call")
+	entry := Entry{ID: "dispatch-1", Status: StatusProvisioned}
+	reg.Register(entry)
+	reg.SetSession(entry.ID, "msg$$call")
 
 	collector.processSessionEvent(pubsub.Event[session.Session]{
 		Type: pubsub.UpdatedEvent,
@@ -228,7 +222,7 @@ func TestTodoCollectorSnapshotPull(t *testing.T) {
 			Todos: testTodos(),
 		},
 	})
-	ws.SetStatus(entry.ID, StatusRunning)
+	reg.SetStatus(entry.ID, StatusRunning)
 
 	snap, ok := collector.Snapshot("msg$$call")
 	require.True(t, ok)
@@ -244,17 +238,15 @@ func TestTodoCollectorSnapshotPull(t *testing.T) {
 // from session saves and registry transitions alike — and only for its
 // session; the channel closes when its context ends.
 func TestTodoCollectorSubscribeSessionTodos(t *testing.T) {
-	ws, err := newWorkspace(t, newTestRepo(t))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ws.Sweep(context.Background()) })
+	reg := NewAgentRegistry()
 
 	sessions := pubsub.NewBroker[session.Session]()
-	collector := NewTodoCollector(ws, sessions)
+	collector := NewTodoCollector(reg, sessions)
 	collector.Start(t.Context())
 
-	entry, err := ws.Provision(t.Context(), ProvisionOptions{})
-	require.NoError(t, err)
-	ws.SetSession(entry.ID, "msg$$call")
+	entry := Entry{ID: "dispatch-1", Status: StatusProvisioned}
+	reg.Register(entry)
+	reg.SetSession(entry.ID, "msg$$call")
 
 	ch := collector.SubscribeSessionTodos(t.Context(), "msg$$call")
 	other := collector.SubscribeSessionTodos(t.Context(), "other-session")
@@ -288,7 +280,7 @@ func TestTodoCollectorSubscribeSessionTodos(t *testing.T) {
 	require.Equal(t, "write the fix", snap.Todos[1].Content)
 
 	// A registry transition is forwarded too, merged with the session state.
-	ws.SetStatus(entry.ID, StatusRunning)
+	reg.SetStatus(entry.ID, StatusRunning)
 	require.Eventually(t, func() bool {
 		select {
 		case s, ok := <-ch:

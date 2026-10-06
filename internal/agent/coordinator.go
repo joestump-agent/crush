@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
@@ -121,6 +122,14 @@ func isOpenCodeResponsesModel(modelID string) bool {
 
 type Coordinator interface {
 	SetMainAgent(agentName string) error
+	// SetInteractive flips the coordinator between the interactive and
+	// non-interactive tool palettes in place (#420): the question,
+	// dispatch, message_agent and cancel tools follow the flag in
+	// buildTools. A re-init after a new client attach calls it instead
+	// of rebuilding the coordinator, so the dispatch registry, the
+	// injection targets, the cron scheduler and the sweep survive.
+	// Same-mode calls are a no-op; the last attach decides the mode.
+	SetInteractive(ctx context.Context, interactive bool) error
 	Run(ctx context.Context, sessionID, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error)
 	// RunAccepted runs a call that was already accepted via
 	// BeginAccepted on the fire-and-forget dispatch path. The handle is
@@ -165,11 +174,19 @@ type Coordinator interface {
 	// finished handle means. A handle dispatched from another session
 	// does not resolve (#399).
 	DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool)
-	// DeliverAgentMessageByHandle delivers a message to the running
-	// dispatched agent carrying handle (#313) — the editor's leading
-	// @handle routing. A finished, unknown, or foreign-session handle
-	// refuses cleanly (#399).
-	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string) error
+	// DeliverAgentMessageByHandle delivers a message and its
+	// attachments (#414) to the running dispatched agent carrying
+	// handle (#313) — the editor's leading @handle routing. A
+	// finished, unknown, or foreign-session handle refuses cleanly
+	// (#399).
+	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error
+	// CancelDispatch stops one dispatched agent on demand (#373): the
+	// ref resolves through the registry as a dispatch ID, an @handle, or
+	// the dispatched agent's child session ID. The dispatch ends killed
+	// with reason "canceled by user" and its workspace is preserved; the
+	// parent's run is untouched. An unknown ref, a finished dispatch, or
+	// a ref with no live run in this process is an error.
+	CancelDispatch(ctx context.Context, ref string) error
 }
 
 // liveDispatch is the coordinator's record of one running dispatch
@@ -198,9 +215,10 @@ type coordinator struct {
 	runComplete pubsub.Publisher[notify.RunComplete]
 	interactive bool
 
-	// agentMu guards mainAgent and mainAgentName: SetMainAgent runs on
-	// HTTP handler goroutines while runs, cancels, and probes read the
-	// current agent from their own goroutines.
+	// agentMu guards mainAgent, mainAgentName and interactive:
+	// SetMainAgent and SetInteractive run on HTTP handler goroutines
+	// while runs, cancels, and probes read them from their own
+	// goroutines.
 	agentMu       sync.RWMutex
 	mainAgent     SessionAgent
 	mainAgentName string
@@ -208,19 +226,34 @@ type coordinator struct {
 
 	cronStore *scheduler.Store
 
-	// Worktree dispatch (#61): the Workspace registry is created lazily
-	// on first dispatch because a non-git working directory must not
-	// fail coordinator construction, and the failure is cached so later
-	// dispatches report it instead of retrying. dispatchAgentBuilder is
-	// the dispatched-agent constructor the DispatchAgent tool uses; nil
-	// means the real one, and tests substitute a fake through it.
+	// Worktree dispatch (#61): the agent registry is created eagerly (it
+	// is pure in-memory state and never fails), while the git worktree
+	// provider is created lazily on first dispatch because a non-git
+	// working directory must not fail coordinator construction, and the
+	// failure is cached so later dispatches report it instead of
+	// retrying. dispatchAgentBuilder is the dispatched-agent constructor
+	// the DispatchAgent tool uses; nil means the real one, and tests
+	// substitute a fake through it.
 	dispatchMu           sync.Mutex
-	dispatchWS           *dispatch.Workspace
-	dispatchWSErr        error
+	dispatchReg          *dispatch.AgentRegistry
+	dispatchProvider     *dispatch.GitWorktreeProvider
+	dispatchProviderErr  error
 	dispatchAgentBuilder func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error)
+	// spawnDispatch starts a dispatch's background run; nil means the
+	// production `go f()`. Tests install a WaitGroup-backed spawner so
+	// a test can never end while a runDispatch it started is still
+	// running (#422).
+	spawnDispatch func(func())
+	// pendingResults holds each parent session's dispatch results whose
+	// delivery turn has not succeeded yet (#388): a result arrives while
+	// the parent is busy, so it waits here — outside the prompt queue
+	// the user's Esc clears — and flushPendingResults delivers it on the
+	// next idle. Guarded by dispatchMu; lazily created because tests
+	// construct the coordinator struct directly.
+	pendingResults map[string][]dispatch.DispatchResult
 	// dispatchCollector reduces dispatched-session state into
 	// per-dispatch snapshots for the configured sinks (#65); created
-	// with the registry and run on the coordinator's lifetime context.
+	// with the provider and run on the coordinator's lifetime context.
 	dispatchCollector *dispatch.TodoCollector
 	// dispatchRuns maps each running dispatch's task session to its
 	// injection target (#312): the injectable agent plus the call
@@ -234,9 +267,21 @@ type coordinator struct {
 	// teardown. Guarded by dispatchMu; #372 (cancel at shutdown) and
 	// #373 (user-initiated cancel) build on it.
 	liveDispatches map[string]*liveDispatch
+	// shuttingDown is set when CancelAll's dispatch phase begins (#372):
+	// while it is set, a finishing dispatch still records its terminal
+	// result and status in the registry, but deliverDispatchResult
+	// starts no parent turn.
+	shuttingDown atomic.Bool
+	// dispatchShutdownWait bounds the shared wait CancelAll gives the
+	// live dispatches' graceful agent.Cancel to finish each run (#372);
+	// dispatchShutdownRootWait is the extra shared bound the root-cancel
+	// fallback gets. Zero keeps the defaults, 5s and 1s, matching
+	// sessionAgent.CancelAll's own bound; tests shorten them.
+	dispatchShutdownWait     time.Duration
+	dispatchShutdownRootWait time.Duration
 	// dispatchCtx is the NewCoordinator context the collector's
 	// subscriptions run on; nil-safe (tests construct the coordinator
-	// struct directly) — dispatchWorkspace falls back to
+	// struct directly) — dispatchWorkspaceProvider falls back to
 	// context.Background.
 	dispatchCtx   context.Context
 	dispatchSinks []dispatch.TodoSink
@@ -336,6 +381,7 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		semanticStore:   opts.SemanticStore,
 		semanticClient:  opts.SemanticClient,
 		semanticSymbols: symbols.NewExtractor(),
+		dispatchReg:     dispatch.NewAgentRegistry(),
 		dispatchCtx:     ctx,
 		dispatchSinks:   opts.DispatchSinks,
 		dispatchServer:  opts.DispatchServer,
@@ -430,6 +476,46 @@ func (c *coordinator) SetMainAgent(agentName string) error {
 	return nil
 }
 
+// isInteractive reports the current tool-palette mode. Reads take the
+// lock because SetInteractive flips the flag from attach goroutines.
+func (c *coordinator) isInteractive() bool {
+	c.agentMu.RLock()
+	defer c.agentMu.RUnlock()
+	return c.interactive
+}
+
+// SetInteractive implements Coordinator.
+func (c *coordinator) SetInteractive(ctx context.Context, interactive bool) error {
+	c.agentMu.Lock()
+	if c.interactive == interactive {
+		c.agentMu.Unlock()
+		return nil
+	}
+	c.interactive = interactive
+	c.agentMu.Unlock()
+
+	// The flag flips before the rebuild so a run interleaving mid-flight
+	// picks up the new palette on its own updateAgentModels pass, and so
+	// a partially-failed rebuild self-heals on the next run. Rebuild
+	// without agentMu held (run and UpdateModels call it the same way),
+	// and cover both main agents so a SetMainAgent'd plan agent is
+	// rebuilt too. The dispatch registry, the injection targets, the
+	// cron scheduler and the sweep are deliberately untouched: they
+	// belong to the coordinator, not to either palette (#420).
+	for _, name := range []string{config.AgentCoder, config.AgentPlan} {
+		c.agentMu.RLock()
+		agent, ok := c.agents[name]
+		c.agentMu.RUnlock()
+		if !ok || agent == nil {
+			continue
+		}
+		if err := c.updateAgentModels(ctx, agent, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // fireScheduledTask runs a due scheduled task's prompt against its
 // session. The prompt is injected as a normal user turn so it respects
 // the session's busy queue: it fires between turns, never mid-response,
@@ -485,7 +571,7 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	// mid-handshake cannot stall a headless run for minutes. Past the
 	// budget the turn proceeds without the stragglers; their tools simply
 	// stay absent from this run.
-	if !c.interactive {
+	if !c.isInteractive() {
 		if err := mcp.WaitForInitBudget(ctx, mcp.InitWaitBudget); err != nil {
 			return nil, fmt.Errorf("failed to wait for MCP initialization: %w", err)
 		}
@@ -552,6 +638,7 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	// the coalesce closure publishes the final outcome under that
 	// same correlator.
 	runID := RunIDFromContext(ctx)
+	systemDelivery := SystemDeliveryFromContext(ctx)
 	run := func() (*fantasy.AgentResult, error) {
 		return agent.Run(ctx, SessionAgentCall{
 			SessionID:         sessionID,
@@ -568,6 +655,7 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 			TopK:              callTopK(providerCfg, topK),
 			FrequencyPenalty:  freqPenalty,
 			PresencePenalty:   presPenalty,
+			systemDelivery:    systemDelivery,
 			OnComplete:        onComplete,
 			Accepted:          accept,
 			OnAuthRefresh:     c.makeAuthRefreshCallback(providerCfg),
@@ -596,6 +684,10 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 		// error it is about to receive.
 		MarkRunCompletePublished(ctx)
 	}
+	// A run on this session just ended (#388): dispatch results that
+	// pended while it was busy can deliver now. Detached: the flush
+	// runs its own turn.
+	go c.flushPendingResults(sessionID)
 	return result, originalErr
 }
 
@@ -997,6 +1089,11 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 }
 
 func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubAgent bool) ([]fantasy.AgentTool, error) {
+	// One snapshot for the whole palette: SetInteractive may flip the
+	// mode mid-build, and a torn palette (question without dispatch) is
+	// worse than either mode alone.
+	interactive := c.isInteractive()
+
 	var allTools []fantasy.AgentTool
 	if slices.Contains(agent.AllowedTools, AgentToolName) {
 		agentTool, err := c.agentTool(ctx)
@@ -1020,7 +1117,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// interactive-only (#387): a non-interactive `crush run` exits when
 	// the parent's turn ends, so a dispatch would die mid-run with its
 	// result undelivered.
-	if !isSubAgent && c.interactive && slices.Contains(agent.AllowedTools, DispatchAgentToolName) {
+	if !isSubAgent && interactive && slices.Contains(agent.AllowedTools, DispatchAgentToolName) {
 		allTools = append(allTools, c.dispatchTool())
 	}
 
@@ -1031,8 +1128,16 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// deferred (A2A epic #67). Interactive-only for the same reason
 	// dispatch is (#387): a non-interactive run ends with the parent's
 	// turn, so there is no live run left to inject into.
-	if !isSubAgent && c.interactive && slices.Contains(agent.AllowedTools, MessageAgentToolName) {
+	if !isSubAgent && interactive && slices.Contains(agent.AllowedTools, MessageAgentToolName) {
 		allTools = append(allTools, c.messageAgentTool())
+	}
+
+	// On-demand cancel (#373) is the model-facing front door for stopping
+	// one dispatched agent. It rides the same gate as dispatch and
+	// message: main agents only, interactive only — the same reasons
+	// apply, and a tool with nothing running behind it is dead weight.
+	if !isSubAgent && interactive && slices.Contains(agent.AllowedTools, CancelDispatchToolName) {
+		allTools = append(allTools, c.cancelDispatchTool())
 	}
 
 	// Get the model name for the agent
@@ -1084,7 +1189,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	)
 
 	// Question tool is interactive-only and not available to sub-agents.
-	if !isSubAgent && c.interactive {
+	if !isSubAgent && interactive {
 		allTools = append(allTools, tools.NewQuestionTool(c.questions))
 	}
 
@@ -1622,6 +1727,9 @@ func (c *coordinator) Cancel(sessionID string) {
 
 func (c *coordinator) CancelAll() {
 	c.currentAgent().CancelAll()
+	// Quitting stops dispatched agents too (#372): they run on detached
+	// contexts, so the agent cancel above never reaches them.
+	c.cancelDispatchesForShutdown()
 }
 
 func (c *coordinator) ClearQueue(sessionID string) {

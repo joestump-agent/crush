@@ -234,7 +234,7 @@ func TestDispatchTeardownCancelsRootAndDropsRecord(t *testing.T) {
 	f.releaseAgent()
 
 	require.Eventually(t, func() bool {
-		entry, ok := f.c.dispatchWS.Get(f.handle.DispatchID)
+		entry, ok := f.c.dispatchReg.Get(f.handle.DispatchID)
 		return ok && entry.Status != dispatch.StatusRunning
 	}, 10*time.Second, 10*time.Millisecond, "dispatch never reached a terminal status")
 

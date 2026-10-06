@@ -93,7 +93,7 @@ dispatch_agent ──▶ provisioned ──▶ running ──┬──▶ comple
 | `running` | working | The agent is working, and you can steer it. |
 | `completed` | complete | It finished, and the main agent has the result. |
 | `failed` | failed | The run errored; the card shows why. |
-| `killed` | killed | Crush stopped it: ignored todo nudges, stalled todos, a hard timeout, or a tool loop. |
+| `killed` | killed, or canceled when you stopped it | Crush stopped it — ignored todo nudges, stalled todos, a hard timeout, or a tool loop — or you did with <kbd>ctrl+x</kbd>. |
 
 Dispatched agents must keep a todo list. By default, one that ignores two
 nudges about it is killed. See [Todo enforcement](/agents/todo-enforcement).
@@ -104,10 +104,12 @@ hard timeout hangs the dispatch until the 3-minute limit reports it as failed;
 a tool loop reports as completed ([#342](https://github.com/joestump-agent/crush/issues/342), [#343](https://github.com/joestump-agent/crush/issues/343)).
 :::
 
-:::warning[Known issue]
-You can't cancel one dispatched agent; <kbd>esc</kbd> cancels only the main
-agent ([#373](https://github.com/joestump-agent/crush/issues/373)). Steer it instead: `@tester stop now and report what you have`.
-:::
+Stop one dispatched agent yourself: focus its block in the chat (or inspect
+it) and press <kbd>ctrl+x</kbd> — the run ends killed with reason "canceled by
+user", the card shows **canceled**, and the workspace and branch stay for
+review or a re-dispatch. You can also ask the main agent, which cancels by
+handle through its `cancel_dispatch` tool. The main agent's own cancel is
+unchanged: <kbd>esc</kbd> twice cancels only the parent's turn.
 
 ## What happens to the work
 

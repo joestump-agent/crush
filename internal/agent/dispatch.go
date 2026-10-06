@@ -25,12 +25,14 @@ var ErrNoWorkingDir = errors.New("dispatch toolchain requires a workspace direct
 //
 // Every path-rooted tool (bash, edit, multi-edit, write, view, glob, grep,
 // ls, fetch, download) is constructed against the workspace directory, and
-// the LSP manager and permission service are scoped to the same directory,
-// so a SessionAgent built from this toolchain (#64) can only address files
-// inside its workspace through its tools. The isolation boundary is the
-// toolset, not the call: SessionAgentCall is unchanged, and an agent built
-// the usual way — via buildTools against the workspace root — behaves
-// exactly as before.
+// the LSP manager and permission service are scoped to the same directory.
+// The file tools resolve every path against the workspace root and refuse
+// anything outside it (#379): each dispatched call carries the root on its
+// context. Bash is rooted at the workspace directory but its commands can
+// reach anywhere the process can, so staying inside is advised for bash,
+// not enforced. For the file tools the boundary is the toolset, not the
+// call: SessionAgentCall is unchanged, and an agent built the usual way
+// (via buildTools against the workspace root) behaves exactly as before.
 //
 // Deliberately absent, because each would reach back across the isolation
 // boundary:
@@ -65,8 +67,11 @@ func (t *DispatchToolchain) WorkingDir() string {
 }
 
 // Config returns the scoped config store the toolchain was built from —
-// rooted at the workspace directory, with the workspace's own project
-// config, LSP config, and skills paths.
+// the parent's configuration viewed from the workspace directory: the
+// parent's published config (permissions, command allow-lists, LSP
+// servers, skills paths, MCP) with workingDir pointed at the workspace,
+// so directory-scoped behavior resolves there while no policy value can
+// come from the workspace's own config files (#374).
 func (t *DispatchToolchain) Config() *config.ConfigStore {
 	return t.store
 }
@@ -109,16 +114,21 @@ func (t *DispatchToolchain) Close(ctx context.Context) {
 // DispatchToolchainOptions configures BuildDispatchToolchain.
 type DispatchToolchainOptions struct {
 	// WorkingDir is the isolated workspace directory the toolchain is
-	// rooted at — the path Workspace (#63) provisions. Required.
+	// rooted at — the path the git worktree provider (#63) provisions.
+	// Required.
 	WorkingDir string
 }
 
 // BuildDispatchToolchain builds a dispatched agent's entire toolchain
 // rooted at opts.WorkingDir: the file/bash tools are constructed with
 // workingDir = the workspace path, and the LSP manager and permission
-// service are rooted there too. A scoped config store is loaded from the
-// workspace directory (picking up its project config), while the parent's
-// data directory is reused so no second database or lock is taken.
+// service are rooted there too. The scoped config store is the parent's
+// configuration viewed from the workspace directory (#374): the model
+// chooses the base revision, so nothing that revision's config files
+// declare — shell config, permissions, command allow-lists, LSP
+// commands, skills — is read or executed; policy is always the parent's.
+// The parent's data directory is reused so no second database or lock
+// is taken.
 //
 // #64's DispatchAgent tool consumes this: provision a clean workspace,
 // bootstrap the toolchain against its path, run. The caller's context is
@@ -141,25 +151,28 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 		return nil, errors.New("task agent not configured")
 	}
 
-	// Scoped config: config loading, LSP config, and skills paths resolve
-	// against the dispatched workspace. The parent's data directory is
-	// passed through so logs, spill files, and the database stay shared.
-	scoped, err := config.Load(dir, c.cfg.Config().Options.DataDirectory, c.cfg.Config().Options.Debug)
-	if err != nil {
-		return nil, err
-	}
+	// Scoped config: the parent's configuration viewed from the
+	// dispatched workspace (#374). Nothing in the workspace is read or
+	// executed, so a base revision the model chose cannot run its own
+	// shell config or widen policy; directory-scoped behavior (path
+	// tools, LSP roots) still resolves against the workspace, and the
+	// parent's data directory keeps logs, spill files, and the database
+	// shared.
+	scoped := c.cfg.WithWorkingDir(dir)
 
 	lspManager := lsp.NewManager(scoped)
 
 	// Scoped permissions, mirroring app.New's construction: rooted at the
 	// workspace directory and inheriting the parent's allowed-tools so a
-	// dispatched agent starts from the same policy. With a parent
+	// dispatched agent starts from the same policy. The list is read from
+	// the parent's config (#374): a base revision's permissions allow
+	// must never auto-approve a dispatched agent's tools. With a parent
 	// service, skip approval follows the parent's live state so a
 	// runtime yolo toggle reaches dispatched agents; the startup flag is
 	// only a fallback for callers with no parent service.
 	var allowedTools []string
-	if scoped.Config().Permissions != nil && scoped.Config().Permissions.AllowedTools != nil {
-		allowedTools = scoped.Config().Permissions.AllowedTools
+	if parentCfg := c.cfg.Config(); parentCfg.Permissions != nil && parentCfg.Permissions.AllowedTools != nil {
+		allowedTools = parentCfg.Permissions.AllowedTools
 	}
 	var permissions permission.Service
 	if c.permissions != nil {
@@ -322,7 +335,37 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 	if preToolHooks := c.cfg.Config().Hooks[hooks.EventPreToolUse]; len(preToolHooks) > 0 {
 		hookRunner = hooks.NewRunner(preToolHooks, c.cfg.WorkingDir(), c.cfg.WorkingDir())
 	}
+
+	// Every dispatched tool call carries the workspace root on its
+	// context (#379), so path-resolving tools refuse anything outside
+	// it even when the tool itself does not know the working directory.
+	for i, tool := range filtered {
+		filtered[i] = containedTool{inner: tool, workspace: dir}
+	}
 	return wrapToolsWithHooks(filtered, hookRunner, false)
+}
+
+// containedTool injects the dispatch workspace root into a tool
+// call's context before delegating to the inner tool.
+type containedTool struct {
+	inner     fantasy.AgentTool
+	workspace string
+}
+
+func (c containedTool) Info() fantasy.ToolInfo {
+	return c.inner.Info()
+}
+
+func (c containedTool) ProviderOptions() fantasy.ProviderOptions {
+	return c.inner.ProviderOptions()
+}
+
+func (c containedTool) SetProviderOptions(opts fantasy.ProviderOptions) {
+	c.inner.SetProviderOptions(opts)
+}
+
+func (c containedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	return c.inner.Run(tools.WithContainmentRoot(ctx, c.workspace), call)
 }
 
 // bridgePermissions forwards permission requests raised inside a dispatch

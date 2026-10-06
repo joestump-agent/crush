@@ -11,6 +11,7 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/stretchr/testify/require"
 )
 
@@ -78,7 +79,7 @@ func TestDispatchToolAssignsHandles(t *testing.T) {
 	require.Equal(t, first.DispatchID, snap.Entry.ID)
 	require.Equal(t, "writes tests", snap.Entry.Role)
 
-	close(agent.gate)
+	agent.release()
 }
 
 // DispatchLive lists only non-terminal dispatches (#313): finished
@@ -103,10 +104,9 @@ func TestDispatchLiveExcludesFinished(t *testing.T) {
 
 	// Finish the first dispatch; its handle leaves the live set but still
 	// resolves by handle (finished dispatches keep their handle).
-	close(agent.gate)
+	agent.release()
 	require.Eventually(t, func() bool {
-		ws, _ := c.dispatchWorkspace()
-		entry, ok := ws.Get(first.DispatchID)
+		entry, ok := c.dispatchRegistry().Get(first.DispatchID)
 		return ok && entry.Status.IsTerminal()
 	}, 10*time.Second, 50*time.Millisecond)
 
@@ -120,7 +120,7 @@ func TestDispatchLiveExcludesFinished(t *testing.T) {
 	require.Equal(t, first.SessionID, snap.Entry.SessionID)
 
 	// DeliverAgentMessageByHandle refuses the finished handle cleanly.
-	err := c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "tester", "one more thing")
+	err := c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "tester", "one more thing", nil)
 	require.ErrorContains(t, err, "finished")
 	require.ErrorContains(t, err, "dispatch a new agent")
 }
@@ -140,16 +140,19 @@ func TestDeliverByHandleRoutesAndToolAcceptsHandle(t *testing.T) {
 	}, 7))
 	agent.waitRunning(t)
 
-	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "tester", "stop writing Rust"))
-	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "@Tester", "normalized too"))
+	atts := []message.Attachment{{FileName: "ref.png", MimeType: "image/png", Content: []byte("png")}}
+	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "tester", "stop writing Rust", atts))
+	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "@Tester", "normalized too", nil))
 	injected := agent.injected()
 	require.Len(t, injected, 2)
 	require.Equal(t, "stop writing Rust", injected[0].Prompt)
 	require.Equal(t, "normalized too", injected[1].Prompt)
 	require.Equal(t, handle.SessionID, injected[0].SessionID)
+	require.Equal(t, atts, injected[0].Attachments, "the editor's attachments ride the enqueued call")
+	require.Nil(t, injected[1].Attachments)
 
 	// Unknown handle refuses.
-	err := c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "ghost", "hello")
+	err := c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "ghost", "hello", nil)
 	require.ErrorContains(t, err, "no agent with handle @ghost")
 
 	// The model-facing tool addresses by handle as well, with the "@"
@@ -162,7 +165,7 @@ func TestDeliverByHandleRoutesAndToolAcceptsHandle(t *testing.T) {
 	require.Contains(t, resp.Content, "@tester")
 	require.Len(t, agent.injected(), 3)
 
-	close(agent.gate)
+	agent.release()
 }
 
 // runToolAsSession is runTool over a caller-supplied session: the
@@ -206,7 +209,7 @@ func TestDeliverScopedToCallerSession(t *testing.T) {
 	require.ErrorContains(t, err, "no running agent")
 	require.ErrorContains(t, err, "dispatch one first")
 
-	err = c.DeliverAgentMessageByHandle(t.Context(), "dispatch-other-session", "tester", "hello from next door")
+	err = c.DeliverAgentMessageByHandle(t.Context(), "dispatch-other-session", "tester", "hello from next door", nil)
 	require.ErrorContains(t, err, "no agent with handle @tester")
 
 	_, ok := c.DispatchByHandle("dispatch-other-session", "tester")
@@ -231,10 +234,10 @@ func TestDeliverScopedToCallerSession(t *testing.T) {
 		FromSessionID: "dispatch-parent-session",
 		Text:          "from the parent",
 	}))
-	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "tester", "from the parent too"))
+	require.NoError(t, c.DeliverAgentMessageByHandle(t.Context(), "dispatch-parent-session", "tester", "from the parent too", nil))
 	require.Len(t, agent.injected(), 2)
 
-	close(agent.gate)
+	agent.release()
 }
 
 // The @-completion and handle-routing surfaces read the dispatch
@@ -248,15 +251,15 @@ func TestHandleSurfacesDoNotProvisionWorkspace(t *testing.T) {
 	require.Nil(t, c.DispatchLive(""))
 	_, ok := c.DispatchByHandle("", "ghost")
 	require.False(t, ok)
-	err := c.DeliverAgentMessageByHandle(t.Context(), "", "ghost", "hello")
+	err := c.DeliverAgentMessageByHandle(t.Context(), "", "ghost", "hello", nil)
 	require.ErrorContains(t, err, "no agent with handle @ghost")
 
 	_, err = os.Stat(filepath.Join(env.workingDir, ".crush"))
 	require.True(t, os.IsNotExist(err), "a handle read must not create .crush")
 	c.dispatchMu.Lock()
-	ws, collector := c.dispatchWS, c.dispatchCollector
+	provider, collector := c.dispatchProvider, c.dispatchCollector
 	c.dispatchMu.Unlock()
-	require.Nil(t, ws)
+	require.Nil(t, provider)
 	require.Nil(t, collector)
 }
 
@@ -270,7 +273,7 @@ func TestHandleSurfacesInNonGitDirectory(t *testing.T) {
 	require.Nil(t, c.DispatchLive(""))
 	_, ok := c.DispatchByHandle("", "ghost")
 	require.False(t, ok)
-	err := c.DeliverAgentMessageByHandle(t.Context(), "", "ghost", "hello")
+	err := c.DeliverAgentMessageByHandle(t.Context(), "", "ghost", "hello", nil)
 	require.ErrorContains(t, err, "no agent with handle @ghost")
 
 	_, err = os.Stat(filepath.Join(env.workingDir, ".crush"))
