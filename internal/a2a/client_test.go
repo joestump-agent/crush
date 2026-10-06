@@ -147,6 +147,79 @@ func TestStreamDispatchOutOfBandCancelEnds(t *testing.T) {
 	require.Equal(t, "wander kill: hard timeout", outcome.Text)
 }
 
+// CancelDispatch routes the kill through the protocol's tasks/cancel
+// (#348): the reason rides the request metadata, the blocked stream ends
+// canceled carrying it, and exactly one cancel call is needed.
+func TestCancelDispatchEndsStream(t *testing.T) {
+	runner := &blockingCancelRunner{started: make(chan struct{}), kill: make(chan struct{})}
+	server, err := StartServer(t.Context(), ServerParams{
+		Runner:    runner,
+		SessionID: "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+
+	factory := NewServerFactory()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	taskIDCh := make(chan string, 1)
+	outcomeCh := make(chan agent.DispatchTransportOutcome, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		outcome, err := factory.StreamDispatch(ctx, agent.DispatchTransportParams{
+			Endpoint: server.Endpoint,
+			Card:     server.Card,
+			Prompt:   "fix the bug",
+			OnTask:   func(taskID string) { taskIDCh <- taskID },
+		})
+		outcomeCh <- outcome
+		errCh <- err
+	}()
+
+	<-runner.started
+	var taskID string
+	select {
+	case taskID = <-taskIDCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream never named the task")
+	}
+	require.NotEmpty(t, taskID)
+	require.NoError(t, factory.CancelDispatch(ctx, agent.DispatchCancelParams{
+		Endpoint: server.Endpoint,
+		Card:     server.Card,
+		TaskID:   taskID,
+		Reason:   "hard timeout",
+	}))
+
+	var outcome agent.DispatchTransportOutcome
+	select {
+	case outcome = <-outcomeCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stream never ended after the cancel")
+	}
+	require.NoError(t, <-errCh)
+	require.Equal(t, DispatchStatusCanceled, outcome.Status)
+	require.Equal(t, "hard timeout", outcome.Text)
+}
+
+// CancelDispatch without a resolvable card or task ID is an error, not
+// a silent success — the caller's fallback depends on it.
+func TestCancelDispatchRejectsUnusableParams(t *testing.T) {
+	require.Error(t, NewServerFactory().CancelDispatch(t.Context(), agent.DispatchCancelParams{
+		Endpoint: "http://127.0.0.1:1",
+		Card:     "not-a-card",
+		TaskID:   "task-1",
+		Reason:   "hard timeout",
+	}))
+	require.Error(t, NewServerFactory().CancelDispatch(t.Context(), agent.DispatchCancelParams{
+		Endpoint: "http://127.0.0.1:1",
+		Card:     &a2aspec.AgentCard{},
+		TaskID:   "",
+		Reason:   "hard timeout",
+	}))
+}
+
 // An unreachable or bogus endpoint is a transport error before any
 // terminal state, never a silent success.
 func TestStreamDispatchTransportErrors(t *testing.T) {

@@ -312,10 +312,12 @@ type SessionAgentOptions struct {
 	// both false), which keeps direct constructors — tests and the
 	// default agents — unchanged.
 	TodoEnforcement config.TodoEnforcementSettings
-	// TodoKill observes the wander-kill escalation (#316): invoked when
-	// a run ignores its nudges past the resolved kill threshold. The
-	// cancel itself is intrinsic to the run; this is the coordinator's
-	// chance to record the reason. Nil everywhere but dispatched agents,
+	// TodoKill is the wander-kill escalation's supervisor hook (#316):
+	// invoked when a run ignores its nudges past the resolved kill
+	// threshold. The observer owns the kill (#348): it records the
+	// reason and ends the run — routing it through the dispatched run's
+	// tasks/cancel, or the direct fallback — so the ladder closure does
+	// not cancel the run itself. Nil everywhere but dispatched agents,
 	// so only they can be killed.
 	TodoKill func(sessionID string, reason string)
 	// LoopStop observes the loop-detection stop (#343): invoked when the
@@ -856,10 +858,15 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	var onKill func(reason string)
 	if a.todoKill != nil {
 		todoKillFn := a.todoKill
+		// The observer owns the kill (#348): the supervisor records the
+		// reason and routes the kill through the dispatched run's
+		// tasks/cancel, or its direct fallback. The ladder closure here
+		// only reports — canceling itself would bypass the protocol
+		// reason entirely, and an out-of-process agent (#72/#73) has no
+		// in-process cancel to call.
 		onKill = func(reason string) {
 			todoKillFn(call.SessionID, reason)
 			slog.Warn("Todo enforcement killed the run", "session_id", call.SessionID, "reason", reason)
-			a.Cancel(call.SessionID)
 		}
 	}
 	var todoRun *todoEnforcementRun
