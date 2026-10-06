@@ -53,11 +53,6 @@ type TodoSource interface {
 // Compile-time proof that the collector is a TodoSource.
 var _ TodoSource = (*dispatch.TodoCollector)(nil)
 
-// todoMetadataKey is the TaskStatusUpdateEvent metadata key carrying the
-// structured todo snapshot, so consumers (#71) can render a checklist
-// without parsing the message prose.
-const todoMetadataKey = "todos"
-
 // Executor adapts a Crush [agent.SessionAgent] to the [a2asrv.AgentExecutor]
 // interface: it runs one dispatched agent turn, maps the run lifecycle onto
 // A2A task states (submitted -> working -> completed/failed), and emits the git
@@ -428,36 +423,43 @@ func (e *Executor) clearEndedByExecutor(taskID a2aspec.TaskID) {
 // todoStatusUpdate maps one todo snapshot onto a non-terminal Working
 // TaskStatusUpdateEvent (#174): the current activity — the in-progress
 // todo's active form or content — as the message text, falling back to an
-// N/M completed summary, and the structured todo list under
-// [todoMetadataKey] in the event metadata so consumers can render a
-// checklist without parsing the prose.
+// N/M completed summary, and the typed todo progress under the declared
+// todos/v1 extension's URI ([TodoExtensionURI]) in the event metadata, so
+// consumers that negotiated the extension can render a checklist without
+// parsing the prose.
 func todoStatusUpdate(execCtx *a2asrv.ExecutorContext, snap dispatch.TodoSnapshot) *a2aspec.TaskStatusUpdateEvent {
 	text := snap.CurrentTodo
 	if text == "" {
 		text = fmt.Sprintf("%d/%d completed", snap.TodoCompleted, snap.TodoTotal)
 	}
 	ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateWorking, agentMessage(execCtx, text))
-	ev.SetMeta(todoMetadataKey, todoMetadata(snap.Todos))
+	if encoded, err := Encode(TodoExt, todoProgress(snap)); err != nil {
+		// The text still carries the progress; only the structured
+		// checklist is lost.
+		slog.Warn("A2A todo progress failed to encode; event carries no extension metadata", "err", err)
+	} else {
+		ev.SetMeta(TodoExt.URI, encoded)
+	}
 	return ev
 }
 
-// todoMetadata converts the structured todo list into the JSON-shaped
-// values A2A metadata permits ([]any of map[string]any). A typed Go
-// slice here is silently valid to SetMeta and fatal one layer down: the
-// SDK's task store only round-trips nil, bools, numbers, strings, and
-// their slices/maps, so a []session.Todo fails the task-state save and
-// the whole task moves to failed. Same wire shape as before — every
-// field keeps its json tag name — so consumers are unaffected.
-func todoMetadata(todos []session.Todo) []any {
-	out := make([]any, 0, len(todos))
-	for _, todo := range todos {
-		out = append(out, map[string]any{
-			"content":     todo.Content,
-			"status":      string(todo.Status),
-			"active_form": todo.ActiveForm,
+// todoProgress reduces a todo snapshot into the todos/v1 extension's typed
+// payload.
+func todoProgress(snap dispatch.TodoSnapshot) agent.TodoProgress {
+	items := make([]agent.TodoItem, 0, len(snap.Todos))
+	for _, todo := range snap.Todos {
+		items = append(items, agent.TodoItem{
+			Content:    todo.Content,
+			Status:     string(todo.Status),
+			ActiveForm: todo.ActiveForm,
 		})
 	}
-	return out
+	return agent.TodoProgress{
+		Current:   snap.CurrentTodo,
+		Completed: snap.TodoCompleted,
+		Total:     snap.TodoTotal,
+		Todos:     items,
+	}
 }
 
 // Cancel stops the in-flight dispatched run for this executor's session
