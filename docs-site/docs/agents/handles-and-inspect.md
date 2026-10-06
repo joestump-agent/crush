@@ -206,7 +206,9 @@ terminal, and <kbd>esc</kbd> will never cancel the main agent from inspect mode
 ## Sessions tree
 
 In the session picker (<kbd>ctrl+s</kbd>), a session with sub-agent sessions
-shows `▸N` before its timestamp.
+shows `▸N` before its timestamp. The tree loads right after the picker
+opens: until it lands, <kbd>ctrl+]</kbd> reports "Loading sub-agent
+sessions…", and a failed load warns once while leaving the picker usable.
 
 | Key | Session list | Sub-agent list |
 | --- | --- | --- |

@@ -46,6 +46,13 @@ func (f *FilterableList) SetItems(items ...FilterableItem) {
 	f.List.SetItems(fitems...)
 }
 
+// Items returns every item in the list, unfiltered. Callers that
+// mutate items in place (rather than replacing them) use this to
+// reach rows a filter currently hides.
+func (f *FilterableList) Items() []FilterableItem {
+	return f.items
+}
+
 // AppendItems appends items to the list and updates the filtered items.
 func (f *FilterableList) AppendItems(items ...FilterableItem) {
 	f.items = append(f.items, items...)

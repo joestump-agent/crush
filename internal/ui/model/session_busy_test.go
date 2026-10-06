@@ -55,6 +55,15 @@ type countingWorkspace struct {
 	modelCalls       int
 	lspStateCalls    int
 	lspDiagCalls     int
+
+	// sessions / childSessions serve the sessions picker; the child-fetch
+	// counters pin that Update performs no child fetch and that the
+	// picker's command fetches the whole tree exactly once (#409).
+	sessions          []session.Session
+	childSessions     []session.Session
+	allChildErr       error
+	listChildCalls    int
+	listAllChildCalls int
 }
 
 func (w *countingWorkspace) AgentIsReady() bool { w.readyCalls++; return w.ready }
@@ -119,6 +128,32 @@ func (w *countingWorkspace) ListMessages(context.Context, string) ([]message.Mes
 
 func (w *countingWorkspace) ListUserMessages(context.Context, string) ([]message.Message, error) {
 	return nil, nil
+}
+
+// ListSessions and the child-fetch probes serve the sessions picker.
+func (w *countingWorkspace) ListSessions(context.Context) ([]session.Session, error) {
+	return w.sessions, nil
+}
+
+func (w *countingWorkspace) ListChildSessions(context.Context, string) ([]session.Session, error) {
+	w.listChildCalls++
+	return nil, nil
+}
+
+func (w *countingWorkspace) ListAllChildSessions(context.Context) ([]session.Session, error) {
+	w.listAllChildCalls++
+	return w.childSessions, w.allChildErr
+}
+
+// ParseAgentToolSessionID mirrors the real rule: agent-tool task session
+// IDs carry the "messageID$$toolCallID" shape.
+func (w *countingWorkspace) ParseAgentToolSessionID(sessionID string) (string, string, bool) {
+	for i := 0; i+1 < len(sessionID); i++ {
+		if sessionID[i] == '$' && sessionID[i+1] == '$' {
+			return sessionID[:i], sessionID[i+2:], true
+		}
+	}
+	return "", "", false
 }
 
 func (w *countingWorkspace) WorkingDir() string { return "" }
