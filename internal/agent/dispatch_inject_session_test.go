@@ -389,11 +389,11 @@ func newFinalStepDispatchEnv(t *testing.T, env fakeEnv, model fantasy.LanguageMo
 // terminal and returns it.
 func waitDispatchTerminal(t *testing.T, c *coordinator, dispatchID string) dispatch.Entry {
 	t.Helper()
-	ws, _ := c.dispatchWorkspace()
+	reg := c.dispatchRegistry()
 	var e dispatch.Entry
 	require.Eventually(t, func() bool {
 		var ok bool
-		e, ok = ws.Get(dispatchID)
+		e, ok = reg.Get(dispatchID)
 		return ok && e.Status.IsTerminal()
 	}, 10*time.Second, 50*time.Millisecond)
 	return e
