@@ -1435,9 +1435,11 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 	if def.Tools != nil {
 		toolsSpec = *def.Tools
 	}
-	allow := expandToolRefs(toolsSpec.Allow)
-	if allow == nil {
-		allow = allToolNames()
+	// Only an omitted allow list inherits every tool: an explicit empty
+	// allow grants nothing, matching expand(allow) minus expand(deny).
+	allow := allToolNames()
+	if toolsSpec.Allow != nil {
+		allow = expandToolRefs(toolsSpec.Allow)
 	}
 	if deny := expandToolRefs(toolsSpec.Deny); len(deny) > 0 {
 		allow = slices.DeleteFunc(allow, func(name string) bool {

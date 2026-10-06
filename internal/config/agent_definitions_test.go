@@ -205,6 +205,22 @@ func TestAgentDefinitions_DenyInteraction(t *testing.T) {
 	require.Contains(t, coder.AllowedTools, "multiedit")
 }
 
+// TestAgentDefinitions_EmptyAllowMeansNoTools pins the difference
+// between an omitted allow list, which inherits everything, and an
+// explicit empty one, which grants nothing: a restriction typed as []
+// cannot widen an agent.
+func TestAgentDefinitions_EmptyAllowMeansNoTools(t *testing.T) {
+	store := loadAgentsJSON(t, `{"task": {"tools": {"allow": []}}}`)
+	require.Empty(t, store.Config().Agents[config.AgentTask].AllowedTools)
+
+	store = loadAgentsJSON(t, `{
+		"reviewer": {"role": "dispatch", "tools": {"deny": ["bash"]}}
+	}`)
+	reviewer := store.Config().Agents["reviewer"]
+	require.NotContains(t, reviewer.AllowedTools, "bash", "a new agent without allow inherits every tool")
+	require.Contains(t, reviewer.AllowedTools, "edit")
+}
+
 // TestAgentDefinitions_OverlayInherit checks field-by-field overlay: an
 // override touches only the fields it names.
 func TestAgentDefinitions_OverlayInherit(t *testing.T) {
