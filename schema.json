@@ -127,6 +127,20 @@
         }
       ]
     },
+    "DispatchOptions": {
+      "properties": {
+        "max_concurrent": {
+          "type": "integer",
+          "description": "Maximum number of concurrently running dispatched agents; a value below 1 is a load error",
+          "default": 4,
+          "examples": [
+            2
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
     "EmbeddingsConfig": {
       "properties": {
         "base_url": {
@@ -740,6 +754,10 @@
         "todo_enforcement": {
           "$ref": "#/$defs/TodoEnforcementConfig",
           "description": "Proactive todo enforcement: inject a nudge when an agent works without a todo list"
+        },
+        "dispatch": {
+          "$ref": "#/$defs/DispatchOptions",
+          "description": "Dispatched agent options"
         }
       },
       "additionalProperties": false,
@@ -798,6 +816,7 @@
             "azure",
             "bedrock",
             "google-vertex",
+            "hyper",
             "hyper",
             "litellm",
             "llamacpp",
@@ -1017,38 +1036,6 @@
       "additionalProperties": false,
       "type": "object"
     },
-    "Token": {
-      "properties": {
-        "access_token": {
-          "type": "string"
-        },
-        "refresh_token": {
-          "type": "string"
-        },
-        "id_token": {
-          "type": "string"
-        },
-        "account_id": {
-          "type": "string"
-        },
-        "expires_in": {
-          "type": "integer"
-        },
-        "expires_at": {
-          "type": "integer"
-        },
-        "client": {
-          "$ref": "#/$defs/OAuthClient"
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "access_token",
-        "expires_in",
-        "expires_at"
-      ]
-    },
     "TodoEnforcementConfig": {
       "properties": {
         "enabled": {
@@ -1100,10 +1087,50 @@
             "30m",
             "off"
           ]
+        },
+        "inactivity_timeout": {
+          "type": "integer",
+          "description": "A2A backstop: seconds without any event that end a silent dispatched run with a Failed status; 0 disables",
+          "default": 0,
+          "examples": [
+            900
+          ]
         }
       },
       "additionalProperties": false,
       "type": "object"
+    },
+    "Token": {
+      "properties": {
+        "access_token": {
+          "type": "string"
+        },
+        "refresh_token": {
+          "type": "string"
+        },
+        "id_token": {
+          "type": "string"
+        },
+        "account_id": {
+          "type": "string"
+        },
+        "expires_in": {
+          "type": "integer"
+        },
+        "expires_at": {
+          "type": "integer"
+        },
+        "client": {
+          "$ref": "#/$defs/OAuthClient"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "access_token",
+        "expires_in",
+        "expires_at"
+      ]
     },
     "ToolGlob": {
       "properties": {
