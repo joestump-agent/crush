@@ -61,7 +61,7 @@ func TestLeaseHelperProcess(t *testing.T) {
 // reports the owner dead.
 func holdLeaseElsewhere(t *testing.T, path string) {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestLeaseHelperProcess$")
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestLeaseHelperProcess$")
 	cmd.Env = append(os.Environ(), leaseHelperEnv+"=1", leaseHelperPathEnv+"="+path)
 	stdout, err := cmd.StdoutPipe()
 	require.NoError(t, err)
