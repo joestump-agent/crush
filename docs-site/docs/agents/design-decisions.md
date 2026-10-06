@@ -109,14 +109,14 @@ The A2A epic originally ruled out custom extensions, yet todo progress
 already traveled in an undeclared metadata key. Instead of pretending
 otherwise, each kind of Crush metadata gets an extension URI, a Go type and
 a JSON schema. Cards list what they emit and accept, and undeclared keys
-are dropped. The `todos/v1` extension carries dispatch todo progress and
-ships today ([#359](https://github.com/joestump-agent/crush/issues/359)).
-Planned extensions:
-
-- `delegation/v1`, carrying origin, chain, depth and budget; it subsumes
-  [#332](https://github.com/joestump-agent/crush/issues/332) and
-  [#336](https://github.com/joestump-agent/crush/issues/336);
-- `usage/v1`.
+are dropped. Two extensions ship today: `todos/v1` carries dispatch todo
+progress ([#359](https://github.com/joestump-agent/crush/issues/359)), and
+`usage/v1` carries the child session's token totals, cost, model and trace
+id on every post-run terminal status
+([#364](https://github.com/joestump-agent/crush/issues/364)). The planned
+extension is `delegation/v1`, carrying origin, chain, depth and budget; it
+subsumes [#332](https://github.com/joestump-agent/crush/issues/332) and
+[#336](https://github.com/joestump-agent/crush/issues/336).
 
 Tracking: [#364](https://github.com/joestump-agent/crush/issues/364).
 

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2aext"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
@@ -51,6 +52,10 @@ const a2aSocketDirName = "a2a"
 // agentsPathPrefix is the path prefix under which the host routes
 // requests to a dispatch's JSON-RPC handler.
 const agentsPathPrefix = "/agents/"
+
+// traceparentHeader is the W3C Trace Context header the dispatch client
+// sends and the server propagator lifts into the request context (#364).
+const traceparentHeader = "traceparent"
 
 // ServerParams are the inputs for serving one dispatched agent over A2A
 // (#70): the runner drives the agent's session, Diff and Todos feed the
@@ -98,6 +103,11 @@ type ServerParams struct {
 	// the production value is the dispatch run's kill reason. A nil func
 	// or an empty string falls back to "canceled".
 	CancelReason func() string
+	// Usage reads the dispatched session's final usage once its run has
+	// ended (#364). The executor attaches it to every post-run terminal
+	// status under the usage/v1 extension. Optional; nil emits no usage
+	// metadata.
+	Usage func(ctx context.Context) (agent.Usage, error)
 	// TaskStore persists served tasks durably (#354) instead of the
 	// SDK's in-process default, so task state survives a restart.
 	// Optional; the production store arrives with #355. nil keeps
@@ -224,6 +234,9 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	if p.CancelReason != nil {
 		opts = append(opts, WithCancelReason(p.CancelReason))
 	}
+	if p.Usage != nil {
+		opts = append(opts, WithUsage(p.Usage))
+	}
 	opts = append(opts, WithCallTemplate(p.Call))
 	executor := NewExecutor(p.Runner, p.SessionID, opts...)
 
@@ -238,6 +251,15 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	if p.TaskStore != nil {
 		handlerOpts = append(handlerOpts, a2asrv.WithTaskStore(p.TaskStore))
 	}
+	// The traceparent propagator (#364): the W3C traceparent the parent's
+	// client interceptor sent moves into the request context, where the
+	// executor reads it for the dispatch's server-side log lines and the
+	// usage payload's trace_id.
+	handlerOpts = append(handlerOpts, a2asrv.WithCallInterceptors(a2aext.NewServerPropagator(&a2aext.ServerPropagatorConfig{
+		HeaderPredicate: func(_ context.Context, key string) bool {
+			return strings.EqualFold(key, traceparentHeader)
+		},
+	})))
 	handler := a2asrv.NewHandler(executor, handlerOpts...)
 	mux := http.NewServeMux()
 	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
@@ -284,6 +306,7 @@ func (f *ServerFactory) StartDispatchServer(ctx context.Context, p agent.Dispatc
 		Call:              p.Call,
 		InactivityTimeout: p.InactivityTimeout,
 		CancelReason:      p.CancelReason,
+		Usage:             p.Usage,
 	})
 	if err != nil {
 		return "", nil, nil, err

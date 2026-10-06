@@ -488,7 +488,7 @@ func (f *wanderKillFixture) wireTransport(t *testing.T, rt DispatchServerStarter
 	t.Helper()
 	run := f.buildRun()
 	f.c.SetDispatchServerStarter(rt)
-	stop := f.c.startDispatchServer(context.Background(), f.provider, f.reg, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current)
+	stop := f.c.startDispatchServer(context.Background(), f.provider, f.reg, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current, nil)
 	t.Cleanup(func() {
 		if stop != nil {
 			stop()

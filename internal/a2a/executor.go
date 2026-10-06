@@ -16,6 +16,7 @@ import (
 
 	"charm.land/fantasy"
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2aext"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
 	"github.com/charmbracelet/crush/internal/agent"
@@ -98,6 +99,10 @@ type Executor struct {
 	// the Canceled status an out-of-band cancel emits. Optional; a nil
 	// func or an empty string falls back to "canceled".
 	cancelReason func() string
+	// usage reads the dispatched session's final usage once its run has
+	// ended (#364). Optional; nil means terminal statuses carry no usage
+	// metadata.
+	usage func(ctx context.Context) (agent.Usage, error)
 }
 
 // Option configures an [Executor].
@@ -144,6 +149,15 @@ func WithCancelReason(fn func() string) Option {
 	return func(e *Executor) { e.cancelReason = fn }
 }
 
+// WithUsage sets the reader for the dispatched session's final usage
+// (#364): the executor calls it once the run has ended and attaches the
+// value — stamped with the request's W3C trace ID — to every post-run
+// terminal status under the usage/v1 extension. A nil func (the default)
+// emits no usage metadata.
+func WithUsage(fn func(ctx context.Context) (agent.Usage, error)) Option {
+	return func(e *Executor) { e.usage = fn }
+}
+
 // NewExecutor builds an Executor that drives runner against sessionID — the
 // (ephemeral) session backing the dispatched agent.
 func NewExecutor(runner Runner, sessionID string, opts ...Option) *Executor {
@@ -173,6 +187,16 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		// so the silent return of an already-emitted Canceled cannot
 		// outlive the task it belongs to.
 		defer e.forgetCanceledTask(string(execCtx.TaskID))
+
+		// The trace context (#364): the parent's client interceptor sent
+		// the W3C traceparent and the server propagator moved it into
+		// this request's context. Its trace ID is what the dispatch's
+		// server-side log lines carry and what the usage payload echoes
+		// back, so a parent turn and its dispatched run correlate.
+		traceID := traceIDFromContext(ctx)
+		if e.usage != nil || traceID != "" {
+			slog.Debug("A2A dispatch turn starting", "session_id", e.sessionID, "trace_id", traceID)
+		}
 
 		// A message that referenced no existing task starts a new one:
 		// announce it submitted before transitioning to working.
@@ -219,12 +243,16 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 				e.endedByExecutorHas(string(execCtx.TaskID)) || ctx.Err() != nil {
 				return
 			}
-			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled,
-				agentMessage(execCtx, e.canceledStatusText())), nil)
+			ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled,
+				agentMessage(execCtx, e.canceledStatusText()))
+			e.attachUsage(ctx, ev, traceID)
+			yield(ev, nil)
 			return
 		case err != nil:
-			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
-				agentMessage(execCtx, err.Error())), nil)
+			ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
+				agentMessage(execCtx, err.Error()))
+			e.attachUsage(ctx, ev, traceID)
+			yield(ev, nil)
 			return
 		case result == nil:
 			// Run returns (nil, nil) without doing any work when the
@@ -232,8 +260,10 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			// active turn) or a cancel landed during dispatch. No turn ran
 			// on behalf of this task, so completing it would misreport;
 			// fail it and let the caller retry against an idle session.
-			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
-				agentMessage(execCtx, "agent session did not start a turn (busy or canceled)")), nil)
+			ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
+				agentMessage(execCtx, "agent session did not start a turn (busy or canceled)"))
+			e.attachUsage(ctx, ev, traceID)
+			yield(ev, nil)
 			return
 		}
 
@@ -265,8 +295,10 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			}
 		}
 
-		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted,
-			agentMessage(execCtx, result.Response.Content.Text())), nil)
+		ev := a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted,
+			agentMessage(execCtx, result.Response.Content.Text()))
+		e.attachUsage(ctx, ev, traceID)
+		yield(ev, nil)
 	}
 }
 
@@ -307,7 +339,7 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 		// swallow it (#342).
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("Dispatched run panicked", "session_id", e.sessionID, "panic", r, "stack", string(debug.Stack()))
+				slog.Error("Dispatched run panicked", "session_id", e.sessionID, "trace_id", traceIDFromContext(ctx), "panic", r, "stack", string(debug.Stack()))
 				done <- runOutcome{err: fmt.Errorf("dispatched run panicked: %v", r)}
 			}
 		}()
@@ -460,6 +492,46 @@ func todoProgress(snap dispatch.TodoSnapshot) agent.TodoProgress {
 		Total:     snap.TodoTotal,
 		Todos:     items,
 	}
+}
+
+// attachUsage stamps a terminal status update with the usage/v1 extension's
+// payload (#364): the usage closure's reading of the dispatched session's
+// final totals, plus the request's W3C trace ID. Called only on post-run
+// terminals — a status emitted mid-run (the executor's own Cancel) carries
+// no usage, because the run's totals are not final. Every failure — the
+// closure erroring, or the value failing to encode — is logged, and the
+// status ships without metadata: usage is accounting, never a reason to
+// fail a finished run.
+func (e *Executor) attachUsage(ctx context.Context, ev *a2aspec.TaskStatusUpdateEvent, traceID string) {
+	if e.usage == nil {
+		return
+	}
+	// The closure reads the session row; an ended run's context can be
+	// on its way out, and the totals are durable regardless.
+	usage, err := e.usage(context.WithoutCancel(ctx))
+	if err != nil {
+		slog.Warn("A2A usage collection failed; terminal status carries no usage metadata", "session_id", e.sessionID, "trace_id", traceID, "err", err)
+		return
+	}
+	usage.TraceID = traceID
+	encoded, err := Encode(UsageExt, usage)
+	if err != nil {
+		slog.Warn("A2A usage failed to encode; terminal status carries no usage metadata", "session_id", e.sessionID, "trace_id", traceID, "err", err)
+		return
+	}
+	ev.SetMeta(UsageExt.URI, encoded)
+}
+
+// traceIDFromContext returns the trace-id segment of the W3C traceparent
+// the server propagator lifted into the request context (#364), or the
+// empty string when the call carried none.
+func traceIDFromContext(ctx context.Context) string {
+	for key, values := range a2aext.GetRequestHeaders(ctx) {
+		if strings.EqualFold(key, traceparentHeader) && len(values) > 0 {
+			return agent.TraceIDFromTraceparent(values[0])
+		}
+	}
+	return ""
 }
 
 // Cancel stops the in-flight dispatched run for this executor's session

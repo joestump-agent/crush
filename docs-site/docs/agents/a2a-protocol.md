@@ -203,6 +203,43 @@ A progress event looks like this:
 - **Ordering.** Progress events and the terminal status are yielded from
   one goroutine, so no progress event follows a terminal one.
 
+### Usage and trace context
+
+Every post-run terminal status — `TASK_STATE_COMPLETED`, both
+`TASK_STATE_FAILED` paths and an out-of-band `TASK_STATE_CANCELED` —
+carries the declared `usage/v1` extension's metadata key
+([#364](https://github.com/joestump-agent/crush/issues/364)):
+
+```json
+{
+  "https://crush.charm.land/ext/usage/v1": {
+    "model": "claude-opus-5",
+    "provider": "anthropic",
+    "prompt_tokens": 1200,
+    "completion_tokens": 340,
+    "cost": 0.042,
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+  }
+}
+```
+
+- **The totals.** The child session's cumulative token counts and cost at
+  terminal time, plus the model and provider that served the dispatch.
+  Mid-run statuses — including a parent-requested cancel — carry none:
+  the totals are not final.
+- **The trace id.** The parent stamps a W3C `traceparent` header on the
+  dispatch call (a client interceptor sends it, the server propagator
+  lifts it), and the executor echoes its trace-id segment back in
+  `trace_id`, so server-side dispatch logs and the parent's client call
+  share one correlation id. When the parent sent none, the server mints
+  one for its own logs.
+- **Failure.** If the totals cannot be read, the status ships without
+  metadata and the run's outcome is untouched; the parent leaves its
+  recorded cost unchanged rather than guessing.
+- **Limitation.** Usage rides status-update events only: a terminal state
+  recovered through `tasks/get` or `tasks/resubscribe` (the resume path)
+  carries no metadata.
+
 ### The artifacts
 
 Two artifacts carry the work product.
@@ -306,7 +343,6 @@ A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/c
 - **`input-required` and `auth-required`.** Dispatched agents have no
   question tool, and permission prompts use an in-process bridge
   ([#352](https://github.com/joestump-agent/crush/issues/352), [#353](https://github.com/joestump-agent/crush/issues/353)).
-- **Usage and trace metadata** ([#364](https://github.com/joestump-agent/crush/issues/364)); declared extension metadata already ships for todo progress ([#359](https://github.com/joestump-agent/crush/issues/359)).
 - **Durable task state.** A restart loses every task ([#354](https://github.com/joestump-agent/crush/issues/354)).
 - **Authentication** of any kind ([#357](https://github.com/joestump-agent/crush/issues/357)).
 
