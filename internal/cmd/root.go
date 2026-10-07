@@ -387,7 +387,9 @@ func setupLocalWorkspace(cmd *cobra.Command) (workspace.Workspace, func(), error
 	}
 
 	ws := workspace.NewAppWorkspace(appInstance, store)
-	cleanup := func() { appInstance.Shutdown() }
+	// The workspace's Shutdown stops its agent-index watcher (#421)
+	// before it shuts the app down.
+	cleanup := ws.Shutdown
 	return ws, cleanup, nil
 }
 
