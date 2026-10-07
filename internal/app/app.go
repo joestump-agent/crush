@@ -833,8 +833,14 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 	// dispatch records the coordinator writes. Stores wire only with a
 	// database handle; tests build the App without one and keep the
 	// pre-#355 in-memory behavior.
+	//
+	// #358: options.a2a.listen adds a TLS-only TCP listener beside the
+	// socket, serving the same routes; load validation already refused
+	// plain TCP. Without it the host stays on the socket alone.
 	hostID := a2a.HostID()
-	a2aFactoryOpts := []a2a.ServerFactoryOption{}
+	a2aFactoryOpts := []a2a.ServerFactoryOption{
+		a2a.WithTCPListener(app.config.Config().Options.A2A),
+	}
 	if app.conn != nil {
 		a2aFactoryOpts = append(a2aFactoryOpts, a2a.WithTaskStore(a2a.NewSQLiteStore(app.conn, hostID, nil)))
 	}

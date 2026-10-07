@@ -164,3 +164,45 @@ func TestBuildAgentCardDeclaresBearerSecurity(t *testing.T) {
 	require.Empty(t, card.SecurityRequirements[0][bearerSchemeName],
 		"the bearer requirement carries no scopes")
 }
+
+// With the TCP listener running the card lists its HTTPS interface after
+// the socket one (#358); with client_ca it also declares mutual TLS as an
+// alternative to the bearer token.
+func TestBuildAgentCardTLSInterface(t *testing.T) {
+	t.Parallel()
+
+	card := BuildAgentCard(CardParams{
+		Agent:       config.Agent{Name: "worker"},
+		Endpoint:    "http://crush-a2a/agents/worker",
+		TLSEndpoint: "https://127.0.0.1:7443/agents/worker",
+	})
+	require.Len(t, card.SupportedInterfaces, 2)
+	require.Equal(t, "http://crush-a2a/agents/worker", card.SupportedInterfaces[0].URL, "the socket stays first")
+	require.Equal(t, "https://127.0.0.1:7443/agents/worker", card.SupportedInterfaces[1].URL)
+	require.Equal(t, a2aspec.TransportProtocolJSONRPC, card.SupportedInterfaces[1].ProtocolBinding)
+	require.Equal(t, a2aspec.Version, card.SupportedInterfaces[1].ProtocolVersion)
+	require.NotContains(t, card.SecuritySchemes, mtlsSchemeName, "no client CA, no mutual TLS")
+	require.Len(t, card.SecurityRequirements, 1)
+
+	mutual := BuildAgentCard(CardParams{
+		Agent:       config.Agent{Name: "worker"},
+		Endpoint:    "http://crush-a2a/agents/worker",
+		TLSEndpoint: "https://127.0.0.1:7443/agents/worker",
+		MutualTLS:   true,
+	})
+	_, ok := mutual.SecuritySchemes[mtlsSchemeName].(a2aspec.MutualTLSSecurityScheme)
+	require.True(t, ok, "the mutual TLS scheme is declared")
+	require.Contains(t, mutual.SecuritySchemes, bearerSchemeName, "the bearer token still works")
+	require.Len(t, mutual.SecurityRequirements, 2, "either credential satisfies the card")
+	require.Contains(t, mutual.SecurityRequirements[0], bearerSchemeName)
+	require.Contains(t, mutual.SecurityRequirements[1], mtlsSchemeName)
+
+	socketOnly := BuildAgentCard(CardParams{
+		Agent:     config.Agent{Name: "worker"},
+		Endpoint:  "http://crush-a2a/agents/worker",
+		MutualTLS: true,
+	})
+	require.Len(t, socketOnly.SupportedInterfaces, 1)
+	require.NotContains(t, socketOnly.SecuritySchemes, mtlsSchemeName,
+		"mutual TLS means nothing without the TCP listener")
+}
