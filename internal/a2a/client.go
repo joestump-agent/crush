@@ -820,9 +820,6 @@ func (f *ServerFactory) CancelDispatch(ctx context.Context, p agent.DispatchCanc
 	if !ok || card == nil {
 		return fmt.Errorf("a2a: dispatch %s has no resolvable agent card", p.Endpoint)
 	}
-	if p.TaskID == "" {
-		return fmt.Errorf("a2a: dispatch %s has no task id", p.Endpoint)
-	}
 	httpClient := f.httpClient
 	if httpClient == nil {
 		httpClient = f.dispatchHTTPClient()
@@ -831,6 +828,15 @@ func (f *ServerFactory) CancelDispatch(ctx context.Context, p agent.DispatchCanc
 	client, err := newDispatchClient(ctx, card, httpClient, f)
 	if err != nil {
 		return err
+	}
+	return cancelDispatch(ctx, client, p)
+}
+
+// cancelDispatch sends the cancel over client: the host's own socket
+// client, or the server proxy's (#421).
+func cancelDispatch(ctx context.Context, client *a2aclient.Client, p agent.DispatchCancelParams) error {
+	if p.TaskID == "" {
+		return fmt.Errorf("a2a: dispatch %s has no task id", p.Endpoint)
 	}
 	req := &a2aspec.CancelTaskRequest{
 		ID: a2aspec.TaskID(p.TaskID),
@@ -865,12 +871,6 @@ func (f *ServerFactory) SteerDispatch(ctx context.Context, p agent.DispatchSteer
 	if !ok || card == nil {
 		return agent.DispatchSteerOutcome{}, fmt.Errorf("a2a: dispatch %s has no resolvable agent card", p.Endpoint)
 	}
-	if p.ContextID == "" {
-		return agent.DispatchSteerOutcome{}, fmt.Errorf("a2a: dispatch %s has no context id", p.Endpoint)
-	}
-	if p.Text == "" {
-		return agent.DispatchSteerOutcome{}, fmt.Errorf("a2a: steer text is empty")
-	}
 	httpClient := f.httpClient
 	if httpClient == nil {
 		httpClient = f.dispatchHTTPClient()
@@ -880,7 +880,18 @@ func (f *ServerFactory) SteerDispatch(ctx context.Context, p agent.DispatchSteer
 	if err != nil {
 		return agent.DispatchSteerOutcome{}, err
 	}
+	return steerDispatch(ctx, client, p)
+}
 
+// steerDispatch delivers the steer over client: the host's own socket
+// client, or the server proxy's (#421).
+func steerDispatch(ctx context.Context, client *a2aclient.Client, p agent.DispatchSteerParams) (agent.DispatchSteerOutcome, error) {
+	if p.ContextID == "" {
+		return agent.DispatchSteerOutcome{}, fmt.Errorf("a2a: dispatch %s has no context id", p.Endpoint)
+	}
+	if p.Text == "" {
+		return agent.DispatchSteerOutcome{}, fmt.Errorf("a2a: steer text is empty")
+	}
 	req := &a2aspec.SendMessageRequest{
 		Message: a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart(p.Text)),
 	}

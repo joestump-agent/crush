@@ -13,10 +13,12 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/crush/internal/a2a"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/client"
 	"github.com/charmbracelet/crush/internal/commands"
+	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/proto"
@@ -686,6 +688,37 @@ func TestClientWorkspace_RecoversFromWorkspaceGone(t *testing.T) {
 		return degraded && recovered
 	}, 3*time.Second, 5*time.Millisecond,
 		"the UI must be told to resync after the workspace was re-created")
+
+	ws.Shutdown()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runSubscription did not return after Shutdown")
+	}
+}
+
+// After a recovery the old workspace's agent host is gone with it, so an
+// agent it still showed live ends at once rather than staying "working"
+// until the new host's first snapshot, which waits for a dispatch (#421).
+func TestClientWorkspace_RecoveryEndsTheGoneHostsAgents(t *testing.T) {
+	t.Cleanup(SetSSEBackoffForTest(time.Millisecond, 5*time.Millisecond))
+
+	srv := &recoveryServer{liveID: "", nextID: "ws-2"}
+	c := srv.start(t)
+	ws := NewClientWorkspace(c, proto.Workspace{ID: "ws-1", Path: "/tmp/recover-agents"})
+	live := a2a.AgentDescriptor{ID: "d1", ContextID: "c-live", State: a2a.DispatchStatusWorking, Served: true, Revision: 7}
+	ws.agentTasks.apply(a2a.AgentIndexEvent{Snapshot: []a2a.AgentDescriptor{live}}, true)
+
+	done := make(chan struct{})
+	go func() {
+		ws.runSubscription(func(tea.Msg) {})
+		close(done)
+	}()
+	require.Eventually(t, func() bool { return ws.workspaceID() == "ws-2" }, 3*time.Second, 5*time.Millisecond)
+
+	task, ok := ws.agentTasks.bySession("c-live")
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusFailed, task.Status, "the gone host's agent ended with the workspace")
 
 	ws.Shutdown()
 	select {

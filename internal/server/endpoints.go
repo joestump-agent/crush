@@ -356,6 +356,30 @@ func (c *controllerV1) endpoints() []apigen.Endpoint {
 			Fails(400, 404, 409, 500).
 			Handle(c.handlePostWorkspaceAgentMain),
 
+		apigen.Get("/v1/workspaces/{id}/a2a/agents").
+			Summary("Read the workspace's agent index").
+			Description("Proxies the workspace A2A host's agent index: a JSON array of "+
+				"dispatched-agent descriptors, or, with Accept: text/event-stream, an SSE "+
+				"stream of a snapshot followed by one upsert per change. The server "+
+				"authenticates to the host itself. A stream waits for the host to start; "+
+				"a snapshot answers 503 until it has.").
+			Tags("agent").
+			PathParam("id", "Workspace ID").
+			Fails(403, 404, 409, 502, 503).
+			Handle(c.handleGetWorkspaceA2AAgents),
+
+		apigen.Post("/v1/workspaces/{id}/a2a/agents/{agent}").
+			Summary("Call a dispatched agent over A2A").
+			Description("Proxies one A2A JSON-RPC 2.0 request to a dispatched agent on the "+
+				"workspace's A2A host, streaming the answer as SSE when the method streams. "+
+				"The host's own checks apply to the request as sent; the server adds the "+
+				"host's credential.").
+			Tags("agent").
+			PathParam("id", "Workspace ID").
+			PathParam("agent", "Dispatch ID").
+			Fails(400, 403, 404, 409, 415, 502, 503).
+			Handle(c.handlePostWorkspaceA2AAgent),
+
 		apigen.Get("/v1/workspaces/{id}/agent/sessions/{sid}").
 			Summary("Get agent session").
 			Tags("agent").

@@ -823,6 +823,10 @@ func (c *controllerV1) handleError(w http.ResponseWriter, r *http.Request, err e
 		errors.Is(err, backend.ErrServerNotIdle),
 		errors.Is(err, backend.ErrClientRetired):
 		status = http.StatusConflict
+	case errors.Is(err, backend.ErrA2AHostNotRunning):
+		// 503: nothing has been dispatched in the workspace yet, so its
+		// agent host has not started. A later call can succeed.
+		status = http.StatusServiceUnavailable
 	case errors.Is(err, backend.ErrServerShuttingDown):
 		// 503, not 409: the request is not wrong, this process is just
 		// leaving. Clients retry against its replacement.

@@ -149,6 +149,31 @@ Transcripts still come from the session store, so the
 sub-agent's transcript. Making the TUI a real A2A client of the server is
 tracked as [#421](https://github.com/joestump-agent/crush/issues/421).
 
+The server already proxies each workspace's
+[A2A host](/agents/a2a-protocol) for that client:
+
+```
+GET  /v1/workspaces/{id}/a2a/agents
+POST /v1/workspaces/{id}/a2a/agents/{dispatch id}
+```
+
+- **The agent index.** The `GET` is the host's
+  [agent index](/agents/a2a-protocol#agent-index): a JSON snapshot, or, with
+  `Accept: text/event-stream`, the snapshot followed by one upsert per change. A
+  stream opened before anything is dispatched waits for the host to start. A
+  snapshot answers `503` until it has.
+- **A dispatched agent.** The `POST` carries one A2A JSON-RPC request to a
+  dispatched agent: a steer, a cancel, or a task read. It streams the answer
+  when the method streams.
+- **Credentials.** The server authenticates to the host with the host's own
+  token, which never leaves the server process, so the host sees the server
+  as its caller. The host still checks the request's `Content-Type` and
+  version as the client sent them, and a request carrying an `Origin` header
+  is refused.
+
+The TUI follows this surface in place of the dispatch registry once the UI moves
+onto it (#421, step 3); until then, the list above still holds.
+
 :::warning[Known issue]
 Even the server-side half is unreliable today. The server builds the agent
 coordinator on the client's init request context, which ends as soon as that

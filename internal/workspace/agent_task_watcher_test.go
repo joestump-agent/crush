@@ -2,6 +2,8 @@ package workspace
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -312,14 +314,74 @@ func TestAgentTaskWatcherKeepsTheNewestCopy(t *testing.T) {
 
 	newer := a2a.AgentDescriptor{ID: "d1", State: a2a.DispatchStatusCompleted, Served: true, Revision: 20}
 	older := a2a.AgentDescriptor{ID: "d1", State: a2a.DispatchStatusWorking, Served: true, Revision: 10}
-	w.apply(a2a.AgentIndexEvent{Upsert: &newer})
-	w.apply(a2a.AgentIndexEvent{Snapshot: []a2a.AgentDescriptor{older}})
-	w.apply(a2a.AgentIndexEvent{Snapshot: []a2a.AgentDescriptor{newer}})
+	w.apply(a2a.AgentIndexEvent{Upsert: &newer}, true)
+	w.apply(a2a.AgentIndexEvent{Snapshot: []a2a.AgentDescriptor{older}}, true)
+	w.apply(a2a.AgentIndexEvent{Snapshot: []a2a.AgentDescriptor{newer}}, true)
 
 	task, ok := w.bySession("")
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusCompleted, task.Status, "the stale snapshot did not regress the cache")
 	require.Len(t, published, 1, "only the first copy was a change")
+}
+
+// A stream's snapshot is the host's whole index: a live agent it leaves
+// out ran on a host that is gone — a restarted server's — and shows as
+// failed, while an ended one stays so its handle resolves. A read's
+// snapshot can race the stream, so it never marks anything, and a host's
+// copy replaces the inferred mark whatever its revision (#421).
+func TestAgentTaskWatcherStreamSnapshotEndsAgentsOfAGoneHost(t *testing.T) {
+	t.Parallel()
+	w := newAgentTaskWatcher(nil, nil)
+
+	live := a2a.AgentDescriptor{ID: "live", ContextID: "c-live", State: a2a.DispatchStatusWorking, Served: true, Revision: 40}
+	ended := a2a.AgentDescriptor{ID: "ended", ContextID: "c-ended", State: a2a.DispatchStatusCompleted, Served: true, Revision: 41}
+	w.apply(a2a.AgentIndexEvent{Snapshot: []a2a.AgentDescriptor{live, ended}}, true)
+
+	w.apply(a2a.AgentIndexEvent{}, false)
+	task, ok := w.bySession("c-live")
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusRunning, task.Status, "a read's snapshot marks nothing")
+
+	fresh := a2a.AgentDescriptor{ID: "fresh", ContextID: "c-fresh", State: a2a.DispatchStatusWorking, Served: true, Revision: 1}
+	w.apply(a2a.AgentIndexEvent{Snapshot: []a2a.AgentDescriptor{fresh}}, true)
+	task, ok = w.bySession("c-live")
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusFailed, task.Status, "the gone host's live agent ended")
+	task, ok = w.bySession("c-ended")
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusCompleted, task.Status, "an ended agent is kept as it was")
+	task, ok = w.bySession("c-fresh")
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusRunning, task.Status)
+
+	back := live
+	back.Revision = 2
+	w.apply(a2a.AgentIndexEvent{Upsert: &back}, true)
+	task, ok = w.bySession("c-live")
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusRunning, task.Status, "a host's copy replaces the inferred mark")
+}
+
+// A lookup's refresh reads the index outside the stream, so it can race
+// it: it adds what it read and never ends an agent it did not see (#421).
+func TestAgentTaskWatcherRefreshEndsNothing(t *testing.T) {
+	t.Parallel()
+	index := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("[]"))
+	}))
+	t.Cleanup(index.Close)
+	w := newAgentTaskWatcher(func() (a2a.AgentIndexConn, bool, <-chan struct{}) {
+		return a2a.AgentIndexConn{HTTP: index.Client(), BaseURL: index.URL}, true, nil
+	}, nil)
+	live := a2a.AgentDescriptor{ID: "d1", ContextID: "c-live", State: a2a.DispatchStatusWorking, Served: true, Revision: 3}
+	w.apply(a2a.AgentIndexEvent{Snapshot: []a2a.AgentDescriptor{live}}, true)
+
+	w.refresh(t.Context())
+
+	task, ok := w.bySession("c-live")
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusRunning, task.Status)
 }
 
 // A route that went down before its task ended shows as failed, not live
