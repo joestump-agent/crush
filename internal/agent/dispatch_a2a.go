@@ -14,6 +14,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/skills"
 )
 
@@ -154,6 +155,57 @@ type DispatchCanceler interface {
 type DispatchTaskStatus struct {
 	Status string
 	Text   string
+}
+
+// DispatchSteerParams is one mid-run steer (#351): the served dispatch's
+// endpoint and card, the A2A context to deliver on — the dispatch's task
+// session — the message text, and the running task's ID when the registry
+// knows it, sent as the message's ReferenceTasks. Card is the registry
+// entry's opaque AgentCard — the transport owns its concrete type.
+type DispatchSteerParams struct {
+	Endpoint string
+	Card     any
+	// ContextID is the A2A context the steer is delivered on (#350):
+	// the dispatch's task session ID, sent as Message.ContextID. The
+	// served executor resolves it to the running agent and enqueues
+	// the message. Required.
+	ContextID string
+	Text      string
+	// Attachments ride along exactly like a typed prompt's: the editor's
+	// pasted images, files and long pastes (#414). They cross the wire
+	// as parts and come back as the steer call's attachments.
+	Attachments []message.Attachment
+	// ReferenceTaskIDs, when non-empty, names the dispatch's running
+	// task so protocol clients can correlate the steer with it. The
+	// served executor treats them as advisory.
+	ReferenceTaskIDs []string
+}
+
+// DispatchSteerOutcome is the result of one steer delivery, in transport
+// vocabulary. Status is "working" once the served agent accepted the
+// message into its queue — delivery succeeded, the reply streams back on
+// the dispatch's own surfaces — "rejected" when the agent refused it (the
+// run is over), and "failed" when the agent ended before consuming an
+// accepted message. Text carries the served side's reason for
+// rejected/failed.
+type DispatchSteerOutcome struct {
+	Status string
+	Text   string
+}
+
+// DispatchSteerer is the steering half of the A2A client seam (#351):
+// deliver a mid-run message to a served dispatch as a protocol message
+// on the dispatch's running context, instead of the in-process enqueue
+// an out-of-process agent could never receive. Implemented by the same
+// a2a host that streams and serves the dispatch; coordinators assert to
+// it the way they do to [DispatchCanceler].
+type DispatchSteerer interface {
+	// SteerDispatch sends one steer and returns once the served agent
+	// accepted it (Status "working") or refused it. The stream's tail —
+	// the steer task's own terminal state — is consumed by the
+	// implementation and logged, never surfaced here: the steer's reply
+	// arrives on the dispatch's own surfaces, not on this call.
+	SteerDispatch(ctx context.Context, params DispatchSteerParams) (DispatchSteerOutcome, error)
 }
 
 // DispatchTransportOutcome is the terminal outcome of one A2A-driven
@@ -302,6 +354,15 @@ const (
 	transportStatusCompleted = "completed"
 	transportStatusFailed    = "failed"
 	transportStatusCanceled  = "canceled"
+)
+
+// Steer outcome status tokens (#351), the vocabulary of
+// [DispatchSteerOutcome.Status].
+const (
+	steerStatusWorking   = "working"
+	steerStatusRejected  = "rejected"
+	steerStatusFailed    = "failed"
+	steerStatusCompleted = "completed"
 )
 
 // dispatchNaturalOutcomeFromTransport maps an A2A transport outcome onto

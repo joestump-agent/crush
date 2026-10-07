@@ -130,6 +130,18 @@ type SessionAgentCall struct {
 	// recursion drains, so falling back to the default broker
 	// publish keeps the event visible to subscribers.
 	OnComplete func(notify.RunComplete)
+	// OnConsumed, when non-nil, reports what the queue did with this
+	// call (#351): true exactly once, after the message was consumed —
+	// persisted into the active turn by a fold, or the call was
+	// dequeued to run as its own turn — and false exactly once when a
+	// queue-removal path dropped it without running (a cancel covering
+	// it, or an explicit queue clear). The A2A executor's steer path
+	// waits on it to turn the enqueue into a terminal task state; a
+	// run that ends with the call still queued fires nothing, and that
+	// stranded case is #398's. enqueueCall preserves it across
+	// queueing; every fire site is nil-safe and fires at most once per
+	// call.
+	OnConsumed func(consumed bool)
 	// Accepted, when non-nil, is the accept reservation taken by
 	// BeginAccepted before the call was dispatched onto a goroutine
 	// (the client/server fire-and-forget path). Run consumes it under
@@ -160,13 +172,15 @@ type SessionAgentCall struct {
 	// surfaces the original auth error without retry.
 	OnAuthRefresh func(ctx context.Context, err *fantasy.ProviderError) error
 	// turnText, when non-nil, is called once with the finished turn's
-	// response text as its argument, after the turn's final step but
+	// response text as its arguments, after the turn's final step but
 	// before the run hands off to a queued follow-up. enqueueCall strips
 	// only the exported hooks, so the field survives queueing: a turn
 	// re-queued by a summarize continuation reports into the same
-	// holder. Nil everywhere but dispatched agents, which use it to keep
-	// a steer's follow-up reply out of the work turn's findings (#397).
-	turnText func(text string)
+	// holder. Set only on the dispatch call template, which routes by
+	// the turn's own call: the work turn reports its findings, a steer
+	// turn (#397) reports into the steers' record instead. Nil
+	// everywhere else.
+	turnText func(call SessionAgentCall, text string)
 }
 
 func filterToolsForChannel(agentTools []fantasy.AgentTool, channel string, states map[string]mcp.ClientInfo) []fantasy.AgentTool {
@@ -205,6 +219,16 @@ type SessionAgent interface {
 	Summarize(context.Context, string, fantasy.ProviderOptions, func(context.Context, *fantasy.ProviderError) error) error
 	Model() Model
 	GenerateTitle(ctx context.Context, sessionID, userPrompt string)
+	// EnqueueWhenBusy enqueues call behind the session's active turn
+	// and reports whether it was accepted (#351): true means the call
+	// sits in the queue and will be consumed — folded into the active
+	// turn or run as the follow-up turn — while false means the run
+	// has ended and the session refuses the message instead of
+	// starting a fresh turn on a task session that is never
+	// continuable. It is the delivery primitive behind mid-run
+	// steering, both in-process and through the A2A executor's steer
+	// path.
+	EnqueueWhenBusy(call SessionAgentCall) bool
 }
 
 type Model struct {
@@ -488,8 +512,21 @@ func (a *sessionAgent) enqueueCall(call SessionAgentCall) {
 	}
 	queued.OnComplete = nil
 	queued.Accepted = nil
+	// OnConsumed is deliberately kept (#351): the queued call's waiter
+	// is told when the queue consumes or drops it, which is the whole
+	// point of the hook.
 	existing = append(existing, queued)
 	a.messageQueue.Set(call.SessionID, existing)
+}
+
+// consume reports a queued call's fate to its OnConsumed waiter (#351):
+// true when the queue handed the message to a turn, false when a
+// queue-removal path dropped it without running. Nil-safe — calls with
+// no waiter fire nothing — and expected to fire at most once per call.
+func (c SessionAgentCall) consume(consumed bool) {
+	if c.OnConsumed != nil {
+		c.OnConsumed(consumed)
+	}
 }
 
 // EnqueueWhenBusy enqueues call on the session's queue only while a run
@@ -544,6 +581,9 @@ func (a *sessionAgent) drainQueueForStep(sessionID string) (fold, canceledWithRu
 			continue
 		}
 		if a.canceledBySeq(sessionID, queued.acceptSeq) {
+			// The steer waiter learns the drop (#351), including the
+			// non-RunID drops that were silent before.
+			queued.consume(false)
 			if queued.RunID != "" {
 				canceledWithRunID = append(canceledWithRunID, queued)
 			}
@@ -614,6 +654,7 @@ func (a *sessionAgent) clearQueueAndNotify(sessionID string) {
 			keep = append(keep, call)
 			continue
 		}
+		call.consume(false)
 		drops = append(drops, call)
 	}
 	if len(keep) > 0 {
@@ -1033,6 +1074,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 					return callContext, prepared, createErr
 				}
 				prepared.Messages = append(prepared.Messages, userMessage.ToAIMessage()...)
+				// The fold persisted the message into this turn (#351):
+				// the steer waiter may stop waiting.
+				queued.consume(true)
 			}
 
 			// The todo enforcement nudge (#315): after the queued
@@ -1448,7 +1492,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// the handed-off turn, is attributed to its own call's observer
 	// and never replaces this turn's findings.
 	if call.turnText != nil && currentAssistant != nil && (!shouldSummarize || len(currentAssistant.ToolCalls()) == 0) {
-		call.turnText(result.Response.Content.Text())
+		call.turnText(call, result.Response.Content.Text())
 	}
 
 	// Release active request before publishing the notification.
@@ -1499,6 +1543,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 				continue
 			}
 			if q.acceptSeq == 0 || q.acceptSeq <= mark {
+				q.consume(false)
 				if q.RunID != "" {
 					canceledRunIDDrops = append(canceledRunIDDrops, q)
 				}
@@ -1562,6 +1607,11 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// that window now records a pending cancel (acceptedRuns > 0) that
 	// the recursive Run's accepted path observes as cancel-on-entry.
 	firstQueuedMessage.Accepted = a.BeginAccepted(call.SessionID)
+	// The dequeued call starts its own turn: tell its OnConsumed waiter
+	// the message was consumed (#351), before the recursive Run can drop
+	// it again through a different path (a cancel-on-entry fires the
+	// accepted call's own cleanup, not this one).
+	firstQueuedMessage.consume(true)
 	mu.Unlock()
 	if outerOwesRunComplete {
 		complete := notify.RunComplete{SessionID: call.SessionID, RunID: call.RunID}
