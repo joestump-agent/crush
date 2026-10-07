@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"log/slog"
 	"net/http"
@@ -92,6 +93,8 @@ type externalServer struct {
 	card func(base string) *a2aspec.AgentCard
 	// cardHandler, when set, replaces the card endpoint outright.
 	cardHandler http.HandlerFunc
+	// callHandler, when set, replaces the JSON-RPC endpoint outright.
+	callHandler http.HandlerFunc
 
 	mu       sync.Mutex
 	requests []recordedRequest
@@ -105,7 +108,14 @@ func newExternalServer(t *testing.T, scenario externalScenario) (*externalServer
 	es.card = func(base string) *a2aspec.AgentCard { return externalTestCard(base+"/a2a", true) }
 	handler := a2asrv.NewHandler(es.exec, a2asrv.WithLogger(slog.New(slog.DiscardHandler)))
 	mux := http.NewServeMux()
-	mux.Handle("/a2a", a2asrv.NewJSONRPCHandler(handler))
+	jsonrpc := a2asrv.NewJSONRPCHandler(handler)
+	mux.HandleFunc("/a2a", func(w http.ResponseWriter, r *http.Request) {
+		if es.callHandler != nil {
+			es.callHandler(w, r)
+			return
+		}
+		jsonrpc.ServeHTTP(w, r)
+	})
 	mux.HandleFunc(externalCardPath, func(w http.ResponseWriter, r *http.Request) {
 		if es.cardHandler != nil {
 			es.cardHandler(w, r)
@@ -725,4 +735,78 @@ func mustURL(t *testing.T, raw string) *url.URL {
 	u, err := url.Parse(raw)
 	require.NoError(t, err)
 	return u
+}
+
+// sseHandler answers every call with an event stream whose body is
+// written by write.
+func sseHandler(write func(w io.Writer)) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		write(w)
+	}
+}
+
+// A remote that keeps talking is cut off at the call body cap: the
+// stream fails rather than buffering without end.
+func TestExternalAgentCapsCallBody(t *testing.T) {
+	t.Parallel()
+	es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+	keepalive := []byte(strings.Repeat(": keepalive\n\n", 4096))
+	es.callHandler = sseHandler(func(w io.Writer) {
+		for written := 0; written <= maxExternalBodyBytes; written += len(keepalive) {
+			if _, err := w.Write(keepalive); err != nil {
+				return
+			}
+		}
+	})
+	ext := resolveTestAgent(t, es)
+	_, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
+	require.ErrorContains(t, err, "request body too large")
+}
+
+// One server-sent event with no boundary is cut off at the event cap,
+// whatever the body cap leaves.
+func TestExternalAgentCapsSSEEvent(t *testing.T) {
+	t.Parallel()
+	es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+	es.callHandler = sseHandler(func(w io.Writer) {
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(bytes.Repeat([]byte("a"), maxExternalEventBytes+1))
+		_, _ = w.Write([]byte("\n\n"))
+	})
+	ext := resolveTestAgent(t, es)
+	_, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
+	require.ErrorContains(t, err, "server-sent event over")
+}
+
+// The event cap counts from the last boundary in every line-ending
+// style, so a long stream of small events never trips it.
+func TestSSEEventLimitBoundaries(t *testing.T) {
+	t.Parallel()
+	for name, stream := range map[string]string{
+		"lf":   strings.Repeat("data: {}\n\n", 50),
+		"crlf": strings.Repeat("data: {}\r\n\r\n", 50),
+		"cr":   strings.Repeat("data: {}\r\r", 50),
+	} {
+		limited := &sseEventLimit{body: io.NopCloser(strings.NewReader(stream)), limit: 16, lineEmpty: true}
+		got, err := io.ReadAll(limited)
+		require.NoError(t, err, name)
+		require.Equal(t, stream, string(got), name)
+	}
+	long := &sseEventLimit{body: io.NopCloser(strings.NewReader("data: 0123456789\ndata: 0123456789\n\n")), limit: 16, lineEmpty: true}
+	_, err := io.ReadAll(long)
+	require.ErrorIs(t, err, errSSEEventTooLarge, "data lines of one event add up")
+}
+
+// The artifacts an external agent's output is collected from are
+// capped: a remote cannot grow the fold with endless artifacts.
+func TestExternalFoldCapsArtifacts(t *testing.T) {
+	t.Parallel()
+	var fold externalFold
+	for i := range 3 * maxExternalArtifacts {
+		fold.artifact(&a2aspec.Artifact{ID: a2aspec.ArtifactID(fmt.Sprintf("art-%d", i)), Parts: []*a2aspec.Part{a2aspec.NewTextPart("x")}}, false)
+	}
+	require.Len(t, fold.order, maxExternalArtifacts)
+	require.Len(t, fold.texts, maxExternalArtifacts)
 }

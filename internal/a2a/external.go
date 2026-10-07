@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -59,6 +60,18 @@ const (
 	// maxExternalCardBytes caps the card body: a card is a small JSON
 	// document, and a hostile endpoint must not stream gigabytes into it.
 	maxExternalCardBytes = 1 << 20
+	// maxExternalBodyBytes caps every task call's response body, a whole
+	// event stream included: the parent keeps at most
+	// maxExternalTextBytes of it, so a remote that keeps talking past
+	// this is cut off rather than buffered.
+	maxExternalBodyBytes = 16 << 20
+	// maxExternalEventBytes caps one server-sent event: the SDK joins an
+	// event's data lines without a bound, so a stream that sends this
+	// much with no event boundary fails instead of growing one string.
+	maxExternalEventBytes = 4 << 20
+	// maxExternalArtifacts caps the distinct artifacts an external
+	// agent's output is collected from; later ones are dropped.
+	maxExternalArtifacts = 64
 	// maxExternalTextBytes caps the text an external agent hands the
 	// parent — findings and failure reasons alike — so a remote cannot
 	// flood the parent's context.
@@ -127,7 +140,12 @@ func (f *ServerFactory) ResolveExternalAgent(ctx context.Context, p agent.Extern
 	}
 
 	httpClient := &http.Client{
-		Transport:     &pinnedTransport{base: base, origin: pinned},
+		Transport: &pinnedTransport{
+			base:          base,
+			origin:        pinned,
+			maxBody:       maxExternalBodyBytes,
+			maxEventBytes: maxExternalEventBytes,
+		},
 		CheckRedirect: pinnedRedirects(pinned),
 	}
 	// The client sees only the pinned interface, so the SDK's transport
@@ -241,11 +259,14 @@ func (o origin) String() string { return o.scheme + "://" + o.host }
 // pinnedTransport is the round tripper under every external request
 // (#434): a request to any origin but the pinned one is refused before
 // it is sent, whatever produced it — a tampered card, a redirect, or a
-// future SDK path. maxBody, when positive, caps response bodies.
+// future SDK path. maxBody, when positive, caps response bodies, and
+// maxEventBytes, when positive, caps each server-sent event in a
+// text/event-stream body.
 type pinnedTransport struct {
-	base    http.RoundTripper
-	origin  origin
-	maxBody int64
+	base          http.RoundTripper
+	origin        origin
+	maxBody       int64
+	maxEventBytes int64
 }
 
 func (t *pinnedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -256,12 +277,65 @@ func (t *pinnedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("a2a: refusing a request to %s: this external agent is pinned to %s", at, t.origin)
 	}
 	resp, err := t.base.RoundTrip(req)
-	if err != nil || t.maxBody <= 0 {
+	if err != nil {
 		return resp, err
 	}
-	resp.Body = http.MaxBytesReader(nil, resp.Body, t.maxBody)
+	if t.maxBody > 0 {
+		resp.Body = http.MaxBytesReader(nil, resp.Body, t.maxBody)
+	}
+	if t.maxEventBytes > 0 && strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		resp.Body = &sseEventLimit{body: resp.Body, limit: t.maxEventBytes, lineEmpty: true}
+	}
 	return resp, nil
 }
+
+// errSSEEventTooLarge ends an event stream that sent too much without an
+// event boundary.
+var errSSEEventTooLarge = fmt.Errorf("a2a: external agent sent a server-sent event over %d bytes", maxExternalEventBytes)
+
+// sseEventLimit wraps an event-stream body and fails the read once more
+// than limit bytes arrive without an event boundary — a blank line, in
+// any of the LF, CRLF and CR line endings the format allows.
+type sseEventLimit struct {
+	body  io.ReadCloser
+	limit int64
+	// since counts the bytes read since the last event boundary.
+	since int64
+	// lineEmpty reports that the current line has no characters yet;
+	// a line ending that finds it set is a boundary.
+	lineEmpty bool
+	// afterCR reports that the previous byte was a CR, so an LF right
+	// after it belongs to the same line ending.
+	afterCR bool
+}
+
+func (s *sseEventLimit) Read(p []byte) (int, error) {
+	n, err := s.body.Read(p)
+	for _, b := range p[:n] {
+		switch {
+		case b == '\n' && s.afterCR:
+			s.afterCR = false
+			continue
+		case b == '\n' || b == '\r':
+			s.afterCR = b == '\r'
+			if s.lineEmpty {
+				s.since = 0
+				continue
+			}
+			s.lineEmpty = true
+		default:
+			s.afterCR = false
+			s.lineEmpty = false
+		}
+		s.since++
+		if s.since > s.limit {
+			return 0, errSSEEventTooLarge
+		}
+	}
+	return n, err
+}
+
+func (s *sseEventLimit) Close() error { return s.body.Close() }
 
 // CloseIdleConnections forwards to the base transport, so closing the
 // client releases its pooled connections.
@@ -494,6 +568,9 @@ func (f *externalFold) artifact(art *a2aspec.Artifact, appendTo bool) {
 	}
 	current, seen := f.texts[art.ID]
 	if !seen {
+		if len(f.order) >= maxExternalArtifacts {
+			return
+		}
 		f.order = append(f.order, art.ID)
 	}
 	text := b.String()
