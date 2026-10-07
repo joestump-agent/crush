@@ -127,6 +127,16 @@ type AgentDefinition struct {
 	// Kill configures the deterministic kill thresholds; dispatch
 	// agents only.
 	Kill *AgentKill `json:"kill,omitempty" jsonschema:"description=Kill thresholds for this agent; dispatch agents only"`
+	// TodoEnforcement is the legacy alias for Todos and Kill (#402):
+	// PRs #325/#329 documented agents.<id>.todo_enforcement with the
+	// options.todo_enforcement shape before the todos and kill blocks
+	// existed, so the alias stays accepted for those configs. It
+	// carries the same fields: the nudge knobs map onto Todos, the
+	// kill knobs onto Kill. Setting it together with either block is a
+	// load error, and its kill fields are ignored on non-dispatch
+	// agents with a warning — kill is dispatch-only, the same rule the
+	// Kill block enforces as a load error.
+	TodoEnforcement *TodoEnforcementConfig `json:"todo_enforcement,omitempty" jsonschema:"description=Legacy alias for the todos and kill blocks, with the options.todo_enforcement shape; cannot be combined with either block"`
 	// Card, Auth, and Transport configure runtime a2a agents: the
 	// external Agent Card URL, the bearer token, and the idle timeout.
 	Card      *string         `json:"card,omitempty" jsonschema:"description=External Agent Card URL for runtime a2a agents"`
@@ -452,6 +462,12 @@ func overlayDefinition(base, over AgentDefinition) AgentDefinition {
 			base.Kill.Timeout = over.Kill.Timeout
 		}
 	}
+	// The legacy alias replaces wholesale: it is either present or not,
+	// and validation has already rejected a definition that also sets
+	// the todos or kill blocks (#402).
+	if over.TodoEnforcement != nil {
+		base.TodoEnforcement = over.TodoEnforcement
+	}
 	if over.Card != nil {
 		base.Card = over.Card
 	}
@@ -580,7 +596,7 @@ func isZeroDefinition(def AgentDefinition) bool {
 		def.Prompt == nil && def.PromptAppend == nil && def.Tools == nil &&
 		def.MCP == nil && def.Skills == nil && def.ContextPaths == nil &&
 		def.Workspace == nil && def.Card == nil && def.Auth == nil &&
-		def.Transport == nil
+		def.Transport == nil && def.TodoEnforcement == nil
 }
 
 // validateAgentDefinition runs the structural rules on one definition.
@@ -638,6 +654,21 @@ func validateAgentDefinition(c *Config, id string, def AgentDefinition) error {
 	if role != AgentRoleDispatch && def.Kill != nil {
 		return fmt.Errorf("%s.kill: kill thresholds apply to %q agents only", path, AgentRoleDispatch)
 	}
+	if def.TodoEnforcement != nil {
+		if def.Todos != nil || def.Kill != nil {
+			conflicts := make([]string, 0, 2)
+			if def.Todos != nil {
+				conflicts = append(conflicts, path+".todos")
+			}
+			if def.Kill != nil {
+				conflicts = append(conflicts, path+".kill")
+			}
+			return fmt.Errorf("%s.todo_enforcement: set either todo_enforcement or %s, not both (todo_enforcement is the legacy alias)", path, strings.Join(conflicts, " and "))
+		}
+		if err := def.TodoEnforcement.Validate(path + ".todo_enforcement"); err != nil {
+			return err
+		}
+	}
 	return validateTodosAndKill(path, def.Todos, def.Kill)
 }
 
@@ -676,6 +707,7 @@ func validateA2AFields(path string, def AgentDefinition) error {
 		{"transport", def.Transport != nil},
 		{"todos", def.Todos != nil},
 		{"kill", def.Kill != nil},
+		{"todo_enforcement", def.TodoEnforcement != nil},
 	}
 	for _, field := range fields {
 		if field.isSet && !a2aAllowedFields(field.name) {
@@ -855,5 +887,15 @@ func warnUnhonoredFields(id string, def AgentDefinition) {
 			continue
 		}
 		slog.Warn("Agent definition field is parsed but not honored yet", "agent", id, "field", field.name)
+	}
+	// The alias's kill rung is dispatch-only (#402); agentFromDefinition
+	// drops it on every other role, so a user tuning a kill knob on, say,
+	// the coder hears why nothing changed.
+	if alias := def.TodoEnforcement; alias != nil && definitionRole(id, def) != AgentRoleDispatch &&
+		(alias.KillAfterNudges != nil || alias.StallWindow != nil || alias.HardTimeout != nil) {
+		key := id + ".todo_enforcement.kill"
+		if _, loaded := warnedDefinitionFields.LoadOrStore(key, struct{}{}); !loaded {
+			slog.Warn("Kill thresholds apply to dispatch agents only and are ignored", "agent", id, "field", "todo_enforcement")
+		}
 	}
 }
