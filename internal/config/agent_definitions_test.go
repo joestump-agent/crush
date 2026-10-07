@@ -336,6 +336,63 @@ func TestAgentDefinitions_A2AAgentDefaults(t *testing.T) {
 	require.Equal(t, config.AgentWorkspaceWorktree, cfg.Agents[config.AgentWorker].Workspace, "the builtin worker keeps its worktree")
 }
 
+// TestAgentDefinitions_UnusableExternalAgentLoads checks that one bad
+// external definition fails closed per agent rather than failing the
+// whole load (#434): the config loads, the other agents are untouched,
+// and the bad agent carries the reason dispatch refuses it with.
+func TestAgentDefinitions_UnusableExternalAgentLoads(t *testing.T) {
+	cases := []struct {
+		name string
+		def  string
+		want string
+	}{
+		{
+			name: "no card",
+			def:  `{"role": "dispatch", "runtime": "a2a"}`,
+			want: `agents.reviewer.card: a runtime a2a agent needs the URL of its Agent Card`,
+		},
+		{
+			name: "http card off loopback",
+			def:  `{"role": "dispatch", "runtime": "a2a", "card": "http://example.com/agent.json"}`,
+			want: `agents.reviewer.card: must use https; plain http is allowed only for loopback hosts`,
+		},
+		{
+			name: "file card",
+			def:  `{"role": "dispatch", "runtime": "a2a", "card": "file:///etc/agent.json"}`,
+			want: `agents.reviewer.card: must be an absolute URL with a host`,
+		},
+		{
+			name: "card carrying credentials",
+			def:  `{"role": "dispatch", "runtime": "a2a", "card": "https://user:secret@example.com/agent.json"}`,
+			want: `agents.reviewer.card: must not carry credentials; set them in auth`,
+		},
+		{
+			name: "auth with no token",
+			def:  `{"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "auth": {"type": "bearer"}}`,
+			want: `agents.reviewer.auth.token: a bearer token is required when auth is set`,
+		},
+		{
+			name: "negative idle timeout",
+			def:  `{"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "transport": {"idle_timeout": "-1m"}}`,
+			want: `agents.reviewer.transport.idle_timeout: must not be negative (got -60)`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := loadAgentsJSON(t, `{"reviewer": `+tc.def+`}`)
+			cfg := store.Config()
+			reviewer, ok := cfg.Agents["reviewer"]
+			require.True(t, ok, "the bad external agent still resolves")
+			require.Equal(t, tc.want, reviewer.Unusable)
+			require.NotContains(t, reviewer.Unusable, "secret", "the reason never echoes the card URL")
+			require.Empty(t, cfg.Agents[config.AgentWorker].Unusable, "the other agents are untouched")
+		})
+	}
+
+	good := loadAgentsJSON(t, `{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "auth": {"token": "$T"}}}`)
+	require.Empty(t, good.Config().Agents["reviewer"].Unusable)
+}
+
 // TestValidateAgentCardURL pins the card URL rule the loader and the
 // dispatch-time resolver share (#434).
 func TestValidateAgentCardURL(t *testing.T) {
@@ -471,36 +528,6 @@ func TestAgentDefinitions_ValidationErrors(t *testing.T) {
 			name:    "a2a auth type",
 			agents:  `{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "auth": {"type": "basic"}}}`,
 			wantErr: `agents.reviewer.auth.type: unknown auth type "basic"`,
-		},
-		{
-			name:    "a2a agent needs a card",
-			agents:  `{"reviewer": {"role": "dispatch", "runtime": "a2a"}}`,
-			wantErr: `agents.reviewer.card: a runtime a2a agent needs the URL of its Agent Card`,
-		},
-		{
-			name:    "a2a card must be https",
-			agents:  `{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "http://example.com/agent.json"}}`,
-			wantErr: `agents.reviewer.card: must use https; plain http is allowed only for loopback hosts`,
-		},
-		{
-			name:    "a2a card may not be a file",
-			agents:  `{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "file:///etc/agent.json"}}`,
-			wantErr: `agents.reviewer.card: must be an absolute URL with a host`,
-		},
-		{
-			name:    "a2a card may not carry credentials",
-			agents:  `{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "https://user:secret@example.com/agent.json"}}`,
-			wantErr: `agents.reviewer.card: must not carry credentials; set them in auth`,
-		},
-		{
-			name:    "a2a auth needs a token",
-			agents:  `{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "auth": {"type": "bearer"}}}`,
-			wantErr: `agents.reviewer.auth.token: a bearer token is required when auth is set`,
-		},
-		{
-			name:    "a2a negative idle timeout",
-			agents:  `{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "transport": {"idle_timeout": "-1m"}}}`,
-			wantErr: `agents.reviewer.transport.idle_timeout: must not be negative (got -60)`,
 		},
 		{
 			name:    "a2a kill limited to timeout",

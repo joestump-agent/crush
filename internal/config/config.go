@@ -1151,6 +1151,11 @@ type Agent struct {
 	Auth *AgentAuth `json:"-"`
 	// Transport tunes an a2a agent's connection (#434).
 	Transport *AgentTransport `json:"-"`
+	// Unusable is why a runtime a2a definition cannot be dispatched
+	// (#434): a missing or refused card URL, auth without a token, or a
+	// negative idle timeout. The config still loads; dispatch refuses
+	// the agent with this reason. Empty for every usable agent.
+	Unusable string `json:"-"`
 }
 
 type Tools struct {
@@ -1549,6 +1554,12 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 		mcpAllow = def.MCP.Allow
 	}
 
+	var unusable string
+	if orString(def.Runtime, AgentRuntimeBuiltin) == AgentRuntimeA2A {
+		unusable = externalDefinitionProblem("agents."+id, def)
+		warnUnusableExternal(id, unusable)
+	}
+
 	modelType := SelectedModelTypeLarge
 	var modelRef *AgentModelRef
 	if def.Model != nil {
@@ -1576,6 +1587,7 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 		Card:            orString(def.Card, ""),
 		Auth:            def.Auth,
 		Transport:       def.Transport,
+		Unusable:        unusable,
 	}
 }
 

@@ -745,19 +745,30 @@ func validateA2AFields(path string, def AgentDefinition) error {
 	if def.Auth != nil && def.Auth.Type != nil && *def.Auth.Type != "bearer" {
 		return fmt.Errorf("%s.auth.type: unknown auth type %q", path, *def.Auth.Type)
 	}
-	if def.Auth != nil && (def.Auth.Token == nil || strings.TrimSpace(*def.Auth.Token) == "") {
-		return fmt.Errorf("%s.auth.token: a bearer token is required when auth is set", path)
-	}
+	return nil
+}
+
+// externalDefinitionProblem returns why a runtime a2a definition cannot
+// be dispatched (#434), or the empty string when it can: a missing or
+// refused card URL, auth without a token, or a negative idle timeout.
+// These do not fail the load — one bad external agent must not take the
+// whole config down — but they fail closed: the resolved agent carries
+// the reason, a warning names it at load, and dispatch refuses that
+// agent with it.
+func externalDefinitionProblem(path string, def AgentDefinition) string {
 	if def.Card == nil || strings.TrimSpace(*def.Card) == "" {
-		return fmt.Errorf("%s.card: a runtime a2a agent needs the URL of its Agent Card", path)
+		return path + ".card: a runtime a2a agent needs the URL of its Agent Card"
 	}
 	if _, err := ValidateAgentCardURL(*def.Card); err != nil {
-		return fmt.Errorf("%s.card: %w", path, err)
+		return path + ".card: " + err.Error()
+	}
+	if def.Auth != nil && (def.Auth.Token == nil || strings.TrimSpace(*def.Auth.Token) == "") {
+		return path + ".auth.token: a bearer token is required when auth is set"
 	}
 	if def.Transport != nil && def.Transport.IdleTimeout != nil && *def.Transport.IdleTimeout < 0 {
-		return fmt.Errorf("%s.transport.idle_timeout: must not be negative (got %s)", path, durationForError(*def.Transport.IdleTimeout))
+		return fmt.Sprintf("%s.transport.idle_timeout: must not be negative (got %s)", path, durationForError(*def.Transport.IdleTimeout))
 	}
-	return nil
+	return ""
 }
 
 // ValidateAgentCardURL checks an external Agent Card URL (#434) and
@@ -932,12 +943,13 @@ func (c *Config) ValidateAgentModelRefs() error {
 var warnedDefinitionFields sync.Map
 
 // warnUnhonoredFields logs one warning per definition field the runtime
-// parses but does not honor yet, skipping values that merely restate
-// the built-in default so an untouched config starts up silent. #432
+// parses but does not honor, skipping values that merely restate the
+// built-in default so an untouched config starts up silent. #432
 // honored model, prompt, prompt_append, skills, context paths, tools,
 // MCP, and disabled; #434 honored the a2a runtime with its card, auth,
-// transport, and none workspace. What remains is workspace selection
-// for builtin dispatch agents, which always run in a worktree.
+// transport, and none workspace. A builtin-runtime definition that
+// sets card, auth, or transport still has them ignored, and a builtin
+// dispatch agent always runs in a worktree, so those warn.
 func warnUnhonoredFields(id string, def AgentDefinition) {
 	builtin := builtinAgentDefinitions()[id]
 	isA2A := orString(def.Runtime, AgentRuntimeBuiltin) == AgentRuntimeA2A
@@ -946,6 +958,9 @@ func warnUnhonoredFields(id string, def AgentDefinition) {
 		isSet bool
 	}{
 		{"workspace", !isA2A && def.Workspace != nil && (builtin.Workspace == nil || *def.Workspace != *builtin.Workspace)},
+		{"card", !isA2A && def.Card != nil},
+		{"auth", !isA2A && def.Auth != nil},
+		{"transport", !isA2A && def.Transport != nil},
 	}
 	for _, field := range fields {
 		if !field.isSet {
@@ -967,4 +982,16 @@ func warnUnhonoredFields(id string, def AgentDefinition) {
 			slog.Warn("Kill thresholds apply to dispatch agents only and are ignored", "agent", id, "field", "todo_enforcement")
 		}
 	}
+}
+
+// warnUnusableExternal logs, once per agent and reason, why a runtime
+// a2a definition cannot be dispatched (#434).
+func warnUnusableExternal(id, problem string) {
+	if problem == "" {
+		return
+	}
+	if _, loaded := warnedDefinitionFields.LoadOrStore(id+".external:"+problem, struct{}{}); loaded {
+		return
+	}
+	slog.Warn("External agent definition cannot be dispatched", "agent", id, "reason", problem)
 }
