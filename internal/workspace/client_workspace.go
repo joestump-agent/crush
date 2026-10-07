@@ -11,6 +11,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/crush/internal/a2a"
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/notify"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
@@ -53,6 +54,10 @@ type ClientWorkspace struct {
 	// whole workspace) may have been re-created in the meantime.
 	lastSession string
 
+	// agentTasks follows the workspace host's agent index through the
+	// server's proxy (#421).
+	agentTasks *agentTaskWatcher
+
 	// subCtx bounds the lifetime of the event subscription (and its
 	// reconnect loop). Shutdown cancels it so Subscribe stops
 	// reconnecting instead of racing the teardown.
@@ -94,7 +99,7 @@ func NewClientWorkspace(c *client.Client, ws proto.Workspace) *ClientWorkspace {
 	states := protoToSkillStates(ws.Skills)
 	mgr := skills.NewManager(nil, nil, states, skills.WithGlobalMirror())
 	subCtx, subCancel := context.WithCancel(context.Background())
-	return &ClientWorkspace{
+	w := &ClientWorkspace{
 		client:      c,
 		ws:          ws,
 		skills:      mgr,
@@ -103,6 +108,8 @@ func NewClientWorkspace(c *client.Client, ws proto.Workspace) *ClientWorkspace {
 		subDone:     make(chan struct{}),
 		herdrClient: herdr.Init(),
 	}
+	w.agentTasks = newAgentTaskWatcher(w.dialAgentIndex, w.agentClient)
+	return w
 }
 
 // refreshWorkspace re-fetches the workspace from the server, updating
@@ -567,29 +574,46 @@ func (w *ClientWorkspace) CancelDispatch(ctx context.Context, ref string) error 
 	return errors.New("canceling a dispatched agent is not available in client/server mode")
 }
 
-// The agent surface (#421) reaches the server's A2A host through the
-// server in a later change; until then a client/server TUI sees no
-// dispatched agents, and steering or canceling one says so instead of
-// failing silently.
+// The agent surface (#421) is the same watcher local mode runs, reaching
+// the workspace's A2A host through the server's proxy. The workspace ID
+// is read on every dial, so after a recovery the watcher follows the
+// workspace that replaced the old one.
+
+// dialAgentIndex reaches the workspace host's index through the proxy.
+// The server holds a stream until the host starts, so there is nothing
+// to wait for here.
+func (w *ClientWorkspace) dialAgentIndex() (a2a.AgentIndexConn, bool, <-chan struct{}) {
+	return w.client.A2AProxy(w.workspaceID()).IndexConn(), true, nil
+}
+
+// agentClient steers and cancels through the proxy.
+func (w *ClientWorkspace) agentClient() (agentClient, bool) {
+	return w.client.A2AProxy(w.workspaceID()), true
+}
 
 func (w *ClientWorkspace) ListAgentTasks(sessionID string) []AgentTask {
-	return nil
+	w.agentTasks.start(nil)
+	return w.agentTasks.list(sessionID)
 }
 
 func (w *ClientWorkspace) AgentTask(sessionID string) (AgentTask, bool) {
-	return AgentTask{}, false
+	w.agentTasks.start(nil)
+	return w.agentTasks.bySession(sessionID)
 }
 
 func (w *ClientWorkspace) AgentTaskByHandle(sessionID, handle string) (AgentTask, bool) {
-	return AgentTask{}, false
+	w.agentTasks.start(nil)
+	return w.agentTasks.byHandle(sessionID, handle)
 }
 
 func (w *ClientWorkspace) SendAgentMessage(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
-	return errors.New("steering a dispatched agent is not available in client/server mode yet")
+	w.agentTasks.start(nil)
+	return w.agentTasks.steer(ctx, sessionID, handle, text, attachments)
 }
 
 func (w *ClientWorkspace) CancelAgentTask(ctx context.Context, ref string) error {
-	return errors.New("canceling a dispatched agent is not available in client/server mode yet")
+	w.agentTasks.start(nil)
+	return w.agentTasks.cancelTask(ctx, ref)
 }
 
 // -- LSP --
@@ -985,6 +1009,7 @@ func (w *ClientWorkspace) Subscribe(program *tea.Program) {
 		program.Quit()
 	})
 
+	w.agentTasks.start(program.Send)
 	w.runSubscription(program.Send)
 }
 
@@ -1218,6 +1243,7 @@ func (w *ClientWorkspace) Shutdown() {
 		w.subCancel()
 	}
 	w.awaitSubscription()
+	w.agentTasks.stop()
 	w.herdrClient.Close()
 
 	// Retiring the client releases every claim it holds, on every workspace,

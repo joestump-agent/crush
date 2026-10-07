@@ -121,7 +121,7 @@ func (w *agentTaskWatcher) run(ctx context.Context) {
 		events, err := conn.WatchAgents(ctx)
 		if err == nil {
 			for ev := range events {
-				w.apply(ev)
+				w.apply(ev, true)
 				backoff = agentWatchBackoffMin
 			}
 		} else if ctx.Err() == nil {
@@ -150,8 +150,9 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // changed. A copy older than the one cached — a snapshot read while a
 // newer change was already on the stream — is ignored, and a copy the
 // cache already holds is not published again, so a reconnect's snapshot
-// repeats no card update.
-func (w *agentTaskWatcher) apply(ev a2a.AgentIndexEvent) {
+// repeats no card update. A stream's snapshot is also authoritative:
+// see below.
+func (w *agentTaskWatcher) apply(ev a2a.AgentIndexEvent, fromStream bool) {
 	descriptors := ev.Snapshot
 	if ev.Upsert != nil {
 		descriptors = []a2a.AgentDescriptor{*ev.Upsert}
@@ -169,6 +170,32 @@ func (w *agentTaskWatcher) apply(ev a2a.AgentIndexEvent) {
 		}
 		w.tasks[d.ID] = task
 		changed = append(changed, task)
+	}
+	// A stream's snapshot is the whole index of the host that sent it,
+	// and every later change follows it on the same stream. A live agent
+	// it leaves out ran on a host that is gone — a restarted server's,
+	// after a client/server reconnect — so it is marked unserved, which
+	// shows as failed, rather than left running forever. Ended agents
+	// stay, so their handles still resolve. The mark is an inference, not
+	// a host's copy: its revision is cleared so any copy a host sends
+	// replaces it.
+	if fromStream && ev.Upsert == nil {
+		listed := make(map[string]struct{}, len(ev.Snapshot))
+		for _, d := range ev.Snapshot {
+			listed[d.ID] = struct{}{}
+		}
+		for _, id := range w.order {
+			task := w.tasks[id]
+			if _, ok := listed[id]; ok || !task.Served || task.Terminal() {
+				continue
+			}
+			d := task.descriptor
+			d.Served = false
+			d.Revision = 0
+			task = agentTaskFromDescriptor(d)
+			w.tasks[id] = task
+			changed = append(changed, task)
+		}
 	}
 	send := w.send
 	w.mu.Unlock()
@@ -258,7 +285,8 @@ func (w *agentTaskWatcher) refresh(ctx context.Context) {
 		slog.Debug("Agent index read failed", "error", err)
 		return
 	}
-	w.apply(a2a.AgentIndexEvent{Snapshot: descriptors})
+	// A read can race the stream, so it only adds what it saw.
+	w.apply(a2a.AgentIndexEvent{Snapshot: descriptors}, false)
 }
 
 // steer sends text to the running agent dispatched from sessionID under

@@ -150,6 +150,14 @@ only (`405` otherwise), `403` with an `Origin`, `400` unless the `Host`
 is `crush-a2a`, and the host's bearer token from the host's own user
 (`401` otherwise).
 
+In client/server mode the TUI runs in another process. It reaches the index,
+and each dispatch's route, through the server's proxy at
+`/v1/workspaces/{id}/a2a/agents`; see
+[Dispatched agents against a server](/features/server-and-workspaces#dispatched-agents-against-a-server).
+The server adds the host's token itself. The request keeps its `Origin`,
+`Content-Type` and version headers, so the checks above judge it as the
+client sent it.
+
 ## Methods
 
 The SDK's default request handler serves the whole A2A method set. Crush's
