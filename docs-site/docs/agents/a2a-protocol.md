@@ -79,7 +79,7 @@ the wire:
 | `description` | The dispatch's `role`, which may be empty. |
 | `version` | The Crush build version. |
 | `supportedInterfaces[0]` | The routed endpoint, `http://crush-a2a/agents/<dispatch id>`, JSON-RPC binding, protocol `1.0`. Always exactly one. |
-| `capabilities` | `streaming: true` and the declared `extensions`: `todos/v1`, `usage/v1`, `questions/v1` and `answers/v1`, each with its JSON Schema in its params. No push notifications, no extended card. |
+| `capabilities` | `streaming: true` and the declared `extensions`: `todos/v1`, `usage/v1`, `questions/v1`, `answers/v1`, `permissions/v1` and `permission-decisions/v1`, each with its JSON Schema in its params. No push notifications, no extended card. |
 | `defaultInputModes`, `defaultOutputModes` | `text/plain` both ways. |
 | `skills` | One entry per Crush skill the dispatch was given: every discovered skill when the dispatch named none. `id` and `name` are the skill name, and every entry carries the single tag `crush-skill`. |
 
@@ -283,8 +283,9 @@ parent's:
 
 An answer and a steer are told apart explicitly. A message whose `taskId`
 names a task in `TASK_STATE_INPUT_REQUIRED` is an answer; with no
-question pending on that task it is `TASK_STATE_REJECTED` ("no question
-is pending on this task") and starts nothing. Every other message on the
+question or permission request pending on that task it is
+`TASK_STATE_REJECTED` ("no question or permission request is pending on
+this task") and starts nothing. Every other message on the
 context is a turn or a steer, as above, so a steer sent while a question
 is open is still only a steer, and the question stays open.
 
@@ -294,6 +295,53 @@ and `stall_window` keep counting. A kill ends the wait on your answer:
 the client cancels the parked task with the kill reason, the parked tool
 call returns an error, and the task ends `TASK_STATE_CANCELED`. A
 `CancelTask` on a parked task does the same.
+
+### Permission prompts
+
+A dispatched agent's tool calls ask for permission through the dispatch's
+own scoped permission service
+([#353](https://github.com/joestump-agent/crush/issues/353)). Yolo and the
+allowlists resolve inside that service, so only a request that needs a
+person ever reaches the protocol. Such a request parks the run exactly like
+a question:
+
+1. **The pause.** The stream ends with `TASK_STATE_INPUT_REQUIRED`. The
+   status message carries a one-line summary as a text part and the
+   request as a data part, the declared `permissions/v1` extension, named
+   in the message's `extensions`:
+
+   ```json
+   {
+     "role": "ROLE_AGENT",
+     "extensions": ["https://crush.charm.land/ext/permissions/v1"],
+     "parts": [
+       { "text": "Permission required: bash: Execute command: make test" },
+       { "data": { "id": "…", "session_id": "…", "tool_call_id": "…",
+         "tool_name": "bash", "description": "Execute command: make test",
+         "action": "execute", "params": { "command": "make test" },
+         "path": "/…/worktree" } }
+     ]
+   }
+   ```
+
+2. **The decision.** The parent's coordinator requests it on the parent's
+   own permission service, with the dispatch's `@handle` in front of the
+   description. That service applies your live yolo setting and the grants
+   you made for the session before it shows the dialog. The tool's params
+   decode back to the tool's own type, so the dialog renders a dispatched
+   request like a local one. With no handler on the client, the request is
+   denied.
+3. **The answer.** The client sends a user message with the parked task's
+   `taskId`, whose data part is the declared `permission-decisions/v1`
+   extension: `{"allow": true}` or `{"allow": false}`. Only an explicit
+   allow grants the request; a message with no decodable decision denies
+   it. The same run resumes, and the tool call runs or returns a denial.
+
+Requests from parallel tool calls park one at a time, oldest first: after
+each decision the run resumes and parks again on the next one. A kill
+while a request is parked ends the wait the same way it does for a
+question, and a `CancelTask` on a task parked on a request denies it before
+the task ends `TASK_STATE_CANCELED`.
 
 ## Event stream
 
@@ -430,7 +478,7 @@ rides the result.
 | Agent was busy, or a cancel landed at start | `TASK_STATE_FAILED`, "agent session did not start a turn (busy or canceled)". The prompt is still queued on the session, and the running agent reads it. |
 | `CancelTask` | `TASK_STATE_CANCELED`, the request's reason as the status message. |
 | The agent asks a question | `TASK_STATE_INPUT_REQUIRED` with the question; not an end. The answer resumes the run on the same task. |
-| An answer on a task with no question pending | `TASK_STATE_REJECTED`, "no question is pending on this task". |
+| An answer on a task with nothing pending | `TASK_STATE_REJECTED`, "no question or permission request is pending on this task". |
 
 ### How the client maps the outcome
 
@@ -498,9 +546,10 @@ A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/c
 
 ## Not implemented
 
-- **`auth-required`.** Permission prompts use an in-process bridge
-  ([#353](https://github.com/joestump-agent/crush/issues/353)).
-  Questions use `input-required`; see [Questions](#questions).
+- **`auth-required`.** a2a-go v2.5.0 treats it as non-final, so an answer on
+  the same task is refused while the execution stays active. Permission
+  prompts use `input-required` instead; see
+  [Permission prompts](#permission-prompts).
 - **Durable task state.** A restart loses every task ([#354](https://github.com/joestump-agent/crush/issues/354)).
 
 ## Security model
@@ -556,7 +605,7 @@ and stage 3 comes after. The reasoning is in
 | [#361](https://github.com/joestump-agent/crush/issues/361) | The diff as a chunked `text/x-diff` file artifact, plus a summary and a typed `DispatchResult`. | 2 |
 | [#364](https://github.com/joestump-agent/crush/issues/364) | Usage, cost, model and `traceparent` in task metadata. | 2 |
 | [#352](https://github.com/joestump-agent/crush/issues/352) | Questions from dispatched agents through `input-required`. | 3 |
-| [#353](https://github.com/joestump-agent/crush/issues/353) | Permission prompts through `auth-required`, answered by the client holder. | 3 |
+| [#353](https://github.com/joestump-agent/crush/issues/353) | Permission prompts through `input-required`, decided by the parent's permission service. | 3 |
 | [#358](https://github.com/joestump-agent/crush/issues/358) | Optional TCP listener, TLS required, `Host` validated. | 3 |
 | [#356](https://github.com/joestump-agent/crush/issues/356) | Spike: can the SDK's cluster mode carry Clustered Crush peers? | 3 |
 | [#363](https://github.com/joestump-agent/crush/issues/363) | Run the a2a-go TCK against Crush's served card in CI. | 3 |

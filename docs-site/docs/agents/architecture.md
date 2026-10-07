@@ -26,12 +26,13 @@ scoped agent for it, serves that agent over A2A on the process's unix
 socket, and drives exactly one turn through an A2A client. A steer is an
 A2A message on the running context
 ([#351](https://github.com/joestump-agent/crush/issues/351)), and a
-dispatched agent's question pauses its task in `input-required` until the
-answer arrives on the same task
-([#352](https://github.com/joestump-agent/crush/issues/352)). The TUI
+dispatched agent's question or permission request pauses its task in
+`input-required` until the answer arrives on the same task
+([#352](https://github.com/joestump-agent/crush/issues/352),
+[#353](https://github.com/joestump-agent/crush/issues/353)). The TUI
 follows, steers and cancels agents through the host's agent index and the
-protocol ([#421](https://github.com/joestump-agent/crush/issues/421));
-permissions, kill and result delivery still happen in-process, outside the
+protocol ([#421](https://github.com/joestump-agent/crush/issues/421)); kill
+and result delivery still happen in-process, outside the
 protocol.
 
 ## The pieces
@@ -61,7 +62,6 @@ protocol.
 
  Outside the protocol (direct Go calls):
    @handle / message_agent ---> injection queue ---> SessionAgent.EnqueueWhenBusy
-   dispatched permission request ---> permission bridge ---> parent's prompt
    nudge ladder / watchdog ---> SessionAgent.Cancel
 ```
 
@@ -111,7 +111,7 @@ model.
    `bash`, `edit`, `multiedit`, `write` and `todos`, and `question` when
    the parent is interactive. Nothing the base revision's config files
    declare is read or executed. It also builds a scoped LSP manager, a
-   scoped permission service bridged to the parent's, and — for
+   scoped permission service that follows the parent's live yolo state, and — for
    `question` — the dispatch's own question service.
 3. **Agent.** It renders the system prompt from `dispatch.md.tpl` and
    builds a `SessionAgent` on the chosen model, with the todo
