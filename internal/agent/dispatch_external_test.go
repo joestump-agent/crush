@@ -138,8 +138,19 @@ func untilKilled(ctx context.Context, params ExternalDispatchParams) (DispatchTr
 
 // newExternalDispatchEnv builds a dispatch coordinator whose config adds
 // a runtime a2a reviewer, and wires the fake external host. defs is the
-// reviewer's definition JSON.
+// reviewer's definition JSON, which must be usable.
 func newExternalDispatchEnv(t *testing.T, defs string, ext *fakeExternalAgent) (*coordinator, *fakeExternalHost, fakeEnv) {
+	t.Helper()
+	c, host, env := newExternalDispatchEnvUnchecked(t, defs, ext)
+	for id, agentCfg := range c.cfg.Config().Agents {
+		require.Empty(t, agentCfg.Unusable, "agent %s", id)
+	}
+	return c, host, env
+}
+
+// newExternalDispatchEnvUnchecked is newExternalDispatchEnv for a
+// definition that may be unusable.
+func newExternalDispatchEnvUnchecked(t *testing.T, defs string, ext *fakeExternalAgent) (*coordinator, *fakeExternalHost, fakeEnv) {
 	t.Helper()
 	c, env := newDispatchToolEnv(t, &dispatchTestAgent{model: dispatchTestModel()})
 	c.dispatchAgentBuilder = func(context.Context, dispatchAgentOptions) (*dispatchedAgent, error) {
@@ -455,4 +466,21 @@ func TestExternalTerminalMessage(t *testing.T) {
 	}
 	served := dispatch.DispatchResult{DispatchID: "d1", Branch: "crush-dispatch-d1", Status: dispatch.StatusCompleted}.TerminalMessage()
 	require.NotContains(t, served, dispatch.ExternalResultNotice)
+}
+
+// A bad external definition loads but fails closed at dispatch (#434):
+// auth with no token is refused with the load's reason rather than sent
+// without credentials, and the agent is left out of the enum.
+func TestExternalDispatchRefusesUnusableDefinition(t *testing.T) {
+	ext := newFakeExternalAgent(untilKilled)
+	c, host, _ := newExternalDispatchEnvUnchecked(t, `{"reviewer": {
+		"role": "dispatch", "runtime": "a2a", "card": "`+externalTestCardURL+`",
+		"auth": {"type": "bearer"}
+	}}`, ext)
+	require.NotContains(t, c.dispatchableAgentIDs(), "reviewer")
+
+	resp := runDispatchToolCall(t, c.dispatchTool(), DispatchAgentParams{Prompt: "p", Agent: "reviewer"})
+	require.True(t, resp.IsError, "expected a tool error, got: %s", resp.Content)
+	require.Contains(t, resp.Content, `agent "reviewer" cannot be dispatched: agents.reviewer.auth.token: a bearer token is required when auth is set`)
+	require.Empty(t, host.resolutions(), "an unusable agent is never resolved")
 }

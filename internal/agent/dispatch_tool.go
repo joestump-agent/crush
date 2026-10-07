@@ -520,11 +520,11 @@ func (t *dispatchAgentTool) SetProviderOptions(opts fantasy.ProviderOptions) {
 
 // dispatchableAgentIDs returns the sorted ids of the resolved agents a
 // dispatch may run: role dispatch, not disabled, on the builtin runtime
-// or behind an external card (#434).
+// or behind an external card (#434), and not marked unusable.
 func (c *coordinator) dispatchableAgentIDs() []string {
 	ids := make([]string, 0, 4)
 	for id, agentCfg := range c.cfg.Config().Agents {
-		if agentCfg.Role != config.AgentRoleDispatch || agentCfg.Disabled || !dispatchableRuntime(agentCfg.Runtime) {
+		if agentCfg.Role != config.AgentRoleDispatch || agentCfg.Disabled || !dispatchableRuntime(agentCfg.Runtime) || agentCfg.Unusable != "" {
 			continue
 		}
 		ids = append(ids, id)
@@ -563,6 +563,11 @@ func (c *coordinator) resolveDispatchAgent(id string) (config.Agent, string) {
 	}
 	if !dispatchableRuntime(agentCfg.Runtime) {
 		return refuse("agent %q runs on the %q runtime, which dispatch_agent cannot serve", id, agentCfg.Runtime)
+	}
+	// A bad external definition loads but fails closed here (#434): the
+	// reason is the one the load warned with.
+	if agentCfg.Unusable != "" {
+		return refuse("agent %q cannot be dispatched: %s", id, agentCfg.Unusable)
 	}
 	return agentCfg, ""
 }
