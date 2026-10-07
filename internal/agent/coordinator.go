@@ -64,7 +64,6 @@ import (
 // Coordinator errors.
 var (
 	errCoderAgentNotConfigured    = errors.New("coder agent not configured")
-	errPlanAgentNotConfigured     = errors.New("plan agent not configured")
 	errMainAgentNotFound          = errors.New("main agent not found")
 	errModelProviderNotConfigured = errors.New("model provider not configured")
 	errModelNotFound              = errors.New("model not found in provider config")
