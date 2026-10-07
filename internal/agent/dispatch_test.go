@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -54,6 +56,11 @@ func newDispatchTestCoordinatorAt(t *testing.T, env fakeEnv, workingDir, dataDir
 		// test instead of leaking a Background subscription.
 		dispatchCtx: t.Context(),
 	}
+	// The default test host (#347): runDispatch has one execution path
+	// through the A2A client, so every coordinator test drives its
+	// dispatches through a host. A test that needs a different one
+	// replaces it with SetDispatchHost.
+	c.SetDispatchHost(&runnerTransport{})
 	// The session-end cleanup (#63's Sweep), run as a cleanup: a
 	// dispatch's workspace outlives its background run — runDispatch
 	// never releases it — so the worktree provider's ownership-lease
@@ -117,6 +124,79 @@ func reapDispatchRuns(t *testing.T, c *coordinator, gates ...func()) {
 	})
 }
 
+// runnerTransport is the default test host (#343, #347):
+// StartDispatchServer records the DispatchServerParams like the real
+// factory and stamps a canned endpoint/card on the registry entry, and
+// StreamDispatch drives the recorded runner with the recorded call,
+// mapping the outcome the way the executor does (#342) — a canceled run
+// to canceled, an error or a nil result to failed, anything else to
+// completed with the response text and the diff artifact, with diff
+// capture errors dropped. newDispatchTestCoordinator wires one by
+// default, so every coordinator test runs its dispatches through the
+// one execution path; a test that needs a different host calls
+// SetDispatchHost with its own.
+type runnerTransport struct {
+	mu     sync.Mutex
+	served []DispatchServerParams
+}
+
+func (f *runnerTransport) StartDispatchServer(ctx context.Context, params DispatchServerParams) (string, any, func(), error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.served = append(f.served, params)
+	return "http://127.0.0.1:19999", "fake-card", func() {}, nil
+}
+
+// serve records the runner and call the way StartDispatchServer does,
+// for tests that drive the run without standing up the server half.
+func (f *runnerTransport) serve(params DispatchServerParams) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.served = append(f.served, params)
+}
+
+func (f *runnerTransport) lastServed() DispatchServerParams {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.served[len(f.served)-1]
+}
+
+func (f *runnerTransport) StreamDispatch(ctx context.Context, _ DispatchTransportParams) (DispatchTransportOutcome, error) {
+	params := f.lastServed()
+	result, err := params.Runner.Run(ctx, params.Call)
+	switch {
+	case errors.Is(err, context.Canceled):
+		return DispatchTransportOutcome{Status: transportStatusCanceled}, nil
+	case err != nil:
+		return DispatchTransportOutcome{Status: transportStatusFailed, Text: err.Error()}, nil
+	case result == nil:
+		return DispatchTransportOutcome{Status: transportStatusFailed, Text: "agent session did not start a turn (busy or canceled)"}, nil
+	}
+	outcome := DispatchTransportOutcome{
+		Status: transportStatusCompleted,
+		Text:   subAgentOutput(result),
+	}
+	if params.Usage != nil {
+		// The executor attaches the dispatched session's final usage to
+		// the terminal status (#364); a failed read simply emits none.
+		if u, uerr := params.Usage(ctx); uerr == nil {
+			outcome.Usage = &u
+		}
+	}
+	if params.Diff != nil {
+		// The wire carries the diff verdict itself (#361): the diff, or
+		// the capture error when it failed.
+		diff, derr := params.Diff(ctx)
+		switch {
+		case derr != nil:
+			outcome.DiffError = derr.Error()
+		case diff != "":
+			outcome.Diff = diff
+		}
+	}
+	return outcome, nil
+}
+
 // provisionDispatchEntry provisions a workspace through the
 // coordinator's git worktree provider and registers its entry, the same
 // two steps the dispatch tool performs. It returns the registered entry
@@ -127,6 +207,36 @@ func provisionDispatchEntry(t *testing.T, c *coordinator, base string) (dispatch
 	require.NoError(t, err)
 	entry := provisionProviderEntry(t, provider, c.dispatchRegistry(), dispatch.ProvisionOptions{Base: base})
 	return entry, provider
+}
+
+// dispatchTestUsage mirrors the dispatch tool's usage closure (#364):
+// the served task reports the dispatched session's final totals on the
+// terminal status.
+func dispatchTestUsage(c *coordinator, sessionID string) func(context.Context) (Usage, error) {
+	return func(ctx context.Context) (Usage, error) {
+		sess, err := c.sessions.Get(ctx, sessionID)
+		if err != nil {
+			return Usage{}, fmt.Errorf("get dispatch session: %w", err)
+		}
+		return Usage{PromptTokens: sess.PromptTokens, CompletionTokens: sess.CompletionTokens, Cost: sess.Cost}, nil
+	}
+}
+
+// serveDispatchRun stands a directly-driven run's A2A server up on the
+// coordinator's host, the way the dispatch tool does (#347): runDispatch
+// takes only the served transport path, so a test that calls runDispatch
+// with a hand-built run must serve its entry first. Call from the test
+// goroutine.
+func serveDispatchRun(t *testing.T, c *coordinator, run dispatchRun) {
+	t.Helper()
+	stop, err := c.startDispatchServer(context.Background(), run.provider, run.reg, run.entry.ID, run.sessionID, "tester", "dispatch test", run.agent, nil, run.call(c), run.killSettings.InactivityTimeout, run.kill.current, dispatchTestUsage(c, run.sessionID))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if stop != nil {
+			stop()
+		}
+		c.stopDispatchServer(run.reg, run.entry.ID, nil)
+	})
 }
 
 // provisionProviderEntry provisions a workspace on provider and

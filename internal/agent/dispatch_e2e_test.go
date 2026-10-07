@@ -33,7 +33,7 @@ import (
 func TestDispatchE2EOverServerFactory(t *testing.T) {
 	t.Parallel()
 
-	defaultFactory := func() agent.DispatchServerStarter { return a2a.NewServerFactory(t.TempDir()) }
+	defaultFactory := func() agent.DispatchHost { return a2a.NewServerFactory(t.TempDir()) }
 
 	// shortClientDeadlineFactory injects the client #344's seam exists
 	// for: a 250ms response-header deadline, with no total timeout. A
@@ -41,7 +41,7 @@ func TestDispatchE2EOverServerFactory(t *testing.T) {
 	// long-run scenario. The custom transport dials the factory's unix
 	// socket (the endpoint is a routing label), so the deadline is the
 	// only thing under test.
-	shortClientDeadlineFactory := func() agent.DispatchServerStarter {
+	shortClientDeadlineFactory := func() agent.DispatchHost {
 		var f *a2a.ServerFactory
 		f = a2a.NewServerFactory(t.TempDir(), a2a.WithHTTPClient(&http.Client{
 			Transport: &http.Transport{
@@ -62,7 +62,7 @@ func TestDispatchE2EOverServerFactory(t *testing.T) {
 	scenarios := []struct {
 		name     string
 		settings config.TodoEnforcementSettings
-		factory  func() agent.DispatchServerStarter
+		factory  func() agent.DispatchHost
 		model    func(t *testing.T) (fantasy.LanguageModel, func())
 		check    func(t *testing.T, entry dispatch.Entry, elapsed time.Duration)
 	}{

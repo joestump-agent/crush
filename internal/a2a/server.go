@@ -161,7 +161,7 @@ func (s *Server) Stop(_ context.Context) error {
 // lazily on the first [ServerFactory.StartServer], with a mutex-guarded
 // route table mapping /agents/<dispatch id> onto each dispatch's
 // JSON-RPC handler. It implements the agent package's
-// [agent.DispatchServerStarter] seam, which is how the dependency stays
+// [agent.DispatchHost] seam, which is how the dependency stays
 // one-way: a2a imports agent, never the reverse.
 type ServerFactory struct {
 	dataDir string
@@ -318,7 +318,7 @@ func WithHTTPClient(client *http.Client) ServerFactoryOption {
 	return func(f *ServerFactory) { f.httpClient = client }
 }
 
-// StartDispatchServer implements [agent.DispatchServerStarter]: it
+// StartDispatchServer implements [agent.DispatchHost]: it
 // registers the dispatch's route on the process host and returns its
 // endpoint, the AgentCard to stamp on the dispatch registry entry, and
 // the stop function the dispatch run defers. The card is returned as the
@@ -631,4 +631,6 @@ func (r *ContextRegistry) clear() {
 }
 
 // Compile-time proof that the factory satisfies the agent-side seam.
-var _ agent.DispatchServerStarter = (*ServerFactory)(nil)
+// Compile-time proof that the factory satisfies the agent-side host
+// seam (the transport half is proven in client.go).
+var _ agent.DispatchHost = (*ServerFactory)(nil)

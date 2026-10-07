@@ -346,6 +346,11 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 	env := testEnv(t)
 	initGitRepo(t, env.workingDir)
 	c := newDispatchTestCoordinator(t, env)
+	// Join every spawned dispatch goroutine — the delivery turn a
+	// completed run fires rides the spawn seam (#422) — before the
+	// TempDir removal: an unjoined turn keeps writing after the
+	// directory is gone, and on macOS the cleanup races it.
+	reapDispatchRuns(t, c)
 
 	// The delivery run resolves the main agent's models from the config
 	// store; register the offline test provider the fake main agent
@@ -396,6 +401,11 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 	c.mainAgent = f.main
 	c.mainAgentName = config.AgentCoder
 	c.agents = map[string]SessionAgent{config.AgentCoder: f.main}
+
+	// The one execution path (#347): serve the dispatch on the
+	// coordinator's default host so runDispatchSync drives it over the
+	// transport, exactly as a tool-started dispatch runs.
+	f.serveDispatch(t)
 	return f
 }
 
@@ -470,9 +480,15 @@ func (f *wanderKillFixture) armRunRoot() {
 	f.runCtx, f.runCancel = context.WithCancel(context.WithoutCancel(context.Background()))
 }
 
-// runDispatchSync drives the fixture's dispatch to completion.
+// runDispatchSync drives the fixture's dispatch to completion. It
+// re-serves the dispatch on the coordinator's current host first: tests
+// reshape the run between construction and the run (swapping the model,
+// wrapping the agent in lateStartAgent), and the transport drives the
+// runner the host recorded at serve time — the same re-serve the
+// dispatch tool performs for the run it is about to start.
 func (f *wanderKillFixture) runDispatchSync(t *testing.T) {
 	t.Helper()
+	f.serveDispatch(t)
 	ctx := context.WithoutCancel(t.Context())
 	if f.runCtx != nil {
 		ctx = f.runCtx
@@ -480,24 +496,28 @@ func (f *wanderKillFixture) runDispatchSync(t *testing.T) {
 	f.c.runDispatch(ctx, f.buildRun())
 }
 
-// wireTransport serves the fixture's dispatch through rt: the real
-// startDispatchServer path records the runner and call on the transport
-// and stamps the endpoint and card on the registry entry, so the run
-// takes the served transport path instead of the direct one.
-func (f *wanderKillFixture) wireTransport(t *testing.T, rt DispatchServerStarter) {
+// serveDispatch stands the fixture's dispatch up on the coordinator's
+// current host the way the dispatch tool does (#347): runDispatch takes
+// only the served transport path, so a fixture-driven run must be
+// served. Called at fixture construction for the default host; tests
+// that swap a host in call wireTransport, which re-serves on it. Call
+// from the test goroutine.
+func (f *wanderKillFixture) serveDispatch(t *testing.T) {
 	t.Helper()
 	run := f.buildRun()
-	f.c.SetDispatchServerStarter(rt)
-	stop := f.c.startDispatchServer(context.Background(), f.provider, f.reg, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current, nil)
-	t.Cleanup(func() {
-		if stop != nil {
-			stop()
-		}
-		f.c.stopDispatchServer(f.reg, f.entry.ID, nil)
-	})
+	_, err := f.c.startDispatchServer(context.Background(), f.provider, f.reg, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current, dispatchTestUsage(f.c, run.sessionID))
+	require.NoError(t, err)
 	entry, ok := f.reg.Get(f.entry.ID)
 	require.True(t, ok)
 	require.NotEmpty(t, entry.Endpoint, "the dispatch must be served for the transport to drive it")
+}
+
+// wireTransport replaces the fixture's host with rt and re-serves the
+// dispatch through it, so the run's stream and kills hit rt.
+func (f *wanderKillFixture) wireTransport(t *testing.T, rt DispatchHost) {
+	t.Helper()
+	f.c.SetDispatchHost(rt)
+	f.serveDispatch(t)
 }
 
 // requireKilled asserts the registry-level kill record and the preserved
@@ -1003,14 +1023,6 @@ func TestDispatchResult_KilledRoundTrips(t *testing.T) {
 	var back dispatch.DispatchResult
 	require.NoError(t, json.Unmarshal(b, &back))
 	assert.Equal(t, dispatch.ReasonStalledTodos, back.KilledReason)
-}
-
-// TestDispatchRunStoppedInLoop pins the loop-stop detector's nil guard;
-// the signature match itself is covered by loop_detection_test.go and
-// TestWanderKill_ToolLoop covers the attribution end to end.
-func TestDispatchRunStoppedInLoop(t *testing.T) {
-	t.Parallel()
-	assert.False(t, dispatchRunStoppedInLoop(nil))
 }
 
 // cancelingTransport is the served test host for the protocol kill

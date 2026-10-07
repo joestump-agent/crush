@@ -386,7 +386,7 @@ func (c *coordinator) releaseDispatchSlot() {
 // call builds the full SessionAgentCall a dispatch's turns run with:
 // the chosen model's shaping, the parent turn's content width, and the
 // non-interactive flag. Built per consumer — the server stamps its
-// executor's template with it at start (#71), and the direct run and the
+// executor's template with it at start (#71), and the transport and the
 // injection queue clone it at run time.
 func (r dispatchRun) call(c *coordinator) SessionAgentCall {
 	maxTokens := r.model.CatwalkCfg.DefaultMaxTokens
@@ -426,6 +426,13 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 		func(ctx context.Context, params DispatchAgentParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			if params.Prompt == "" {
 				return fantasy.NewTextErrorResponse("prompt is required"), nil
+			}
+
+			// Every dispatch runs behind the A2A host (#347): without one
+			// wired there is no execution path, so refuse before
+			// provisioning anything.
+			if c.a2aHost() == nil {
+				return fantasy.NewTextErrorResponse("dispatch unavailable: no A2A host"), nil
 			}
 
 			modelType := config.SelectedModelType(params.Model)
@@ -627,7 +634,9 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// status carrying it. The usage closure (#364) reads the
 			// dispatched session's final totals once the run ends, so the
 			// terminal status carries them and the parent can account for
-			// the run without sharing a database row.
+			// the run without sharing a database row. A start failure is a
+			// dispatch failure (#347): tear the dispatch down and report
+			// the tool error — nothing runs unserved.
 			usage := func(ctx context.Context) (Usage, error) {
 				sess, err := c.sessions.Get(ctx, taskSession.ID)
 				if err != nil {
@@ -641,7 +650,14 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 					Cost:             sess.Cost,
 				}, nil
 			}
-			run.stopServer = c.startDispatchServer(ctx, provider, reg, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current, usage)
+			stopServer, err := c.startDispatchServer(ctx, provider, reg, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current, usage)
+			if err != nil {
+				rootCancel()
+				c.releaseDispatchSlot()
+				c.removeDispatch(ctx, reg, provider, entry, toolchain)
+				return fantasy.NewTextErrorResponse(fmt.Sprintf("start A2A server: %s", err)), nil
+			}
+			run.stopServer = stopServer
 
 			// The dispatch runs on its root context, detached from the
 			// tool call's (#371): the permission bridge bound to the root
@@ -800,52 +816,13 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		defer c.unregisterDispatchRun(run.sessionID)
 	}
 
-	// The transport swap (#71): a served dispatch — an endpoint and card
-	// stamped on its registry entry, and a transport wired with the
-	// server factory — runs over the A2A client, its SSE stream consumed
-	// to the terminal state. Everything else (an unserved dispatch, no
-	// factory wired) keeps the direct in-process run. Either way the
-	// injection target above is the same: the agent behind the session
-	// is one and the same object on both paths.
-	var terminal dispatch.DispatchResult
-	var servedUsage *Usage
-	transported, usage, ok := c.runDispatchOverTransport(ctx, run)
-	if ok {
-		terminal = transported
-		servedUsage = usage
-	} else {
-		result, err := run.agent.Run(ctx, call)
-		watchStop()
-
-		// A nil result with a nil error means no turn ran — the session was
-		// busy or a cancel landed during dispatch (#173 review note on #64).
-		// With one ephemeral session per dispatch it should not fire, but it
-		// is a failure, never a success. One dispatch = one turn, so the
-		// queued-behind-a-busy-session path cannot produce a late result
-		// either.
-		if err != nil {
-			slog.Error("Dispatched agent run failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "error", err)
-		} else if result == nil {
-			slog.Error("Dispatched agent ran no turn", "dispatch_id", run.entry.ID, "session_id", run.sessionID)
-		}
-
-		// Kill the run's background jobs before terminal assembly, so the
-		// salvage diff cannot race a job still writing the workspace
-		// (#385).
-		c.killDispatchSessionJobs(ctx, run)
-
-		terminal = c.assembleTerminalDispatchResult(ctx, run, dispatchNaturalOutcome{
-			completed:     err == nil && result != nil,
-			findings:      subAgentOutput(result),
-			runErr:        err,
-			stoppedInLoop: dispatchRunStoppedInLoop(result),
-			diff: func(ctx context.Context) (string, error) {
-				return run.provider.Diff(ctx, run.entry)
-			},
-		})
-	}
-	// The kill watch ends with the run on both paths, before terminal
-	// assembly fires the escalation hook against a finished dispatch.
+	// One execution path (#347): the served dispatch is driven through
+	// the A2A client, its SSE stream consumed to the terminal state.
+	// The injection target above is the same agent the server's executor
+	// runs — one object on both sides of the protocol boundary.
+	terminal, servedUsage := c.runDispatchOverTransport(ctx, run)
+	// The kill watch ends with the run, before terminal assembly fires
+	// the escalation hook against a finished dispatch.
 	watchStop()
 
 	// Drop the injection target before the terminal status is published
@@ -876,20 +853,14 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// child-row copy, which is what lets an out-of-process or remote
 	// dispatched agent (#72/#73) report cost at all. A dispatch whose
 	// usage is missing or undecodable leaves the parent's cost
-	// untouched. The direct in-process path keeps the row-copy mirror.
-	// Both are best-effort, mirroring runSubAgent: a failure here must
-	// not lose the run's outcome.
-	switch {
-	case servedUsage != nil:
+	// untouched. This is best-effort, mirroring runSubAgent: a failure
+	// here must not lose the run's outcome.
+	if servedUsage != nil {
 		if err := c.sessions.AddSessionUsage(ctx, run.parentSessionID, servedUsage.PromptTokens, servedUsage.CompletionTokens, servedUsage.Cost); err != nil {
 			slog.Warn("Failed to add dispatched usage to parent session", "child_session", run.sessionID, "parent_session", run.parentSessionID, "error", err)
 		}
-	case ok:
+	} else {
 		slog.Warn("Served dispatch carried no usage; parent cost unchanged", "child_session", run.sessionID, "parent_session", run.parentSessionID)
-	default:
-		if err := c.updateParentSessionCost(ctx, run.sessionID, run.parentSessionID); err != nil {
-			slog.Warn("Failed to update parent session cost", "child_session", run.sessionID, "parent_session", run.parentSessionID, "error", err)
-		}
 	}
 
 	c.deliverDispatchResult(ctx, run.parentSessionID, terminal)
@@ -972,11 +943,10 @@ func (c *coordinator) persistDispatchTerminalResult(ctx context.Context, run dis
 	}
 }
 
-// dispatchNaturalOutcome is the path-neutral natural outcome of one
-// dispatched run (#343): what the run did, before the kill and loop
-// rules are applied. The direct path fills it from Run's (result, err);
-// the transport path fills it from the DispatchTransportOutcome — so
-// both paths assemble through one set of rules and read the same.
+// dispatchNaturalOutcome is the natural outcome of one dispatched run
+// (#343): what the run did, before the kill and loop rules are applied.
+// The transport fills it via dispatchNaturalOutcomeFromTransport — the
+// only execution path since #347.
 type dispatchNaturalOutcome struct {
 	// completed reports whether the run finished its turn naturally —
 	// false for failed, canceled, and runs that never started a turn.
@@ -985,21 +955,13 @@ type dispatchNaturalOutcome struct {
 	// turn text may arrive here as the last turn's; assembleDispatchResult
 	// prefers the run's findings record over it (#397).
 	findings string
-	// runErr is the run's error; nil when the turn ran to a natural end
-	// or was stopped by the loop-detection stop condition.
+	// runErr is the run's error; nil when the turn ran to a natural end.
 	runErr error
-	// stoppedInLoop reports that the run ended on the loop-detection
-	// stop condition, detected from the result's steps. The transport
-	// path carries no steps: there a loop stop arrives as the kill
-	// state's tool-loop reason instead, recorded in-process by the
-	// served agent's observer.
-	stoppedInLoop bool
-	// diff resolves the run's diff-vs-base on demand. The direct path
-	// captures in-process after the run; the transport path prefers the
-	// diff that arrived on the wire and falls back to an in-process
-	// capture when none did, so a capture error surfaces as "(diff
-	// unavailable: ...)" instead of "(no changes)" (#361 puts the error
-	// on the wire and deletes this).
+	// diff resolves the run's diff-vs-base on demand: the transport
+	// prefers the diff that arrived on the wire and falls back to an
+	// in-process capture when none did, so a capture error surfaces as
+	// "(diff unavailable: ...)" instead of "(no changes)" (#361 puts the
+	// error on the wire and deletes this).
 	diff func(ctx context.Context) (string, error)
 	// killReason is a kill reason the transport outcome carried (#348):
 	// a terminal Canceled whose status message is one of the kill
@@ -1012,18 +974,17 @@ type dispatchNaturalOutcome struct {
 
 // assembleTerminalDispatchResult maps a finished dispatched run onto its
 // terminal DispatchResult, preferring the kill outcome (#316) over the
-// natural one: a run the ladder or watchdog killed — or one the
-// loop-detection stop ended — is killed, and everything else falls
+// natural one: a run the ladder or watchdog killed — or one the served
+// agent's loop observer stopped — is killed, and everything else falls
 // through to the completed/failed mapping. A run that completed
 // naturally before the kill's cancel took effect delivers its natural
 // completion (the late kill is discarded).
 func (c *coordinator) assembleTerminalDispatchResult(ctx context.Context, run dispatchRun, natural dispatchNaturalOutcome) dispatch.DispatchResult {
 	if reason := run.kill.current(); reason != "" {
 		// The kill's cancel either ended the run (error) or stopped it on
-		// loop detection — recorded as the tool-loop kill reason by the
-		// served agent's observer, or visible in the direct path's
-		// result steps.
-		if natural.runErr != nil || reason == dispatch.ReasonToolLoop || natural.stoppedInLoop {
+		// loop detection — the loop reason is recorded in-process by the
+		// served agent's observer.
+		if natural.runErr != nil || reason == dispatch.ReasonToolLoop {
 			return c.assembleKilledDispatchResult(ctx, run, reason)
 		}
 	} else if natural.killReason != "" {
@@ -1031,10 +992,6 @@ func (c *coordinator) assembleTerminalDispatchResult(ctx context.Context, run di
 		// (#348): the served task's Canceled status message is a kill
 		// reason, so the parent reads killed with it.
 		return c.assembleKilledDispatchResult(ctx, run, natural.killReason)
-	} else if natural.stoppedInLoop {
-		// Loop detection's StopWhen ended the run in-process with no kill
-		// recorded; the block records it as the tool-loop kill reason.
-		return c.assembleKilledDispatchResult(ctx, run, dispatch.ReasonToolLoop)
 	}
 	return c.assembleDispatchResult(ctx, run, natural)
 }
@@ -1049,17 +1006,6 @@ func (c *coordinator) killDispatchSessionJobs(ctx context.Context, run dispatchR
 	if killed > 0 {
 		slog.Debug("Killed dispatch background jobs", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "killed", killed)
 	}
-}
-
-// dispatchRunStoppedInLoop reports whether a finished run ended on the
-// loop-detection stop condition (#316's tool-loop kill reason): the same
-// signature check the StopWhen in Run uses, applied to the result's
-// steps.
-func dispatchRunStoppedInLoop(result *fantasy.AgentResult) bool {
-	if result == nil {
-		return false
-	}
-	return hasRepeatedToolCalls(result.Steps, loopDetectionWindowSize, loopDetectionMaxRepeats)
 }
 
 // startDispatchKillWatch runs the time-based kill reasons (#316) for one
@@ -1375,9 +1321,12 @@ func (c *coordinator) flushPendingResults(parentSessionID string) {
 		prompt.WriteString("\n\n")
 	}
 
-	go func() {
+	c.startDispatchRun(func() {
 		// Detached: the flush caller (a dispatch goroutine or a run-end
-		// hook) must not block on the delivery turn. WithoutCancel: the
+		// hook) must not block on the delivery turn. Riding the spawn seam
+		// (#422) keeps it a plain goroutine in production while letting a
+		// test's reaper join it, so no delivery turn races the test's
+		// TempDir removal. WithoutCancel: the
 		// dispatch goroutine's context ends when deliverDispatchResult
 		// returns, and the delivered turn must outlive it. The hidden
 		// marker keeps the injected prompt out of the chat UI — the
@@ -1417,7 +1366,7 @@ func (c *coordinator) flushPendingResults(parentSessionID string) {
 				c.flushPendingResults(parentSessionID)
 			})
 		}
-	}()
+	})
 }
 
 // dispatchRegistry returns the coordinator's dispatch registry,

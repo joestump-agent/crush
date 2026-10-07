@@ -14,74 +14,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// runnerTransport is the fake A2A host (#343): StartDispatchServer
-// records the DispatchServerParams like the real factory, and
-// StreamDispatch drives the recorded runner with the recorded call,
-// mapping the outcome the way the executor does (#342) — a canceled run
-// to canceled, an error or a nil result to failed, anything else to
-// completed with the response text and the diff artifact, with diff
-// capture errors dropped.
-type runnerTransport struct {
-	mu     sync.Mutex
-	served []DispatchServerParams
-}
-
-func (f *runnerTransport) StartDispatchServer(ctx context.Context, params DispatchServerParams) (string, any, func(), error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.served = append(f.served, params)
-	return "http://127.0.0.1:19999", "fake-card", func() {}, nil
-}
-
-// serve records the runner and call the way StartDispatchServer does,
-// for tests that drive the run without standing up the server half.
-func (f *runnerTransport) serve(params DispatchServerParams) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.served = append(f.served, params)
-}
-
-func (f *runnerTransport) lastServed() DispatchServerParams {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.served[len(f.served)-1]
-}
-
-func (f *runnerTransport) StreamDispatch(ctx context.Context, _ DispatchTransportParams) (DispatchTransportOutcome, error) {
-	params := f.lastServed()
-	result, err := params.Runner.Run(ctx, params.Call)
-	switch {
-	case errors.Is(err, context.Canceled):
-		return DispatchTransportOutcome{Status: transportStatusCanceled}, nil
-	case err != nil:
-		return DispatchTransportOutcome{Status: transportStatusFailed, Text: err.Error()}, nil
-	case result == nil:
-		return DispatchTransportOutcome{Status: transportStatusFailed, Text: "agent session did not start a turn (busy or canceled)"}, nil
-	}
-	outcome := DispatchTransportOutcome{
-		Status: transportStatusCompleted,
-		Text:   subAgentOutput(result),
-	}
-	if params.Diff != nil {
-		// The wire carries the diff verdict itself (#361): the diff, or
-		// the capture error when it failed.
-		diff, derr := params.Diff(ctx)
-		switch {
-		case derr != nil:
-			outcome.DiffError = derr.Error()
-		case diff != "":
-			outcome.Diff = diff
-		}
-	}
-	return outcome, nil
-}
-
 // gatedServingTransport is the a2a factory's test double: it starts
-// "servers" like fakeServerStarter and also implements the transport
+// "servers" like fakeDispatchHost and also implements the transport
 // seam (#71), gating the stream so a test can inject mid-run exactly as
 // against the real loopback server.
 type gatedServingTransport struct {
-	fakeServerStarter
+	fakeDispatchHost
 
 	gate     chan struct{}
 	gateOnce sync.Once
@@ -161,7 +99,7 @@ func TestDispatchRunsOverTransportSeam(t *testing.T) {
 		Diff:          "--- a/x\n+++ b/x\n@@\n+y",
 		WorkingEvents: 3,
 	})
-	c.SetDispatchServerStarter(transport)
+	c.SetDispatchHost(transport)
 	tool := c.dispatchTool()
 
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{
@@ -224,7 +162,7 @@ func TestDispatchStreamStampsRegistryTaskID(t *testing.T) {
 		Text:   "done, all fixed",
 	})
 	transport.taskID = "task-123"
-	c.SetDispatchServerStarter(transport)
+	c.SetDispatchHost(transport)
 	tool := c.dispatchTool()
 
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{
@@ -260,7 +198,7 @@ func TestDispatchTransportStreamErrorFails(t *testing.T) {
 	c, _ := newInjectionEnv(t, agent)
 	transport := newGatedServingTransport(DispatchTransportOutcome{})
 	transport.err = errors.New("connection reset")
-	c.SetDispatchServerStarter(transport)
+	c.SetDispatchHost(transport)
 	tool := c.dispatchTool()
 
 	decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
@@ -287,7 +225,7 @@ func TestDispatchTransportStreamErrorCancelsRun(t *testing.T) {
 	c, _ := newInjectionEnv(t, agent)
 	transport := newGatedServingTransport(DispatchTransportOutcome{})
 	transport.err = errors.New("SSE stream error: context deadline exceeded")
-	c.SetDispatchServerStarter(transport)
+	c.SetDispatchHost(transport)
 	tool := c.dispatchTool()
 
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
@@ -305,22 +243,6 @@ func TestDispatchTransportStreamErrorCancelsRun(t *testing.T) {
 	require.Equal(t, []string{handle.SessionID}, agent.cancels())
 	// The cancel did not double-run the prompt directly.
 	require.False(t, agent.ranOnce())
-}
-
-// A starter that is not a transport keeps the direct in-process path:
-// the server exists (endpoint stamped) but the coordinator drives the
-// agent itself, as before #71.
-func TestServedButNotTransportedRunsDirectly(t *testing.T) {
-	agent := newGatedDispatchAgent()
-	c, _ := newInjectionEnv(t, agent)
-	c.SetDispatchServerStarter(&fakeServerStarter{})
-	tool := c.dispatchTool()
-
-	decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
-	agent.waitRunning(t)
-	require.True(t, agent.ranOnce(), "a served dispatch without a transport runs directly")
-
-	agent.release()
 }
 
 // assembleFromTransport runs the transported outcome through the same
@@ -430,12 +352,12 @@ func newTestRepoForTransport(t *testing.T) string {
 	return dir
 }
 
-// TestDispatchParityAcrossPaths pins #343: every terminal outcome a
-// dispatched run can reach reads the same on the direct in-process path
-// and the served transport path — same status, kill reason, diff
-// summary and handle — because both paths assemble through one set of
-// rules.
-func TestDispatchParityAcrossPaths(t *testing.T) {
+// TestDispatchTerminalOutcomesEndToEnd pins the outcome table #343
+// unified and #347 made the only path: every terminal outcome a
+// dispatched run can reach — kill, loop stop, diff error, natural
+// completion, late kill — reads the same status, kill reason, diff
+// summary and handle through the one served execution path.
+func TestDispatchTerminalOutcomesEndToEnd(t *testing.T) {
 	t.Parallel()
 
 	type want struct {
@@ -550,57 +472,52 @@ func TestDispatchParityAcrossPaths(t *testing.T) {
 		},
 	}
 
-	for _, path := range []string{"direct", "transport"} {
-		for _, sc := range scenarios {
-			t.Run(path+"/"+sc.name, func(t *testing.T) {
-				t.Parallel()
-				var f *wanderKillFixture
-				switch sc.name {
-				case "hard timeout":
-					model := &scriptedModel{steps: []scriptedStep{
-						{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
-						{text: "done"},
-					}}
-					blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
-					settings := config.TodoEnforcementSettings{Enabled: false, HardTimeout: 200 * time.Millisecond}
-					f = newWanderKillFixture(t, model, settings)
-					f.runModel = blocked
-					f.buildDispatched(t, blocked, settings, nil)
-				case "ignored nudges":
-					var steps []scriptedStep
-					for range 3 {
-						steps = append(steps, scriptedStep{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}})
-					}
-					steps = append(steps, scriptedStep{text: "done"})
-					settings := config.TodoEnforcementSettings{Enabled: true, NudgeThreshold: 1, KillAfterNudges: 1}
-					f = newWanderKillFixture(t, &scriptedModel{steps: steps}, settings)
-				case "tool loop":
-					var steps []scriptedStep
-					for range 12 {
-						steps = append(steps, scriptedStep{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}})
-					}
-					steps = append(steps, scriptedStep{text: "done"})
-					settings := config.TodoEnforcementSettings{Enabled: true, NudgeThreshold: 50, KillAfterNudges: 0}
-					f = newWanderKillFixture(t, &scriptedModel{steps: steps}, settings)
-				default:
-					settings := config.TodoEnforcementSettings{}
-					f = newWanderKillFixture(t, &scriptedModel{steps: []scriptedStep{{text: "all done"}}}, settings)
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			t.Parallel()
+			var f *wanderKillFixture
+			switch sc.name {
+			case "hard timeout":
+				model := &scriptedModel{steps: []scriptedStep{
+					{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+					{text: "done"},
+				}}
+				blocked := &blockingScriptedModel{scriptedModel: model, hold: make(chan struct{})}
+				settings := config.TodoEnforcementSettings{Enabled: false, HardTimeout: 200 * time.Millisecond}
+				f = newWanderKillFixture(t, model, settings)
+				f.runModel = blocked
+				f.buildDispatched(t, blocked, settings, nil)
+			case "ignored nudges":
+				var steps []scriptedStep
+				for range 3 {
+					steps = append(steps, scriptedStep{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}})
 				}
-				if path == "transport" {
-					f.wireTransport(t, &runnerTransport{})
+				steps = append(steps, scriptedStep{text: "done"})
+				settings := config.TodoEnforcementSettings{Enabled: true, NudgeThreshold: 1, KillAfterNudges: 1}
+				f = newWanderKillFixture(t, &scriptedModel{steps: steps}, settings)
+			case "tool loop":
+				var steps []scriptedStep
+				for range 12 {
+					steps = append(steps, scriptedStep{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}})
 				}
-				sc.build(t, f)
+				steps = append(steps, scriptedStep{text: "done"})
+				settings := config.TodoEnforcementSettings{Enabled: true, NudgeThreshold: 50, KillAfterNudges: 0}
+				f = newWanderKillFixture(t, &scriptedModel{steps: steps}, settings)
+			default:
+				settings := config.TodoEnforcementSettings{}
+				f = newWanderKillFixture(t, &scriptedModel{steps: []scriptedStep{{text: "all done"}}}, settings)
+			}
+			sc.build(t, f)
 
-				w := sc.check(t, f)
-				entry, ok := f.reg.Get(f.entry.ID)
-				require.True(t, ok)
-				require.NotNil(t, entry.Result)
-				require.Equal(t, w.status, entry.Result.Status, "both paths must report the same status")
-				require.Equal(t, w.reason, entry.Result.KilledReason, "both paths must report the same kill reason")
-				require.Equal(t, "tester", entry.Result.Handle, "both paths must carry the handle")
-				require.Contains(t, entry.Result.DiffSummary, w.summaryOf(f), "both paths must report the same diff outcome")
-			})
-		}
+			w := sc.check(t, f)
+			entry, ok := f.reg.Get(f.entry.ID)
+			require.True(t, ok)
+			require.NotNil(t, entry.Result)
+			require.Equal(t, w.status, entry.Result.Status, "the outcome table holds end to end")
+			require.Equal(t, w.reason, entry.Result.KilledReason, "the kill reason maps through")
+			require.Equal(t, "tester", entry.Result.Handle, "the result carries the handle")
+			require.Contains(t, entry.Result.DiffSummary, w.summaryOf(f), "the diff outcome maps through")
+		})
 	}
 }
 
@@ -617,7 +534,7 @@ func TestTransportFinalStepSteerKeepsDispatchFindings(t *testing.T) {
 	model := newGatedFinalTextModel()
 	c := newFinalStepDispatchEnv(t, env, model, nil)
 	transport := &runnerTransport{}
-	c.SetDispatchServerStarter(transport)
+	c.SetDispatchHost(transport)
 	tool := c.dispatchTool()
 
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{

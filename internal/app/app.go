@@ -905,8 +905,10 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		// attaches as a second sink over the same reduction.
 		DispatchSinks: []dispatch.TodoSink{app},
 		// #70: every dispatch is registered on the process-wide A2A host
-		// for in-memory discovery and served over its unix socket.
-		DispatchServer: a2aFactory,
+		// for in-memory discovery and served over its unix socket. This
+		// is the one execution path (#347): without it dispatches are
+		// refused.
+		DispatchHost: a2aFactory,
 	}
 
 	// Semantic search is opt-in: only wire the store and client when an

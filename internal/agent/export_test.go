@@ -107,12 +107,12 @@ type DispatchHarness struct {
 // NewDispatchHarness builds the harness: a git-rooted coordinator, the
 // scripted model installed as the dispatched agent through the real
 // dispatched-agent builder, a recording fake main agent on a real
-// parent session, the A2A server starter wired, and a terminal
+// parent session, the A2A host wired, and a terminal
 // transition counter fed by the dispatch registry's event stream. The
 // settings resolve through the coordinator's global todo-enforcement
 // options — the same path the dispatch tool reads — so the watchdog and
 // the A2A backstop arm exactly as configured.
-func NewDispatchHarness(t *testing.T, model fantasy.LanguageModel, settings config.TodoEnforcementSettings, starter DispatchServerStarter) *DispatchHarness {
+func NewDispatchHarness(t *testing.T, model fantasy.LanguageModel, settings config.TodoEnforcementSettings, host DispatchHost) *DispatchHarness {
 	t.Helper()
 	env := testEnv(t)
 	initGitRepo(t, env.workingDir)
@@ -167,8 +167,8 @@ func NewDispatchHarness(t *testing.T, model fantasy.LanguageModel, settings conf
 	c.mainAgentName = config.AgentCoder
 	c.agents = map[string]SessionAgent{config.AgentCoder: h.main}
 
-	if starter != nil {
-		c.SetDispatchServerStarter(starter)
+	if host != nil {
+		c.SetDispatchHost(host)
 	}
 
 	events := c.dispatchRegistry().Subscribe(t.Context())

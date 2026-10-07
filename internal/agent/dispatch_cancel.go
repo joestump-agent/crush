@@ -115,7 +115,7 @@ func (c *coordinator) killDispatch(reg *dispatch.AgentRegistry, entryID, reason 
 	if fallback == nil {
 		fallback = func() { c.cancelDispatchRun(entryID) }
 	}
-	canceler, ok := c.dispatchServerStarter().(DispatchCanceler)
+	canceler, ok := c.a2aHost().(DispatchCanceler)
 	if !ok || canceler == nil {
 		fallback()
 		return
