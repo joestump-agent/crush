@@ -328,8 +328,10 @@ func TestTCPListenerServesDispatchOverTLS(t *testing.T) {
 	require.Equal(t, "fix the bug over tls", runner.gotCall.Prompt)
 }
 
-// The TCP listener is TLS only (#358): plain HTTP to the same port is
-// answered with the TLS server's 400 and never reaches a route.
+// The TCP listener is TLS only (#358): plain HTTP to the same port fails
+// and never reaches a route. The TLS server usually answers 400, but it
+// closes the connection right after, so the client may see the close
+// first; either outcome is the failure this asserts.
 func TestTCPListenerRejectsPlainHTTP(t *testing.T) {
 	t.Parallel()
 
@@ -345,12 +347,14 @@ func TestTCPListenerRejectsPlainHTTP(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(bearerAuthorizationHeader, "Bearer "+factory.authToken())
 	resp, err := plain.Do(req)
-	require.NoError(t, err)
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	require.NoError(t, err)
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	require.Contains(t, string(body), "HTTPS server")
+	if err == nil {
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr == nil {
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode, "plain HTTP must not succeed")
+			require.Contains(t, string(body), "HTTPS server")
+		}
+	}
 	require.False(t, runner.ran, "plain HTTP must never reach the runner")
 }
 
