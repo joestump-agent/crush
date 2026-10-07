@@ -232,3 +232,10 @@ type WriteResponseMetadata struct {
 	Additions int    `json:"additions"`
 	Removals  int    `json:"removals"`
 }
+
+// ReplaceSymbolToolName is the name of the LSP replace-symbol tool.
+const ReplaceSymbolToolName = tools.ReplaceSymbolToolName
+
+// ReplaceSymbolPermissionsParams represents the permission parameters for
+// the LSP replace-symbol tool.
+type ReplaceSymbolPermissionsParams = tools.ReplaceSymbolPermissionsParams

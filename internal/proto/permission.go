@@ -136,9 +136,17 @@ func unmarshalToolParams(toolName string, raw json.RawMessage) (any, error) {
 			return nil, err
 		}
 		return params, nil
+	case ReplaceSymbolToolName:
+		var params ReplaceSymbolPermissionsParams
+		if err := json.Unmarshal(raw, &params); err != nil {
+			return nil, err
+		}
+		return params, nil
 	default:
-		// For unknown tools, keep the raw JSON as-is.
-		var generic map[string]any
+		// For unknown tools, keep the JSON value as decoded, whatever its
+		// shape: MCP tools pass their raw input as a JSON string, which
+		// the permission dialog renders as is (#353).
+		var generic any
 		if err := json.Unmarshal(raw, &generic); err != nil {
 			return nil, err
 		}
