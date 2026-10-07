@@ -128,7 +128,7 @@ See [Scheduled tasks](/features/scheduled-tasks).
 | Tool | Does |
 | --- | --- |
 | `todos` | A structured task list for multi-step work; each task is pending, in progress, or completed. In the fork, an agent that works without one is nudged to start one — see [Todo enforcement](/agents/todo-enforcement) |
-| `question` | Ask you a structured question and wait for the answer. Interactive sessions only; never available to sub-agents |
+| `question` | Ask you a structured question and wait for the answer. Interactive sessions only; never available to sub-agents. A [dispatched agent](#what-dispatched-agents-get) gets it while the session is interactive |
 | `crush_info` | Crush's live runtime state: active model and provider, LSP/MCP status, skills, hooks, permissions, disabled tools |
 | `crush_logs` | Read Crush's internal application logs — useful when debugging Crush itself |
 | `agent` | Launch a sub-agent with `glob`, `grep`, `ls`, and `view`, for searches that need several tries |
@@ -170,8 +170,12 @@ A dispatched agent gets the `agent` sub-agent's read-only set — `glob`,
 `lsp_symbols`, and `lsp_call_hierarchy` — plus `bash`, `edit`, `multiedit`,
 `write`, and `todos`. Every path-based tool is rooted at the agent's worktree.
 
-It never gets `agent`, `agentic_fetch`, `question`, MCP tools, semantic
-search, `dispatch_agent`, or `message_agent`. The outer `dispatch_agent` and
+While the session is interactive it also gets `question`: each question
+pauses the dispatched run and appears in your question prompt labeled with the
+agent's `@handle`, and the run resumes with your answer.
+
+It never gets `agent`, `agentic_fetch`, MCP tools, semantic search,
+`dispatch_agent`, or `message_agent`. The outer `dispatch_agent` and
 `message_agent` calls are hooked like any top-level tool call.
 
 :::warning[Known issue]
