@@ -189,6 +189,17 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 	}
 	store.SetupAgents()
 
+	// The default dispatch agent names a resolved agent (#433): checked
+	// once the agents exist, so an unknown, non-dispatch, or disabled
+	// id fails the load like a bad agent definition does. An enabled
+	// agent that resolves to no tools fails here too.
+	if err := store.Config().ValidateDispatchDefaultAgent(); err != nil {
+		return nil, fmt.Errorf("invalid dispatch configuration: %w", err)
+	}
+	if err := store.Config().ValidateAgentToolsets(); err != nil {
+		return nil, fmt.Errorf("invalid agent definitions: %w", err)
+	}
+
 	// Capture initial staleness snapshot
 	// Capture initial staleness snapshot. Track every discovered config path,
 	// not just the ones that loaded, so a config file created after startup

@@ -506,12 +506,21 @@ type Options struct {
 // disk, memory and API budget.
 const DefaultDispatchMaxConcurrent = 4
 
+// DefaultDispatchAgent is the agent definition dispatch_agent runs when
+// its call names no agent (#433).
+const DefaultDispatchAgent = AgentWorker
+
 // DispatchOptions configures the dispatch_agent tool (#390).
 type DispatchOptions struct {
 	// MaxConcurrent caps the concurrently running dispatched agents:
 	// live dispatches plus setups still in flight. A value below 1 is
 	// a load error; nil resolves to DefaultDispatchMaxConcurrent.
 	MaxConcurrent *int `json:"max_concurrent,omitempty" jsonschema:"description=Maximum number of concurrently running dispatched agents; a value below 1 is a load error,default=4,example=2"`
+	// DefaultAgent is the agent id dispatch_agent runs when its call
+	// names no agent (#433). It must name an existing dispatch agent
+	// that is not disabled; anything else is a load error. Empty
+	// resolves to DefaultDispatchAgent.
+	DefaultAgent string `json:"default_agent,omitempty" jsonschema:"description=Agent id dispatch_agent runs when the call names no agent; must be an enabled dispatch agent,default=worker"`
 }
 
 // GetDispatchMaxConcurrent returns the resolved dispatch concurrency cap
@@ -525,6 +534,17 @@ func (o *Options) GetDispatchMaxConcurrent() int {
 	return *o.Dispatch.MaxConcurrent
 }
 
+// GetDispatchDefaultAgent returns the resolved default dispatch agent
+// id (#433): the configured default_agent, or DefaultDispatchAgent when
+// unset. The nil receiver and the empty field both mean the default, so
+// callers can ask without unwrapping either.
+func (o *Options) GetDispatchDefaultAgent() string {
+	if o == nil || o.Dispatch == nil || o.Dispatch.DefaultAgent == "" {
+		return DefaultDispatchAgent
+	}
+	return o.Dispatch.DefaultAgent
+}
+
 // Validate checks the dispatch concurrency cap: a positive value
 // configures it, and a value below 1 is a load error, not a setting —
 // a cap of 0 would refuse every dispatch. The path names the block in
@@ -535,6 +555,80 @@ func (d *DispatchOptions) Validate(path string) error {
 	}
 	if d.MaxConcurrent != nil && *d.MaxConcurrent < 1 {
 		return fmt.Errorf("%s.max_concurrent: must be at least 1 (got %d)", path, *d.MaxConcurrent)
+	}
+	return nil
+}
+
+// ValidateDispatchDefaultAgent checks options.dispatch.default_agent
+// against the resolved agents (#433): the id must exist and be a dispatch
+// agent, so a dispatch that names no agent never fails at dispatch time
+// on a bad default. An explicitly named disabled id is an error; the
+// implicit default resolving to a disabled worker is not — that is the
+// opt-out, and the dispatch tools simply go away with it. It runs after
+// SetupAgents, at load and reload time, and names the config path in
+// every error.
+func (c *Config) ValidateDispatchDefaultAgent() error {
+	const path = "options.dispatch.default_agent"
+	explicit := c.Options != nil && c.Options.Dispatch != nil && c.Options.Dispatch.DefaultAgent != ""
+	id := c.Options.GetDispatchDefaultAgent()
+	agent, ok := c.Agents[id]
+	if !ok {
+		return fmt.Errorf("%s: unknown agent %q", path, id)
+	}
+	if agent.Role != AgentRoleDispatch {
+		return fmt.Errorf("%s: agent %q is a %q agent, not a dispatch agent", path, id, agent.Role)
+	}
+	if agent.Disabled && explicit {
+		return fmt.Errorf("%s: agent %q is disabled", path, id)
+	}
+	return nil
+}
+
+// definitionToolset resolves a definition's own tool palette: allow
+// expanded (an omitted list inherits every tool), minus deny — before
+// the user's disabled_tools. Policy is not a definition error (#433),
+// so the load-time sanity check reads this set, not the policy-filtered
+// AllowedTools the resolved Agent carries.
+func definitionToolset(def AgentDefinition) []string {
+	var toolsSpec AgentTools
+	if def.Tools != nil {
+		toolsSpec = *def.Tools
+	}
+	allow := allToolNames()
+	if toolsSpec.Allow != nil {
+		allow = expandToolRefs(toolsSpec.Allow)
+	}
+	if deny := expandToolRefs(toolsSpec.Deny); len(deny) > 0 {
+		allow = slices.DeleteFunc(allow, func(name string) bool {
+			return slices.Contains(deny, name)
+		})
+	}
+	return allow
+}
+
+// ValidateAgentToolsets runs the load-time sanity checks (#433): an
+// enabled coder, plan, or dispatch agent whose definition resolves to no
+// tools fails the load instead of quietly producing an agent that can do
+// nothing. The user's disabled_tools and permissions deny are policy,
+// not definition errors — they keep their runtime behavior, including
+// the #376 refusal. A disabled agent always loads: it is the opt-out.
+// It runs after SetupAgents, at load and reload time, and names the
+// config path in every error.
+func (c *Config) ValidateAgentToolsets() error {
+	effective := effectiveAgentDefinitions(c.AgentDefinitions)
+	for _, id := range slices.Sorted(maps.Keys(effective)) {
+		switch definitionRole(id, effective[id]) {
+		case AgentRoleMain, AgentRoleDispatch:
+		default:
+			continue
+		}
+		if agent, ok := c.Agents[id]; !ok || agent.Disabled {
+			continue
+		}
+		if len(definitionToolset(effective[id])) > 0 {
+			continue
+		}
+		return fmt.Errorf("agents.%s: enabled agent resolves to no tools", id)
 	}
 	return nil
 }
@@ -1443,21 +1537,9 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 		enforcementDef.TodoEnforcement = &trimmed
 	}
 
-	var toolsSpec AgentTools
-	if def.Tools != nil {
-		toolsSpec = *def.Tools
-	}
 	// Only an omitted allow list inherits every tool: an explicit empty
 	// allow grants nothing, matching expand(allow) minus expand(deny).
-	allow := allToolNames()
-	if toolsSpec.Allow != nil {
-		allow = expandToolRefs(toolsSpec.Allow)
-	}
-	if deny := expandToolRefs(toolsSpec.Deny); len(deny) > 0 {
-		allow = slices.DeleteFunc(allow, func(name string) bool {
-			return slices.Contains(deny, name)
-		})
-	}
+	allow := definitionToolset(def)
 	allowedTools := resolveAllowedTools(allow, c.Options.DisabledTools)
 
 	var mcpAllow []string

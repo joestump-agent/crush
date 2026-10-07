@@ -66,6 +66,9 @@ type DispatchResult struct {
 	// uses in the editor and the model uses with the message tool.
 	// Empty for results from before handles existed.
 	Handle string `json:"handle,omitempty"`
+	// Agent is the agent definition id the dispatch ran (#433). Empty
+	// for results from before the field existed.
+	Agent string `json:"agent,omitempty"`
 	// Branch is the workspace branch, crush-dispatch-{id}.
 	Branch string `json:"branch"`
 	// WorkspacePath is the absolute workspace directory the dispatched

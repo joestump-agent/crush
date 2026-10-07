@@ -70,3 +70,183 @@ func TestDispatchOptionsValidate(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "options.dispatch.max_concurrent")
 }
+
+func TestOptionsGetDispatchDefaultAgent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		options  *Options
+		expected string
+	}{
+		{
+			name:     "nil options",
+			options:  nil,
+			expected: DefaultDispatchAgent,
+		},
+		{
+			name:     "unset section",
+			options:  &Options{},
+			expected: DefaultDispatchAgent,
+		},
+		{
+			name:     "unset field",
+			options:  &Options{Dispatch: &DispatchOptions{}},
+			expected: DefaultDispatchAgent,
+		},
+		{
+			name:     "configured",
+			options:  &Options{Dispatch: &DispatchOptions{DefaultAgent: "reviewer"}},
+			expected: "reviewer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.expected, tt.options.GetDispatchDefaultAgent())
+		})
+	}
+}
+
+func TestOptionsDispatchDefaultAgentFromJSON(t *testing.T) {
+	t.Parallel()
+
+	var cfg Config
+	require.NoError(t, json.Unmarshal([]byte(`{"options":{"dispatch":{"default_agent":"reviewer"}}}`), &cfg))
+	require.NotNil(t, cfg.Options.Dispatch)
+	require.Equal(t, "reviewer", cfg.Options.Dispatch.DefaultAgent)
+	require.Equal(t, "reviewer", cfg.Options.GetDispatchDefaultAgent())
+}
+
+// ValidateDispatchDefaultAgent runs against the resolved agents, so every
+// case below populates Config.Agents the way SetupAgents would.
+func TestValidateDispatchDefaultAgent(t *testing.T) {
+	t.Parallel()
+
+	agents := func(m map[string]Agent) map[string]Agent { return m }
+	worker := Agent{ID: AgentWorker, Role: AgentRoleDispatch}
+
+	tests := []struct {
+		name    string
+		options *Options
+		agents  map[string]Agent
+		wantErr string
+	}{
+		{
+			name:    "unset default resolves to the worker",
+			options: &Options{},
+			agents:  agents(map[string]Agent{AgentWorker: worker}),
+		},
+		{
+			name:    "valid user dispatch agent",
+			options: &Options{Dispatch: &DispatchOptions{DefaultAgent: "reviewer"}},
+			agents: agents(map[string]Agent{
+				AgentWorker: worker,
+				"reviewer":  {ID: "reviewer", Role: AgentRoleDispatch},
+			}),
+		},
+		{
+			name:    "unknown agent",
+			options: &Options{Dispatch: &DispatchOptions{DefaultAgent: "nope"}},
+			agents:  agents(map[string]Agent{AgentWorker: worker}),
+			wantErr: `options.dispatch.default_agent: unknown agent "nope"`,
+		},
+		{
+			name:    "non-dispatch agent",
+			options: &Options{Dispatch: &DispatchOptions{DefaultAgent: "coder"}},
+			agents: agents(map[string]Agent{
+				AgentWorker: worker,
+				"coder":     {ID: "coder", Role: AgentRoleMain},
+			}),
+			wantErr: `options.dispatch.default_agent: agent "coder" is a "main" agent, not a dispatch agent`,
+		},
+		{
+			name:    "disabled agent",
+			options: &Options{Dispatch: &DispatchOptions{DefaultAgent: "reviewer"}},
+			agents: agents(map[string]Agent{
+				AgentWorker: worker,
+				"reviewer":  {ID: "reviewer", Role: AgentRoleDispatch, Disabled: true},
+			}),
+			wantErr: `options.dispatch.default_agent: agent "reviewer" is disabled`,
+		},
+		{
+			name:    "an implicitly disabled worker is the opt-out, not an error",
+			options: &Options{},
+			agents:  agents(map[string]Agent{AgentWorker: {ID: AgentWorker, Role: AgentRoleDispatch, Disabled: true}}),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := &Config{Options: tt.options, Agents: tt.agents}
+			err := c.ValidateDispatchDefaultAgent()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
+// ValidateAgentToolsets runs the #433 load-time sanity checks against
+// the resolved agents, so every case resolves definitions through
+// SetupAgents first.
+func TestValidateAgentToolsets(t *testing.T) {
+	t.Parallel()
+
+	validate := func(t *testing.T, agentsJSON string) error {
+		t.Helper()
+		var cfg Config
+		cfg.Options = &Options{}
+		if agentsJSON != "" {
+			require.NoError(t, json.Unmarshal([]byte(agentsJSON), &cfg.AgentDefinitions))
+		}
+		cfg.SetupAgents()
+		return cfg.ValidateAgentToolsets()
+	}
+
+	t.Run("the defaults all resolve to tools", func(t *testing.T) {
+		t.Parallel()
+		require.NoError(t, validate(t, ""))
+	})
+
+	t.Run("an @read worker is the reviewer use case and loads", func(t *testing.T) {
+		t.Parallel()
+		require.NoError(t, validate(t, `{"worker": {"tools": {"allow": ["@read"]}}}`))
+	})
+
+	t.Run("a disabled worker is the opt-out and loads", func(t *testing.T) {
+		t.Parallel()
+		require.NoError(t, validate(t, `{"worker": {"disabled": true}}`))
+	})
+
+	t.Run("a tool-less coder fails at load", func(t *testing.T) {
+		t.Parallel()
+		err := validate(t, `{"coder": {"tools": {"allow": []}}}`)
+		require.EqualError(t, err, "agents.coder: enabled agent resolves to no tools")
+	})
+
+	t.Run("a tool-less plan fails at load", func(t *testing.T) {
+		t.Parallel()
+		err := validate(t, `{"plan": {"tools": {"allow": []}}}`)
+		require.EqualError(t, err, "agents.plan: enabled agent resolves to no tools")
+	})
+
+	t.Run("a tool-less dispatch agent fails at load", func(t *testing.T) {
+		t.Parallel()
+		err := validate(t, `{"reviewer": {"role": "dispatch", "tools": {"allow": []}}}`)
+		require.EqualError(t, err, "agents.reviewer: enabled agent resolves to no tools")
+	})
+
+	t.Run("a disabled tool-less dispatch agent loads", func(t *testing.T) {
+		t.Parallel()
+		require.NoError(t, validate(t, `{"reviewer": {"role": "dispatch", "disabled": true, "tools": {"allow": []}}}`))
+	})
+
+	t.Run("a tool-less task keeps its runtime behavior", func(t *testing.T) {
+		t.Parallel()
+		require.NoError(t, validate(t, `{"task": {"tools": {"allow": []}}}`))
+	})
+}

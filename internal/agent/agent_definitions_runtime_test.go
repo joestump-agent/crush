@@ -345,7 +345,10 @@ func TestWorkerDefinitionModel(t *testing.T) {
 		{name: "the worker's slot is the default", agents: `{"worker": {"model": "large"}}`, want: defLargeProvider},
 		{name: "the parameter overrides the worker's slot", agents: `{"worker": {"model": "large"}}`, modelType: config.SelectedModelTypeSmall, want: defSmallProvider},
 		{name: "a pinned worker runs on its pin", agents: `{"worker": {"model": ` + pinJSON + `}}`, want: defPinProvider},
-		{name: "a pin wins over the parameter", agents: `{"worker": {"model": ` + pinJSON + `}}`, modelType: config.SelectedModelTypeLarge, want: defPinProvider},
+		// The tool refuses a model parameter on a pinned definition
+		// (#433); this subtest covers the builder's defensive fallback
+		// for callers that drive it directly.
+		{name: "a pinned worker keeps its pin when the builder is driven directly", agents: `{"worker": {"model": ` + pinJSON + `}}`, modelType: config.SelectedModelTypeLarge, want: defPinProvider},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -369,6 +372,45 @@ func TestWorkerDefinitionModel(t *testing.T) {
 			require.Equal(t, tt.want, dispatched.agent.Model().ModelCfg.Provider)
 		})
 	}
+}
+
+// The toolchain builder resolves opts.Agent (#433): the tools come from
+// the named definition, an empty id means the worker, and an unknown id
+// fails the build the way a bad default agent fails the load.
+func TestBuildDispatchToolchainResolvesAgent(t *testing.T) {
+	t.Parallel()
+
+	env := testEnv(t)
+	initGitRepo(t, env.workingDir)
+	c := newDefinitionCoordinator(t, env, `{"reviewer": {"role": "dispatch"}}`, "")
+
+	_, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: env.workingDir, Agent: "nope"})
+	require.ErrorContains(t, err, `agent "nope" not configured`)
+
+	entry, _ := provisionDispatchEntry(t, c, "")
+	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path, Agent: "reviewer"})
+	require.NoError(t, err)
+	t.Cleanup(func() { tc.Close(context.Background()) })
+
+	// A read-only reviewer stands out next to the worker's default
+	// palette: bash is a worker write tool a read-only definition drops.
+	c.cfg.Config().AgentDefinitions = map[string]config.AgentDefinition{
+		"reviewer": {Role: ptr(config.AgentRoleDispatch), Tools: &config.AgentTools{Allow: []string{"@read"}}},
+	}
+	c.cfg.Config().SetupAgents()
+	readOnly, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path, Agent: "reviewer"})
+	require.NoError(t, err)
+	t.Cleanup(func() { readOnly.Close(context.Background()) })
+
+	names := func(tc *DispatchToolchain) []string {
+		out := make([]string, 0, len(tc.Tools()))
+		for _, tool := range tc.Tools() {
+			out = append(out, tool.Info().Name)
+		}
+		return out
+	}
+	require.Contains(t, names(tc), tools.BashToolName, "the worker toolchain keeps the default palette")
+	require.NotContains(t, names(readOnly), tools.BashToolName, "the reviewer toolchain is read-only")
 }
 
 // fakeDefinitionMCPTool stands in for an MCP tool in filterMCPTools: only the

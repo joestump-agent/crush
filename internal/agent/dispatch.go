@@ -137,12 +137,17 @@ type DispatchToolchainOptions struct {
 	// rooted at — the path the git worktree provider (#63) provisions.
 	// Required.
 	WorkingDir string
+	// Agent is the id of the agent definition the toolchain's tools are
+	// built from (#433); empty means the worker definition.
+	Agent string
 }
 
 // BuildDispatchToolchain builds a dispatched agent's entire toolchain
 // rooted at opts.WorkingDir: the file/bash tools are constructed with
 // workingDir = the workspace path, and the LSP manager and permission
-// service are rooted there too. The scoped config store is the parent's
+// service are rooted there too. The tool palette is the selected agent
+// definition's (#433): opts.Agent names it, empty meaning the worker
+// definition. The scoped config store is the parent's
 // configuration viewed from the workspace directory (#374): the model
 // chooses the base revision, so nothing that revision's config files
 // declare — shell config, permissions, command allow-lists, LSP
@@ -166,12 +171,16 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 		return nil, fmt.Errorf("dispatch working directory %q does not exist", opts.WorkingDir)
 	}
 
-	workerCfg, ok := c.cfg.Config().Agents[config.AgentWorker]
-	if !ok {
-		return nil, errors.New("worker agent not configured")
+	agentID := opts.Agent
+	if agentID == "" {
+		agentID = config.AgentWorker
 	}
-	if workerCfg.Disabled {
-		return nil, errors.New("worker agent is disabled")
+	agentCfg, ok := c.cfg.Config().Agents[agentID]
+	if !ok {
+		return nil, fmt.Errorf("agent %q not configured", agentID)
+	}
+	if agentCfg.Disabled {
+		return nil, fmt.Errorf("agent %q is disabled", agentID)
 	}
 
 	// Scoped config: the parent's configuration viewed from the
@@ -222,7 +231,7 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 	if c.isInteractive() {
 		t.questions = question.NewService()
 	}
-	t.tools = c.buildDispatchTools(workerCfg, t)
+	t.tools = c.buildDispatchTools(agentCfg, t)
 	return t, nil
 }
 
