@@ -2,6 +2,8 @@ package a2a
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -389,8 +391,9 @@ func (f *ServerFactory) Close(ctx context.Context) error {
 }
 
 // ensureHost lazily starts the process-wide listener: the socket lives
-// under the data directory (created 0700) and is named after the pid, so
-// a stale file always belongs to a dead process and plain removal before
+// under the data directory (created 0700) and is named after the pid —
+// and, on the temp-dir fallback, a hash of the data directory — so a
+// stale file always belongs to a dead process and plain removal before
 // the bind is safe; no live-server probing is needed. The socket is
 // chmod-ed 0600 right after the bind (non-Windows), so only the same
 // user can reach the unauthenticated JSON-RPC surface (#346).
@@ -445,25 +448,69 @@ func (f *ServerFactory) ensureHost(ctx context.Context) error {
 // a2aSocketPath returns where the process host binds its socket:
 // under the data directory when the path fits the 104-byte sun_path
 // limit, otherwise under a per-user, 0700 directory in [os.TempDir].
+//
+// Both paths are unique per (process, data directory). The primary path
+// gets that from its directory; the fallback directory is shared by
+// every data directory, so its file name carries a short hash of the
+// data directory next to the pid. Without it, two hosts in one process
+// rooted at different data directories would share one fallback path,
+// and the second bind would remove the first host's live socket and
+// take over its traffic.
+//
+// The fallback exists only to fit the path limit, so every component
+// stays short: the user directory names a long uid by its hash, and the
+// data directory hash is 8 hex characters.
 func a2aSocketPath(dataDir string) (string, error) {
 	uid := "unknown"
 	if usr, err := user.Current(); err == nil && usr.Uid != "" {
 		uid = usr.Uid
 	}
-	name := fmt.Sprintf("%d.sock", os.Getpid())
 	dir := filepath.Join(dataDir, a2aSocketDirName)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("a2a: create socket dir: %w", err)
 	}
-	path := filepath.Join(dir, name)
+	path := filepath.Join(dir, fmt.Sprintf("%d.sock", os.Getpid()))
 	if len(path) <= maxUnixSocketPathLen {
 		return path, nil
 	}
-	dir = filepath.Join(os.TempDir(), "crush-a2a-"+uid)
+	dir = filepath.Join(os.TempDir(), "crush-a2a-"+fallbackUserTag(uid))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("a2a: create fallback socket dir: %w", err)
 	}
+	name := fmt.Sprintf("%d-%s.sock", os.Getpid(), shortHash(fallbackDataDirKey(dataDir), 4))
 	return filepath.Join(dir, name), nil
+}
+
+// maxFallbackUserTagLen is the longest uid the fallback directory names
+// as is: any POSIX uid fits.
+const maxFallbackUserTagLen = 12
+
+// fallbackUserTag names the user in the fallback socket directory: the
+// uid itself when it is short, otherwise 12 hex characters of its hash.
+// A Windows SID runs to about 45 characters, which on its own nearly
+// fills the 108-byte AF_UNIX path under the user's temp directory.
+func fallbackUserTag(uid string) string {
+	if len(uid) <= maxFallbackUserTagLen {
+		return uid
+	}
+	return shortHash(uid, maxFallbackUserTagLen/2)
+}
+
+// fallbackDataDirKey is the data directory as the fallback socket name
+// hashes it: absolute, so two spellings of one directory share a socket
+// the way they share the primary path.
+func fallbackDataDirKey(dataDir string) string {
+	abs, err := filepath.Abs(dataDir)
+	if err != nil {
+		return filepath.Clean(dataDir)
+	}
+	return abs
+}
+
+// shortHash returns the first n bytes of s's SHA-256, hex-encoded.
+func shortHash(s string, n int) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:n])
 }
 
 // serveHTTP is the host's single root handler (#346): middleware first,

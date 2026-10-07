@@ -425,6 +425,84 @@ func TestHostLongDataDirFallsBack(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
+// Two hosts in one process whose data dirs both overflow the socket
+// path limit share the fallback directory but never a socket (#346):
+// before the fallback name carried the data dir, the second bind
+// removed the first host's live socket and took over its traffic, so a
+// client reached the wrong host. Each host keeps its own socket and
+// serves its own dispatch.
+func TestHostFallbackSocketIsPerDataDir(t *testing.T) {
+	type host struct {
+		factory *ServerFactory
+		server  *Server
+		runner  *fakeRunner
+	}
+	start := func() host {
+		deep := filepath.Join(t.TempDir(), strings.Repeat("sub/", 60))
+		primary := filepath.Join(deep, a2aSocketDirName, fmt.Sprintf("%d.sock", os.Getpid()))
+		require.Greater(t, len(primary), maxUnixSocketPathLen, "the test data dir must overflow the socket path limit")
+
+		runner := &fakeRunner{result: textResult("done")}
+		factory := NewServerFactory(deep)
+		server, err := factory.StartServer(t.Context(), ServerParams{
+			DispatchID: "dispatch-1",
+			Runner:     runner,
+			SessionID:  "dispatch-session",
+			ContextID:  "dispatch-session",
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = factory.Close(context.Background()) })
+		return host{factory: factory, server: server, runner: runner}
+	}
+	first, second := start(), start()
+
+	fallback := filepath.Join(os.TempDir(), "crush-a2a-")
+	for _, h := range []host{first, second} {
+		require.True(t, strings.HasPrefix(h.factory.socketPath(), fallback),
+			"the socket must fall back to the per-user temp dir, got %s", h.factory.socketPath())
+		require.LessOrEqual(t, len(h.factory.socketPath()), maxUnixSocketPathLen,
+			"the fallback exists to fit the socket path limit, got %s", h.factory.socketPath())
+	}
+	require.NotEqual(t, first.factory.socketPath(), second.factory.socketPath(),
+		"hosts rooted at different data dirs must not share a fallback socket")
+	_, err := os.Stat(first.factory.socketPath())
+	require.NoError(t, err, "the second host's bind must leave the first host's socket in place")
+
+	for i, h := range []host{first, second} {
+		resp, err := postJSONRPC(t, unixDialClient(h.factory), h.server.Endpoint, sendMessageBody(t, "dispatch-session", "run the task"))
+		require.NoError(t, err)
+		var rpcResp struct {
+			Result struct {
+				Task *a2aspec.Task `json:"task"`
+			} `json:"result"`
+			Error any `json:"error"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&rpcResp))
+		_ = resp.Body.Close()
+		require.Nil(t, rpcResp.Error, "host %d must serve its own dispatch on its own socket", i)
+		require.NotNil(t, rpcResp.Result.Task)
+		require.Equal(t, a2aspec.TaskStateCompleted, rpcResp.Result.Task.Status.State)
+		require.True(t, h.runner.ran, "host %d's own runner must serve its socket", i)
+	}
+}
+
+// The fallback directory names a POSIX uid as is, and a long uid — a
+// Windows SID, which alone nearly fills the AF_UNIX path limit under
+// the user's temp dir — by a short hash that still tells users apart.
+func TestFallbackUserTag(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "501", fallbackUserTag("501"))
+	require.Equal(t, "unknown", fallbackUserTag("unknown"))
+
+	sid := "S-1-5-21-1643835476-1616584234-1346609752-500"
+	tag := fallbackUserTag(sid)
+	require.Len(t, tag, maxFallbackUserTagLen)
+	require.Equal(t, tag, fallbackUserTag(sid), "the tag must be stable for one user")
+	require.NotEqual(t, tag, fallbackUserTag("S-1-5-21-1643835476-1616584234-1346609752-501"),
+		"different users must get different directories")
+}
+
 // A stale socket file at the host's path is replaced on start: the path
 // is pid-scoped, so anything there belongs to a dead process and plain
 // removal before the bind is safe (#346).
