@@ -94,7 +94,12 @@ func TestDispatchE2EOverServerFactory(t *testing.T) {
 			},
 			model: blockedModel,
 			check: func(t *testing.T, entry dispatch.Entry, elapsed time.Duration) {
-				require.Less(t, elapsed, 10*time.Second,
+				// Timed from the run's own start, not the dispatch call:
+				// provisioning the worktree is no part of the kill, and on
+				// a loaded Windows runner it alone can take seconds.
+				require.False(t, entry.StartedAt.IsZero(), "the dispatched agent started running")
+				require.False(t, entry.FinishedAt.IsZero(), "the kill recorded when the run ended")
+				require.Less(t, entry.FinishedAt.Sub(entry.StartedAt), 10*time.Second,
 					"the kill must end the dispatch in seconds, not the three-minute stream cut")
 				require.Equal(t, dispatch.StatusKilled, entry.Status)
 				require.Equal(t, dispatch.ReasonHardTimeout, entry.Result.KilledReason)
