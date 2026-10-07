@@ -450,6 +450,86 @@ func TestTCPListenerMutualTLS(t *testing.T) {
 	require.Equal(t, task.ID, listResp.Result.Tasks[0].ID)
 }
 
+// A client certificate's identity is its issuer and subject (#358), so
+// two CAs issuing the same subject name two identities, and a
+// certificate without a subject is named by its fingerprint.
+func TestCertIdentity(t *testing.T) {
+	t.Parallel()
+
+	pki := newTestPKI(t)
+	otherCA, otherKey := newTestCA(t, "second CA")
+	first := clientCert(t, pki.ca, pki.caKey, "peer-host")
+	second := clientCert(t, otherCA, otherKey, "peer-host")
+
+	require.Equal(t, "CN=crush test CA/CN=peer-host", certIdentity(first.Leaf))
+	require.Equal(t, "CN=second CA/CN=peer-host", certIdentity(second.Leaf))
+
+	der, _ := pki.issue(t, &x509.Certificate{ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
+	bare, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+	require.Regexp(t, `^CN=crush test CA/sha256:[0-9a-f]{64}$`, certIdentity(bare))
+}
+
+// Two CAs in one client_ca bundle that issue the same subject do not
+// share a task namespace (#358): each holder lists only its own tasks
+// and cannot read the other's.
+func TestTCPListenerMutualTLSSeparatesCAs(t *testing.T) {
+	t.Parallel()
+
+	pki := newTestPKI(t)
+	otherCA, otherKey := newTestCA(t, "second CA")
+	bundle := filepath.Join(pki.dir, "bundle.pem")
+	data := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pki.ca.Raw})
+	data = append(data, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: otherCA.Raw})...)
+	require.NoError(t, os.WriteFile(bundle, data, 0o600))
+
+	opts := pki.listenerOptions()
+	opts.ClientCA = bundle
+	_, server := startTCPDispatch(t, opts, &fakeRunner{result: textResult("done")})
+	url := server.Card.SupportedInterfaces[1].URL
+
+	firstCert := clientCert(t, pki.ca, pki.caKey, "peer-host")
+	secondCert := clientCert(t, otherCA, otherKey, "peer-host")
+	first := pki.httpsClient(t, &firstCert)
+	second := pki.httpsClient(t, &secondCert)
+
+	task, rpcErr := sendOverTCP(t, first, url, "", "")
+	require.Nil(t, rpcErr)
+	require.NotNil(t, task)
+
+	listTasks := func(client *http.Client) []*a2aspec.Task {
+		body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "ListTasks", "params": map[string]any{}})
+		require.NoError(t, err)
+		resp, err := postJSONRPC(t, client, url, body)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		var listResp struct {
+			Result struct {
+				Tasks []*a2aspec.Task `json:"tasks"`
+			} `json:"result"`
+			Error any `json:"error"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&listResp))
+		require.Nil(t, listResp.Error)
+		return listResp.Result.Tasks
+	}
+	require.Len(t, listTasks(first), 1, "the holder sees its own task")
+	require.Empty(t, listTasks(second), "the same subject from another CA sees nothing")
+
+	getBody, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "GetTask", "params": map[string]any{"id": task.ID}})
+	require.NoError(t, err)
+	resp, err := postJSONRPC(t, second, url, getBody)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	var getResp struct {
+		Result *a2aspec.Task `json:"result"`
+		Error  *rpcError     `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&getResp))
+	require.NotNil(t, getResp.Error, "another CA's holder cannot read the task")
+	require.Nil(t, getResp.Result)
+}
+
 // Close shuts both listeners (#358): the socket file is gone and the
 // TCP listener accepts nothing more.
 func TestTCPListenerClosedOnShutdown(t *testing.T) {

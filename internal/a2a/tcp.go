@@ -301,14 +301,18 @@ func (t *tcpHost) serveContext(routeCtx context.Context, r *http.Request) contex
 	return context.WithValue(routeCtx, remotePeerContextKey{}, peer)
 }
 
-// certIdentity names a verified client certificate: its subject, or its
-// SHA-256 fingerprint when the subject is empty.
+// certIdentity names a verified client certificate "<issuer>/<subject>"
+// by its distinguished names (#358). A client_ca bundle can hold several
+// CAs, and two of them can issue the same subject: keyed by the subject
+// alone, their holders would share one task namespace. An empty subject
+// falls back to the certificate's SHA-256 fingerprint.
 func certIdentity(cert *x509.Certificate) string {
-	if subject := cert.Subject.String(); subject != "" {
-		return subject
+	subject := cert.Subject.String()
+	if subject == "" {
+		sum := sha256.Sum256(cert.Raw)
+		subject = "sha256:" + hex.EncodeToString(sum[:])
 	}
-	sum := sha256.Sum256(cert.Raw)
-	return "sha256:" + hex.EncodeToString(sum[:])
+	return cert.Issuer.String() + "/" + subject
 }
 
 // advertisedAddr is the host:port the cards list for the TCP listener:
