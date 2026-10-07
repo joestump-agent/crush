@@ -232,6 +232,33 @@ var PermissionDecisionExt = Extension{
 	Schema:      new(jsonschema.Reflector).Reflect(agent.PermissionDecision{}),
 }
 
+// UndeliveredSteersExtensionURI is the URI of the undelivered-steers/v1
+// extension: the steers a dispatched agent accepted but never consumed,
+// carried in the dispatch's terminal TaskStatusUpdateEvent metadata (#398).
+const UndeliveredSteersExtensionURI = extensionURIPrefix + "undelivered-steers/v1"
+
+// UndeliveredSteersExt is the undelivered-steers/v1 extension's registry
+// entry.
+var UndeliveredSteersExt = Extension{
+	URI:         UndeliveredSteersExtensionURI,
+	Description: "Steers the dispatched agent accepted but never consumed, in terminal TaskStatusUpdateEvent metadata.",
+	Type:        reflect.TypeFor[agent.UndeliveredSteers](),
+	Schema:      new(jsonschema.Reflector).Reflect(agent.UndeliveredSteers{}),
+}
+
+// SteerRefusalExtensionURI is the URI of the steer-refusals/v1 extension:
+// why a dispatched agent refused a steer, carried in the steer task's
+// Rejected TaskStatusUpdateEvent metadata (#398).
+const SteerRefusalExtensionURI = extensionURIPrefix + "steer-refusals/v1"
+
+// SteerRefusalExt is the steer-refusals/v1 extension's registry entry.
+var SteerRefusalExt = Extension{
+	URI:         SteerRefusalExtensionURI,
+	Description: "Why the dispatched agent refused a steer, in the steer task's Rejected TaskStatusUpdateEvent metadata.",
+	Type:        reflect.TypeFor[agent.SteerRefusal](),
+	Schema:      new(jsonschema.Reflector).Reflect(agent.SteerRefusal{}),
+}
+
 // The statically known extensions, registered at init so every card, stream,
 // and decode sees them.
 func init() {
@@ -241,6 +268,8 @@ func init() {
 	mustRegister(AnswerExt)
 	mustRegister(PermissionExt)
 	mustRegister(PermissionDecisionExt)
+	mustRegister(UndeliveredSteersExt)
+	mustRegister(SteerRefusalExt)
 }
 
 // cardExtensions derives the agent card's advertised extension list from the

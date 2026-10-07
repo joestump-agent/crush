@@ -321,11 +321,9 @@ func (c *coordinator) teardownLiveDispatch(id string) {
 // client stream, and one more shared bound; anything that outlives that
 // is logged with its dispatch ID and left to its run goroutine.
 func (c *coordinator) cancelDispatchesForShutdown() {
-	// Raise the flag before touching any dispatch: from here on a
-	// finishing dispatch records its terminal state but starts no
-	// parent delivery turn.
-	c.shuttingDown.Store(true)
-
+	// CancelAll raised the shutdown flag before canceling anything: a
+	// dispatch finishing from here on records its terminal state but
+	// starts no parent delivery turn.
 	type shutdownTarget struct {
 		id   string
 		live *liveDispatch
@@ -1156,6 +1154,9 @@ type dispatchNaturalOutcome struct {
 	// out-of-process supervisor (#72/#73) that killed the served task
 	// directly. Empty unless the wire said killed.
 	killReason string
+	// undeliveredSteers are the steers the served agent accepted but
+	// never consumed (#398), from the transport outcome.
+	undeliveredSteers []string
 }
 
 // assembleTerminalDispatchResult maps a finished dispatched run onto its
@@ -1166,6 +1167,16 @@ type dispatchNaturalOutcome struct {
 // naturally before the kill's cancel took effect delivers its natural
 // completion (the late kill is discarded).
 func (c *coordinator) assembleTerminalDispatchResult(ctx context.Context, run dispatchRun, natural dispatchNaturalOutcome) dispatch.DispatchResult {
+	// Whatever the outcome, the steers the agent never read are named
+	// on it (#398).
+	terminal := c.assembleTerminalOutcome(ctx, run, natural)
+	terminal.UndeliveredSteers = natural.undeliveredSteers
+	return terminal
+}
+
+// assembleTerminalOutcome is assembleTerminalDispatchResult's choice
+// between the kill outcome and the natural one.
+func (c *coordinator) assembleTerminalOutcome(ctx context.Context, run dispatchRun, natural dispatchNaturalOutcome) dispatch.DispatchResult {
 	if reason := run.kill.current(); reason != "" {
 		// The kill's cancel either ended the run (error) or stopped it on
 		// loop detection — the loop reason is recorded in-process by the

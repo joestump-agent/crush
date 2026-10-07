@@ -344,6 +344,25 @@ func (s *dispatchStream) answer(ctx context.Context, q agent.QuestionRequest) (*
 	return &a2aspec.SendMessageRequest{Message: msg}, nil
 }
 
+// steerRefusalReason decodes the typed reason a served agent gave for
+// refusing a steer (#398), from the steer-refusals/v1 extension on the
+// status update; empty when it carried none.
+func steerRefusalReason(ev *a2aspec.TaskStatusUpdateEvent) string {
+	raw, ok := ev.Meta()[SteerRefusalExt.URI]
+	if !ok {
+		return ""
+	}
+	decoded, err := DecodeValue(SteerRefusalExt, raw)
+	if err != nil {
+		slog.Warn("A2A steer refusal failed to decode; dropped", "err", err)
+		return ""
+	}
+	if refusal, ok := decoded.(*agent.SteerRefusal); ok {
+		return refusal.Reason
+	}
+	return ""
+}
+
 // cancelParked ends a parked task no answer is coming for (#352): a
 // tasks/cancel carrying the reason, on a context detached from the
 // caller's — the cancel must land even when the caller's context is what
@@ -604,6 +623,9 @@ func (d *metadataDecoder) apply(outcome *agent.DispatchTransportOutcome, ev *a2a
 		// parent's cost unchanged rather than charging a partial reading.
 		if usage, ok := decoded.(*agent.Usage); ok && ev.Status.State.Terminal() {
 			outcome.Usage = usage
+		}
+		if steers, ok := decoded.(*agent.UndeliveredSteers); ok {
+			outcome.UndeliveredSteers = steers.Steers
 		}
 	}
 }
@@ -1084,6 +1106,7 @@ func steerDispatch(ctx context.Context, client *a2aclient.Client, p agent.Dispat
 		if sue.Status.Message != nil {
 			outcome.Text = statusUpdateMessageText(sue)
 		}
+		outcome.Reason = steerRefusalReason(sue)
 		return outcome, nil
 	}
 	if !accepted && outcome.Status == "" {

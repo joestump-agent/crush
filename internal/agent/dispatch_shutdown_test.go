@@ -88,6 +88,10 @@ type shutdownMainAgent struct {
 	mu         sync.Mutex
 	runs       []SessionAgentCall
 	cancelAlls int
+	// onCancelAll, when set, runs inside CancelAll: it models what a
+	// real agent's cancel triggers while CancelAll waits, such as a run
+	// ending on the parent session.
+	onCancelAll func()
 }
 
 func (m *shutdownMainAgent) Run(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
@@ -103,7 +107,12 @@ func (m *shutdownMainAgent) CancelAll() {
 	m.mu.Lock()
 	m.cancelAlls++
 	m.mu.Unlock()
+	if m.onCancelAll != nil {
+		m.onCancelAll()
+	}
 }
+
+func (m *shutdownMainAgent) IsSessionBusy(string) bool { return false }
 
 func (m *shutdownMainAgent) runCount() int {
 	m.mu.Lock()
@@ -316,4 +325,61 @@ func TestDeliverDispatchResultSkippedWhileShuttingDown(t *testing.T) {
 	})
 
 	require.Never(t, func() bool { return main.runCount() > 0 }, 500*time.Millisecond, 25*time.Millisecond)
+}
+
+// CancelAll raises the shutdown flag before it cancels the main agent
+// (#372). That cancel ends the parent's runs, and each run end fires the
+// pending-result flush; a dispatch can also finish while the cancel
+// waits. Neither may start a delivery turn: the results stay pending for
+// the next start's reconcile.
+func TestCancelAllRaisesShutdownBeforeCancelingAgents(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		trigger func(c *coordinator, parentID string)
+	}{
+		{
+			name: "run end flush",
+			trigger: func(c *coordinator, parentID string) {
+				c.flushPendingResults(parentID)
+			},
+		},
+		{
+			name: "dispatch finishing",
+			trigger: func(c *coordinator, parentID string) {
+				c.deliverDispatchResult(context.Background(), parentID, dispatch.DispatchResult{
+					DispatchID: "d-late",
+					Status:     dispatch.StatusCompleted,
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			main := &shutdownMainAgent{model: dispatchTestModel()}
+			c, env := newShutdownTestCoordinator(t, main)
+
+			parent, err := env.sessions.Create(t.Context(), "parent")
+			require.NoError(t, err)
+			c.dispatchMu.Lock()
+			c.pendingResults = map[string][]dispatch.DispatchResult{
+				parent.ID: {{DispatchID: "d-pending", Status: dispatch.StatusCompleted}},
+			}
+			c.dispatchMu.Unlock()
+
+			// Record delivery turns instead of running them, so a turn
+			// that starts is seen synchronously.
+			var spawned atomic.Int32
+			c.spawnDispatch = func(func()) { spawned.Add(1) }
+			main.onCancelAll = func() { tc.trigger(c, parent.ID) }
+
+			c.CancelAll()
+
+			require.Zero(t, spawned.Load(), "no delivery turn may start once CancelAll has begun")
+			require.Equal(t, 0, main.runCount())
+			c.dispatchMu.Lock()
+			require.NotEmpty(t, c.pendingResults[parent.ID], "undelivered results stay pending")
+			c.dispatchMu.Unlock()
+		})
+	}
 }

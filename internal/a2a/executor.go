@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"charm.land/fantasy"
@@ -44,6 +45,15 @@ type Runner interface {
 
 // Compile-time proof that a real SessionAgent can be used as a Runner.
 var _ Runner = agent.SessionAgent(nil)
+
+// queueClearer is the optional slice of a [Runner] that drops a session's
+// queued calls, reporting each one unconsumed to its OnConsumed (#398).
+// The executor clears a dispatch's session when its run ends, so the
+// steers it never read are reported rather than left waiting. A real
+// SessionAgent has it.
+type queueClearer interface {
+	ClearQueue(sessionID string)
+}
 
 // DiffFunc returns the git diff produced by a dispatched run, emitted as the
 // task's completion artifact. It is called after a successful run. An empty
@@ -183,16 +193,31 @@ type Executor struct {
 	// onTurn is told the task that starts the dispatch's own turn (#421);
 	// nil when nothing tracks it.
 	onTurn func(taskID string)
+	// runEnded is set once the dispatch's run goroutine has returned
+	// (#398): a steer the runner refuses before then is refused as not
+	// ready, not as a finished run.
+	runEnded atomic.Bool
 	// turnMu guards turnStarted (#351): one executor serves one
 	// dispatch's route, and every message on its context either starts
 	// the dispatch's own turn — the first one — or is a steer.
 	turnMu      sync.Mutex
 	turnStarted bool
-	// runsMu guards runs: the in-flight run records by task ID (#352).
-	// A record outlives the execution that drains it, so the executor —
-	// not Execute's stack — owns it.
+	// steersMu guards steers and undelivered (#398): steers holds every
+	// steer accepted into the running session's queue whose fate is not
+	// known yet, and undelivered the text of each one the queue dropped
+	// unread. The run's terminal status reports undelivered.
+	steersMu    sync.Mutex
+	steers      map[*steerRecord]struct{}
+	undelivered []string
+	// runsMu guards runs and live. runs holds the in-flight run records
+	// by task ID (#352): a record outlives the execution that drains it,
+	// so the executor — not Execute's stack — owns it. live holds every
+	// run goroutine that has not returned yet. A record leaves runs when
+	// its drain ends or a cancel drops it, while its goroutine may still
+	// be unwinding a tool call, so stopRuns joins live, not runs.
 	runsMu sync.Mutex
 	runs   map[string]*taskRun
+	live   map[*taskRun]struct{}
 	// hooks are test-only seams; every field is nil in production.
 	hooks executorHooks
 }
@@ -239,6 +264,8 @@ type taskRun struct {
 	cancel context.CancelFunc
 	// done receives the run goroutine's single outcome.
 	done chan runOutcome
+	// exited is closed once the run goroutine has returned.
+	exited chan struct{}
 	// todoCh is the run's todo subscription (#174); nil without a todo
 	// source.
 	todoCh <-chan dispatch.TodoSnapshot
@@ -460,6 +487,14 @@ func (e *Executor) finish(ctx context.Context, execCtx *a2asrv.ExecutorContext, 
 		// The consumer stopped consuming mid-run: nothing further can
 		// be delivered, and the run's own outcome is dropped with it.
 		return
+	}
+
+	// The run is over (#398): steers still queued on its session will
+	// never be read. Drop them, and name every unread steer on the
+	// terminal status this execution yields.
+	unread := e.dropUnreadSteers(binding)
+
+	switch {
 	case errors.Is(err, context.Canceled):
 		// A canceled run is either this executor's own Cancel — which
 		// emits the terminal Canceled status itself, and a second one
@@ -479,12 +514,14 @@ func (e *Executor) finish(ctx context.Context, execCtx *a2asrv.ExecutorContext, 
 		ev := statusEvent(execCtx, a2aspec.TaskStateCanceled,
 			agentMessage(execCtx, e.canceledStatusText()))
 		e.attachUsage(ctx, ev, binding.SessionID, traceID)
+		attachUndeliveredSteers(ev, unread)
 		yield(ev, nil)
 		return
 	case err != nil:
 		ev := statusEvent(execCtx, a2aspec.TaskStateFailed,
 			agentMessage(execCtx, err.Error()))
 		e.attachUsage(ctx, ev, binding.SessionID, traceID)
+		attachUndeliveredSteers(ev, unread)
 		yield(ev, nil)
 		return
 	case result == nil:
@@ -496,6 +533,7 @@ func (e *Executor) finish(ctx context.Context, execCtx *a2asrv.ExecutorContext, 
 		ev := statusEvent(execCtx, a2aspec.TaskStateFailed,
 			agentMessage(execCtx, "agent session did not start a turn (busy or canceled)"))
 		e.attachUsage(ctx, ev, binding.SessionID, traceID)
+		attachUndeliveredSteers(ev, unread)
 		yield(ev, nil)
 		return
 	}
@@ -531,6 +569,7 @@ func (e *Executor) finish(ctx context.Context, execCtx *a2asrv.ExecutorContext, 
 	ev := statusEvent(execCtx, a2aspec.TaskStateCompleted,
 		agentMessage(execCtx, result.Response.Content.Text()))
 	e.attachUsage(ctx, ev, binding.SessionID, traceID)
+	attachUndeliveredSteers(ev, unread)
 	yield(ev, nil)
 }
 
@@ -810,6 +849,7 @@ func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		binding: binding,
 		cancel:  cancel,
 		done:    make(chan runOutcome, 1),
+		exited:  make(chan struct{}),
 	}
 	if e.todos != nil {
 		run.todoCh = e.todos.SubscribeSessionTodos(runCtx, binding.SessionID)
@@ -829,9 +869,16 @@ func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		e.runs = make(map[string]*taskRun)
 	}
 	e.runs[run.taskID] = run
+	if e.live == nil {
+		e.live = make(map[*taskRun]struct{})
+	}
+	e.live[run] = struct{}{}
 	e.runsMu.Unlock()
 
 	go func() {
+		// Deferred first so it runs last: the run has handed back its
+		// outcome, panic or not, before stopRuns can see it exit.
+		defer e.runExited(run)
 		// A panic in a tool or provider adapter must fail this task, not
 		// the whole process (#345): recover it, log it, and hand a run
 		// error back so Execute yields its single Failed status. The
@@ -841,6 +888,7 @@ func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("Dispatched run panicked", "session_id", binding.SessionID, "trace_id", traceIDFromContext(runCtx), "panic", r, "stack", string(debug.Stack()))
+				e.runEnded.Store(true)
 				run.done <- runOutcome{err: fmt.Errorf("dispatched run panicked: %v", r)}
 			}
 		}()
@@ -851,9 +899,53 @@ func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		// A2A task ID back as RunID, so the task and the run correlate.
 		call.RunID = run.taskID
 		result, err := binding.Runner.Run(runCtx, call)
+		e.runEnded.Store(true)
 		run.done <- runOutcome{result, err}
 	}()
 	return run
+}
+
+// runExited drops a returned run goroutine from live and closes its
+// exited channel.
+func (e *Executor) runExited(run *taskRun) {
+	e.runsMu.Lock()
+	delete(e.live, run)
+	e.runsMu.Unlock()
+	close(run.exited)
+}
+
+// stopRuns ends the executor's runs for the route's teardown: it cancels
+// every run it still records, parked ones included, then waits until
+// every run goroutine has returned or ctx ends. A canceled run can still
+// be unwinding a tool call in the dispatch's workspace, and the teardown
+// after Stop closes the toolchain and releases that workspace. A run that
+// starts during the wait is canceled and joined too.
+func (e *Executor) stopRuns(ctx context.Context) error {
+	e.runsMu.Lock()
+	records := e.runs
+	e.runs = nil
+	e.runsMu.Unlock()
+	for _, run := range records {
+		run.cancel()
+	}
+	for {
+		e.runsMu.Lock()
+		var next *taskRun
+		for run := range e.live {
+			next = run
+			break
+		}
+		e.runsMu.Unlock()
+		if next == nil {
+			return nil
+		}
+		next.cancel()
+		select {
+		case <-next.exited:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // drainRun drains the run record until the run ends or the drain cannot
@@ -1406,11 +1498,17 @@ func (e *Executor) executeSteer(ctx context.Context, execCtx *a2asrv.ExecutorCon
 	call.Steer = true
 	call.Accepted = nil
 	call.OnComplete = nil
-	call.OnConsumed = func(ok bool) { consumed <- ok }
+	// The steer is tracked until its verdict (#398): one the queue drops
+	// unread is reported on the run's terminal status.
+	steer := e.trackSteer(prompt)
+	call.OnConsumed = func(ok bool) {
+		e.settleSteer(steer, ok)
+		consumed <- ok
+	}
 
 	if !binding.Runner.EnqueueWhenBusy(call) {
-		yield(statusEvent(execCtx, a2aspec.TaskStateRejected,
-			agentMessage(execCtx, "agent is no longer running; task sessions are not continuable")), nil)
+		e.untrackSteer(steer)
+		yield(e.steerRefusedStatus(execCtx), nil)
 		return
 	}
 
@@ -1431,6 +1529,95 @@ func (e *Executor) executeSteer(ctx context.Context, execCtx *a2asrv.ExecutorCon
 				agentMessage(execCtx, "agent finished before the message was consumed")), nil)
 		}
 	}
+}
+
+// steerRecord is one accepted steer awaiting its verdict (#398).
+type steerRecord struct {
+	text string
+}
+
+// trackSteer records a steer about to be enqueued (#398).
+func (e *Executor) trackSteer(text string) *steerRecord {
+	rec := &steerRecord{text: text}
+	e.steersMu.Lock()
+	defer e.steersMu.Unlock()
+	if e.steers == nil {
+		e.steers = make(map[*steerRecord]struct{})
+	}
+	e.steers[rec] = struct{}{}
+	return rec
+}
+
+// untrackSteer forgets a steer the runner refused: it was never queued.
+func (e *Executor) untrackSteer(rec *steerRecord) {
+	e.steersMu.Lock()
+	defer e.steersMu.Unlock()
+	delete(e.steers, rec)
+}
+
+// settleSteer records a queued steer's verdict (#398): consumed steers are
+// forgotten, and the text of one dropped unread is kept for the run's
+// terminal status.
+func (e *Executor) settleSteer(rec *steerRecord, consumed bool) {
+	e.steersMu.Lock()
+	defer e.steersMu.Unlock()
+	if _, ok := e.steers[rec]; !ok {
+		return
+	}
+	delete(e.steers, rec)
+	if !consumed {
+		e.undelivered = append(e.undelivered, rec.text)
+	}
+}
+
+// dropUnreadSteers ends a finished run's steer bookkeeping (#398). The
+// dispatched session never runs again, so whatever is still queued on it
+// is dropped — each dropped steer's verdict reports it unread — and the
+// text of every steer the agent accepted but never read is returned.
+func (e *Executor) dropUnreadSteers(binding ContextBinding) []string {
+	if clearer, ok := binding.Runner.(queueClearer); ok {
+		clearer.ClearQueue(binding.SessionID)
+	}
+	e.steersMu.Lock()
+	defer e.steersMu.Unlock()
+	unread := e.undelivered
+	e.undelivered = nil
+	return unread
+}
+
+// attachUndeliveredSteers puts the steers the agent never read on a
+// terminal status under the undelivered-steers/v1 extension (#398).
+func attachUndeliveredSteers(ev *a2aspec.TaskStatusUpdateEvent, unread []string) {
+	if len(unread) == 0 {
+		return
+	}
+	encoded, err := Encode(UndeliveredSteersExt, agent.UndeliveredSteers{Steers: unread})
+	if err != nil {
+		slog.Warn("A2A undelivered steers failed to encode; terminal status omits them", "err", err)
+		return
+	}
+	ev.SetMeta(UndeliveredSteersExt.URI, encoded)
+}
+
+// steerRefusedStatus is the Rejected status for a steer the runner would
+// not enqueue (#398). While the run is still live its session can be
+// briefly idle: before the run marks it busy, and around a mid-turn
+// context compaction. That refusal says to send the message again and
+// carries the not-ready reason under the steer-refusals/v1 extension.
+// Once the run has returned, the refusal is final.
+func (e *Executor) steerRefusedStatus(execCtx *a2asrv.ExecutorContext) *a2aspec.TaskStatusUpdateEvent {
+	if e.runEnded.Load() {
+		return statusEvent(execCtx, a2aspec.TaskStateRejected,
+			agentMessage(execCtx, "agent is no longer running; task sessions are not continuable"))
+	}
+	ev := statusEvent(execCtx, a2aspec.TaskStateRejected,
+		agentMessage(execCtx, "agent is not ready for messages yet; send the message again in a moment"))
+	if encoded, err := Encode(SteerRefusalExt, agent.SteerRefusal{Reason: agent.SteerRefusalNotReady}); err != nil {
+		slog.Warn("A2A steer refusal failed to encode", "err", err)
+	} else {
+		ev.SetMeta(SteerRefusalExt.URI, encoded)
+	}
+	return ev
 }
 
 // steerAttachments decodes a steer message's non-text parts back into

@@ -250,6 +250,34 @@ type DispatchSteerParams struct {
 type DispatchSteerOutcome struct {
 	Status string
 	Text   string
+	// Reason is the served agent's typed reason for refusing the steer
+	// (#398), from the steer-refusals/v1 extension on its Rejected
+	// status: SteerRefusalNotReady while the run is live but cannot take
+	// the message yet. Empty for a plain refusal, such as a run that
+	// ended.
+	Reason string
+}
+
+// SteerRefusalNotReady is the reason a served agent gives for a steer it
+// would not enqueue while its run is still live (#398): the run has
+// started but its session is not taking messages yet, or is between the
+// run and a context compaction. The message can be sent again in a
+// moment; the run has not ended.
+const SteerRefusalNotReady = "not_ready"
+
+// SteerRefusal is the statically typed payload of the steer-refusals/v1
+// extension (#398): why a served agent refused a steer, carried in the
+// steer task's Rejected status metadata.
+type SteerRefusal struct {
+	Reason string `json:"reason"`
+}
+
+// UndeliveredSteers is the statically typed payload of the
+// undelivered-steers/v1 extension (#398): the text of every steer the
+// served agent accepted but never consumed, carried in the dispatch's
+// terminal status metadata.
+type UndeliveredSteers struct {
+	Steers []string `json:"steers"`
 }
 
 // DispatchSteerer is the steering half of the A2A client seam (#351):
@@ -303,6 +331,12 @@ type DispatchTransportOutcome struct {
 	// value that failed to decode — a dispatch whose usage is missing
 	// leaves the parent session's cost untouched.
 	Usage *Usage
+	// UndeliveredSteers are the steers the served agent accepted but
+	// never consumed before its run ended (#398), decoded from the
+	// terminal TaskStatusUpdateEvent metadata (extension
+	// https://crush.charm.land/ext/undelivered-steers/v1). Empty when
+	// every steer was consumed or the agent did not declare it.
+	UndeliveredSteers []string
 }
 
 // TodoItem is one entry of the todos/v1 extension's todo list, the
@@ -507,6 +541,7 @@ func dispatchNaturalOutcomeFromTransport(outcome DispatchTransportOutcome) dispa
 			return "", nil
 		}
 	}
+	natural.undeliveredSteers = outcome.UndeliveredSteers
 	switch outcome.Status {
 	case transportStatusCompleted:
 		natural.completed = true

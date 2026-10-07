@@ -315,10 +315,10 @@ func (w *agentTaskWatcher) steer(ctx context.Context, sessionID, handle, text st
 	}
 	// Until the executor has named the dispatch's own task, the first
 	// message on its context would start the dispatch's turn rather than
-	// steer it (#351): refuse, as the coordinator does before its server
-	// is up.
+	// steer it (#351). The agent is starting, not gone: refuse for now,
+	// as the coordinator does before its server is up (#398).
 	if d.TaskID == "" {
-		return fmt.Errorf("no running agent for session %s; dispatch one first", task.SessionID)
+		return fmt.Errorf("agent %s is not ready for messages yet; send the message again in a moment", task.SessionID)
 	}
 	client, ok := w.client()
 	if !ok {
