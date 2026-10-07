@@ -89,6 +89,69 @@ func (b *BlockingScriptedModel) Release() {
 	b.once.Do(func() { close(b.inner.hold) })
 }
 
+// FailingAfterGateModel is a dispatched-agent model whose first stream
+// call starts a text answer, signals Streaming, then holds until Fail and
+// ends the stream with a provider error (#398): the window a steer is
+// accepted in before the run ends without reading it.
+type FailingAfterGateModel struct {
+	fantasy.LanguageModel
+	streaming chan struct{}
+	fail      chan struct{}
+	once      sync.Once
+	failOnce  sync.Once
+}
+
+// NewFailingAfterGateModel builds a FailingAfterGateModel.
+func NewFailingAfterGateModel() *FailingAfterGateModel {
+	return &FailingAfterGateModel{
+		LanguageModel: newScriptedModelFromSteps(nil),
+		streaming:     make(chan struct{}),
+		fail:          make(chan struct{}),
+	}
+}
+
+// Streaming is closed once the first stream call is under way.
+func (m *FailingAfterGateModel) Streaming() <-chan struct{} { return m.streaming }
+
+// Fail ends the held stream with a provider error. Safe to call more
+// than once.
+func (m *FailingAfterGateModel) Fail() { m.failOnce.Do(func() { close(m.fail) }) }
+
+// Stream holds the turn, then fails it. A call without tools is not the
+// turn — the session's title generation also streams through this model —
+// and gets a short answer instead, so only the turn's own step holds.
+func (m *FailingAfterGateModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
+	if len(call.Tools) == 0 {
+		return func(yield func(fantasy.StreamPart) bool) {
+			if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextStart, ID: "t"}) {
+				return
+			}
+			if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextDelta, ID: "t", Delta: "title"}) {
+				return
+			}
+			if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextEnd, ID: "t"}) {
+				return
+			}
+			yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeFinish, FinishReason: fantasy.FinishReasonStop})
+		}, nil
+	}
+	return func(yield func(fantasy.StreamPart) bool) {
+		if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextStart, ID: "1"}) {
+			return
+		}
+		if !yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeTextDelta, ID: "1", Delta: "working on it"}) {
+			return
+		}
+		m.once.Do(func() { close(m.streaming) })
+		select {
+		case <-m.fail:
+		case <-ctx.Done():
+			return
+		}
+		yield(fantasy.StreamPart{Type: fantasy.StreamPartTypeError, Error: errors.New("provider exploded")})
+	}, nil
+}
+
 // DispatchHarness drives one dispatch end to end: the dispatch_agent
 // tool provisions the workspace, the scripted dispatched agent serves
 // its turn over the wired starter's A2A server, the coordinator streams
@@ -219,6 +282,17 @@ func (h *DispatchHarness) Dispatch(t *testing.T, prompt string) dispatch.Dispatc
 
 // ParentSessionID is the session the harness dispatches from.
 func (h *DispatchHarness) ParentSessionID() string { return h.parentID }
+
+// Steer sends text to the running dispatch as the parent's user would,
+// through the coordinator's DeliverAgentMessage (#351).
+func (h *DispatchHarness) Steer(t *testing.T, handle dispatch.DispatchResult, text string) error {
+	t.Helper()
+	return h.c.DeliverAgentMessage(t.Context(), AgentMessage{
+		SessionID:     handle.SessionID,
+		FromSessionID: h.parentID,
+		Text:          text,
+	})
+}
 
 // WaitTerminal blocks until the dispatch's registry entry is terminal
 // and returns it.

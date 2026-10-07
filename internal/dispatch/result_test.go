@@ -306,3 +306,21 @@ func TestSummarizeDiffFileCap(t *testing.T) {
 	require.Contains(t, summary, "... 50 more files\n")
 	require.NotContains(t, summary, "f100.txt |")
 }
+
+// The terminal message names the steers the agent never read (#398), and
+// says nothing about them when there are none.
+func TestDispatchResultTerminalMessageUndeliveredSteers(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []Status{StatusFailed, StatusKilled} {
+		r := DispatchResult{DispatchID: "d1", Branch: "crush-dispatch-d1", Status: status, UndeliveredSteers: []string{"also update the docs"}}
+		msg := r.TerminalMessage()
+		require.Contains(t, msg, "1 message(s) sent to this agent while it ran were accepted but never reached it before its run ended")
+		require.Contains(t, msg, `"undelivered_steers": [`)
+		require.Contains(t, msg, "also update the docs")
+	}
+
+	r := DispatchResult{DispatchID: "d1", Branch: "crush-dispatch-d1", Status: StatusCompleted}
+	require.NotContains(t, r.TerminalMessage(), "never reached it")
+	require.NotContains(t, r.TerminalMessage(), "undelivered_steers")
+}

@@ -103,13 +103,16 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 		return fmt.Errorf("agent %s finished (%s); task sessions are never continuable — dispatch a new agent instead", msg.SessionID, entry.Status)
 	}
 
-	// The server stands up after the handle is returned (#426): in that
-	// window the entry runs but nothing is listening on its context yet,
-	// so delivery refuses with the same wording as the pre-server state
-	// it is indistinguishable from.
 	steerer, ok := c.dispatchHost.(DispatchSteerer)
-	if !ok || steerer == nil || entry.Endpoint == "" || entry.AgentCard == nil {
+	if !ok || steerer == nil {
 		return fmt.Errorf("no running agent for session %s; dispatch one first", msg.SessionID)
+	}
+	// The server stands up after the handle is returned (#426): in that
+	// window the entry runs but nothing is listening on its context yet.
+	// The agent is starting, not gone, so the refusal says to send the
+	// message again rather than inviting a duplicate dispatch (#398).
+	if entry.Endpoint == "" || entry.AgentCard == nil {
+		return fmt.Errorf("agent %s is not ready for messages yet; send the message again in a moment", msg.SessionID)
 	}
 
 	var referenceTasks []string
@@ -143,9 +146,14 @@ func SteerOutcomeError(sessionID string, outcome DispatchSteerOutcome) error {
 	case steerStatusWorking, steerStatusCompleted:
 		return nil
 	case steerStatusRejected:
-		// The served agent refused the enqueue — the run ended between
-		// the lookup and the delivery. Same refusal as a finished
-		// dispatch.
+		// A live run that cannot take the message yet refuses for now
+		// (#398): the agent is still working, so the message can go
+		// again in a moment, and a new dispatch would duplicate it.
+		if outcome.Reason == SteerRefusalNotReady {
+			return fmt.Errorf("agent %s is not ready for messages yet; send the message again in a moment", sessionID)
+		}
+		// Otherwise the run ended between the registry lookup and the
+		// delivery. Same refusal as a finished dispatch.
 		return fmt.Errorf("agent %s is no longer running; dispatch a new agent instead", sessionID)
 	default:
 		return fmt.Errorf("agent %s: %s", sessionID, outcome.Text)
@@ -202,8 +210,12 @@ func (c *coordinator) messageAgentTool() fantasy.AgentTool {
 			if addressed == "" {
 				addressed = "@" + dispatch.HandleSlug(params.Handle)
 			}
+			// Queued, not delivered (#398): the message reaches the agent
+			// at its next step, and a run that ends first never reads it —
+			// the dispatch's terminal result then lists it under
+			// undelivered_steers.
 			return fantasy.NewTextResponse(fmt.Sprintf(
-				"Message delivered to the running agent (%s). It lands as the agent's next input; the agent's response appears on its dispatch block in the chat.",
+				"Message queued for the running agent (%s). It lands as the agent's next input; the agent's response appears on its dispatch block in the chat. If the agent's run ends before it reads the message, the dispatch result lists it under undelivered_steers.",
 				addressed,
 			)), nil
 		},

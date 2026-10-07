@@ -215,3 +215,30 @@ func TestDispatchListedOnAgentIndexE2E(t *testing.T) {
 	require.Equal(t, h.ParentSessionID(), listed.ParentSessionID)
 	require.Equal(t, a2a.DispatchStatusCompleted, listed.State)
 }
+
+// TestDispatchUndeliveredSteerE2E runs #398 through the real server
+// factory and a real session agent: a steer accepted while the turn
+// streams, and never read because the provider then fails the run, comes
+// back on the failed result's undelivered_steers, and the parent's
+// terminal message says so.
+func TestDispatchUndeliveredSteerE2E(t *testing.T) {
+	t.Parallel()
+
+	model := agent.NewFailingAfterGateModel()
+	h := agent.NewDispatchHarness(t, model, config.TodoEnforcementSettings{}, a2a.NewServerFactory(t.TempDir()))
+	handle := h.Dispatch(t, "do the work")
+
+	select {
+	case <-model.Streaming():
+	case <-time.After(30 * time.Second):
+		t.Fatal("the dispatched turn never started streaming")
+	}
+	require.NoError(t, h.Steer(t, handle, "also update the docs"), "the steer is accepted while the turn streams")
+	model.Fail()
+
+	entry := h.WaitTerminal(t, handle.DispatchID)
+	require.Equal(t, dispatch.StatusFailed, entry.Status)
+	require.NotNil(t, entry.Result)
+	require.Equal(t, []string{"also update the docs"}, entry.Result.UndeliveredSteers)
+	require.Contains(t, entry.Result.TerminalMessage(), "never reached it before its run ended")
+}

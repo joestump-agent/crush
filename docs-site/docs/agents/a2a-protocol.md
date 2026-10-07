@@ -79,7 +79,7 @@ the wire:
 | `description` | The dispatch's `role`, which may be empty. |
 | `version` | The Crush build version. |
 | `supportedInterfaces[0]` | The routed endpoint, `http://crush-a2a/agents/<dispatch id>`, JSON-RPC binding, protocol `1.0`. Always exactly one. |
-| `capabilities` | `streaming: true` and the declared `extensions`: `todos/v1`, `usage/v1`, `questions/v1` and `answers/v1`, each with its JSON Schema in its params. No push notifications, no extended card. |
+| `capabilities` | `streaming: true` and the declared `extensions`: `todos/v1`, `usage/v1`, `questions/v1`, `answers/v1`, `undelivered-steers/v1` and `steer-refusals/v1`, each with its JSON Schema in its params. No push notifications, no extended card. |
 | `defaultInputModes`, `defaultOutputModes` | `text/plain` both ways. |
 | `skills` | One entry per Crush skill the dispatch was given: every discovered skill when the dispatch named none. `id` and `name` are the skill name, and every entry carries the single tag `crush-skill`. |
 
@@ -222,11 +222,22 @@ The steer is its own task, terminal on the queue's verdict:
 | Outcome | State | Status message |
 | --- | --- | --- |
 | The running agent consumed the message — folded into its active turn or picked up as its follow-up turn | `TASK_STATE_COMPLETED` | `delivered` |
-| The queue dropped it without running (the run was canceled while the steer sat queued) | `TASK_STATE_FAILED` | `agent finished before the message was consumed` |
+| The queue dropped it without running: the run ended — failed, canceled or killed — while the steer sat queued | `TASK_STATE_FAILED` | `agent finished before the message was consumed` |
+| The run is live but its session is not taking messages yet: the run is starting, or between its turn and a context compaction | `TASK_STATE_REJECTED` | `agent is not ready for messages yet; send the message again in a moment`, with `{"reason": "not_ready"}` under the `steer-refusals/v1` extension in the status metadata |
 | The run has ended — task sessions are not continuable | `TASK_STATE_REJECTED` | `agent is no longer running; task sessions are not continuable` |
 
 The steer's reply streams on the dispatch's own surfaces — the parent's
 dispatch block, `@handle` inspection — never on the steer's task.
+
+A steer is accepted once it is queued, and that is when `message_agent`
+returns ("queued"). A run that ends before reading a queued steer drops
+it ([#398](https://github.com/joestump-agent/crush/issues/398)): the
+dispatch's terminal status names every steer the agent accepted but
+never read under the `undelivered-steers/v1` extension
+(`{"steers": [...]}`), and the parent's result lists them as
+`undelivered_steers`. A steer the agent read — folded into a step or
+run as a follow-up turn — is never listed, even if the run then
+fails.
 
 ### Questions
 

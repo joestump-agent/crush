@@ -156,6 +156,10 @@ func reapDispatchRuns(t *testing.T, c *coordinator, gates ...func()) {
 type runnerTransport struct {
 	mu     sync.Mutex
 	served []DispatchServerParams
+	// ended marks the sessions whose run has returned, the way the
+	// executor tracks its run (#398): a steer refused before then is
+	// refused as not ready, not as a finished run.
+	ended map[string]bool
 }
 
 func (f *runnerTransport) StartDispatchServer(ctx context.Context, params DispatchServerParams) (string, any, func(), error) {
@@ -182,6 +186,12 @@ func (f *runnerTransport) lastServed() DispatchServerParams {
 func (f *runnerTransport) StreamDispatch(ctx context.Context, _ DispatchTransportParams) (DispatchTransportOutcome, error) {
 	params := f.lastServed()
 	result, err := params.Runner.Run(ctx, params.Call)
+	f.mu.Lock()
+	if f.ended == nil {
+		f.ended = make(map[string]bool)
+	}
+	f.ended[params.SessionID] = true
+	f.mu.Unlock()
 	switch {
 	case errors.Is(err, context.Canceled):
 		return DispatchTransportOutcome{Status: transportStatusCanceled}, nil
@@ -219,8 +229,8 @@ func (f *runnerTransport) StreamDispatch(ctx context.Context, _ DispatchTranspor
 // it derives the steer call from the recorded dispatch call — same
 // shaping, prompt replaced, RunID empty, Steer set, hooks stripped — and
 // enqueues it through the runner's EnqueueWhenBusy. "working" means the
-// runner accepted the message; "rejected" means it refused, the way an
-// ended run does.
+// runner accepted the message; "rejected" means it refused: with the
+// not-ready reason while the run is live (#398), plainly once it ended.
 func (f *runnerTransport) SteerDispatch(ctx context.Context, p DispatchSteerParams) (DispatchSteerOutcome, error) {
 	if p.ContextID == "" {
 		return DispatchSteerOutcome{}, errors.New("a2a: steer context id is empty")
@@ -237,6 +247,12 @@ func (f *runnerTransport) SteerDispatch(ctx context.Context, p DispatchSteerPara
 	call.Accepted = nil
 	call.OnComplete = nil
 	if !params.Runner.EnqueueWhenBusy(call) {
+		f.mu.Lock()
+		ended := f.ended[params.SessionID]
+		f.mu.Unlock()
+		if !ended {
+			return DispatchSteerOutcome{Status: steerStatusRejected, Text: "agent is not ready for messages yet; send the message again in a moment", Reason: SteerRefusalNotReady}, nil
+		}
 		return DispatchSteerOutcome{Status: steerStatusRejected, Text: "agent is no longer running; task sessions are not continuable"}, nil
 	}
 	return DispatchSteerOutcome{Status: steerStatusWorking}, nil
