@@ -270,12 +270,13 @@ type DispatchTransportOutcome struct {
 }
 
 // TodoItem is one entry of the todos/v1 extension's todo list, the
-// transport-vocabulary mirror of session.Todo (json tag names kept
-// identical) so the wire shape stays stable as the session type evolves.
+// transport-vocabulary mirror of session.Todo with camelCase field
+// names: the A2A wire format is lowerCamelCase (TCK DM-SERIAL-001),
+// while session.Todo's local persistence keeps its own snake_case tags.
 type TodoItem struct {
 	Content    string `json:"content"`
 	Status     string `json:"status"`
-	ActiveForm string `json:"active_form"`
+	ActiveForm string `json:"activeForm"`
 }
 
 // TodoProgress is the statically typed payload the todos/v1 extension
@@ -305,13 +306,13 @@ type Usage struct {
 	// Provider is the provider ID the dispatched agent ran on.
 	Provider string `json:"provider"`
 	// PromptTokens and CompletionTokens are the child session's totals.
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
+	PromptTokens     int64 `json:"promptTokens"`
+	CompletionTokens int64 `json:"completionTokens"`
 	// Cost is the child session's total cost.
 	Cost float64 `json:"cost"`
 	// TraceID is the trace-id segment of the W3C traceparent the parent
 	// sent with the dispatch call. Empty when the call carried none.
-	TraceID string `json:"trace_id"`
+	TraceID string `json:"traceId"`
 }
 
 // traceparentCtxKey is the context key the parent's dispatch turn stores

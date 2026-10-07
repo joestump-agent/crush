@@ -141,3 +141,26 @@ func TestCardNameFallbacks(t *testing.T) {
 		})
 	}
 }
+
+// The card declares the bearer security scheme served calls are
+// authenticated with (#357), and requires it — so a caller without the
+// host's token is told what the card demands before it dials.
+func TestBuildAgentCardDeclaresBearerSecurity(t *testing.T) {
+	t.Parallel()
+
+	card := BuildAgentCard(CardParams{
+		Agent:    config.Agent{ID: "reviewer", Name: "Reviewer"},
+		Endpoint: "http://crush-a2a/agents/reviewer",
+		Version:  "1.2.3",
+	})
+
+	require.Contains(t, card.SecuritySchemes, bearerSchemeName)
+	scheme, ok := card.SecuritySchemes[bearerSchemeName].(a2aspec.HTTPAuthSecurityScheme)
+	require.True(t, ok, "the declared scheme must be the HTTP auth kind")
+	require.Equal(t, "bearer", scheme.Scheme)
+
+	require.Len(t, card.SecurityRequirements, 1)
+	require.Contains(t, card.SecurityRequirements[0], bearerSchemeName)
+	require.Empty(t, card.SecurityRequirements[0][bearerSchemeName],
+		"the bearer requirement carries no scopes")
+}

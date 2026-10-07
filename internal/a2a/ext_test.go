@@ -101,7 +101,7 @@ func TestDecodeValueDynamic(t *testing.T) {
 		"current":   "reading the code",
 		"completed": float64(1),
 		"total":     float64(3),
-		"todos":     []any{map[string]any{"content": "read the code", "status": "in_progress", "active_form": "reading the code"}},
+		"todos":     []any{map[string]any{"content": "read the code", "status": "in_progress", "activeForm": "reading the code"}},
 	})
 	require.NoError(t, err)
 	progress, ok := decoded.(*agent.TodoProgress)

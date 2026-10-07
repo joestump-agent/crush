@@ -49,7 +49,9 @@ type CardParams struct {
 // BuildAgentCard derives a spec-valid A2A AgentCard from a dispatched agent's
 // config. The card advertises the agent's identity, its endpoint and
 // transport, streaming capability (dispatched runs stream progress via SSE),
-// and one A2A skill per loaded Crush skill.
+// one A2A skill per loaded Crush skill, and the bearer security scheme served
+// calls are authenticated with (#357) — declared as required, so a caller
+// without the host's token is told what the card demands.
 func BuildAgentCard(p CardParams) *a2aspec.AgentCard {
 	transport := p.Transport
 	if transport == "" {
@@ -74,6 +76,18 @@ func BuildAgentCard(p CardParams) *a2aspec.AgentCard {
 		DefaultInputModes:  defaultInputModes,
 		DefaultOutputModes: defaultOutputModes,
 		Skills:             agentSkills(p.Skills),
+		// Authentication (#357): the host's per-process bearer token,
+		// required of every call. Scopes are empty — the token either
+		// matches or the call is rejected.
+		SecuritySchemes: a2aspec.NamedSecuritySchemes{
+			bearerSchemeName: a2aspec.HTTPAuthSecurityScheme{
+				Scheme:      "bearer",
+				Description: "Per-process bearer token minted by the serving Crush process.",
+			},
+		},
+		SecurityRequirements: a2aspec.SecurityRequirementsOptions{
+			{bearerSchemeName: {}},
+		},
 	}
 }
 
