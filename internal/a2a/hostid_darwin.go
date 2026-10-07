@@ -3,6 +3,7 @@
 package a2a
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -15,7 +16,9 @@ import (
 // read from ps's lstart — the token that changes when the same pid is
 // reused by a new process.
 func processStartToken(pid int) (string, error) {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	// No deadline on purpose: a probe killed by its context fails with
+	// an *exec.ExitError, which processAlive reads as a dead process.
+	out, err := exec.CommandContext(context.Background(), "ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
 	if err != nil {
 		return "", err
 	}
