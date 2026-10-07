@@ -250,6 +250,12 @@ type ServerFactory struct {
 	// defaults.
 	httpClient *http.Client
 
+	// externalTransport, when set, is the base transport external agent
+	// calls dial through under the origin pin (#434) — the test seam
+	// for TLS test servers. Production leaves it nil, and each external
+	// agent gets a transport of its own.
+	externalTransport http.RoundTripper
+
 	mu         sync.Mutex
 	started    bool
 	closed     bool

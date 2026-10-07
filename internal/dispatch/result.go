@@ -47,6 +47,10 @@ const (
 	// ReasonShutdown: the run was canceled because the application is
 	// shutting down (#372).
 	ReasonShutdown = "crush exited"
+	// ReasonIdleTimeout: an external agent's stream stayed silent past
+	// its definition's transport.idle_timeout (#434), so the dispatch
+	// canceled its task.
+	ReasonIdleTimeout = "idle timeout"
 )
 
 // DispatchResult is the model-facing result of a dispatch: the running
