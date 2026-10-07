@@ -1468,6 +1468,10 @@ func (c *coordinator) deliverDispatchResult(ctx context.Context, parentSessionID
 // no error means the turn was queued behind a busy session, in which
 // case the queued (system-delivery) call now owns the delivery and
 // nothing is re-pended.
+//
+// Either way the durable records (#355) are stamped delivered only
+// where the payload reaches the parent: a turn that runs now stamps on
+// its success, and a queued call stamps on the queue's verdict.
 func (c *coordinator) flushPendingResults(parentSessionID string) {
 	agent := c.currentAgent()
 	if agent == nil {
@@ -1510,6 +1514,33 @@ func (c *coordinator) flushPendingResults(parentSessionID string) {
 		prompt.WriteString("\n\n")
 	}
 
+	// The delivered stamp (#355), once per flush. A turn the parent
+	// turned busy for in the window before Run is queued as a
+	// system-delivery call, and only the queue knows when it reaches
+	// the parent, so the stamp rides the call's OnConsumed (#351).
+	// True means the queue dequeued the call into its own turn, which
+	// persists the payload as the parent's next input. False means a
+	// removal path dropped it unrun; the records stay unstamped and the
+	// next startup's reconcile re-delivers them. Stamping at enqueue
+	// instead would lose a payload that a crash caught still queued.
+	// The once covers the summarize continuation, which re-queues a
+	// running call: a delivery turn cut by a summary can report
+	// consumed and also return delivered.
+	var stampOnce sync.Once
+	stampDelivered := func() {
+		stampOnce.Do(func() { c.recordDelivered(pending) })
+	}
+	onConsumed := func(consumed bool) {
+		if !consumed {
+			slog.Warn("Queued dispatch result delivery dropped; the next start re-delivers it", "parent_session", parentSessionID, "results", len(pending))
+			return
+		}
+		// The verdict fires under the parent session's queue lock, so
+		// the database write runs detached; the spawn seam (#422) lets
+		// a test's reaper join it.
+		c.startDispatchRun(stampDelivered)
+	}
+
 	c.startDispatchRun(func() {
 		// Detached: the flush caller (a dispatch goroutine or a run-end
 		// hook) must not block on the delivery turn. Riding the spawn seam
@@ -1524,25 +1555,21 @@ func (c *coordinator) flushPendingResults(parentSessionID string) {
 		// delivery's terminal event is never mistaken for the tool
 		// call's. The system-delivery marker keeps the queued call (if
 		// the parent turned busy in the window before Run) alive across
-		// queue clears.
+		// queue clears, and the queued call reports its fate to the
+		// delivered stamp above.
 		runCtx := message.WithHiddenUserMessage(
-			WithRunID(WithSystemDelivery(context.WithoutCancel(context.Background())), ""),
+			WithRunID(withDeliveryConsumed(WithSystemDelivery(context.WithoutCancel(context.Background())), onConsumed), ""),
 		)
 		result, err := c.run(runCtx, nil, parentSessionID, prompt.String())
 		switch {
 		case err == nil && result != nil:
 			// Delivered: stamp the durable records (#355) so a restart
 			// never re-delivers a payload the parent has already seen.
-			if c.dispatchRecords != nil {
-				for _, terminal := range pending {
-					if err := c.dispatchRecords.RecordDelivered(terminal.DispatchID); err != nil {
-						slog.Warn("Failed to stamp dispatch result delivered", "dispatch_id", terminal.DispatchID, "error", err)
-					}
-				}
-			}
+			stampDelivered()
 		case err == nil && result == nil:
 			// The turn was queued behind a busy session; the queued
-			// system-delivery call owns the delivery now.
+			// system-delivery call owns the delivery now, and its
+			// OnConsumed verdict owns the stamp.
 		default:
 			slog.Error("Dispatch result delivery failed; pended for retry", "parent_session", parentSessionID, "error", err)
 			c.dispatchMu.Lock()
@@ -1564,6 +1591,24 @@ func (c *coordinator) flushPendingResults(parentSessionID string) {
 			})
 		}
 	})
+}
+
+// recordDelivered stamps the durable record of every result in
+// delivered (#355), so a restart never re-delivers a payload the parent
+// has already seen. A no-op without records wired; a failed stamp is
+// logged and leaves that record for the next startup's reconcile.
+func (c *coordinator) recordDelivered(delivered []dispatch.DispatchResult) {
+	c.dispatchMu.Lock()
+	records := c.dispatchRecords
+	c.dispatchMu.Unlock()
+	if records == nil {
+		return
+	}
+	for _, terminal := range delivered {
+		if err := records.RecordDelivered(terminal.DispatchID); err != nil {
+			slog.Warn("Failed to stamp dispatch result delivered", "dispatch_id", terminal.DispatchID, "error", err)
+		}
+	}
 }
 
 // dispatchRegistry returns the coordinator's dispatch registry,
@@ -1675,11 +1720,12 @@ func (c *coordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, b
 // Every terminal record without a delivered stamp whose parent session
 // still exists goes through deliverDispatchResult — #388's
 // pending-delivery machinery, so the delivered stamp lands only when
-// the delivery turn succeeds. A parent session that no longer exists
-// drops the payload permanently: nobody can ever receive it, and the
-// row's terminal state still seeds the UI. Called from the app at
-// startup, after a2a.ReconcileOrphanedTasks and before the UI loads
-// sessions.
+// the payload reaches the parent: the delivery turn succeeds, or its
+// call, queued behind a busy parent, is consumed. A parent session
+// that no longer exists drops the payload permanently: nobody can ever
+// receive it, and the row's terminal state still seeds the UI. Called
+// from the app at startup, after a2a.ReconcileOrphanedTasks and before
+// the UI loads sessions.
 func (c *coordinator) ReconcileDispatchDeliveries(ctx context.Context) {
 	c.dispatchMu.Lock()
 	records := c.dispatchRecords

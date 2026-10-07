@@ -664,6 +664,10 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	// same correlator.
 	runID := RunIDFromContext(ctx)
 	systemDelivery := SystemDeliveryFromContext(ctx)
+	// A delivery turn's queue verdict (#355): set only on the dispatch
+	// delivery path, it stamps the durable records once a queued
+	// delivery reaches the parent. Nil everywhere else.
+	onConsumed := deliveryConsumedFromContext(ctx)
 	run := func() (*fantasy.AgentResult, error) {
 		return agent.Run(ctx, SessionAgentCall{
 			SessionID:         sessionID,
@@ -682,6 +686,7 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 			PresencePenalty:   presPenalty,
 			systemDelivery:    systemDelivery,
 			OnComplete:        onComplete,
+			OnConsumed:        onConsumed,
 			Accepted:          accept,
 			OnAuthRefresh:     c.makeAuthRefreshCallback(providerCfg),
 		})

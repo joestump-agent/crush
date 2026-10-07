@@ -136,11 +136,12 @@ type SessionAgentCall struct {
 	// dequeued to run as its own turn — and false exactly once when a
 	// queue-removal path dropped it without running (a cancel covering
 	// it, or an explicit queue clear). The A2A executor's steer path
-	// waits on it to turn the enqueue into a terminal task state; a
-	// run that ends with the call still queued fires nothing, and that
-	// stranded case is #398's. enqueueCall preserves it across
-	// queueing; every fire site is nil-safe and fires at most once per
-	// call.
+	// waits on it to turn the enqueue into a terminal task state, and a
+	// queued dispatch delivery stamps its durable records delivered on
+	// true (#355); a run that ends with the call still queued fires
+	// nothing, and that stranded case is #398's. enqueueCall preserves
+	// it across queueing; every fire site is nil-safe and fires at most
+	// once per call.
 	OnConsumed func(consumed bool)
 	// Accepted, when non-nil, is the accept reservation taken by
 	// BeginAccepted before the call was dispatched onto a goroutine
