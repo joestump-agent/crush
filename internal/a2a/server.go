@@ -160,20 +160,46 @@ type Server struct {
 	Card *a2aspec.AgentCard
 
 	factory   *ServerFactory
+	executor  *Executor
 	id        string
 	contextID string
 	stopOnce  sync.Once
+	stopped   chan struct{}
+	stopErr   error
 }
+
+// servedRunStopWait bounds how long Stop waits for the route's run
+// goroutines when the caller's context has no deadline, matching the
+// coordinator's other shutdown waits.
+const servedRunStopWait = 5 * time.Second
 
 // Stop unregisters the dispatch's route from the process host and
 // unbinds its A2A context (#350), canceling the route's context so any
-// in-flight stream on it ends. Safe to call more than once; the host
-// keeps serving the other dispatches.
-func (s *Server) Stop(_ context.Context) error {
+// in-flight stream on it ends. It then cancels the route's runs and
+// waits for their goroutines to return: a canceled run can still be
+// unwinding a tool call, and the caller's teardown closes the toolchain
+// and releases the workspace that call runs in. The wait ends with ctx,
+// or after servedRunStopWait when ctx has no deadline; a run still going
+// then is logged and Stop reports the context's error. Safe to call more
+// than once; the host keeps serving the other dispatches.
+func (s *Server) Stop(ctx context.Context) error {
 	s.stopOnce.Do(func() {
+		defer close(s.stopped)
 		s.factory.unregister(s.id, s.contextID)
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, servedRunStopWait)
+			defer cancel()
+		}
+		if err := s.executor.stopRuns(ctx); err != nil {
+			slog.Warn("Served run still running after its server stopped", "dispatch_id", s.id, "error", err)
+			s.stopErr = err
+		}
 	})
-	return nil
+	// stopOnce only serializes the first call: a second caller returns
+	// from Do at once, so it waits here rather than racing on stopErr.
+	<-s.stopped
+	return s.stopErr
 }
 
 // ServerFactory hosts every in-process A2A server for dispatched agents
@@ -410,7 +436,7 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 			ParentSessionID: p.ParentSessionID,
 		})
 	}
-	return &Server{Endpoint: endpoint, Card: card, factory: f, id: p.DispatchID, contextID: p.ContextID}, nil
+	return &Server{Endpoint: endpoint, Card: card, factory: f, executor: executor, id: p.DispatchID, contextID: p.ContextID, stopped: make(chan struct{})}, nil
 }
 
 // cancelRaceHandler reports the SDK's two outcomes of one race the same

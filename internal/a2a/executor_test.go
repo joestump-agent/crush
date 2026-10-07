@@ -1691,3 +1691,101 @@ func TestExecuteSteerWhileParkedStaysASteer(t *testing.T) {
 	}, states(t, answered))
 	require.Contains(t, (<-runner.toolResp).Content, "User provided: postgres")
 }
+
+// unwindingRunner models a run still unwinding a tool call after its
+// context ended: Run reports the context's end on ctxDone, then returns
+// only once unwind is closed.
+type unwindingRunner struct {
+	started chan struct{}
+	ctxDone chan struct{}
+	unwind  chan struct{}
+}
+
+func newUnwindingRunner() *unwindingRunner {
+	return &unwindingRunner{
+		started: make(chan struct{}),
+		ctxDone: make(chan struct{}),
+		unwind:  make(chan struct{}),
+	}
+}
+
+func (r *unwindingRunner) Run(ctx context.Context, _ agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	close(r.started)
+	<-ctx.Done()
+	close(r.ctxDone)
+	<-r.unwind
+	return nil, ctx.Err()
+}
+
+func (r *unwindingRunner) Cancel(string)                               {}
+func (r *unwindingRunner) EnqueueWhenBusy(agent.SessionAgentCall) bool { return false }
+
+// startUnwindingRun starts one run of runner on exec and waits until the
+// runner is in its turn.
+func startUnwindingRun(exec *Executor, runner *unwindingRunner) {
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("go"))
+	go func() {
+		for range exec.Execute(context.Background(), newExecCtx(msg)) {
+		}
+	}()
+	<-runner.started
+}
+
+// A canceled run can still be unwinding a tool call after Cancel has
+// reported the task canceled. stopRuns waits for its goroutine to
+// return, so the route's teardown never closes the toolchain or releases
+// the workspace under it.
+func TestStopRunsJoinsUnwindingRun(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		runner := newUnwindingRunner()
+		exec := newBoundExecutor(runner)
+		startUnwindingRun(exec, runner)
+
+		collect(t, exec.Cancel(context.Background(), newExecCtx(nil)))
+		<-runner.ctxDone
+
+		stopped := make(chan error, 1)
+		go func() { stopped <- exec.stopRuns(context.Background()) }()
+		synctest.Wait()
+		select {
+		case <-stopped:
+			t.Fatal("stopRuns returned while the canceled run was still unwinding")
+		default:
+		}
+
+		close(runner.unwind)
+		require.NoError(t, <-stopped)
+	})
+}
+
+// stopRuns cancels a run that nothing else canceled and joins it.
+func TestStopRunsCancelsLiveRun(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		runner := newUnwindingRunner()
+		close(runner.unwind)
+		exec := newBoundExecutor(runner)
+		startUnwindingRun(exec, runner)
+
+		require.NoError(t, exec.stopRuns(context.Background()))
+		select {
+		case <-runner.ctxDone:
+		default:
+			t.Fatal("stopRuns returned without canceling the run")
+		}
+	})
+}
+
+// A run that never returns cannot hold stopRuns past its context.
+func TestStopRunsHonorsContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		runner := newUnwindingRunner()
+		exec := newBoundExecutor(runner)
+		startUnwindingRun(exec, runner)
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		require.ErrorIs(t, exec.stopRuns(ctx), context.DeadlineExceeded)
+
+		close(runner.unwind)
+	})
+}
