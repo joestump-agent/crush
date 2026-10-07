@@ -1570,3 +1570,59 @@ func TestDispatchAgentToolFailedSetupReleasesSlot(t *testing.T) {
 
 	close(gate)
 }
+
+// TestDispatchEnforcementFromConfig pins the #402 wiring: the dispatch
+// tool's watchdog settings and the dispatched agent's ladder both resolve
+// from the worker definition in the config file, so a kill threshold
+// configured on the agent trips in both places or neither.
+func TestDispatchEnforcementFromConfig(t *testing.T) {
+	env := testEnv(t)
+	initGitRepo(t, env.workingDir)
+
+	// config.Init discovers crush.json in the working directory, so the
+	// file is in place before the coordinator builds its config.
+	require.NoError(t, os.WriteFile(filepath.Join(env.workingDir, "crush.json"), []byte(`{
+		"options": {"todo_enforcement": {"nudge_threshold": 5}},
+		"agents": {"worker": {"kill": {"after_ignored_nudges": 3}}}
+	}`), 0o644))
+
+	c := newDispatchTestCoordinator(t, env)
+
+	settings := c.dispatchEnforcement()
+	require.Equal(t, 3, settings.KillAfterNudges,
+		"the worker definition's kill block feeds the dispatch enforcement")
+	require.Equal(t, 5, settings.NudgeThreshold,
+		"the global options underlay the dispatched agent's ladder")
+	require.Equal(t, 2,
+		c.cfg.Config().Agents[config.AgentCoder].
+			ResolvedTodoEnforcement(c.cfg.Config().Options.TodoEnforcement).KillAfterNudges,
+		"the kill rung stays dispatch-only")
+
+	// The dispatched agent the tool builds carries the same resolved
+	// ladder: the watchdog's killSettings and the agent's own
+	// enforcement can never diverge.
+	const providerID = "test-provider"
+	c.cfg.Config().Providers.Set(providerID, config.ProviderConfig{
+		ID:      providerID,
+		Name:    "Test",
+		Type:    openaicompat.Name,
+		BaseURL: "http://127.0.0.1:0/v1",
+		APIKey:  "test",
+		Models:  []catwalk.Model{{ID: "test-model", DefaultMaxTokens: 4096}},
+	})
+	selected := config.SelectedModel{Provider: providerID, Model: "test-model"}
+	c.cfg.OverridePreferredModel(config.SelectedModelTypeLarge, selected)
+	c.cfg.OverridePreferredModel(config.SelectedModelTypeSmall, selected)
+
+	entry, _ := provisionDispatchEntry(t, c, "")
+	toolchain, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: entry.Path})
+	require.NoError(t, err)
+	defer toolchain.Close(t.Context())
+
+	dispatched, err := c.buildDispatchedAgent(t.Context(), dispatchAgentOptions{Toolchain: toolchain})
+	require.NoError(t, err)
+	sa := dispatched.agent.(*sessionAgent)
+	require.NotNil(t, sa.todoEnforcement, "the dispatched agent wires its enforcement ladder")
+	require.Equal(t, settings, sa.todoEnforcement.settings,
+		"the agent's ladder matches the watchdog's kill settings")
+}

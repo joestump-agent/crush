@@ -103,8 +103,10 @@ model.
    scoped LSP manager and a scoped permission service bridged to the
    parent's.
 3. **Agent.** It renders the system prompt from `dispatch.md.tpl` and
-   builds a `SessionAgent` on the chosen model, using the global
-   `todo_enforcement` settings.
+   builds a `SessionAgent` on the chosen model, with the todo
+   enforcement ladder resolved from the worker definition's `todos` and
+   `kill` blocks layered over the global `todo_enforcement` settings
+   ([#402](https://github.com/joestump-agent/crush/issues/402)).
 4. **Session and handle.** It creates a task session titled "Dispatched
    Agent", a child of the parent session. The registry entry gets the
    session, the `running` status, and an `@handle` derived from `handle`,

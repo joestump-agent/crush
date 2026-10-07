@@ -514,3 +514,167 @@ func TestAgentDefinitions_ReloadPicksUpAndRollsBack(t *testing.T) {
 	require.Contains(t, store.Config().Agents[config.AgentCoder].AllowedTools, "edit",
 		"the live config keeps the last valid resolution")
 }
+
+// loadTodoJSON is loadAgentsJSON with an options block: the todo
+// enforcement tests need both the global options.todo_enforcement
+// defaults and a per-agent agents block in the same file, loaded
+// through the real pipeline. Either argument may be empty.
+func loadTodoJSON(t *testing.T, optionsJSON, agentsJSON string) *config.ConfigStore {
+	t.Helper()
+	workDir, dataDir := isolateReloadEnv(t)
+	globalDir := os.Getenv("CRUSH_GLOBAL_CONFIG")
+	require.NoError(t, os.MkdirAll(globalDir, 0o755))
+	configPath := filepath.Join(globalDir, "crush.json")
+	body := agentsBaseConfig
+	if optionsJSON != "" || agentsJSON != "" {
+		body = agentsBaseConfig[:len(agentsBaseConfig)-1]
+		if optionsJSON != "" {
+			body += `,"options":` + optionsJSON
+		}
+		if agentsJSON != "" {
+			body += `,"agents":` + agentsJSON
+		}
+		body += `}`
+	}
+	require.NoError(t, os.WriteFile(configPath, []byte(body), 0o600))
+	store, err := config.Load(workDir, dataDir, false)
+	require.NoError(t, err)
+	return store
+}
+
+// resolvedNudge reads the nudge threshold an agent resolves to.
+func resolvedNudge(cfg *config.Config, id string) int {
+	return cfg.Agents[id].ResolvedTodoEnforcement(cfg.Options.TodoEnforcement).NudgeThreshold
+}
+
+// resolvedKill reads the kill threshold an agent resolves to.
+func resolvedKill(cfg *config.Config, id string) int {
+	return cfg.Agents[id].ResolvedTodoEnforcement(cfg.Options.TodoEnforcement).KillAfterNudges
+}
+
+// TestAgentDefinitions_TodoEnforcementPrecedence pins the per-agent
+// precedence (#402): a todos block on one agent overrides the global
+// options.todo_enforcement for that agent only, and every other agent
+// resolves from the global value with the built-in kill default.
+func TestAgentDefinitions_TodoEnforcementPrecedence(t *testing.T) {
+	store := loadTodoJSON(t,
+		`{"todo_enforcement": {"nudge_threshold": 5}}`,
+		`{"coder": {"todos": {"nudge_after_tool_calls": 8}}}`)
+	cfg := store.Config()
+
+	require.Equal(t, 8, resolvedNudge(cfg, config.AgentCoder),
+		"the per-agent todos block replaces the global threshold")
+	for _, id := range []string{config.AgentPlan, config.AgentTask, config.AgentWorker} {
+		require.Equal(t, 5, resolvedNudge(cfg, id), "%s resolves the global threshold", id)
+	}
+	for _, id := range []string{config.AgentCoder, config.AgentPlan, config.AgentTask, config.AgentWorker} {
+		require.Equal(t, 2, resolvedKill(cfg, id),
+			"%s keeps the default kill threshold with nothing set", id)
+	}
+}
+
+// TestAgentDefinitions_TodoEnforcementDefaultsLayer checks the $defaults
+// rung of the precedence ladder: $defaults todos and kill underlay every
+// agent and sit above the global options, a per-agent block still wins
+// for the agent that sets it.
+func TestAgentDefinitions_TodoEnforcementDefaultsLayer(t *testing.T) {
+	store := loadTodoJSON(t,
+		`{"todo_enforcement": {"nudge_threshold": 5}}`,
+		`{
+			"$defaults": {"todos": {"nudge_after_tool_calls": 6}},
+			"coder": {"todos": {"nudge_after_tool_calls": 8}}
+		}`)
+	cfg := store.Config()
+
+	require.Equal(t, 8, resolvedNudge(cfg, config.AgentCoder), "per-agent beats $defaults")
+	for _, id := range []string{config.AgentPlan, config.AgentTask, config.AgentWorker} {
+		require.Equal(t, 6, resolvedNudge(cfg, id), "%s resolves the $defaults threshold", id)
+	}
+}
+
+// TestAgentDefinitions_WorkerKillBothSpellings checks that the kill rung
+// resolves identically whether it is set through the new-style kill
+// block or the legacy todo_enforcement alias (#402), and that the kill
+// default survives on agents with nothing set.
+func TestAgentDefinitions_WorkerKillBothSpellings(t *testing.T) {
+	store := loadTodoJSON(t, "",
+		`{"worker": {"kill": {"after_ignored_nudges": 3}}}`)
+	cfg := store.Config()
+	require.Equal(t, 3, resolvedKill(cfg, config.AgentWorker),
+		"the kill block configures the worker's kill threshold")
+	require.Equal(t, 2, resolvedKill(cfg, config.AgentCoder),
+		"other agents keep the default kill threshold")
+
+	store = loadTodoJSON(t, "",
+		`{"worker": {"todo_enforcement": {"kill_after_nudges": 3}}}`)
+	cfg = store.Config()
+	require.Equal(t, 3, resolvedKill(cfg, config.AgentWorker),
+		"the legacy alias configures the same kill threshold")
+	require.Equal(t, 2, resolvedKill(cfg, config.AgentCoder))
+}
+
+// TestAgentDefinitions_TodoEnforcementAliasConflicts walks the alias
+// rules that are load errors: combining the legacy todo_enforcement
+// alias with either the todos or kill block, setting the alias on
+// $defaults, a negative knob through the alias, and the alias on a
+// runtime a2a agent.
+func TestAgentDefinitions_TodoEnforcementAliasConflicts(t *testing.T) {
+	cases := []struct {
+		name    string
+		agents  string
+		wantErr string
+	}{
+		{
+			name:    "alias with todos",
+			agents:  `{"coder": {"todo_enforcement": {"nudge_threshold": 9}, "todos": {"nudge_after_tool_calls": 1}}}`,
+			wantErr: `agents.coder.todo_enforcement: set either todo_enforcement or agents.coder.todos, not both (todo_enforcement is the legacy alias)`,
+		},
+		{
+			name:    "alias with kill",
+			agents:  `{"worker": {"todo_enforcement": {"nudge_threshold": 9}, "kill": {"after_ignored_nudges": 2}}}`,
+			wantErr: `agents.worker.todo_enforcement: set either todo_enforcement or agents.worker.kill, not both (todo_enforcement is the legacy alias)`,
+		},
+		{
+			name:    "alias on $defaults",
+			agents:  `{"$defaults": {"todo_enforcement": {"nudge_threshold": 9}}}`,
+			wantErr: `agents.$defaults: only todos and kill may be set`,
+		},
+		{
+			name:    "negative knob through the alias",
+			agents:  `{"worker": {"todo_enforcement": {"kill_after_nudges": -1}}}`,
+			wantErr: `agents.worker.todo_enforcement.kill_after_nudges: must not be negative (got -1)`,
+		},
+		{
+			name:    "alias on a runtime a2a agent",
+			agents:  `{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "todo_enforcement": {"nudge_threshold": 9}}}`,
+			wantErr: `agents.reviewer.todo_enforcement: a runtime a2a agent is defined by its card and may not set this field`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadAgentsJSONErr(t, tc.agents)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// TestAgentDefinitions_TodoEnforcementAliasOnNonDispatch checks the
+// asymmetric rule the issue pins: the alias is accepted on a
+// non-dispatch agent (unlike the new-style kill block, which is a load
+// error), its nudge knobs are honored, and its kill knobs are dropped
+// with a warning rather than failing the load.
+func TestAgentDefinitions_TodoEnforcementAliasOnNonDispatch(t *testing.T) {
+	store := loadTodoJSON(t, "",
+		`{"coder": {"todo_enforcement": {"nudge_threshold": 9, "kill_after_nudges": 3}}}`)
+	cfg := store.Config()
+
+	coder := cfg.Agents[config.AgentCoder]
+	require.NotNil(t, coder.TodoEnforcement, "the alias feeds the agent's override")
+	require.Equal(t, 9, resolvedNudge(cfg, config.AgentCoder),
+		"the alias's nudge knob is honored on a non-dispatch agent")
+	require.Nil(t, coder.TodoEnforcement.KillAfterNudges,
+		"the alias's kill knob is dropped on a non-dispatch agent")
+	require.Equal(t, 2, resolvedKill(cfg, config.AgentCoder),
+		"the kill rung stays at the default on a non-dispatch agent")
+}

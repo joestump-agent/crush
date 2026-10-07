@@ -1431,6 +1431,19 @@ func (c *Config) SetupAgents() {
 func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 	warnUnhonoredFields(id, def)
 
+	// The alias's kill knobs are dispatch-only (#402): on any other role
+	// they are dropped here and warned about, not a load error. The
+	// new-style Kill block takes the hard error instead.
+	enforcementDef := def
+	if alias := def.TodoEnforcement; alias != nil && definitionRole(id, def) != AgentRoleDispatch {
+		trimmed := *alias
+		trimmed.KillAfterNudges = nil
+		trimmed.StallWindow = nil
+		trimmed.HardTimeout = nil
+		trimmed.InactivityTimeout = nil
+		enforcementDef.TodoEnforcement = &trimmed
+	}
+
 	var toolsSpec AgentTools
 	if def.Tools != nil {
 		toolsSpec = *def.Tools
@@ -1474,7 +1487,7 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 		AllowedTools:    allowedTools,
 		AllowedMCP:      expandMCPAllow(mcpAllow),
 		ContextPaths:    contextPaths,
-		TodoEnforcement: todoEnforcementFromDefinition(def),
+		TodoEnforcement: todoEnforcementFromDefinition(enforcementDef),
 		Role:            definitionRole(id, def),
 		Runtime:         orString(def.Runtime, AgentRuntimeBuiltin),
 		Prompt:          orString(def.Prompt, ""),
@@ -1489,9 +1502,14 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 }
 
 // todoEnforcementFromDefinition maps a definition's todos and kill
-// blocks onto the resolved TodoEnforcementConfig, nil when neither
-// block set anything.
+// blocks, or the legacy todo_enforcement alias, onto the resolved
+// TodoEnforcementConfig; nil when neither set anything. Validation has
+// already rejected a definition that sets the alias together with
+// either block, so at most one source feeds the mapping (#402).
 func todoEnforcementFromDefinition(def AgentDefinition) *TodoEnforcementConfig {
+	if def.TodoEnforcement != nil {
+		return def.TodoEnforcement
+	}
 	if def.Todos == nil && def.Kill == nil {
 		return nil
 	}

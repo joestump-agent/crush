@@ -93,15 +93,19 @@ the two are deep-merged, and Crush logs a warning that both exist. Tracked in
 Agent definitions load and validate from both config formats
 ([#333](https://github.com/joestump-agent/crush/issues/333),
 [#431](https://github.com/joestump-agent/crush/issues/431)), and each carries
-its own `todos` and `kill` blocks. The dispatch runtime does not read them
-yet: dispatched agents are still built from the global
-`options.todo_enforcement`.
+its own `todos` and `kill` blocks. Dispatched agents resolve the worker
+definition's blocks layered over the global `options.todo_enforcement`
+([#402](https://github.com/joestump-agent/crush/issues/402)); the dispatch
+tool's watchdog and the dispatched agent's ladder read the same resolved
+settings, so a kill threshold configured on the definition trips in both
+places. [#433](https://github.com/joestump-agent/crush/issues/433) lets
+`dispatch_agent` choose which definition a dispatch runs.
 
-:::info[Planned]
-Per-agent thresholds arrive with agent definitions: the `todos` and `kill`
-blocks on each definition, with `agents.<id>.todo_enforcement` accepted as an
-alias and the global block as the default. Tracked in [#402](https://github.com/joestump-agent/crush/issues/402).
-:::
+`agents.<id>.todo_enforcement` stays accepted as a legacy alias for the
+`todos` and `kill` blocks: its nudge knobs map onto `todos`, its kill knobs
+onto `kill`. Setting the alias together with either block is a load error,
+and on a non-dispatch agent its kill knobs are dropped with a warning (kill
+is dispatch-only, the same rule the `kill` block enforces as a load error).
 
 ## What a dispatched agent can use
 
@@ -317,5 +321,6 @@ option dispatch-max-concurrent 4
 ```
 
 In this design, per-agent thresholds are the `todos` and `kill` blocks inside
-each definition. `agents.<id>.todo_enforcement` is accepted as an alias for
-them ([#402](https://github.com/joestump-agent/crush/issues/402)), and `options.todo_enforcement` stays as the global default.
+each definition. `agents.<id>.todo_enforcement` is accepted as a legacy alias
+for them ([#402](https://github.com/joestump-agent/crush/issues/402)), and
+`options.todo_enforcement` stays as the global default.

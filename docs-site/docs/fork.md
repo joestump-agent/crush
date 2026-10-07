@@ -129,7 +129,6 @@ built by [Charm](https://charm.land) — bugs in them belong
 | Thing | Status |
 | --- | --- |
 | A2A as an external interface | Every dispatch is served over A2A on a loopback port, but only Crush's own in-process client talks to it. There is no authentication and the endpoint is not shown anywhere, so third-party A2A clients are not a supported interface yet. See [the A2A protocol page](/agents/a2a-protocol). |
-| Per-agent `todo_enforcement` | The config types carry a per-agent override, but agent definitions are not configurable yet, so every agent uses the global `options.todo_enforcement`. Tracked as [#402](https://github.com/joestump-agent/crush/issues/402). |
 
 ## Reporting bugs
 
