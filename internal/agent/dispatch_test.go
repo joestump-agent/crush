@@ -256,7 +256,7 @@ func dispatchTestUsage(c *coordinator, sessionID string) func(context.Context) (
 // goroutine.
 func serveDispatchRun(t *testing.T, c *coordinator, run dispatchRun) {
 	t.Helper()
-	stop, err := c.startDispatchServer(context.Background(), run.provider, run.reg, run.entry.ID, run.sessionID, "tester", "dispatch test", run.agent, nil, run.call(c), run.killSettings.InactivityTimeout, run.kill.current, dispatchTestUsage(c, run.sessionID))
+	stop, err := c.startDispatchServer(context.Background(), run.provider, run.reg, run.entry.ID, run.sessionID, "tester", "dispatch test", run.agent, nil, run.call(c), run.killSettings.InactivityTimeout, run.kill.current, dispatchTestUsage(c, run.sessionID), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		if stop != nil {

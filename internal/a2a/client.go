@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2aext"
 
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/question"
 )
 
 // Dispatch transport status tokens (#71) — the protocol-side vocabulary
@@ -90,6 +92,12 @@ func newDispatchClient(ctx context.Context, card *a2aspec.AgentCard, httpClient 
 // the artifact (the diff), and how many Working progress events were
 // observed on the wire.
 //
+// A stream that ends in input-required (#352) is a question, not an
+// end: the typed question goes to the params' OnInputRequired, the
+// answer goes back as a message on the same task, and the stream that
+// opens consumes on toward the terminal state — or the next question.
+// When no answer is coming, the parked task is canceled with the reason.
+//
 // In-process the agent block keeps rendering from the dispatch
 // registry's todo collector — the same snapshots the server re-emits as
 // Working TaskStatusUpdateEvents (#174) — so the client counts but does
@@ -133,70 +141,214 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 	}
 	req.Message.ContextID = p.ContextID
 
-	var outcome agent.DispatchTransportOutcome
-	var taskID a2aspec.TaskID
-	for ev, err := range client.SendStreamingMessage(ctx, req) {
+	// One task, one or more streams (#352): each stream runs to a
+	// terminal state or to an input-required pause; a pause is answered
+	// on the same task, which opens the next stream on the same run.
+	s := &dispatchStream{params: p, client: client, decoder: decoder}
+	for {
+		if err := s.consume(ctx, client.SendStreamingMessage(ctx, req)); err != nil {
+			return agent.DispatchTransportOutcome{}, err
+		}
+		if s.outcome.Status != "" {
+			return s.outcome, nil
+		}
+		parked := s.question
+		if parked == nil {
+			return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch stream ended without a terminal state")
+		}
+		s.question = nil
+		next, err := s.answer(ctx, *parked)
 		if err != nil {
-			// A stream error after a terminal state is the transport
-			// winding down. Before one, the task is still live server
-			// side — and once the stream has named the task (#349),
-			// the run is recoverable through resubscribe plus
-			// tasks/get; without the ID there is nothing to resume
-			// and the error stands.
-			if outcome.Status != "" {
-				return outcome, nil
+			return agent.DispatchTransportOutcome{}, err
+		}
+		if next == nil {
+			// The parked task was canceled instead of answered; its
+			// terminal state is folded.
+			return s.outcome, nil
+		}
+		req = next
+	}
+}
+
+// dispatchStream is one dispatch's client-side state across its streams
+// (#349, #352): the outcome folded so far, the served task's ID once the
+// first event named it, and the question the last stream parked on.
+type dispatchStream struct {
+	params  agent.DispatchTransportParams
+	client  *a2aclient.Client
+	decoder *metadataDecoder
+	outcome agent.DispatchTransportOutcome
+	taskID  a2aspec.TaskID
+	// question is the question the task is parked on (#352): set by an
+	// input-required status or task snapshot, cleared by any later
+	// non-terminal state; nil when the stream ended any other way.
+	question *agent.QuestionRequest
+}
+
+// consume folds one stream's events into the dispatch's state. A stream
+// error after a terminal state or a pause is the transport winding down.
+// Before one, the task is still live server side — and once the stream
+// has named the task (#349), the run is recoverable through resubscribe
+// plus tasks/get; without the ID there is nothing to resume and the
+// error stands.
+func (s *dispatchStream) consume(ctx context.Context, events iter.Seq2[a2aspec.Event, error]) error {
+	for ev, err := range events {
+		if err != nil {
+			if s.outcome.Status != "" || s.question != nil {
+				return nil
 			}
-			if taskID == "" {
-				return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch stream: %w", err)
+			if s.taskID == "" {
+				return fmt.Errorf("a2a: dispatch stream: %w", err)
 			}
-			if rerr := resumeDispatchStream(ctx, client, string(taskID), &outcome); rerr != nil {
-				return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch stream: %w (resume: %w)", err, rerr)
+			if rerr := s.resume(ctx); rerr != nil {
+				return fmt.Errorf("a2a: dispatch stream: %w (resume: %w)", err, rerr)
 			}
-			return outcome, nil
+			return nil
 		}
 		// The first event names the served task (#349): hand the ID to
 		// the caller before anything else, so the registry entry
 		// carries it from the first event onward.
-		if taskID == "" {
+		if s.taskID == "" {
 			if id := ev.TaskInfo().TaskID; id != "" {
-				taskID = id
-				if p.OnTask != nil {
-					p.OnTask(string(id))
+				s.taskID = id
+				if s.params.OnTask != nil {
+					s.params.OnTask(string(id))
 				}
 			}
 		}
 		switch e := ev.(type) {
 		case *a2aspec.TaskStatusUpdateEvent:
-			applyStatusUpdate(&outcome, e)
-			decoder.apply(&outcome, e)
+			applyStatusUpdate(&s.outcome, e)
+			s.decoder.apply(&s.outcome, e)
+			s.noteQuestion(e.Status)
 		case *a2aspec.TaskArtifactUpdateEvent:
-			applyArtifactUpdate(&outcome, e)
+			applyArtifactUpdate(&s.outcome, e)
 		case *a2aspec.Task:
-			foldTaskSnapshot(&outcome, e)
+			foldTaskSnapshot(&s.outcome, e)
+			s.noteQuestion(e.Status)
 		}
 	}
-	if outcome.Status == "" {
-		return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch stream ended without a terminal state")
-	}
-	return outcome, nil
+	return nil
 }
 
-// resumeDispatchStream recovers a dispatch whose SSE stream dropped
-// before a terminal state (#349): the task is still running — or
-// already finished — server side, and resubscribe plus tasks/get bring
-// the run home. Up to three attempts, the backoff before each:
-// SubscribeToTask replays the stored task snapshot and then the live
-// events; when the execution has already ended the server answers
-// ErrTaskNotFound and GetTask returns the stored task instead. The
-// caller's stream error stands only when every attempt is exhausted —
-// after that, the coordinator's cancel-before-teardown (#344) reaps
+// noteQuestion tracks whether the task is parked on a question (#352):
+// an input-required status parks it with the question it carries, and
+// any later non-terminal status means the run moved on.
+func (s *dispatchStream) noteQuestion(status a2aspec.TaskStatus) {
+	switch {
+	case s.outcome.Status != "":
+		s.question = nil
+	case status.State == a2aspec.TaskStateInputRequired:
+		q := questionFromStatus(status.Message)
+		s.question = &q
+	default:
+		s.question = nil
+	}
+}
+
+// answer gets the parked question answered (#352) and returns the
+// message that sends the answer on the same task. Without a handler the
+// question gets agent.UnattendedQuestionAnswer. When no answer is
+// coming — the handler failed, a kill ended its wait — the parked task
+// is canceled with the error's text as the reason, its terminal state
+// folded, and the returned request is nil.
+func (s *dispatchStream) answer(ctx context.Context, q agent.QuestionRequest) (*a2aspec.SendMessageRequest, error) {
+	answer := agent.UnattendedQuestionAnswer(q)
+	if s.params.OnInputRequired != nil {
+		var err error
+		answer, err = s.params.OnInputRequired(ctx, q)
+		if err != nil {
+			return nil, s.cancelParked(ctx, err.Error())
+		}
+	}
+	encoded, err := Encode(AnswerExt, answer)
+	if err != nil {
+		return nil, s.cancelParked(ctx, err.Error())
+	}
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewDataPart(encoded))
+	msg.TaskID = s.taskID
+	msg.ContextID = s.params.ContextID
+	msg.Extensions = []string{AnswerExtensionURI}
+	return &a2aspec.SendMessageRequest{Message: msg}, nil
+}
+
+// cancelParked ends a parked task no answer is coming for (#352): a
+// tasks/cancel carrying the reason, on a context detached from the
+// caller's — the cancel must land even when the caller's context is what
+// ended the wait. A task that is already terminal (a kill's own
+// tasks/cancel got there first) is read back with tasks/get instead.
+// Either way its terminal state folds into the outcome.
+func (s *dispatchStream) cancelParked(ctx context.Context, reason string) error {
+	ctx = context.WithoutCancel(ctx)
+	task, err := s.client.CancelTask(ctx, &a2aspec.CancelTaskRequest{
+		ID: s.taskID,
+		Metadata: map[string]any{
+			CancelReasonMetadataKey: CancelReason{Reason: reason},
+		},
+	})
+	if err != nil {
+		var gerr error
+		task, gerr = s.client.GetTask(ctx, &a2aspec.GetTaskRequest{ID: s.taskID})
+		if gerr != nil {
+			return fmt.Errorf("a2a: cancel parked task %s: %w (get: %w)", s.taskID, err, gerr)
+		}
+	}
+	foldTaskSnapshot(&s.outcome, task)
+	if s.outcome.Status == "" {
+		return fmt.Errorf("a2a: parked task %s did not end after its cancel", s.taskID)
+	}
+	return nil
+}
+
+// questionFromStatus reads the question off an input-required status
+// message (#352): the typed questions/v1 DataPart, or — for a served
+// agent that only wrote prose — the message text as one free-text
+// question.
+func questionFromStatus(msg *a2aspec.Message) agent.QuestionRequest {
+	if msg != nil {
+		for _, part := range msg.Parts {
+			if part == nil {
+				continue
+			}
+			data, ok := part.Content.(a2aspec.Data)
+			if !ok {
+				continue
+			}
+			decoded, err := DecodeValue(QuestionExt, data.Value)
+			if err != nil {
+				slog.Warn("A2A question DataPart failed to decode; asking the status text instead", "err", err)
+				continue
+			}
+			if req, ok := decoded.(*agent.QuestionRequest); ok && len(req.Questions) > 0 {
+				return *req
+			}
+		}
+	}
+	return agent.QuestionRequest{Questions: []question.Question{{
+		ID:          "input",
+		Type:        question.TypeFreeText,
+		Text:        statusUpdateMessageText(&a2aspec.TaskStatusUpdateEvent{Status: a2aspec.TaskStatus{Message: msg}}),
+		Description: "The dispatched agent asked this without a typed question.",
+	}}}
+}
+
+// resume recovers a dispatch whose SSE stream dropped before a terminal
+// state (#349): the task is still running — or already finished, or
+// parked on a question (#352) — server side, and resubscribe plus
+// tasks/get bring the run home. Up to three attempts, the backoff
+// before each: SubscribeToTask replays the stored task snapshot and then
+// the live events; when the execution has already ended the server
+// answers ErrTaskNotFound and GetTask returns the stored task instead.
+// The caller's stream error stands only when every attempt is exhausted
+// — after that, the coordinator's cancel-before-teardown (#344) reaps
 // the run.
-func resumeDispatchStream(ctx context.Context, client *a2aclient.Client, taskID string, outcome *agent.DispatchTransportOutcome) error {
+func (s *dispatchStream) resume(ctx context.Context) error {
 	var lastErr error
 	for _, delay := range dispatchResumeBackoff {
-		// A terminal state from a prior attempt — the stream may have
-		// cut right after naming one — already ended the run.
-		if outcome.Status != "" {
+		// A terminal state or a pause from a prior attempt — the stream
+		// may have cut right after naming one — already ended the
+		// stream.
+		if s.ended() {
 			return nil
 		}
 		select {
@@ -204,7 +356,7 @@ func resumeDispatchStream(ctx context.Context, client *a2aclient.Client, taskID 
 			return ctx.Err()
 		case <-time.After(delay):
 		}
-		err := consumeResubscription(ctx, client, taskID, outcome)
+		err := s.consumeResubscription(ctx)
 		switch {
 		case err == nil:
 			return nil
@@ -217,55 +369,66 @@ func resumeDispatchStream(ctx context.Context, client *a2aclient.Client, taskID 
 		}
 		// The execution has ended server side: tasks/get returns the
 		// stored task with its status and artifacts. A terminal state
-		// folds and lands; a non-terminal one means the task is live
-		// without an execution — retry the subscription instead.
-		task, gerr := client.GetTask(ctx, &a2aspec.GetTaskRequest{ID: a2aspec.TaskID(taskID)})
+		// folds and lands, and so does a question the task is parked on;
+		// any other state means the task is live without an execution —
+		// retry the subscription instead.
+		task, gerr := s.client.GetTask(ctx, &a2aspec.GetTaskRequest{ID: s.taskID})
 		if gerr != nil {
 			lastErr = gerr
 			continue
 		}
-		foldTaskSnapshot(outcome, task)
-		if outcome.Status != "" {
+		foldTaskSnapshot(&s.outcome, task)
+		s.noteQuestion(task.Status)
+		if s.ended() {
 			return nil
 		}
 	}
 	if lastErr != nil {
-		return fmt.Errorf("resume attempts exhausted for task %s: %w", taskID, lastErr)
+		return fmt.Errorf("resume attempts exhausted for task %s: %w", s.taskID, lastErr)
 	}
-	return fmt.Errorf("resume attempts exhausted for task %s without a terminal state", taskID)
+	return fmt.Errorf("resume attempts exhausted for task %s without a terminal state", s.taskID)
+}
+
+// ended reports whether the stream reached its end: a terminal state, or
+// a pause on a question (#352).
+func (s *dispatchStream) ended() bool {
+	return s.outcome.Status != "" || s.question != nil
 }
 
 // consumeResubscription subscribes to the task's event stream and folds
 // what arrives into the outcome (#349). The replay opens with the
 // stored task snapshot — authoritative for the artifacts received
 // before the cut — and then only newer events. Nil only when a
-// terminal state landed; the error wraps a2a.ErrTaskNotFound when the
-// server has no active execution for the task.
-func consumeResubscription(ctx context.Context, client *a2aclient.Client, taskID string, outcome *agent.DispatchTransportOutcome) error {
-	req := &a2aspec.SubscribeToTaskRequest{ID: a2aspec.TaskID(taskID)}
-	for ev, err := range client.SubscribeToTask(ctx, req) {
+// terminal state or a pause landed; the error wraps
+// a2a.ErrTaskNotFound when the server has no active execution for the
+// task.
+func (s *dispatchStream) consumeResubscription(ctx context.Context) error {
+	req := &a2aspec.SubscribeToTaskRequest{ID: s.taskID}
+	for ev, err := range s.client.SubscribeToTask(ctx, req) {
 		if err != nil {
-			return fmt.Errorf("a2a: resubscribe task %s: %w", taskID, err)
+			return fmt.Errorf("a2a: resubscribe task %s: %w", s.taskID, err)
 		}
-		foldEvent(outcome, ev)
+		s.foldEvent(ev)
 	}
-	if outcome.Status == "" {
-		return fmt.Errorf("a2a: resubscribed stream for task %s ended without a terminal state", taskID)
+	if !s.ended() {
+		return fmt.Errorf("a2a: resubscribed stream for task %s ended without a terminal state", s.taskID)
 	}
 	return nil
 }
 
-// foldEvent folds one stream or replay event into the outcome. Both
-// the initial stream and a resubscription's replay carry the same
-// event vocabulary, so they share one folder.
-func foldEvent(outcome *agent.DispatchTransportOutcome, ev a2aspec.Event) {
+// foldEvent folds one replay event into the dispatch's state. Both the
+// initial stream and a resubscription's replay carry the same event
+// vocabulary.
+func (s *dispatchStream) foldEvent(ev a2aspec.Event) {
 	switch e := ev.(type) {
 	case *a2aspec.TaskStatusUpdateEvent:
-		applyStatusUpdate(outcome, e)
+		applyStatusUpdate(&s.outcome, e)
+		s.noteQuestion(e.Status)
 	case *a2aspec.TaskArtifactUpdateEvent:
-		applyArtifactUpdate(outcome, e)
+		applyArtifactUpdate(&s.outcome, e)
 	case *a2aspec.Task:
-		foldTaskSnapshot(outcome, e)
+		foldTaskSnapshot(&s.outcome, e)
+		s.noteQuestion(e.Status)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/internal/question"
 )
 
 // ErrNoWorkingDir is returned by BuildDispatchToolchain when no workspace
@@ -39,9 +40,14 @@ var ErrNoWorkingDir = errors.New("dispatch toolchain requires a workspace direct
 //
 //   - the agent and agentic_fetch tools, which build sub-agents from the
 //     parent coordinator's scope;
-//   - the question tool, since dispatched runs are non-interactive;
 //   - MCP tools, whose clients are rooted at the parent workspace;
 //   - semantic search, whose index is rooted at the parent workspace.
+//
+// The question tool is present only when the parent is interactive
+// (#352), and it never reaches the parent's question service directly:
+// it asks through the toolchain's own service, which the served
+// executor turns into an input-required pause on the A2A task, and the
+// parent's transport carries the question to its user.
 //
 // Phase 1 is in-process: the parent's session, history, and file-tracker
 // services are shared (they are keyed by session ID, not path), and the
@@ -54,6 +60,10 @@ type DispatchToolchain struct {
 	lspManager  *lsp.Manager
 	permissions permission.Service
 	tools       []fantasy.AgentTool
+	// questions is the dispatched agent's own question service (#352),
+	// the one its question tool asks through. Nil when the parent was
+	// not interactive at build time, and the agent has no question tool.
+	questions question.Service
 
 	// cancel stops the permission bridge. Nil when the toolchain was
 	// built without a parent permission service to bridge to.
@@ -86,6 +96,16 @@ func (t *DispatchToolchain) LSPManager() *lsp.Manager {
 // directory.
 func (t *DispatchToolchain) Permissions() permission.Service {
 	return t.permissions
+}
+
+// Questions returns the dispatched agent's own question service (#352):
+// the served executor watches it and parks the run on each question.
+// Nil when the agent has no question tool.
+func (t *DispatchToolchain) Questions() question.Service {
+	if t == nil {
+		return nil
+	}
+	return t.questions
 }
 
 // Tools returns the constructed tool set, filtered to the task agent's
@@ -195,6 +215,12 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 		lspManager:  lspManager,
 		permissions: permissions,
 		cancel:      cancel,
+	}
+	// A dispatched agent may ask the parent's user a question (#352), but
+	// only while someone can answer: a non-interactive parent's dispatch
+	// gets no question service, and with it no question tool.
+	if c.isInteractive() {
+		t.questions = question.NewService()
 	}
 	t.tools = c.buildDispatchTools(workerCfg, t)
 	return t, nil
@@ -307,6 +333,14 @@ func (c *coordinator) buildDispatchTools(workerCfg config.Agent, t *DispatchTool
 	// and the worker definition's AllowedMCP decides what the
 	// dispatched agent may call.
 	filtered = append(filtered, filterMCPTools(workerCfg, tools.GetMCPTools(t.permissions, t.store, dir))...)
+
+	// The question tool (#352) asks through the toolchain's own service,
+	// never the parent's: the served executor parks the run on each
+	// question and the parent's transport carries it to the user. A
+	// question tool the user denied stays denied.
+	if t.questions != nil && !slices.Contains(c.cfg.Config().Options.DisabledTools, tools.QuestionToolName) {
+		filtered = append(filtered, tools.NewQuestionTool(t.questions))
+	}
 
 	// Dispatched agents fire the parent's PreToolUse hooks (#377): they
 	// carry bash, edit, multiedit, and write, so a hook that blocks a

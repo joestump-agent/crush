@@ -514,7 +514,7 @@ func (f *wanderKillFixture) runDispatchSync(t *testing.T) {
 func (f *wanderKillFixture) serveDispatch(t *testing.T) {
 	t.Helper()
 	run := f.buildRun()
-	_, err := f.c.startDispatchServer(context.Background(), f.provider, f.reg, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current, dispatchTestUsage(f.c, run.sessionID))
+	_, err := f.c.startDispatchServer(context.Background(), f.provider, f.reg, f.entry.ID, f.taskSess.ID, "tester", "dispatch tester", run.agent, nil, run.call(f.c), run.killSettings.InactivityTimeout, run.kill.current, dispatchTestUsage(f.c, run.sessionID), nil)
 	require.NoError(t, err)
 	entry, ok := f.reg.Get(f.entry.ID)
 	require.True(t, ok)
