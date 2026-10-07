@@ -456,11 +456,11 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// with (#376): the worktree's own config must not widen it
 			// (#374). Without any write tool left there is nothing a
 			// dispatch can do, so refuse before provisioning a workspace.
-			agentCfg, ok := c.cfg.Config().Agents[config.AgentTask]
-			if !ok {
-				return fantasy.NewTextErrorResponse("dispatch unavailable: task agent not configured"), nil
+			workerCfg, ok := c.cfg.Config().Agents[config.AgentWorker]
+			if !ok || workerCfg.Disabled {
+				return fantasy.NewTextErrorResponse("dispatch unavailable: worker agent not configured"), nil
 			}
-			surviving := dispatchAllowedTools(agentCfg, c.cfg.Config().Options.DisabledTools)
+			surviving := dispatchAllowedTools(workerCfg, c.cfg.Config().Options.DisabledTools)
 			if !slices.ContainsFunc(dispatchCapabilityTools, func(name string) bool {
 				return slices.Contains(surviving, name)
 			}) {
@@ -703,8 +703,9 @@ func (c *coordinator) dispatchEnforcement() config.TodoEnforcementSettings {
 }
 
 // buildDispatchedAgent constructs the agent a dispatch runs: the chosen
-// selected model (small by default), a system prompt rendered at dispatch
-// time from the dispatch template against the workspace's scoped store
+// selected model (small by default) — the worker definition's explicit
+// pin wins (#432) — a system prompt rendered at dispatch time from the
+// worker definition's prompt against the workspace's scoped store
 // (template + dispatch context: git status, context files, skills), and
 // the workspace-rooted toolchain's tools.
 func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAgentOptions) (*dispatchedAgent, error) {
@@ -719,21 +720,53 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 	if opts.ModelType == config.SelectedModelTypeLarge {
 		model = large
 	}
+	workerCfg, ok := c.cfg.Config().Agents[config.AgentWorker]
+	if !ok {
+		return nil, errors.New("worker agent not configured")
+	}
+	// The worker definition's explicit pin (#432) wins over the chosen
+	// slot: a pinned worker runs every dispatch on its own provider and
+	// model, whatever the dispatch asked for. The small slot stays the
+	// user's small model for auxiliary work.
+	if workerCfg.ModelRef != nil {
+		pinned, err := c.buildModelFromSelected(ctx, config.SelectedModel{
+			Provider: workerCfg.ModelRef.Provider,
+			Model:    workerCfg.ModelRef.Model,
+		}, true)
+		if err != nil {
+			return nil, err
+		}
+		model = pinned
+	}
 
 	providerCfg, ok := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
 	if !ok {
 		return nil, errModelProviderNotConfigured
 	}
 
+	// The dispatched prompt renders from the worker definition (#432):
+	// builtin:dispatch by default, the definition's file: template when
+	// it names one, against the scoped workspace store. The dispatch's
+	// requested skills narrow the definition's set — a dispatch asks for
+	// fewer skills, never more.
 	promptOpts := []prompt.Option{prompt.WithWorkingDir(opts.Toolchain.WorkingDir())}
-	if len(opts.Skills) > 0 {
-		promptOpts = append(promptOpts, prompt.WithSkills(opts.Skills))
+	promptOpts = append(promptOpts, agentPromptOptions(workerCfg)...)
+	requestedSkills := opts.Skills
+	if len(workerCfg.Skills) > 0 {
+		if len(requestedSkills) == 0 {
+			requestedSkills = workerCfg.Skills
+		} else {
+			requestedSkills = intersectSkills(requestedSkills, workerCfg.Skills)
+		}
 	}
-	systemPrompt, err := dispatchPrompt(promptOpts...)
+	if len(requestedSkills) > 0 {
+		promptOpts = append(promptOpts, prompt.WithSkills(requestedSkills))
+	}
+	systemPromptTemplate, err := agentPrompt(workerCfg, c.cfg.WorkingDir(), promptOpts...)
 	if err != nil {
 		return nil, err
 	}
-	rendered, err := systemPrompt.Build(ctx, model.Model.Provider(), model.Model.Model(), opts.Toolchain.Config())
+	rendered, err := agentSystemPrompt(ctx, systemPromptTemplate, workerCfg, c.cfg.WorkingDir(), model.Model.Provider(), model.Model.Model(), opts.Toolchain.Config())
 	if err != nil {
 		return nil, fmt.Errorf("render dispatch system prompt: %w", err)
 	}

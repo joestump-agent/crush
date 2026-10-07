@@ -844,14 +844,17 @@ func TestBuildDispatchedAgent(t *testing.T) {
 	toolchain.Config().Config().Options.ContextPaths = savedContextPaths
 	toolchain.Config().Config().Options.GlobalContextPaths = savedGlobalContextPaths
 
-	// The tools are the task agent's read-only set widened with the
-	// dispatch write tools.
+	// The tools are the worker definition's default dispatch set
+	// (#432): the read and write groups plus the support tools.
 	toolNames := toolNamesOf(dispatched.agent)
-	for _, name := range dispatchWriteTools {
+	for _, name := range []string{
+		tools.BashToolName, tools.EditToolName, tools.MultiEditToolName,
+		tools.WriteToolName, tools.TodosToolName,
+		tools.JobOutputToolName, tools.JobKillToolName, tools.DiagnosticsToolName,
+		tools.GlobToolName, tools.ViewToolName,
+	} {
 		require.Contains(t, toolNames, name)
 	}
-	require.Contains(t, toolNames, tools.GlobToolName)
-	require.Contains(t, toolNames, tools.ViewToolName)
 }
 
 // toolNamesOf returns the names of an agent's current tool set.

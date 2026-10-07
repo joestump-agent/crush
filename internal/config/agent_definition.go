@@ -309,9 +309,14 @@ func builtinAgentDefinitions() map[string]AgentDefinition {
 			Description: strPtr("An agent that produces work in an isolated workspace."),
 			Model:       &AgentModel{Type: SelectedModelTypeSmall},
 			Prompt:      strPtr("builtin:dispatch"),
-			Tools:       &AgentTools{Allow: []string{"@read", "@write"}},
-			MCP:         &AgentMCP{Allow: []string{}},
-			Workspace:   strPtr(AgentWorkspaceWorktree),
+			// The dispatch toolset (#432): the read and write groups
+			// plus the support tools (#384) that let a dispatch observe
+			// what it ran and wrote. MCP stays off by default — the
+			// no-section dispatch set matches the pre-#432 union; widen
+			// with agents.worker.mcp.allow.
+			Tools:     &AgentTools{Allow: slices.Concat(readOnlyToolNames, writeToolNames, []string{"job_output", "job_kill", "lsp_diagnostics"})},
+			MCP:       &AgentMCP{Allow: []string{}},
+			Workspace: strPtr(AgentWorkspaceWorktree),
 		},
 	}
 }
@@ -860,7 +865,9 @@ var warnedDefinitionFields sync.Map
 // warnUnhonoredFields logs one warning per definition field the runtime
 // parses but does not honor yet, skipping values that merely restate
 // the built-in default so an untouched config starts up silent. #432
-// builds agents from definitions and retires these.
+// honored model, prompt, prompt_append, skills, context paths, tools,
+// MCP, and disabled; what remains waits on the a2a runtime (#392,
+// #434) and dispatch workspace selection.
 func warnUnhonoredFields(id string, def AgentDefinition) {
 	builtin := builtinAgentDefinitions()[id]
 	fields := []struct {
@@ -868,11 +875,6 @@ func warnUnhonoredFields(id string, def AgentDefinition) {
 		isSet bool
 	}{
 		{"runtime", orString(def.Runtime, AgentRuntimeBuiltin) == AgentRuntimeA2A},
-		{"disabled", def.Disabled != nil && *def.Disabled},
-		{"model", def.Model != nil && def.Model.Ref != nil},
-		{"prompt", def.Prompt != nil && (builtin.Prompt == nil || *def.Prompt != *builtin.Prompt)},
-		{"prompt_append", def.PromptAppend != nil},
-		{"skills", def.Skills != nil},
 		{"workspace", def.Workspace != nil && (builtin.Workspace == nil || *def.Workspace != *builtin.Workspace)},
 		{"card", def.Card != nil},
 		{"auth", def.Auth != nil},

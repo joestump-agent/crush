@@ -63,16 +63,13 @@ import (
 
 // Coordinator errors.
 var (
-	errCoderAgentNotConfigured         = errors.New("coder agent not configured")
-	errPlanAgentNotConfigured          = errors.New("plan agent not configured")
-	errMainAgentNotFound               = errors.New("main agent not found")
-	errModelProviderNotConfigured      = errors.New("model provider not configured")
-	errLargeModelNotSelected           = errors.New("large model not selected")
-	errSmallModelNotSelected           = errors.New("small model not selected")
-	errLargeModelProviderNotConfigured = errors.New("large model provider not configured")
-	errSmallModelProviderNotConfigured = errors.New("small model provider not configured")
-	errLargeModelNotFound              = errors.New("large model not found in provider config")
-	errSmallModelNotFound              = errors.New("small model not found in provider config")
+	errCoderAgentNotConfigured    = errors.New("coder agent not configured")
+	errPlanAgentNotConfigured     = errors.New("plan agent not configured")
+	errMainAgentNotFound          = errors.New("main agent not found")
+	errModelProviderNotConfigured = errors.New("model provider not configured")
+	errModelNotFound              = errors.New("model not found in provider config")
+	errLargeModelNotSelected      = errors.New("large model not selected")
+	errSmallModelNotSelected      = errors.New("small model not selected")
 )
 
 // Copilot models that use the Responses API instead of Chat Completions.
@@ -398,48 +395,32 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		return nil, errCoderAgentNotConfigured
 	}
 
-	// TODO: make this dynamic when we support multiple agents
 	// A2UI is on unless the user disables it; see prompt.WithA2UI for the
-	// host-capability trade-off.
-	// The cron tools below are registered unconditionally in buildAgent, so
-	// the matching prompt guidance is always on for the coder agent.
-	//
-	// Bound to coderPrompt rather than prompt: the plan agent below calls
-	// planPrompt(prompt.WithWorkingDir(...)), so the prompt package must
-	// stay unshadowed for the rest of the constructor.
-	promptOpts := []prompt.Option{
-		prompt.WithWorkingDir(c.cfg.WorkingDir()),
-		prompt.WithScheduling(),
-	}
+	// host-capability trade-off. The cron tools are registered
+	// unconditionally in buildAgent, so the matching prompt guidance is
+	// always on for the coder agent. These coder-only sections ride the
+	// coder agent's build (#432): the definition's prompt — builtin or
+	// file — renders with them, and a file-based template that does not
+	// reference the fields is unaffected.
+	coderOpts := []prompt.Option{prompt.WithScheduling()}
 	if !c.cfg.Config().Options.DisableA2UI {
-		promptOpts = append(promptOpts, prompt.WithA2UI())
-	}
-	coderPrompt, err := coderPrompt(promptOpts...)
-	if err != nil {
-		return nil, err
+		coderOpts = append(coderOpts, prompt.WithA2UI())
 	}
 
-	agent, err := c.buildAgent(ctx, coderPrompt, agentCfg, false)
+	agent, err := c.buildAgent(ctx, agentCfg, false, coderOpts...)
 	if err != nil {
 		return nil, err
 	}
 	c.agents[config.AgentCoder] = agent
 
 	planCfg, ok := c.cfg.Config().Agents[config.AgentPlan]
-	if !ok {
-		return nil, errPlanAgentNotConfigured
+	if ok && !planCfg.Disabled {
+		planAgent, err := c.buildAgent(ctx, planCfg, false)
+		if err != nil {
+			return nil, err
+		}
+		c.agents[config.AgentPlan] = planAgent
 	}
-
-	planSystemPrompt, err := planPrompt(prompt.WithWorkingDir(c.cfg.WorkingDir()))
-	if err != nil {
-		return nil, err
-	}
-
-	planAgent, err := c.buildAgent(ctx, planSystemPrompt, planCfg, false)
-	if err != nil {
-		return nil, err
-	}
-	c.agents[config.AgentPlan] = planAgent
 
 	cronScheduler := scheduler.NewScheduler(c.cronStore, c.fireScheduledTask)
 	go cronScheduler.Run(ctx)
@@ -476,6 +457,11 @@ func (c *coordinator) SetMainAgent(agentName string) error {
 	defer c.agentMu.Unlock()
 	agent, ok := c.agents[agentName]
 	if !ok {
+		if c.cfg != nil {
+			if cfg, ok := c.cfg.Config().Agents[agentName]; ok && cfg.Disabled {
+				return fmt.Errorf("agent %q is disabled", agentName)
+			}
+		}
 		return fmt.Errorf("%w: %s", errMainAgentNotFound, agentName)
 	}
 	c.mainAgent = agent
@@ -1023,13 +1009,45 @@ func mergeCallOptions(model Model, cfg config.ProviderConfig) (fantasy.ProviderO
 	return modelOptions, temp, topP, topK, freqPenalty, presPenalty
 }
 
-func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, agent config.Agent, isSubAgent bool) (SessionAgent, error) {
+// buildAgent builds one agent from its resolved definition (#432): the
+// model comes from the definition (slot ref or explicit pin) over the
+// configured slots, the prompt renders from the definition's prompt
+// reference with the definition's context paths and skills, and the
+// tools build from the definition's allow list. extraOpts carry
+// caller-owned prompt sections — the coder-only scheduling guidance and
+// A2UI; a file-based template that does not reference those fields is
+// unaffected by them.
+func (c *coordinator) buildAgent(ctx context.Context, agent config.Agent, isSubAgent bool, extraOpts ...prompt.Option) (SessionAgent, error) {
 	large, small, err := c.buildAgentModels(ctx, isSubAgent)
 	if err != nil {
 		return nil, err
 	}
 
+	// An agent pinned to an explicit provider and model (#432) runs on
+	// it in the large slot; the small slot stays the user's small model
+	// for auxiliary work.
+	if agent.ModelRef != nil {
+		pinned, err := c.buildModelFromSelected(ctx, config.SelectedModel{
+			Provider: agent.ModelRef.Provider,
+			Model:    agent.ModelRef.Model,
+		}, isSubAgent)
+		if err != nil {
+			return nil, err
+		}
+		large = pinned
+	}
+
 	largeProviderCfg, _ := c.cfg.Config().Providers.Get(large.ModelCfg.Provider)
+
+	promptOpts := append([]prompt.Option{
+		prompt.WithWorkingDir(c.cfg.WorkingDir()),
+	}, extraOpts...)
+	promptOpts = append(promptOpts, agentPromptOptions(agent)...)
+	systemPromptTemplate, err := agentPrompt(agent, c.cfg.WorkingDir(), promptOpts...)
+	if err != nil {
+		return nil, err
+	}
+
 	result := newSessionAgent(SessionAgentOptions{
 		LargeModel:           large,
 		SmallModel:           small,
@@ -1073,7 +1091,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 
 	var build errgroup.Group
 	build.Go(func() error {
-		systemPrompt, err := prompt.Build(initCtx, large.Model.Provider(), large.Model.Model(), c.cfg)
+		systemPrompt, err := agentSystemPrompt(initCtx, systemPromptTemplate, agent, c.cfg.WorkingDir(), large.Model.Provider(), large.Model.Model(), c.cfg)
 		if err != nil {
 			return err
 		}
@@ -1101,8 +1119,26 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// worse than either mode alone.
 	interactive := c.isInteractive()
 
+	// Effective palette: the definition's allow list (#432) minus the
+	// user's disabled tools, applied last so a definition can never
+	// widen user policy. A disabled task agent takes the `agent` tool
+	// off the main agents' palettes — there is no sub-agent to run —
+	// and with no enabled dispatch agent the dispatch and message
+	// tools have nothing to act on.
+	allowedTools := effectiveToolNames(agent.AllowedTools, c.cfg.Config().Options.DisabledTools)
+	if taskCfg, ok := c.cfg.Config().Agents[config.AgentTask]; ok && taskCfg.Disabled {
+		allowedTools = slices.DeleteFunc(allowedTools, func(name string) bool {
+			return name == AgentToolName
+		})
+	}
+	if !hasEnabledDispatchAgent(c.cfg.Config()) {
+		allowedTools = slices.DeleteFunc(allowedTools, func(name string) bool {
+			return name == DispatchAgentToolName || name == MessageAgentToolName || name == CancelDispatchToolName
+		})
+	}
+
 	var allTools []fantasy.AgentTool
-	if slices.Contains(agent.AllowedTools, AgentToolName) {
+	if slices.Contains(allowedTools, AgentToolName) {
 		agentTool, err := c.agentTool(ctx)
 		if err != nil {
 			return nil, err
@@ -1110,7 +1146,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 		allTools = append(allTools, agentTool)
 	}
 
-	if slices.Contains(agent.AllowedTools, tools.AgenticFetchToolName) {
+	if slices.Contains(allowedTools, tools.AgenticFetchToolName) {
 		agenticFetchTool, err := c.agenticFetchTool(ctx, nil)
 		if err != nil {
 			return nil, err
@@ -1124,7 +1160,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// interactive-only (#387): a non-interactive `crush run` exits when
 	// the parent's turn ends, so a dispatch would die mid-run with its
 	// result undelivered.
-	if !isSubAgent && interactive && slices.Contains(agent.AllowedTools, DispatchAgentToolName) {
+	if !isSubAgent && interactive && slices.Contains(allowedTools, DispatchAgentToolName) {
 		allTools = append(allTools, c.dispatchTool())
 	}
 
@@ -1135,7 +1171,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// deferred (A2A epic #67). Interactive-only for the same reason
 	// dispatch is (#387): a non-interactive run ends with the parent's
 	// turn, so there is no live run left to inject into.
-	if !isSubAgent && interactive && slices.Contains(agent.AllowedTools, MessageAgentToolName) {
+	if !isSubAgent && interactive && slices.Contains(allowedTools, MessageAgentToolName) {
 		allTools = append(allTools, c.messageAgentTool())
 	}
 
@@ -1143,13 +1179,18 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// one dispatched agent. It rides the same gate as dispatch and
 	// message: main agents only, interactive only — the same reasons
 	// apply, and a tool with nothing running behind it is dead weight.
-	if !isSubAgent && interactive && slices.Contains(agent.AllowedTools, CancelDispatchToolName) {
+	if !isSubAgent && interactive && slices.Contains(allowedTools, CancelDispatchToolName) {
 		allTools = append(allTools, c.cancelDispatchTool())
 	}
 
-	// Get the model name for the agent
+	// Get the model name for the agent: an explicit pin (#432) names it,
+	// otherwise the agent's slot does.
 	modelID := ""
-	if modelCfg, ok := c.cfg.Config().Models[agent.Model]; ok {
+	if agent.ModelRef != nil {
+		if model := c.cfg.Config().GetModel(agent.ModelRef.Provider, agent.ModelRef.Model); model != nil {
+			modelID = model.ID
+		}
+	} else if modelCfg, ok := c.cfg.Config().Models[agent.Model]; ok {
 		if model := c.cfg.Config().GetModel(modelCfg.Provider, modelCfg.Model); model != nil {
 			modelID = model.ID
 		}
@@ -1238,34 +1279,12 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 
 	var filteredTools []fantasy.AgentTool
 	for _, tool := range allTools {
-		if slices.Contains(agent.AllowedTools, tool.Info().Name) {
+		if slices.Contains(allowedTools, tool.Info().Name) {
 			filteredTools = append(filteredTools, tool)
 		}
 	}
 
-	for _, tool := range tools.GetMCPTools(c.permissions, c.cfg, c.cfg.WorkingDir()) {
-		if agent.AllowedMCP == nil {
-			// No MCP restrictions
-			filteredTools = append(filteredTools, tool)
-			continue
-		}
-		if len(agent.AllowedMCP) == 0 {
-			// No MCPs allowed
-			slog.Debug("No MCPs allowed", "tool", tool.Name(), "agent", agent.Name)
-			break
-		}
-
-		for mcp, tools := range agent.AllowedMCP {
-			if mcp != tool.MCP() {
-				continue
-			}
-			if len(tools) == 0 || slices.Contains(tools, tool.MCPToolName()) {
-				filteredTools = append(filteredTools, tool)
-				break
-			}
-			slog.Debug("MCP not allowed", "tool", tool.Name(), "agent", agent.Name)
-		}
-	}
+	filteredTools = append(filteredTools, filterMCPTools(agent, tools.GetMCPTools(c.permissions, c.cfg, c.cfg.WorkingDir()))...)
 	slices.SortFunc(filteredTools, func(a, b fantasy.AgentTool) int {
 		return strings.Compare(a.Info().Name, b.Info().Name)
 	})
@@ -1280,7 +1299,64 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	return filteredTools, nil
 }
 
-// TODO: when we support multiple agents we need to change this so that we pass in the agent specific model config
+// effectiveToolNames computes an agent's effective tool list: the
+// definition's resolved allow list minus the user's disabled tools,
+// applied last so a definition can never widen user policy (#432).
+// The returned slice is a fresh copy; the definition's list is shared.
+func effectiveToolNames(allowed, disabled []string) []string {
+	return slices.DeleteFunc(slices.Clone(allowed), func(name string) bool {
+		return slices.Contains(disabled, name)
+	})
+}
+
+// hasEnabledDispatchAgent reports whether any builtin dispatch-role
+// agent is enabled (#432). With none, the dispatch and message tools
+// have nothing to act on and stay off the palette.
+func hasEnabledDispatchAgent(c *config.Config) bool {
+	for _, a := range c.Agents {
+		if a.Role == config.AgentRoleDispatch && a.Runtime == config.AgentRuntimeBuiltin && !a.Disabled {
+			return true
+		}
+	}
+	return false
+}
+
+// filterMCPTools keeps the MCP tools an agent's definition allows
+// (#432): a nil AllowedMCP means no restriction, an empty one allows
+// no MCP tools, and entries allow a whole server or named tools on it
+// (the config resolves server:tool pairs on load).
+func filterMCPTools(agent config.Agent, mcpTools []*tools.Tool) []fantasy.AgentTool {
+	var filtered []fantasy.AgentTool
+	for _, tool := range mcpTools {
+		if agent.AllowedMCP == nil {
+			// No MCP restrictions
+			filtered = append(filtered, tool)
+			continue
+		}
+		if len(agent.AllowedMCP) == 0 {
+			// No MCPs allowed
+			slog.Debug("No MCPs allowed", "tool", tool.Name(), "agent", agent.Name)
+			break
+		}
+
+		for mcp, names := range agent.AllowedMCP {
+			if mcp != tool.MCP() {
+				continue
+			}
+			if len(names) == 0 || slices.Contains(names, tool.MCPToolName()) {
+				filtered = append(filtered, tool)
+				break
+			}
+			slog.Debug("MCP not allowed", "tool", tool.Name(), "agent", agent.Name)
+		}
+	}
+	return filtered
+}
+
+// buildAgentModels resolves the configured large and small model slots.
+// An agent that carries its own model — a slot ref or an explicit
+// provider and model pin (#432) — replaces its large slot with
+// buildModelFromSelected.
 func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Model, Model, error) {
 	largeModelCfg, ok := c.cfg.Config().Models[config.SelectedModelTypeLarge]
 	if !ok {
@@ -1291,98 +1367,68 @@ func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Mo
 		return Model{}, Model{}, errSmallModelNotSelected
 	}
 
-	largeProviderCfg, ok := c.cfg.Config().Providers.Get(largeModelCfg.Provider)
-	if !ok {
-		return Model{}, Model{}, errLargeModelProviderNotConfigured
-	}
-
-	largeProvider, err := c.buildProvider(largeProviderCfg, largeModelCfg, isSubAgent)
+	large, err := c.buildModelFromSelected(ctx, largeModelCfg, isSubAgent)
 	if err != nil {
 		return Model{}, Model{}, err
 	}
-
-	smallProviderCfg, ok := c.cfg.Config().Providers.Get(smallModelCfg.Provider)
-	if !ok {
-		return Model{}, Model{}, errSmallModelProviderNotConfigured
-	}
-
-	smallProvider, err := c.buildProvider(smallProviderCfg, smallModelCfg, true)
+	small, err := c.buildModelFromSelected(ctx, smallModelCfg, true)
 	if err != nil {
 		return Model{}, Model{}, err
 	}
+	return large, small, nil
+}
 
-	var largeCatwalkModel *catwalk.Model
-	var smallCatwalkModel *catwalk.Model
+// buildModelFromSelected builds one Model from a selected model: the
+// provider is constructed, the model resolved against the provider's
+// catalog, and the request-timeout and Hyper-credits wrappers applied.
+func (c *coordinator) buildModelFromSelected(ctx context.Context, selected config.SelectedModel, isSubAgent bool) (Model, error) {
+	providerCfg, ok := c.cfg.Config().Providers.Get(selected.Provider)
+	if !ok {
+		return Model{}, fmt.Errorf("%w: %q", errModelProviderNotConfigured, selected.Provider)
+	}
 
-	for _, m := range largeProviderCfg.Models {
-		if m.ID == largeModelCfg.Model {
-			largeCatwalkModel = &m
+	provider, err := c.buildProvider(providerCfg, selected, isSubAgent)
+	if err != nil {
+		return Model{}, err
+	}
+
+	var catwalkModel *catwalk.Model
+	for _, m := range providerCfg.Models {
+		if m.ID == selected.Model {
+			catwalkModel = &m
 		}
 	}
-	for _, m := range smallProviderCfg.Models {
-		if m.ID == smallModelCfg.Model {
-			smallCatwalkModel = &m
-		}
+	if catwalkModel == nil {
+		return Model{}, fmt.Errorf("%w: %q in provider %q", errModelNotFound, selected.Model, selected.Provider)
 	}
 
-	if largeCatwalkModel == nil {
-		return Model{}, Model{}, errLargeModelNotFound
+	modelID := selected.Model
+	if selected.Provider == openrouter.Name && isExactoSupported(modelID) {
+		modelID += ":exacto"
 	}
 
-	if smallCatwalkModel == nil {
-		return Model{}, Model{}, errSmallModelNotFound
-	}
-
-	largeModelID := largeModelCfg.Model
-	smallModelID := smallModelCfg.Model
-
-	if largeModelCfg.Provider == openrouter.Name && isExactoSupported(largeModelID) {
-		largeModelID += ":exacto"
-	}
-
-	if smallModelCfg.Provider == openrouter.Name && isExactoSupported(smallModelID) {
-		smallModelID += ":exacto"
-	}
-
-	largeModel, err := largeProvider.LanguageModel(ctx, largeModelID)
+	model, err := provider.LanguageModel(ctx, modelID)
 	if err != nil {
-		return Model{}, Model{}, err
-	}
-	smallModel, err := smallProvider.LanguageModel(ctx, smallModelID)
-	if err != nil {
-		return Model{}, Model{}, err
+		return Model{}, err
 	}
 
 	// Bound each request with the configured timeout so unreachable or hung
 	// providers fail instead of blocking a session forever. The wrapper is
 	// applied per request, so retries get a fresh budget each attempt.
-	requestTimeout := c.cfg.Config().Options.GetRequestTimeout()
-	largeModel = newRequestTimeoutModel(largeModel, requestTimeout)
-	smallModel = newRequestTimeoutModel(smallModel, requestTimeout)
+	model = newRequestTimeoutModel(model, c.cfg.Config().Options.GetRequestTimeout())
 
 	// Hyper completions no longer report the hypercredit balance, so wrap
 	// the Hyper models to fetch it from /v1/credits on every request.
-	if largeModelCfg.Provider == hyper.Name {
-		largeModel = newHyperCreditsModel(largeModel, c.hyperAPIKey)
-	}
-	if smallModelCfg.Provider == hyper.Name {
-		smallModel = newHyperCreditsModel(smallModel, c.hyperAPIKey)
+	if selected.Provider == hyper.Name {
+		model = newHyperCreditsModel(model, c.hyperAPIKey)
 	}
 
-	large := Model{
-		Model:      largeModel,
-		CatwalkCfg: *largeCatwalkModel,
-		ModelCfg:   largeModelCfg,
-		FlatRate:   largeProviderCfg.FlatRate,
-	}
-	small := Model{
-		Model:      smallModel,
-		CatwalkCfg: *smallCatwalkModel,
-		ModelCfg:   smallModelCfg,
-		FlatRate:   smallProviderCfg.FlatRate,
-	}
-
-	return large, small, nil
+	return Model{
+		Model:      model,
+		CatwalkCfg: *catwalkModel,
+		ModelCfg:   selected,
+		FlatRate:   providerCfg.FlatRate,
+	}, nil
 }
 
 // hyperAPIKey resolves the Hyper API key from the live config, so an
