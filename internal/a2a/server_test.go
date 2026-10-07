@@ -226,6 +226,44 @@ func TestServerStopReleasesSocket(t *testing.T) {
 	require.True(t, os.IsNotExist(statErr), "the socket file must be removed on Close")
 }
 
+// Stop ends the route's runs before it returns: a run still in flight is
+// canceled and joined, so the dispatch's teardown after Stop never closes
+// the toolchain or releases the workspace under a running tool call.
+func TestServerStopJoinsInFlightRun(t *testing.T) {
+	runner := newUnwindingRunner()
+	close(runner.unwind)
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+
+	client := unixDialClient(factory)
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		resp, err := postJSONRPCAuthed(t, factory, client, server.Endpoint, sendMessageBody(t, "dispatch-session", "run the task"))
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	<-runner.started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, server.Stop(ctx))
+	select {
+	case <-runner.ctxDone:
+	default:
+		t.Fatal("Stop returned without ending the in-flight run")
+	}
+	<-sent
+}
+
 // A request that is not a JSON POST never reaches the dispatch (#346):
 // a text/plain body (the browser CSRF shape) and a missing content type
 // are both rejected with 415, and the runner is not invoked.

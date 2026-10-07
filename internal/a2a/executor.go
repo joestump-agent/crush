@@ -162,11 +162,15 @@ type Executor struct {
 	// the dispatch's own turn — the first one — or is a steer.
 	turnMu      sync.Mutex
 	turnStarted bool
-	// runsMu guards runs: the in-flight run records by task ID (#352).
-	// A record outlives the execution that drains it, so the executor —
-	// not Execute's stack — owns it.
+	// runsMu guards runs and live. runs holds the in-flight run records
+	// by task ID (#352): a record outlives the execution that drains it,
+	// so the executor — not Execute's stack — owns it. live holds every
+	// run goroutine that has not returned yet. A record leaves runs when
+	// its drain ends or a cancel drops it, while its goroutine may still
+	// be unwinding a tool call, so stopRuns joins live, not runs.
 	runsMu sync.Mutex
 	runs   map[string]*taskRun
+	live   map[*taskRun]struct{}
 	// hooks are test-only seams; every field is nil in production.
 	hooks executorHooks
 }
@@ -213,6 +217,8 @@ type taskRun struct {
 	cancel context.CancelFunc
 	// done receives the run goroutine's single outcome.
 	done chan runOutcome
+	// exited is closed once the run goroutine has returned.
+	exited chan struct{}
 	// todoCh is the run's todo subscription (#174); nil without a todo
 	// source.
 	todoCh <-chan dispatch.TodoSnapshot
@@ -673,6 +679,7 @@ func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		binding: binding,
 		cancel:  cancel,
 		done:    make(chan runOutcome, 1),
+		exited:  make(chan struct{}),
 	}
 	if e.todos != nil {
 		run.todoCh = e.todos.SubscribeSessionTodos(runCtx, binding.SessionID)
@@ -687,9 +694,16 @@ func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		e.runs = make(map[string]*taskRun)
 	}
 	e.runs[run.taskID] = run
+	if e.live == nil {
+		e.live = make(map[*taskRun]struct{})
+	}
+	e.live[run] = struct{}{}
 	e.runsMu.Unlock()
 
 	go func() {
+		// Deferred first so it runs last: the run has handed back its
+		// outcome, panic or not, before stopRuns can see it exit.
+		defer e.runExited(run)
 		// A panic in a tool or provider adapter must fail this task, not
 		// the whole process (#345): recover it, log it, and hand a run
 		// error back so Execute yields its single Failed status. The
@@ -712,6 +726,49 @@ func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		run.done <- runOutcome{result, err}
 	}()
 	return run
+}
+
+// runExited drops a returned run goroutine from live and closes its
+// exited channel.
+func (e *Executor) runExited(run *taskRun) {
+	e.runsMu.Lock()
+	delete(e.live, run)
+	e.runsMu.Unlock()
+	close(run.exited)
+}
+
+// stopRuns ends the executor's runs for the route's teardown: it cancels
+// every run it still records, parked ones included, then waits until
+// every run goroutine has returned or ctx ends. A canceled run can still
+// be unwinding a tool call in the dispatch's workspace, and the teardown
+// after Stop closes the toolchain and releases that workspace. A run that
+// starts during the wait is canceled and joined too.
+func (e *Executor) stopRuns(ctx context.Context) error {
+	e.runsMu.Lock()
+	records := e.runs
+	e.runs = nil
+	e.runsMu.Unlock()
+	for _, run := range records {
+		run.cancel()
+	}
+	for {
+		e.runsMu.Lock()
+		var next *taskRun
+		for run := range e.live {
+			next = run
+			break
+		}
+		e.runsMu.Unlock()
+		if next == nil {
+			return nil
+		}
+		next.cancel()
+		select {
+		case <-next.exited:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // drainRun drains the run record until the run ends or the drain cannot
