@@ -1053,11 +1053,12 @@ func (f *ServerFactory) socketPath() string {
 
 // tcpEndpoint returns the HTTPS URL the TCP listener serves id at, and
 // whether it requires client certificates (#358). The URL is empty when
-// no TCP listener runs, so the card lists only the socket interface.
+// no TCP listener runs, or when it has no address a client could dial,
+// so the card lists only the socket interface.
 func (f *ServerFactory) tcpEndpoint(id string) (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.tcp == nil {
+	if f.tcp == nil || f.tcp.baseURL() == "" {
 		return "", false
 	}
 	return f.tcp.baseURL() + agentsPathPrefix + id, f.tcp.mutualTLS

@@ -704,18 +704,95 @@ func TestTCPHostAllowed(t *testing.T) {
 }
 
 // The advertised address keeps a specific listen host with the bound
-// port, and replaces a wildcard with the certificate's first DNS SAN
-// (#358).
+// port, and replaces a wildcard with the certificate's first
+// non-wildcard DNS SAN, else its first specific IP SAN (#358). With
+// neither there is nothing to advertise.
 func TestAdvertisedAddr(t *testing.T) {
 	t.Parallel()
 
 	pki := newTestPKI(t)
-	require.Equal(t, "127.0.0.1:5555", advertisedAddr("127.0.0.1:0", "127.0.0.1:5555", pki.serverLeaf))
-	require.Equal(t, "a2a.internal:7443", advertisedAddr("a2a.internal:7443", "10.0.0.5:7443", pki.serverLeaf))
-	require.Equal(t, "localhost:7443", advertisedAddr("0.0.0.0:7443", "0.0.0.0:7443", pki.serverLeaf))
-	require.Equal(t, "localhost:7443", advertisedAddr(":7443", "[::]:7443", pki.serverLeaf))
-	require.Equal(t, "[::]:7443", advertisedAddr(":7443", "[::]:7443", &x509.Certificate{}),
-		"without a usable SAN the bound address is the last resort")
+	advertised := func(listen, bound string, leaf *x509.Certificate) string {
+		t.Helper()
+		addr, ok := advertisedAddr(listen, bound, leaf)
+		require.True(t, ok, "%s bound at %s", listen, bound)
+		return addr
+	}
+	require.Equal(t, "127.0.0.1:5555", advertised("127.0.0.1:0", "127.0.0.1:5555", pki.serverLeaf))
+	require.Equal(t, "a2a.internal:7443", advertised("a2a.internal:7443", "10.0.0.5:7443", pki.serverLeaf))
+	require.Equal(t, "localhost:7443", advertised("0.0.0.0:7443", "0.0.0.0:7443", pki.serverLeaf))
+	require.Equal(t, "localhost:7443", advertised(":7443", "[::]:7443", pki.serverLeaf))
+
+	ipOnly := &x509.Certificate{
+		DNSNames:    []string{"*.example.com"},
+		IPAddresses: []net.IP{net.IPv4zero, net.ParseIP("192.0.2.10")},
+	}
+	require.Equal(t, "192.0.2.10:7443", advertised("0.0.0.0:7443", "0.0.0.0:7443", ipOnly),
+		"a wildcard DNS SAN is skipped for the first specific IP SAN")
+
+	for _, leaf := range []*x509.Certificate{{}, {DNSNames: []string{"*.example.com"}, IPAddresses: []net.IP{net.IPv6unspecified}}} {
+		addr, ok := advertisedAddr(":7443", "[::]:7443", leaf)
+		require.False(t, ok, "no dialable SAN behind a wildcard listen address")
+		require.Empty(t, addr)
+	}
+}
+
+// A listener with no address to advertise lists no HTTPS interface on
+// the cards (#358), rather than one no client could dial.
+func TestTCPEndpointWithoutAdvertisedAddress(t *testing.T) {
+	t.Parallel()
+
+	factory := NewServerFactory(t.TempDir())
+	factory.tcp = &tcpHost{bound: "[::]:7443", advertised: ""}
+	url, _ := factory.tcpEndpoint("dispatch-1")
+	require.Empty(t, url)
+
+	factory.tcp = &tcpHost{bound: "[::]:7443", advertised: "localhost:7443", mutualTLS: true}
+	url, mutual := factory.tcpEndpoint("dispatch-1")
+	require.Equal(t, "https://localhost:7443/agents/dispatch-1", url)
+	require.True(t, mutual)
+}
+
+// The listener warns at startup (#358) when it has no address to
+// advertise, and when it is reachable from other machines but takes
+// only this process's bearer token, which never leaves the process.
+func TestTCPListenerStartupWarnings(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		host         tcpHost
+		noAdvertised bool
+		tokenOnly    bool
+	}{
+		{name: "loopback without client_ca", host: tcpHost{listen: "127.0.0.1:7443", advertised: "127.0.0.1:7443"}},
+		{name: "localhost without client_ca", host: tcpHost{listen: "localhost:7443", advertised: "localhost:7443"}},
+		{name: "IPv6 loopback without client_ca", host: tcpHost{listen: "[::1]:7443", advertised: "[::1]:7443"}},
+		{name: "wildcard with client_ca", host: tcpHost{listen: "0.0.0.0:7443", advertised: "localhost:7443", mutualTLS: true}},
+		{name: "wildcard without client_ca", host: tcpHost{listen: "0.0.0.0:7443", advertised: "localhost:7443"}, tokenOnly: true},
+		{name: "empty host without client_ca", host: tcpHost{listen: ":7443", advertised: "localhost:7443"}, tokenOnly: true},
+		{name: "public name without client_ca", host: tcpHost{listen: "a2a.example.com:7443", advertised: "a2a.example.com:7443"}, tokenOnly: true},
+		{name: "nothing to advertise", host: tcpHost{listen: "0.0.0.0:7443", mutualTLS: true}, noAdvertised: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			logs := newLogCapture()
+			h := tc.host
+			h.logger = logs.logger()
+			h.logStartupWarnings()
+			out := logs.String()
+			if tc.noAdvertised {
+				require.Contains(t, out, "no address to advertise")
+			} else {
+				require.NotContains(t, out, "no address to advertise")
+			}
+			if tc.tokenOnly {
+				require.Contains(t, out, "remote clients cannot authenticate without options.a2a.client_ca")
+				require.Contains(t, out, "level=WARN")
+			} else {
+				require.NotContains(t, out, "client_ca")
+			}
+		})
+	}
 }
 
 // The TCP half of the auth decision (#358): a verified client

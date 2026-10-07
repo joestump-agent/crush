@@ -114,7 +114,7 @@ type tcpHost struct {
 
 	// listen is the configured address, bound the address the listener
 	// actually bound (they differ for port 0), and advertised the
-	// host:port the cards list.
+	// host:port the cards list — empty when there is none to dial.
 	listen     string
 	bound      string
 	advertised string
@@ -167,7 +167,8 @@ func startTCPHost(ctx context.Context, f *ServerFactory, opts *config.A2AOptions
 		maxBody:   maxTCPRequestBody,
 		logger:    f.log(),
 	}
-	t.advertised = advertisedAddr(t.listen, t.bound, leaf)
+	t.advertised, _ = advertisedAddr(t.listen, t.bound, leaf)
+	t.logStartupWarnings()
 	t.server = &http.Server{
 		Handler:           http.HandlerFunc(t.serveHTTP),
 		ReadHeaderTimeout: tcpReadHeaderTimeout,
@@ -205,8 +206,12 @@ func leafCertificate(cert tls.Certificate) (*x509.Certificate, error) {
 	return leaf, nil
 }
 
-// baseURL is the listener's https:// origin as the cards advertise it.
+// baseURL is the listener's https:// origin as the cards advertise it,
+// or empty when it has no address to advertise.
 func (t *tcpHost) baseURL() string {
+	if t.advertised == "" {
+		return ""
+	}
 	return "https://" + t.advertised
 }
 
@@ -320,22 +325,50 @@ func certIdentity(cert *x509.Certificate) string {
 // advertisedAddr is the host:port the cards list for the TCP listener:
 // the configured host with the bound port, so port 0 advertises the
 // port the kernel picked. A wildcard listen address (empty, 0.0.0.0 or
-// ::) names no reachable host, so the certificate's first DNS SAN — or
-// its first specific IP SAN — stands in, and the bound address is the
-// last resort.
-func advertisedAddr(listen, bound string, leaf *x509.Certificate) string {
-	boundHost, port, err := net.SplitHostPort(bound)
+// ::) names no reachable host, so the certificate's first non-wildcard
+// DNS SAN stands in, else its first specific IP SAN. With neither, ok is
+// false: there is no address a client could dial and pass the Host
+// check with, so the cards list no HTTPS interface.
+func advertisedAddr(listen, bound string, leaf *x509.Certificate) (addr string, ok bool) {
+	_, port, err := net.SplitHostPort(bound)
 	if err != nil {
-		return bound
+		return "", false
 	}
 	host, _, err := net.SplitHostPort(listen)
 	if err != nil || isWildcardHost(host) {
 		host = certHost(leaf)
 	}
 	if host == "" {
-		host = boundHost
+		return "", false
 	}
-	return net.JoinHostPort(host, port)
+	return net.JoinHostPort(host, port), true
+}
+
+// isLoopbackHost reports a listen host only this machine can reach:
+// localhost or a loopback IP. A wildcard is not one.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// logStartupWarnings flags a listener that cannot do what it is
+// probably meant for (#358): one with no dialable address to advertise,
+// and one reachable from other machines that only takes this process's
+// bearer token — which never leaves the process, so no remote client can
+// authenticate without client_ca.
+func (t *tcpHost) logStartupWarnings() {
+	if t.advertised == "" {
+		t.logger.Warn("A2A TCP listener has no address to advertise; cards list no HTTPS interface",
+			"listen", t.listen, "hint", "listen on a specific host, or give tls_cert a DNS or IP SAN")
+	}
+	host, _, err := net.SplitHostPort(t.listen)
+	if !t.mutualTLS && (err != nil || !isLoopbackHost(host)) {
+		t.logger.Warn("A2A TCP listener accepts only this process's bearer token, which never leaves the process; remote clients cannot authenticate without options.a2a.client_ca",
+			"listen", t.listen)
+	}
 }
 
 // isWildcardHost reports a listen host that binds every interface.
