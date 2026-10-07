@@ -6,8 +6,9 @@
 // real dispatch gets — backed by a scripted runner (a fixed completion,
 // one todo snapshot, a small diff), and fronts the host with a loopback
 // TCP proxy the TCK can reach. The proxy serves the agent card at the
-// well-known path with its endpoint rewritten to itself, and injects
-// the host's bearer token on every forwarded call.
+// well-known path with its endpoint rewritten to itself, injects the
+// host's bearer token on every forwarded call, and stamps the
+// dispatch's A2A context on messages that start a task without one.
 //
 // Run the TCK against it with make tck (scripts/run_tck.sh), or point
 // the TCK's runner at the printed base URL by hand:
@@ -74,7 +75,7 @@ func main() {
 		log.Fatalf("start host: %v", err)
 	}
 
-	proxy, err := NewProxy(ctx, factory, server, *port)
+	proxy, err := NewProxy(ctx, factory, server, sessionID, *port)
 	if err != nil {
 		log.Fatalf("start proxy: %v", err)
 	}

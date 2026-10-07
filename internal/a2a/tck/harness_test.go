@@ -37,7 +37,7 @@ func startHarness(t *testing.T) (baseURL string, factory *a2a.ServerFactory) {
 		_ = factory.Close(context.Background())
 	})
 
-	proxy, err := NewProxy(context.Background(), factory, server, 0)
+	proxy, err := NewProxy(context.Background(), factory, server, sessionID, 0)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = proxy.Close() })
 
@@ -159,6 +159,121 @@ func TestHarnessServesCardAndSendMessage(t *testing.T) {
 		fmt.Sprintf("the completion artifact must carry the scripted diff, got %q", diff))
 	require.Contains(t, text, "TCK scripted answer",
 		fmt.Sprintf("the agent's final message must carry the scripted answer, got %q", text))
+}
+
+// sendRawMessage posts a JSON-RPC SendMessage carrying message, shaped
+// as the TCK sends it, to the proxy's dispatch endpoint and returns the
+// task's state and context.
+func sendRawMessage(t *testing.T, baseURL string, message map[string]any) (state, contextID string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "SendMessage",
+		"params":  map[string]any{"message": message},
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, baseURL+"/agents/tck-test", bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out struct {
+		Result struct {
+			Task *struct {
+				ContextID string `json:"contextId"`
+				Status    struct {
+					State string `json:"state"`
+				} `json:"status"`
+			} `json:"task"`
+		} `json:"result"`
+		Error map[string]any `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.Nil(t, out.Error, "JSON-RPC error on SendMessage: %v", out.Error)
+	require.NotNil(t, out.Result.Task)
+	return out.Result.Task.Status.State, out.Result.Task.ContextID
+}
+
+// The TCK starts tasks with no contextId (#363), and a served dispatch
+// runs only messages on its own bound context (#350): the proxy stamps
+// the dispatch's context on such a message, so the scripted run
+// completes instead of every TCK task being rejected. A message that
+// brings a context of its own is forwarded untouched and meets the
+// host's own rejection.
+func TestHarnessStampsDispatchContextOnNewTasks(t *testing.T) {
+	baseURL, _ := startHarness(t)
+
+	state, contextID := sendRawMessage(t, baseURL, map[string]any{
+		"role":      "ROLE_USER",
+		"parts":     []map[string]any{{"text": "run the scripted scenario"}},
+		"messageId": "tck-no-context",
+	})
+	require.Equal(t, "TASK_STATE_COMPLETED", state)
+	require.Equal(t, sessionID, contextID)
+
+	state, contextID = sendRawMessage(t, baseURL, map[string]any{
+		"role":      "ROLE_USER",
+		"parts":     []map[string]any{{"text": "run the scripted scenario"}},
+		"messageId": "tck-foreign-context",
+		"contextId": "tck-foreign-context",
+	})
+	require.Equal(t, "TASK_STATE_REJECTED", state)
+	require.Equal(t, "tck-foreign-context", contextID)
+}
+
+// withDispatchContext stamps the context only on a message that starts
+// a task without one; every other body passes through byte for byte.
+func TestWithDispatchContext(t *testing.T) {
+	t.Parallel()
+
+	stampedContext := func(t *testing.T, body []byte) any {
+		t.Helper()
+		var out struct {
+			Params struct {
+				Message map[string]any `json:"message"`
+			} `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(body, &out))
+		return out.Params.Message["contextId"]
+	}
+
+	for name, body := range map[string]string{
+		"no context":    `{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m","parts":[{"text":"hi"}]}}}`,
+		"empty context": `{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"messageId":"m","contextId":"","parts":[{"text":"hi"}]}}}`,
+		"null context":  `{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m","contextId":null,"parts":[{"text":"hi"}]}}}`,
+	} {
+		t.Run("stamps "+name, func(t *testing.T) {
+			t.Parallel()
+			got := withDispatchContext([]byte(body), sessionID)
+			require.Equal(t, sessionID, stampedContext(t, got))
+
+			var before, after map[string]any
+			require.NoError(t, json.Unmarshal([]byte(body), &before))
+			require.NoError(t, json.Unmarshal(got, &after))
+			before["params"].(map[string]any)["message"].(map[string]any)["contextId"] = sessionID
+			require.Equal(t, before, after, "only the contextId may change")
+		})
+	}
+
+	for name, body := range map[string]string{
+		"own context":     `{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m","contextId":"theirs","parts":[{"text":"hi"}]}}}`,
+		"names a task":    `{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m","taskId":"t-1","parts":[{"text":"hi"}]}}}`,
+		"no message":      `{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t-1"}}`,
+		"null message":    `{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":null}}`,
+		"no params":       `{"jsonrpc":"2.0","id":1,"method":"SendMessage"}`,
+		"batch":           `[{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m"}}}]`,
+		"not json":        `not json`,
+		"non-string task": `{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m","taskId":7}}}`,
+	} {
+		t.Run("leaves "+name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, body, string(withDispatchContext([]byte(body), sessionID)))
+		})
+	}
 }
 
 // TestHarnessProxyForwardsWithoutOriginHeader pins the browser-hardening

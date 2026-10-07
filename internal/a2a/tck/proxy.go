@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -25,7 +27,9 @@ const wellKnownCardPath = "/.well-known/agent-card.json"
 // listener the TCK can reach (#363): the card is served directly, with
 // its endpoint rewritten to this listener, and every other request is
 // reverse-proxied to the host with the Authorization header and
-// Content-Type the served card demands injected.
+// Content-Type the served card demands injected, and with the
+// dispatch's A2A context stamped on messages that start a task without
+// one (#350).
 type Proxy struct {
 	listener net.Listener
 	server   *http.Server
@@ -41,9 +45,10 @@ type Proxy struct {
 }
 
 // NewProxy starts the proxy on 127.0.0.1:port (port 0 picks a free
-// one) in front of the factory's host, serving server's dispatch. Use
-// [Proxy.BaseURL] as the TCK's --sut-host.
-func NewProxy(ctx context.Context, factory *a2a.ServerFactory, server *a2a.Server, port int) (*Proxy, error) {
+// one) in front of the factory's host, serving server's dispatch, whose
+// bound A2A context is contextID. Use [Proxy.BaseURL] as the TCK's
+// --sut-host.
+func NewProxy(ctx context.Context, factory *a2a.ServerFactory, server *a2a.Server, contextID string, port int) (*Proxy, error) {
 	endpoint, err := url.Parse(server.Endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("tck: parse endpoint %q: %w", server.Endpoint, err)
@@ -122,13 +127,94 @@ func NewProxy(ctx context.Context, factory *a2a.ServerFactory, server *a2a.Serve
 			slog.Warn("TCK: write card", "err", err)
 		}
 	})
-	mux.Handle("/", rp)
+	mux.Handle("/", stampDispatchContext(rp, contextID))
 
 	proxy.server = &http.Server{Handler: mux, ReadHeaderTimeout: 30 * time.Second}
 	go func() {
 		_ = proxy.server.Serve(listener)
 	}()
 	return proxy, nil
+}
+
+// stampDispatchContext fills in the dispatch's A2A context on the
+// messages that start a new task without one (#350). A served dispatch
+// runs only messages on its own bound context, and Crush's dispatch
+// client always sends it as Message.ContextID; the TCK's new-task
+// messages carry none, so the host sees the context the SDK mints for
+// them and rejects every such task before the runner is called. Like
+// the bearer token, the proxy supplies what the dispatch client would.
+// A message that names a task, whose context the SDK infers from the
+// stored task, or that brings its own context is forwarded untouched,
+// so the TCK's context-inference and mismatch checks still see the
+// host's own answers.
+func stampDispatchContext(next http.Handler, contextID string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.Body == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if err != nil {
+			http.Error(w, "tck: read request body", http.StatusBadRequest)
+			return
+		}
+		body = withDispatchContext(body, contextID)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withDispatchContext returns the JSON-RPC request body with contextID
+// set as params.message.contextId when the message starts a new task
+// without a context: no taskId, and no or an empty contextId. Anything
+// else — a request without a message, a batch, a message naming a task
+// or its own context, or a body that is not JSON — comes back
+// unchanged.
+func withDispatchContext(body []byte, contextID string) []byte {
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal(body, &envelope) != nil {
+		return body
+	}
+	var params map[string]json.RawMessage
+	if json.Unmarshal(envelope["params"], &params) != nil {
+		return body
+	}
+	var message map[string]json.RawMessage
+	if json.Unmarshal(params["message"], &message) != nil || message == nil {
+		return body
+	}
+	if setField(message["taskId"]) || setField(message["contextId"]) {
+		return body
+	}
+
+	var err error
+	if message["contextId"], err = json.Marshal(contextID); err != nil {
+		return body
+	}
+	if params["message"], err = json.Marshal(message); err != nil {
+		return body
+	}
+	if envelope["params"], err = json.Marshal(params); err != nil {
+		return body
+	}
+	stamped, err := json.Marshal(envelope)
+	if err != nil {
+		return body
+	}
+	return stamped
+}
+
+// setField reports whether a JSON field carries a value: a non-empty
+// string, or any non-string value, which is the host's to judge. An
+// absent field, null and "" are unset.
+func setField(raw json.RawMessage) bool {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return len(raw) > 0
+	}
+	return s != ""
 }
 
 // BaseURL is the loopback URL the TCK points --sut-host at.

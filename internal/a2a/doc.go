@@ -71,6 +71,17 @@
 //     independent task contexts on one endpoint
 //     (tests/compatibility/core_operations task-history cases) see the
 //     shared context instead.
+//   - One context per dispatch. The A2A context is the dispatch's
+//     session (#350): the executor runs only messages on the
+//     dispatch's own bound context and rejects the task otherwise.
+//     Crush's dispatch client always sends that context; the TCK's
+//     new-task messages send none, and the context the SDK mints for
+//     them would be rejected. The harness's proxy stamps the
+//     dispatch's context on a message that starts a task without one,
+//     the way it injects the bearer token; a message naming a task or
+//     its own context is forwarded untouched, so the TCK's
+//     context-inference and mismatch checks (CORE-MULTI-002a,
+//     CORE-MULTI-005, CORE-MULTI-006) see the host's own answers.
 //
 // # TCK results and known deviations
 //
