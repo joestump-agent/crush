@@ -1020,7 +1020,9 @@ type Agent struct {
 	//  if the string array is nil, all tools from the AllowedMCP are available
 	AllowedMCP map[string][]string `json:"allowed_mcp,omitempty"`
 
-	// Overrides the context paths for this agent
+	// ContextPaths overrides options.context_paths for this agent's
+	// prompt (#432). Nil inherits the global paths at render time, so a
+	// dispatch renders the workspace's own context files.
 	ContextPaths []string `json:"context_paths,omitempty"`
 
 	// TodoEnforcement overrides the global todo enforcement settings
@@ -1470,11 +1472,6 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 		modelRef = def.Model.Ref
 	}
 
-	contextPaths := def.ContextPaths
-	if contextPaths == nil {
-		contextPaths = c.Options.ContextPaths
-	}
-
 	return Agent{
 		ID:              id,
 		Name:            orString(def.Name, id),
@@ -1483,7 +1480,7 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 		Model:           modelType,
 		AllowedTools:    allowedTools,
 		AllowedMCP:      expandMCPAllow(mcpAllow),
-		ContextPaths:    contextPaths,
+		ContextPaths:    def.ContextPaths,
 		TodoEnforcement: todoEnforcementFromDefinition(enforcementDef),
 		Role:            definitionRole(id, def),
 		Runtime:         orString(def.Runtime, AgentRuntimeBuiltin),
