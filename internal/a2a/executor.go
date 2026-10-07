@@ -21,6 +21,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
 )
 
@@ -31,6 +32,11 @@ import (
 type Runner interface {
 	Run(context.Context, agent.SessionAgentCall) (*fantasy.AgentResult, error)
 	Cancel(sessionID string)
+	// EnqueueWhenBusy accepts a steer into the running session's queue
+	// and reports whether it was accepted (#351): false means the run
+	// has ended and the session refuses the message instead of running
+	// another turn on a task session that is never continuable.
+	EnqueueWhenBusy(call agent.SessionAgentCall) bool
 }
 
 // Compile-time proof that a real SessionAgent can be used as a Runner.
@@ -73,10 +79,14 @@ var _ TodoSource = (*dispatch.TodoCollector)(nil)
 // artifact emission) are unchanged, and todo events never race the terminal
 // status — both are yielded from this iterator's single goroutine.
 //
-// A second message on a bound context whose run is still in flight keeps
-// the runner's busy-session behavior — the turn queues behind the active
-// one and the task fails as "did not start a turn" — until #351 turns it
-// into steering.
+// While the run is in flight, a second message on the bound context is a
+// steer (#351): the executor enqueues it on the running session and
+// completes the steer's own task once the message was consumed — folded
+// into the active turn or picked up as the follow-up turn — or fails it
+// when the run dropped it without running. The reply itself streams back
+// on the dispatch's own surfaces, never on the steer task. The first
+// message on a context starts the dispatch's own turn; anything after
+// that is steering.
 type Executor struct {
 	// contexts resolves the A2A context ID onto the dispatch binding the
 	// turn runs against (#350). The host owns the registry; the binding
@@ -116,6 +126,11 @@ type Executor struct {
 	// ended (#364). Optional; nil means terminal statuses carry no usage
 	// metadata.
 	usage func(ctx context.Context) (agent.Usage, error)
+	// turnMu guards turnStarted (#351): one executor serves one
+	// dispatch's route, and every message on its context either starts
+	// the dispatch's own turn — the first one — or is a steer.
+	turnMu      sync.Mutex
+	turnStarted bool
 }
 
 // Option configures an [Executor].
@@ -244,6 +259,14 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		if prompt == "" {
 			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateRejected,
 				agentMessage(execCtx, "message has no text to run")), nil)
+			return
+		}
+
+		// The first message on the context starts the dispatch's own turn;
+		// everything after it is a steer (#351) and never reaches the
+		// runner's Run.
+		if e.markTurnStarted() {
+			e.executeSteer(ctx, execCtx, binding, prompt, yield)
 			return
 		}
 
@@ -744,6 +767,119 @@ func scrubGitEnv(extraEnv []string) []string {
 	env = append(env, "LC_ALL=C")
 	env = append(env, extraEnv...)
 	return env
+}
+
+// markTurnStarted flips the executor's first-turn flag (#351): it
+// reports whether a turn had already started on this route, in which case
+// the arriving message is a steer, not the dispatch's own turn. One
+// executor serves one dispatch route, so the first message is the served
+// dispatch's prompt and everything after it steers. A steer that races
+// the first message cannot observe a busy session — the session only
+// becomes busy once the first message starts its run — so the ordering
+// is safe.
+func (e *Executor) markTurnStarted() bool {
+	e.turnMu.Lock()
+	defer e.turnMu.Unlock()
+	started := e.turnStarted
+	e.turnStarted = true
+	return started
+}
+
+// executeSteer delivers one mid-run message to the running agent (#351):
+// it enqueues the message through the runner's EnqueueWhenBusy — the same
+// delivery primitive the in-process front doors use — and turns the
+// steer's own task terminal on the queue's verdict: Completed once the
+// message was consumed (folded into the active turn or picked up as the
+// follow-up turn), Failed when the queue dropped it without running,
+// Rejected when the runner refused it because the run has ended. The
+// steer's reply streams back on the dispatch's own surfaces, never on
+// this task.
+func (e *Executor) executeSteer(ctx context.Context, execCtx *a2asrv.ExecutorContext, binding ContextBinding, prompt string, yield func(a2aspec.Event, error) bool) {
+	// ReferenceTasks are advisory (#351): a protocol client may name the
+	// running task it is steering — the coordinator's front door does —
+	// but the executor accepts a steer that names nothing, or names
+	// something else, rather than failing a deliverable message over
+	// bookkeeping.
+	if len(execCtx.Message.ReferenceTasks) > 0 {
+		ids := make([]string, 0, len(execCtx.Message.ReferenceTasks))
+		for _, id := range execCtx.Message.ReferenceTasks {
+			ids = append(ids, string(id))
+		}
+		slog.Debug("A2A steer references tasks",
+			"context_id", execCtx.ContextID,
+			"task_id", string(execCtx.TaskID),
+			"reference_tasks", ids)
+	}
+
+	// The steer call inherits the run's shaping from the binding's call
+	// template with the message as its prompt. RunID and accept state
+	// stay empty: a RunID-bearing queued call runs as its own turn with
+	// its own lifecycle, while an untracked one folds into the running
+	// agent's next input — the injection contract. Steer marks the
+	// persisted message as an injection (#410). OnConsumed is the
+	// queue's verdict channel (#351); the buffer absorbs a verdict that
+	// lands before the wait below starts.
+	consumed := make(chan bool, 1)
+	call := binding.Call
+	call.SessionID = binding.SessionID
+	call.Prompt = prompt
+	call.Attachments = steerAttachments(execCtx.Message)
+	call.RunID = ""
+	call.Steer = true
+	call.Accepted = nil
+	call.OnComplete = nil
+	call.OnConsumed = func(ok bool) { consumed <- ok }
+
+	if !binding.Runner.EnqueueWhenBusy(call) {
+		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateRejected,
+			agentMessage(execCtx, "agent is no longer running; task sessions are not continuable")), nil)
+		return
+	}
+
+	if !yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateWorking, nil), nil) {
+		return
+	}
+
+	select {
+	case <-ctx.Done():
+		// The consumer is gone; nothing further can be delivered, and the
+		// message stays queued for the agent to consume on its own.
+	case ok := <-consumed:
+		if ok {
+			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted,
+				agentMessage(execCtx, "delivered")), nil)
+		} else {
+			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
+				agentMessage(execCtx, "agent finished before the message was consumed")), nil)
+		}
+	}
+}
+
+// steerAttachments decodes a steer message's non-text parts back into
+// call attachments (#351): the client encoded the editor's pasted files
+// and long pastes as parts, and the steer call runs them through the
+// same message pipeline a typed prompt's attachments take. Text parts
+// are the prompt itself, never attachments.
+func steerAttachments(msg *a2aspec.Message) []message.Attachment {
+	if msg == nil {
+		return nil
+	}
+	var out []message.Attachment
+	for _, part := range msg.Parts {
+		if part == nil {
+			continue
+		}
+		raw, ok := part.Content.(a2aspec.Raw)
+		if !ok || len(raw) == 0 {
+			continue
+		}
+		out = append(out, message.Attachment{
+			FileName: part.Filename,
+			MimeType: part.MediaType,
+			Content:  []byte(raw),
+		})
+	}
+	return out
 }
 
 // messageText concatenates the text parts of an incoming A2A message into a

@@ -41,64 +41,19 @@ type MessageAgentParams struct {
 //
 // The shape is the transport-agnostic seam: the same message flows from
 // the model's message_agent tool call, from the editor's leading @handle
-// routing (#313), and — when #71 swaps the transport — from an A2A
-// client's follow-up message to a running task. Only the front door
-// differs; the queue and this payload are shared. FromSessionID is the
-// addressing caller's own session (#399): when it is set and does not
-// match the dispatch's parent session, delivery refuses, so one
-// session's model cannot steer another session's agent. It stays empty
-// for callers with no session behind them.
+// routing (#313), and from an A2A client's follow-up message to a running
+// task (#351). Only the front door differs; delivery goes over the A2A
+// protocol for every caller, so an out-of-process agent is steered the
+// same way an in-process one is. FromSessionID is the addressing caller's
+// own session (#399): when it is set and does not match the dispatch's
+// parent session, delivery refuses, so one session's model cannot steer
+// another session's agent. It stays empty for callers with no session
+// behind them.
 type AgentMessage struct {
 	SessionID     string
 	FromSessionID string
 	Text          string
 	Attachments   []message.Attachment
-}
-
-// injectableAgent is the slice of SessionAgent the injection queue
-// delivers through: enqueue-only-while-busy, so a delivered message can
-// never start a fresh turn on a task session that stopped running.
-type injectableAgent interface {
-	EnqueueWhenBusy(call SessionAgentCall) bool
-}
-
-// runningDispatch is one in-flight dispatched run the queue can address:
-// the injectable agent plus the call shaping captured at dispatch time,
-// so an injected message runs under the same model options as the run.
-// Entries live from the background run's start to its return — handle
-// lifetime is run lifetime (#312's refusal rule).
-type runningDispatch struct {
-	sessionID string
-	agent     injectableAgent
-	baseCall  SessionAgentCall
-	// findings is the run's turn-text record (#397): a steer enqueued
-	// behind a finished work turn runs as a follow-up turn, and its
-	// reply is kept out of the findings.
-	findings *dispatchFindings
-}
-
-// registerDispatchRun makes the dispatched agent running on sessionID
-// addressable for mid-run injection, capturing the run's call shaping
-// and findings record.
-func (c *coordinator) registerDispatchRun(sessionID string, agent injectableAgent, baseCall SessionAgentCall, findings *dispatchFindings) {
-	if sessionID == "" || agent == nil {
-		return
-	}
-	c.dispatchMu.Lock()
-	defer c.dispatchMu.Unlock()
-	if c.dispatchRuns == nil {
-		c.dispatchRuns = make(map[string]*runningDispatch)
-	}
-	c.dispatchRuns[sessionID] = &runningDispatch{sessionID: sessionID, agent: agent, baseCall: baseCall, findings: findings}
-}
-
-// unregisterDispatchRun drops the injection target for sessionID when the
-// dispatch it belongs to finishes. The map key is the run's, so a stale
-// entry from a removed dispatch never intercepts a later session's ID.
-func (c *coordinator) unregisterDispatchRun(sessionID string) {
-	c.dispatchMu.Lock()
-	defer c.dispatchMu.Unlock()
-	delete(c.dispatchRuns, sessionID)
 }
 
 // DeliverAgentMessage delivers one message to the dispatched agent
@@ -107,6 +62,13 @@ func (c *coordinator) unregisterDispatchRun(sessionID string) {
 // model step, or run as the immediate follow-up turn — and the response
 // streams back to the parent chat block through the child session's
 // message events.
+//
+// The steer rides the A2A protocol (#351): a message on the dispatch's
+// running context, delivered through the process host's client, so an
+// out-of-process agent is steered exactly like an in-process one. The
+// served executor resolves the context to the running agent and enqueues
+// the message through EnqueueWhenBusy; "working" means it was accepted
+// into the queue.
 //
 // Addressing a finished or unknown session is a clean refusal, never an
 // error path that starts a new run: task sessions are never continuable;
@@ -120,63 +82,63 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 		return errors.New("message text is required")
 	}
 
-	c.dispatchMu.Lock()
-	target := c.dispatchRuns[msg.SessionID]
-	c.dispatchMu.Unlock()
 	reg := c.dispatchRegistry()
+	entry, ok := reg.BySession(msg.SessionID)
+	if !ok {
+		return fmt.Errorf("no running agent for session %s; dispatch one first", msg.SessionID)
+	}
 
 	// Scope to the caller's session (#399): a message carrying a
 	// FromSessionID that does not own this dispatch refuses exactly like
 	// an unknown one, so the caller learns nothing about the other
 	// session's agent.
-	if msg.FromSessionID != "" {
-		if entry, ok := reg.BySession(msg.SessionID); ok && entry.ParentSessionID != "" && entry.ParentSessionID != msg.FromSessionID {
-			return fmt.Errorf("no running agent for session %s in this session; dispatch one first", msg.SessionID)
-		}
+	if msg.FromSessionID != "" && entry.ParentSessionID != "" && entry.ParentSessionID != msg.FromSessionID {
+		return fmt.Errorf("no running agent for session %s in this session; dispatch one first", msg.SessionID)
 	}
 
-	if target == nil {
-		// Distinguish a finished dispatch from an unknown session so the
-		// refusal tells the caller which one happened. A non-terminal
-		// registry entry (e.g. the window between the dispatch handle
-		// being returned and the background run registering its injection
-		// target) must not claim "finished": the entry is not done, and
-		// the caller would be told to dispatch a duplicate.
-		if entry, ok := reg.BySession(msg.SessionID); ok && entry.Status != dispatch.StatusRunning && entry.Status != dispatch.StatusProvisioned {
-			return fmt.Errorf("agent %s finished (%s); task sessions are never continuable — dispatch a new agent instead", msg.SessionID, entry.Status)
-		}
+	// A terminal entry refuses like an unknown one, but says which one
+	// happened: task sessions are never continuable. A non-terminal entry
+	// (running or provisioned) is still steerable.
+	if entry.Status != dispatch.StatusRunning && entry.Status != dispatch.StatusProvisioned {
+		return fmt.Errorf("agent %s finished (%s); task sessions are never continuable — dispatch a new agent instead", msg.SessionID, entry.Status)
+	}
+
+	// The server stands up after the handle is returned (#426): in that
+	// window the entry runs but nothing is listening on its context yet,
+	// so delivery refuses with the same wording as the pre-server state
+	// it is indistinguishable from.
+	steerer, ok := c.dispatchHost.(DispatchSteerer)
+	if !ok || steerer == nil || entry.Endpoint == "" || entry.AgentCard == nil {
 		return fmt.Errorf("no running agent for session %s; dispatch one first", msg.SessionID)
 	}
 
-	// The injected call inherits the run's shaping (model options, width,
-	// non-interactive) with the message as its prompt. RunID and accept
-	// state stay empty: a RunID-bearing queued call runs as its own turn
-	// with its own lifecycle, while an untracked one folds into the
-	// running agent's next input — the injection contract. Steer marks
-	// the persisted message as an injection (#410), so the dispatch card
-	// never mistakes it for the initial prompt or a todo nudge.
-	call := target.baseCall
-	call.Prompt = msg.Text
-	call.Attachments = msg.Attachments
-	call.RunID = ""
-	call.Steer = true
-	call.Accepted = nil
-	call.OnComplete = nil
-	// The steer's own turn observer (#397): a steer folded into the
-	// running turn is part of the work turn and inherits its observer;
-	// a steer that lands as the follow-up turn records its reply in the
-	// run's findings instead of replacing the work's.
-	call.turnText = target.findings.addSteerReply
-
-	if !target.agent.EnqueueWhenBusy(call) {
-		// The run ended between the registry lookup and the enqueue — the
-		// target's unregister is racing us. Same refusal as a finished
-		// dispatch.
-		return fmt.Errorf("agent %s is no longer running; dispatch a new agent instead", msg.SessionID)
+	var referenceTasks []string
+	if entry.TaskID != "" {
+		referenceTasks = []string{entry.TaskID}
 	}
-
-	slog.Debug("Injected message into running agent", "session_id", msg.SessionID)
-	return nil
+	outcome, err := steerer.SteerDispatch(ctx, DispatchSteerParams{
+		Endpoint:         entry.Endpoint,
+		Card:             entry.AgentCard,
+		ContextID:        msg.SessionID,
+		Text:             msg.Text,
+		Attachments:      msg.Attachments,
+		ReferenceTaskIDs: referenceTasks,
+	})
+	if err != nil {
+		return err
+	}
+	switch outcome.Status {
+	case steerStatusWorking, steerStatusCompleted:
+		slog.Debug("Steered running agent over A2A", "session_id", msg.SessionID)
+		return nil
+	case steerStatusRejected:
+		// The served agent refused the enqueue — the run ended between
+		// the registry lookup and the delivery. Same refusal as a
+		// finished dispatch.
+		return fmt.Errorf("agent %s is no longer running; dispatch a new agent instead", msg.SessionID)
+	default:
+		return fmt.Errorf("agent %s: %s", msg.SessionID, outcome.Text)
+	}
 }
 
 // messageAgentTool builds the MessageAgent tool (#312): the model-facing

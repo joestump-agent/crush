@@ -255,12 +255,6 @@ type coordinator struct {
 	// per-dispatch snapshots for the configured sinks (#65); created
 	// with the provider and run on the coordinator's lifetime context.
 	dispatchCollector *dispatch.TodoCollector
-	// dispatchRuns maps each running dispatch's task session to its
-	// injection target (#312): the injectable agent plus the call
-	// shaping captured at dispatch time. An entry lives exactly as long
-	// as the background run, so handle lifetime is run lifetime and a
-	// finished dispatch refuses messages instead of running another turn.
-	dispatchRuns map[string]*runningDispatch
 	// liveDispatches maps each running dispatch's ID to its live record
 	// (#371): the per-dispatch root cancel, the task session and agent
 	// behind the run, the wander-kill, and a done channel closed at

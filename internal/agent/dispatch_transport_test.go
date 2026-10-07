@@ -33,10 +33,28 @@ type gatedServingTransport struct {
 
 	mu       sync.Mutex
 	streamed []DispatchTransportParams
+	steered  []DispatchSteerParams
 }
 
 func newGatedServingTransport(outcome DispatchTransportOutcome) *gatedServingTransport {
 	return &gatedServingTransport{gate: make(chan struct{}), outcome: outcome}
+}
+
+// SteerDispatch records the steer for assertions, then delivers it the
+// way the served executor does — the embedded runnerTransport's
+// EnqueueWhenBusy drive.
+func (f *gatedServingTransport) SteerDispatch(ctx context.Context, p DispatchSteerParams) (DispatchSteerOutcome, error) {
+	f.mu.Lock()
+	f.steered = append(f.steered, p)
+	f.mu.Unlock()
+	return f.runnerTransport.SteerDispatch(ctx, p)
+}
+
+// steeredParams returns a copy of the steers the transport recorded.
+func (f *gatedServingTransport) steeredParams() []DispatchSteerParams {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]DispatchSteerParams(nil), f.steered...)
 }
 
 // release opens the gate exactly once, idempotently, as
