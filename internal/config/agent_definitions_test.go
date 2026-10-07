@@ -701,3 +701,42 @@ func TestAgentDefinitions_RelativePromptFileResolvesAgainstWorkingDir(t *testing
 	require.NoError(t, err)
 	require.Equal(t, "file:prompts/worker.md", store.Config().Agents[config.AgentWorker].PromptAppend)
 }
+
+// The #433 load-time sanity checks and default-agent carve-outs, proven
+// through the real load pipeline: an enabled agent whose definition
+// resolves to no tools fails the load, while a disabled worker — the
+// opt-out — and a read-only worker both load.
+func TestAgentDefinitions_LoadTimeSanityChecks(t *testing.T) {
+	t.Run("a tool-less coder fails at load", func(t *testing.T) {
+		_, err := loadAgentsJSONErr(t, `{"coder": {"tools": {"allow": []}}}`)
+		require.ErrorContains(t, err, "invalid agent definitions:")
+		require.ErrorContains(t, err, "agents.coder: enabled agent resolves to no tools")
+	})
+
+	t.Run("a tool-less dispatch agent fails at load", func(t *testing.T) {
+		_, err := loadAgentsJSONErr(t, `{"reviewer": {"role": "dispatch", "tools": {"allow": []}}}`)
+		require.ErrorContains(t, err, "agents.reviewer: enabled agent resolves to no tools")
+	})
+
+	t.Run("a disabled worker and an @read worker load", func(t *testing.T) {
+		store := loadAgentsJSON(t, `{"worker": {"disabled": true}}`)
+		require.True(t, store.Config().Agents[config.AgentWorker].Disabled)
+
+		store = loadAgentsJSON(t, `{"worker": {"tools": {"allow": ["@read"]}}}`)
+		require.False(t, store.Config().Agents[config.AgentWorker].Disabled)
+	})
+
+	t.Run("an explicitly disabled default_agent fails at load", func(t *testing.T) {
+		workDir, dataDir := isolateReloadEnv(t)
+		globalDir := os.Getenv("CRUSH_GLOBAL_CONFIG")
+		require.NoError(t, os.MkdirAll(globalDir, 0o755))
+		body := agentsBaseConfig[:len(agentsBaseConfig)-1] +
+			`,"agents":{"reviewer":{"role":"dispatch","disabled":true}}` +
+			`,"options":{"dispatch":{"default_agent":"reviewer"}}}`
+		require.NoError(t, os.WriteFile(filepath.Join(globalDir, "crush.json"), []byte(body), 0o600))
+
+		_, err := config.Load(workDir, dataDir, false)
+		require.ErrorContains(t, err, "invalid dispatch configuration:")
+		require.ErrorContains(t, err, `options.dispatch.default_agent: agent "reviewer" is disabled`)
+	})
+}

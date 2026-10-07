@@ -45,13 +45,19 @@ const dispatchResultPersistPoll = 200 * time.Millisecond
 // DispatchAgentParams are the DispatchAgent tool's arguments.
 type DispatchAgentParams struct {
 	Prompt string `json:"prompt" description:"Self-contained task instructions for the dispatched agent"`
+	// Agent selects the agent definition the dispatch runs (#433): the
+	// id of one of the resolved dispatch agents, stamped onto the
+	// parameter schema's enum at Info time by dispatchAgentTool. Empty
+	// runs the configured default agent (options.dispatch.default_agent,
+	// "worker" unless configured).
+	Agent string `json:"agent,omitempty" description:"Agent definition to run the dispatch on: one of the dispatch agent ids in the enum. Omit to use the configured default agent"`
 	// Model is the model type the dispatched agent runs on — "large" or
-	// "small" — defaulting to the worker definition's slot, which is the
-	// small model unless configured (#432). Per-dispatch model choice is
+	// "small" — defaulting to the selected agent definition's slot (#433;
+	// the worker's is the small model). Per-dispatch model choice is
 	// by selected-model type, not raw model ID, matching how agent
-	// configs select models. A worker pinned to an explicit model
-	// ignores it.
-	Model string `json:"model,omitempty" description:"Model type to run the dispatched agent on: \"large\" or \"small\" (default: the worker agent's configured model, normally \"small\")"`
+	// configs select models. A definition pinned to an explicit model
+	// refuses the parameter with a tool error.
+	Model string `json:"model,omitempty" description:"Model type to run the dispatched agent on: \"large\" or \"small\" (default: the selected agent's configured model slot; refused for agents pinned to an explicit model)"`
 	// Skills names the skills the dispatched agent may use; the default
 	// is every skill discovered in the workspace.
 	Skills []string `json:"skills,omitempty" description:"Names of skills to make available to the dispatched agent (default: all skills discovered in the workspace)"`
@@ -79,8 +85,12 @@ type dispatchAgentOptions struct {
 	// Toolchain is the workspace-rooted toolchain the agent runs with
 	// (#62); its Tools, Config, and WorkingDir feed the agent build.
 	Toolchain *DispatchToolchain
+	// AgentID is the id of the resolved agent definition the dispatch
+	// runs (#433); the builder renders its prompt and model. Empty
+	// means the worker definition.
+	AgentID string
 	// ModelType selects which selected model the dispatched agent runs
-	// on. The default (empty) is the worker definition's slot (#432).
+	// on. The default (empty) is the agent definition's slot (#432).
 	ModelType config.SelectedModelType
 	// Skills restricts the rendered available-skills set; empty means
 	// every skill discovered in the workspace.
@@ -450,13 +460,96 @@ func (r dispatchRun) call(c *coordinator) SessionAgentCall {
 	return call
 }
 
+// dispatchAgentParam is the DispatchAgent tool parameter that names the
+// agent definition to run (#433).
+const dispatchAgentParam = "agent"
+
+// dispatchAgentTool wraps the DispatchAgent tool so Info can inject the
+// live agent enum (#433): fantasy derives the parameter schema from the
+// params struct's static tags, so the dispatchable agent ids — resolved
+// from the current config at Info time — are stamped onto the agent
+// parameter here. Everything else delegates to the inner tool.
+type dispatchAgentTool struct {
+	inner fantasy.AgentTool
+	c     *coordinator
+}
+
+func (t *dispatchAgentTool) Info() fantasy.ToolInfo {
+	info := t.inner.Info()
+	if param, ok := info.Parameters[dispatchAgentParam].(map[string]any); ok {
+		param["enum"] = t.c.dispatchableAgentIDs()
+		param["description"] = fmt.Sprintf(
+			"Agent definition to run the dispatch on: one of the dispatch agent ids in the enum. Omit to use the configured default agent (%s)",
+			t.c.cfg.Config().Options.GetDispatchDefaultAgent(),
+		)
+	}
+	return info
+}
+
+func (t *dispatchAgentTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	return t.inner.Run(ctx, call)
+}
+
+func (t *dispatchAgentTool) ProviderOptions() fantasy.ProviderOptions {
+	return t.inner.ProviderOptions()
+}
+
+func (t *dispatchAgentTool) SetProviderOptions(opts fantasy.ProviderOptions) {
+	t.inner.SetProviderOptions(opts)
+}
+
+// dispatchableAgentIDs returns the sorted ids of the resolved agents a
+// dispatch may run: role dispatch, not disabled, builtin runtime. a2a
+// agents join once #434 serves remote agents.
+func (c *coordinator) dispatchableAgentIDs() []string {
+	ids := make([]string, 0, 4)
+	for id, agentCfg := range c.cfg.Config().Agents {
+		if agentCfg.Role != config.AgentRoleDispatch || agentCfg.Disabled || agentCfg.Runtime != config.AgentRuntimeBuiltin {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// resolveDispatchAgent maps the tool call's agent parameter onto the
+// resolved agent definition it names (#433): an empty parameter selects
+// options.dispatch.default_agent, and an unknown, disabled, non-dispatch,
+// or non-builtin id is refused with the valid ids listed.
+func (c *coordinator) resolveDispatchAgent(id string) (config.Agent, string) {
+	if id == "" {
+		id = c.cfg.Config().Options.GetDispatchDefaultAgent()
+	}
+	valid := c.dispatchableAgentIDs()
+	refuse := func(format string, args ...any) (config.Agent, string) {
+		return config.Agent{}, fmt.Sprintf("%s; available dispatch agents: %s",
+			fmt.Sprintf(format, args...), strings.Join(valid, ", "))
+	}
+	agentCfg, ok := c.cfg.Config().Agents[id]
+	if !ok {
+		return refuse("unknown agent %q", id)
+	}
+	if agentCfg.Disabled {
+		return refuse("agent %q is disabled", id)
+	}
+	if agentCfg.Role != config.AgentRoleDispatch {
+		return refuse("agent %q is a %q agent, not a dispatch agent", id, agentCfg.Role)
+	}
+	if agentCfg.Runtime != config.AgentRuntimeBuiltin {
+		return refuse("agent %q runs on the %q runtime, which dispatch_agent cannot serve yet", id, agentCfg.Runtime)
+	}
+	return agentCfg, ""
+}
+
 // dispatchTool builds the DispatchAgent tool (#64): provision a clean
 // workspace (#63), bootstrap the dispatched agent's toolchain rooted at
 // it (#62), run a backgrounded SessionAgent on an ephemeral session
 // (#48/#50), and return a running handle immediately so the main agent
-// keeps working.
+// keeps working. The tool is wrapped so Info can stamp the dispatchable
+// agent ids onto its schema (#433).
 func (c *coordinator) dispatchTool() fantasy.AgentTool {
-	return fantasy.NewParallelAgentTool(
+	inner := fantasy.NewParallelAgentTool(
 		DispatchAgentToolName,
 		dispatchToolDescription,
 		func(ctx context.Context, params DispatchAgentParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
@@ -471,12 +564,29 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse("dispatch unavailable: no A2A host"), nil
 			}
 
+			// The chosen agent definition (#433): the call's agent
+			// parameter, else the configured default. Unknown, disabled,
+			// non-dispatch, and non-builtin ids are refused before
+			// anything is provisioned.
+			agentCfg, refusal := c.resolveDispatchAgent(params.Agent)
+			if refusal != "" {
+				return fantasy.NewTextErrorResponse(refusal), nil
+			}
+
 			modelType := config.SelectedModelType(params.Model)
 			switch modelType {
 			case "", config.SelectedModelTypeLarge, config.SelectedModelTypeSmall:
-				// Empty defaults to the worker definition's slot.
+				// Empty defaults to the selected definition's slot.
 			default:
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("invalid model %q: must be \"large\" or \"small\"", params.Model)), nil
+			}
+			// A pinned definition runs on its own provider and model, so
+			// a slot choice has nothing to apply to: refuse it rather
+			// than silently ignoring it (#433).
+			if modelType != "" && agentCfg.ModelRef != nil {
+				return fantasy.NewTextErrorResponse(fmt.Sprintf(
+					"agent %q pins model %s/%s; omit model",
+					agentCfg.ID, agentCfg.ModelRef.Provider, agentCfg.ModelRef.Model)), nil
 			}
 
 			sessionID := tools.GetSessionFromContext(ctx)
@@ -493,11 +603,8 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// (#374). When the deny list removes every write tool there
 			// is nothing a dispatch can do, so refuse before provisioning
 			// a workspace. The check is on user policy, not the worker's
-			// palette: a worker defined read-only (#432) still dispatches.
-			workerCfg, ok := c.cfg.Config().Agents[config.AgentWorker]
-			if !ok || workerCfg.Disabled {
-				return fantasy.NewTextErrorResponse("dispatch unavailable: worker agent not configured"), nil
-			}
+			// palette: a definition that is read-only (#432) still
+			// dispatches.
 			disabled := c.cfg.Config().Options.DisabledTools
 			if !slices.ContainsFunc(dispatchCapabilityTools, func(name string) bool {
 				return !slices.Contains(disabled, name)
@@ -544,6 +651,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 				Branch:  placement.Branch,
 				Base:    placement.Base,
 				BaseSHA: placement.BaseSHA,
+				Agent:   agentCfg.ID,
 				Status:  dispatch.StatusProvisioned,
 			}
 			reg.Register(entry)
@@ -560,7 +668,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// The toolchain's permission bridge binds to the dispatch's
 			// root (#371): the bridge lives as long as the dispatch, not
 			// the tool call.
-			toolchain, err := c.BuildDispatchToolchain(rootCtx, DispatchToolchainOptions{WorkingDir: entry.Path})
+			toolchain, err := c.BuildDispatchToolchain(rootCtx, DispatchToolchainOptions{WorkingDir: entry.Path, Agent: agentCfg.ID})
 			if err != nil {
 				rootCancel()
 				c.releaseDispatchSlot()
@@ -583,9 +691,10 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// and the run's watchdog both feed it; the run goroutine reads
 			// it to assemble the terminal result.
 			kill := &dispatchKill{}
-			killSettings := c.dispatchEnforcement()
+			killSettings := c.dispatchEnforcement(agentCfg)
 			dispatched, err := builder(ctx, dispatchAgentOptions{
 				Toolchain: toolchain,
+				AgentID:   agentCfg.ID,
 				ModelType: modelType,
 				Skills:    params.Skills,
 				// The ladder's kill rung (#316) reports here; the
@@ -715,6 +824,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			handle := dispatch.DispatchResult{
 				DispatchID:    entry.ID,
 				Handle:        assignedHandle,
+				Agent:         entry.Agent,
 				Branch:        entry.Branch,
 				WorkspacePath: entry.Path,
 				SessionID:     taskSession.ID,
@@ -723,49 +833,51 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			return fantasy.NewTextResponse(handle.Render()), nil
 		},
 	)
+	return &dispatchAgentTool{inner: inner, c: c}
 }
 
 // dispatchEnforcement resolves the enforcement ladder a dispatched
-// agent runs (#402): the dispatch agent definition's todos and kill
-// blocks (the worker until #433 lets dispatch_agent choose) layered
-// over the global options, with the built-in defaults underneath. The
-// run's watchdog killSettings and the agent's own ladder read these
-// same resolved settings, so a kill threshold configured on the
-// definition trips in both places or neither.
-func (c *coordinator) dispatchEnforcement() config.TodoEnforcementSettings {
-	cfg := c.cfg.Config()
-	if worker, ok := cfg.Agents[config.AgentWorker]; ok {
-		return worker.ResolvedTodoEnforcement(cfg.Options.TodoEnforcement)
-	}
-	return config.ResolveTodoEnforcement(cfg.Options.TodoEnforcement, nil)
+// agent runs (#402): the chosen dispatch agent definition's todos and
+// kill blocks (#433) layered over the global options, with the built-in
+// defaults underneath. The run's watchdog killSettings and the agent's
+// own ladder read these same resolved settings, so a kill threshold
+// configured on the definition trips in both places or neither.
+func (c *coordinator) dispatchEnforcement(agentCfg config.Agent) config.TodoEnforcementSettings {
+	return agentCfg.ResolvedTodoEnforcement(c.cfg.Config().Options.TodoEnforcement)
 }
 
 // buildDispatchedAgent constructs the agent a dispatch runs: the chosen
-// selected model (the worker definition's slot by default) — the worker
-// definition's explicit pin wins (#432) — a system prompt rendered at dispatch time from the
-// worker definition's prompt against the workspace's scoped store
-// (template + dispatch context: git status, context files, skills), and
-// the workspace-rooted toolchain's tools.
+// selected model (the definition's slot by default) — an explicit pin
+// wins (#432) — a system prompt rendered at dispatch time from the
+// definition's prompt against the workspace's scoped store (template +
+// dispatch context: git status, context files, skills), and the
+// workspace-rooted toolchain's tools. The definition is the one the
+// dispatch chose (#433): opts.AgentID, else the worker.
 func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAgentOptions) (*dispatchedAgent, error) {
 	large, small, err := c.buildAgentModels(ctx, true)
 	if err != nil {
 		return nil, err
 	}
 
-	workerCfg, ok := c.cfg.Config().Agents[config.AgentWorker]
+	agentID := opts.AgentID
+	if agentID == "" {
+		agentID = config.AgentWorker
+	}
+	agentCfg, ok := c.cfg.Config().Agents[agentID]
 	if !ok {
-		return nil, errors.New("worker agent not configured")
+		return nil, fmt.Errorf("agent %q not configured", agentID)
 	}
 	// The session agent runs on its "large" slot, so the chosen model
 	// goes there; the small model stays available for auxiliary work.
 	// The dispatch's model parameter picks the slot, defaulting to the
-	// worker definition's slot (small for the built-in worker). An
-	// explicit pin on the worker (#432) wins over both: a pinned worker
-	// runs every dispatch on its own provider and model.
-	if opts.ModelType != "" && workerCfg.ModelRef == nil {
-		workerCfg.Model = opts.ModelType
+	// definition's slot. An explicit pin on the definition (#432) wins
+	// over both: a pinned agent runs every dispatch on its own provider
+	// and model. The tool refuses the parameter on a pin (#433); this
+	// fallback keeps the builder safe when it is driven directly.
+	if opts.ModelType != "" && agentCfg.ModelRef == nil {
+		agentCfg.Model = opts.ModelType
 	}
-	model, err := c.agentModel(ctx, workerCfg, large, small, true)
+	model, err := c.agentModel(ctx, agentCfg, large, small, true)
 	if err != nil {
 		return nil, err
 	}
@@ -775,29 +887,29 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 		return nil, errModelProviderNotConfigured
 	}
 
-	// The dispatched prompt renders from the worker definition (#432):
+	// The dispatched prompt renders from the chosen definition (#433):
 	// builtin:dispatch by default, the definition's file: template when
 	// it names one, against the scoped workspace store. The dispatch's
-	// requested skills narrow the definition's set — a dispatch asks for
-	// fewer skills, never more.
+	// requested skills narrow the definition's set — a dispatch asks
+	// for fewer skills, never more.
 	promptOpts := []prompt.Option{prompt.WithWorkingDir(opts.Toolchain.WorkingDir())}
-	promptOpts = append(promptOpts, agentPromptOptions(workerCfg)...)
+	promptOpts = append(promptOpts, agentPromptOptions(agentCfg)...)
 	requestedSkills := opts.Skills
-	if len(workerCfg.Skills) > 0 {
+	if len(agentCfg.Skills) > 0 {
 		if len(requestedSkills) == 0 {
-			requestedSkills = workerCfg.Skills
+			requestedSkills = agentCfg.Skills
 		} else {
-			requestedSkills = intersectSkills(requestedSkills, workerCfg.Skills)
+			requestedSkills = intersectSkills(requestedSkills, agentCfg.Skills)
 		}
 	}
 	if len(requestedSkills) > 0 {
 		promptOpts = append(promptOpts, prompt.WithSkills(requestedSkills))
 	}
-	systemPromptTemplate, err := agentPrompt(workerCfg, c.cfg.WorkingDir(), promptOpts...)
+	systemPromptTemplate, err := agentPrompt(agentCfg, c.cfg.WorkingDir(), promptOpts...)
 	if err != nil {
 		return nil, err
 	}
-	rendered, err := agentSystemPrompt(ctx, systemPromptTemplate, workerCfg, c.cfg.WorkingDir(), model.Model.Provider(), model.Model.Model(), opts.Toolchain.Config())
+	rendered, err := agentSystemPrompt(ctx, systemPromptTemplate, agentCfg, c.cfg.WorkingDir(), model.Model.Provider(), model.Model.Model(), opts.Toolchain.Config())
 	if err != nil {
 		return nil, fmt.Errorf("render dispatch system prompt: %w", err)
 	}
@@ -805,8 +917,8 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 	// Prompt and tools are known at construction, so the agent's
 	// readiness latch is satisfied immediately (newSessionAgent) — no
 	// build-time goroutines to wait for. The todo enforcement ladder
-	// (#315) resolves from the dispatch agent definition (#402): the
-	// worker's todos and kill blocks over the global options.
+	// (#315) resolves from the chosen dispatch agent definition (#402):
+	// its todos and kill blocks over the global options.
 	agent := newSessionAgent(SessionAgentOptions{
 		LargeModel:           model,
 		SmallModel:           small,
@@ -821,7 +933,7 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 		Tools:                opts.Toolchain.Tools(),
 		Notify:               c.notify,
 		RunComplete:          c.runComplete,
-		TodoEnforcement:      c.dispatchEnforcement(),
+		TodoEnforcement:      c.dispatchEnforcement(agentCfg),
 		// The dispatched agent is the one agent whose run may be killed
 		// (#316): the observers hand the reasons to the coordinator's kill
 		// state so the terminal result carries them — the ladder's
@@ -1193,6 +1305,7 @@ func (c *coordinator) dispatchTodosFingerprint(ctx context.Context, sessionID st
 func (c *coordinator) assembleKilledDispatchResult(ctx context.Context, run dispatchRun, reason string) dispatch.DispatchResult {
 	terminal := dispatch.DispatchResult{
 		DispatchID:    run.entry.ID,
+		Agent:         run.entry.Agent,
 		Branch:        run.entry.Branch,
 		WorkspacePath: run.entry.Path,
 		SessionID:     run.sessionID,
@@ -1247,6 +1360,7 @@ func (c *coordinator) dispatchLastAssistantText(ctx context.Context, sessionID s
 func (c *coordinator) assembleDispatchResult(ctx context.Context, run dispatchRun, natural dispatchNaturalOutcome) dispatch.DispatchResult {
 	terminal := dispatch.DispatchResult{
 		DispatchID:    run.entry.ID,
+		Agent:         run.entry.Agent,
 		Branch:        run.entry.Branch,
 		WorkspacePath: run.entry.Path,
 		SessionID:     run.sessionID,

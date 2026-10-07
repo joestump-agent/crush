@@ -125,6 +125,18 @@ func handleOption(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		return nil
 	}
 
+	if key == "dispatch-default-agent" {
+		if val == "" {
+			return usage(stderr, "option: dispatch-default-agent requires a value")
+		}
+		// The id itself is validated at load, against the resolved
+		// agents (#433): a bad default is a load error, not a shell
+		// config error.
+		childMap(o, "dispatch")["default_agent"] = val
+		slog.Info("Option set in shell config", "key", key, "value", val)
+		return nil
+	}
+
 	// The todo-*/dispatch-* keys write into the nested
 	// options.todo_enforcement block, so they are a special case like
 	// attribution-*, not entries in optionSpecs.

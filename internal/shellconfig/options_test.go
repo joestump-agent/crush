@@ -438,3 +438,36 @@ func TestOption_DispatchMaxConcurrentInvalid(t *testing.T) {
 		require.Contains(t, err.Error(), "dispatch-max-concurrent", "script: %s", script)
 	}
 }
+
+func TestOption_DispatchDefaultAgent(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	script := `option dispatch-default-agent reviewer`
+	path := filepath.Join(dir, "crushrc")
+
+	jsonBytes, err := LoadShellConfig(t.Context(), path, []byte(script))
+	require.NoError(t, err)
+
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(jsonBytes, &result))
+
+	opts := result["options"].(map[string]any)
+	dispatch := opts["dispatch"].(map[string]any)
+	require.Equal(t, "reviewer", dispatch["default_agent"])
+}
+
+func TestOption_DispatchDefaultAgentInvalid(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "crushrc")
+
+	for _, script := range []string{
+		"option dispatch-default-agent",
+	} {
+		_, err := LoadShellConfig(t.Context(), path, []byte(script))
+		require.Error(t, err, "script: %s", script)
+		require.Contains(t, err.Error(), "dispatch-default-agent", "script: %s", script)
+	}
+}

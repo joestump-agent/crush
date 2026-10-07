@@ -1459,6 +1459,11 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 					setupErr = fmt.Errorf("invalid agent definitions: %w", err)
 				} else {
 					cfg.SetupAgents()
+					if err := cfg.ValidateDispatchDefaultAgent(); err != nil {
+						setupErr = fmt.Errorf("invalid dispatch configuration: %w", err)
+					} else if err := cfg.ValidateAgentToolsets(); err != nil {
+						setupErr = fmt.Errorf("invalid agent definitions: %w", err)
+					}
 				}
 			}
 		}

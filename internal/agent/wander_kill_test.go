@@ -1316,7 +1316,7 @@ func TestWanderKill_ConfiguredKillEndToEnd(t *testing.T) {
 	c := newDispatchTestCoordinator(t, env)
 	reapDispatchRuns(t, c)
 
-	settings := c.dispatchEnforcement()
+	settings := c.dispatchEnforcement(c.cfg.Config().Agents[config.AgentWorker])
 	require.Equal(t, 3, settings.KillAfterNudges, "the worker definition's kill rung")
 	require.Equal(t, 1, settings.NudgeThreshold, "the global nudge threshold")
 

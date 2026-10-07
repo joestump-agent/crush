@@ -123,6 +123,9 @@ type Entry struct {
 	// and the fallback a handle is derived from when the model did not
 	// supply one.
 	Role string
+	// Agent is the id of the agent definition the dispatch runs (#433):
+	// worker by default, or the agent the tool call named.
+	Agent string
 	// Status is the workspace's lifecycle state.
 	Status Status
 	// Endpoint is the A2A server endpoint serving the dispatched agent

@@ -1591,7 +1591,7 @@ func TestDispatchEnforcementFromConfig(t *testing.T) {
 
 	c := newDispatchTestCoordinator(t, env)
 
-	settings := c.dispatchEnforcement()
+	settings := c.dispatchEnforcement(c.cfg.Config().Agents[config.AgentWorker])
 	require.Equal(t, 3, settings.KillAfterNudges,
 		"the worker definition's kill block feeds the dispatch enforcement")
 	require.Equal(t, 5, settings.NudgeThreshold,
@@ -1628,4 +1628,181 @@ func TestDispatchEnforcementFromConfig(t *testing.T) {
 	require.NotNil(t, sa.todoEnforcement, "the dispatched agent wires its enforcement ladder")
 	require.Equal(t, settings, sa.todoEnforcement.settings,
 		"the agent's ladder matches the watchdog's kill settings")
+}
+
+// #433: the dispatch tool's schema names every agent a call may run —
+// the worker plus each enabled user dispatch agent, never the main or
+// task agents — and stamps the configured default into the description.
+// fantasy derives the parameter schema from static tags, so the enum is
+// injected by the wrapper's Info at call time.
+func TestDispatchToolInfoStampsAgentEnum(t *testing.T) {
+	c, _ := newDispatchToolEnv(t, &dispatchTestAgent{model: dispatchTestModel()})
+
+	param, ok := c.dispatchTool().Info().Parameters[dispatchAgentParam].(map[string]any)
+	require.True(t, ok, "agent parameter missing from the schema")
+	require.Equal(t, []string{config.AgentWorker}, param["enum"])
+
+	// A user dispatch agent joins the enum; a disabled one and the
+	// main and task agents never do.
+	var defs map[string]config.AgentDefinition
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"reviewer": {"role": "dispatch"},
+		"ghost": {"role": "dispatch", "disabled": true}
+	}`), &defs))
+	c.cfg.Config().AgentDefinitions = defs
+	c.cfg.Config().SetupAgents()
+
+	param, ok = c.dispatchTool().Info().Parameters[dispatchAgentParam].(map[string]any)
+	require.True(t, ok, "agent parameter missing from the schema")
+	require.Equal(t, []string{"reviewer", config.AgentWorker}, param["enum"])
+	for _, absent := range []string{config.AgentCoder, config.AgentPlan, config.AgentTask, "ghost"} {
+		require.NotContains(t, param["enum"], absent)
+	}
+	require.Contains(t, param["description"], config.AgentWorker,
+		"the description names the configured default agent")
+}
+
+// #433: the call's agent parameter chooses the definition the dispatch
+// runs on — an explicit id wins, an omitted id takes
+// options.dispatch.default_agent, and the chosen id rides the builder
+// call and the returned handle.
+func TestDispatchAgentParamSelectsDefinition(t *testing.T) {
+	agent := &dispatchTestAgent{model: dispatchTestModel()}
+	c, _ := newDispatchToolEnv(t, agent)
+
+	var built []dispatchAgentOptions
+	c.dispatchAgentBuilder = func(_ context.Context, opts dispatchAgentOptions) (*dispatchedAgent, error) {
+		built = append(built, opts)
+		return &dispatchedAgent{agent: agent, model: agent.model, providerCfg: config.ProviderConfig{ID: "test-provider"}}, nil
+	}
+
+	var defs map[string]config.AgentDefinition
+	require.NoError(t, json.Unmarshal([]byte(`{"reviewer": {"role": "dispatch"}}`), &defs))
+	c.cfg.Config().AgentDefinitions = defs
+	c.cfg.Config().SetupAgents()
+	tool := c.dispatchTool()
+
+	// Omitted agent with no configured default: the worker.
+	handle := decodeDispatchHandle(t, runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "p"}, "dispatch-tool-call-1"))
+	require.Equal(t, config.AgentWorker, handle.Agent)
+	require.Len(t, built, 1)
+	require.Equal(t, config.AgentWorker, built[0].AgentID)
+
+	// A configured default applies when the call omits the agent —
+	// but an explicit agent wins over it.
+	c.cfg.Config().Options.Dispatch = &config.DispatchOptions{DefaultAgent: "reviewer"}
+
+	handle = decodeDispatchHandle(t, runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "p"}, "dispatch-tool-call-2"))
+	require.Equal(t, "reviewer", handle.Agent)
+	require.Len(t, built, 2)
+	require.Equal(t, "reviewer", built[1].AgentID)
+
+	handle = decodeDispatchHandle(t, runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "p", Agent: "reviewer"}, "dispatch-tool-call-3"))
+	require.Equal(t, "reviewer", handle.Agent)
+	require.Len(t, built, 3)
+	require.Equal(t, "reviewer", built[2].AgentID)
+}
+
+// #433: an unknown, disabled, or non-dispatch agent id is refused with
+// the dispatchable ids listed, before anything is provisioned.
+func TestDispatchAgentParamRefusals(t *testing.T) {
+	agent := &dispatchTestAgent{model: dispatchTestModel()}
+	c, _ := newDispatchToolEnv(t, agent)
+
+	var built []dispatchAgentOptions
+	c.dispatchAgentBuilder = func(_ context.Context, opts dispatchAgentOptions) (*dispatchedAgent, error) {
+		built = append(built, opts)
+		return &dispatchedAgent{agent: agent, model: agent.model, providerCfg: config.ProviderConfig{ID: "test-provider"}}, nil
+	}
+
+	var defs map[string]config.AgentDefinition
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"reviewer": {"role": "dispatch"},
+		"ghost": {"role": "dispatch", "disabled": true}
+	}`), &defs))
+	c.cfg.Config().AgentDefinitions = defs
+	c.cfg.Config().SetupAgents()
+	tool := c.dispatchTool()
+
+	tests := []struct {
+		name  string
+		agent string
+		want  string
+	}{
+		{name: "unknown agent", agent: "nope", want: `unknown agent "nope"`},
+		{name: "disabled agent", agent: "ghost", want: `agent "ghost" is disabled`},
+		{name: "non-dispatch agent", agent: "coder", want: `agent "coder" is a "main" agent, not a dispatch agent`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "p", Agent: tt.agent})
+			require.True(t, resp.IsError, "expected a tool error, got: %s", resp.Content)
+			require.Contains(t, resp.Content, tt.want)
+			require.Contains(t, resp.Content, "available dispatch agents: reviewer, worker")
+		})
+	}
+	require.Empty(t, built, "a refused call must not build an agent")
+}
+
+// #433: the model parameter on a pinned dispatch definition is refused —
+// the pin already names the provider and model, so a slot choice would
+// be silently ignored. Without the parameter the pinned definition
+// dispatches normally.
+func TestDispatchAgentParamModelOnPinnedDefinition(t *testing.T) {
+	agent := &dispatchTestAgent{model: dispatchTestModel()}
+	c, _ := newDispatchToolEnv(t, agent)
+
+	var built []dispatchAgentOptions
+	c.dispatchAgentBuilder = func(_ context.Context, opts dispatchAgentOptions) (*dispatchedAgent, error) {
+		built = append(built, opts)
+		return &dispatchedAgent{agent: agent, model: agent.model, providerCfg: config.ProviderConfig{ID: "test-provider"}}, nil
+	}
+
+	var defs map[string]config.AgentDefinition
+	require.NoError(t, json.Unmarshal([]byte(`{"pinned": {"role": "dispatch", "model": {"provider": "p", "model": "m"}}}`), &defs))
+	c.cfg.Config().AgentDefinitions = defs
+	c.cfg.Config().SetupAgents()
+	tool := c.dispatchTool()
+
+	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "p", Agent: "pinned", Model: "large"})
+	require.True(t, resp.IsError, "expected a tool error, got: %s", resp.Content)
+	require.Contains(t, resp.Content, `agent "pinned" pins model p/m; omit model`)
+	require.Empty(t, built)
+
+	bogus := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "p", Agent: "pinned", Model: "medium"})
+	require.True(t, bogus.IsError, "expected a tool error, got: %s", bogus.Content)
+	require.Contains(t, bogus.Content, `invalid model "medium"`)
+
+	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "p", Agent: "pinned"}))
+	require.Equal(t, "pinned", handle.Agent)
+	require.Len(t, built, 1)
+	require.Empty(t, built[0].ModelType, "no model parameter reaches the builder")
+}
+
+// #433: the model parameter overrides a slot-based definition's slot,
+// and an omitted parameter leaves the choice to the definition.
+func TestDispatchAgentParamSlotOverride(t *testing.T) {
+	agent := &dispatchTestAgent{model: dispatchTestModel()}
+	c, _ := newDispatchToolEnv(t, agent)
+
+	var built []dispatchAgentOptions
+	c.dispatchAgentBuilder = func(_ context.Context, opts dispatchAgentOptions) (*dispatchedAgent, error) {
+		built = append(built, opts)
+		return &dispatchedAgent{agent: agent, model: agent.model, providerCfg: config.ProviderConfig{ID: "test-provider"}}, nil
+	}
+
+	var defs map[string]config.AgentDefinition
+	require.NoError(t, json.Unmarshal([]byte(`{"reviewer": {"role": "dispatch", "model": "large"}}`), &defs))
+	c.cfg.Config().AgentDefinitions = defs
+	c.cfg.Config().SetupAgents()
+	tool := c.dispatchTool()
+
+	_ = runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "p", Agent: "reviewer", Model: "small"}, "dispatch-tool-call-slot-1")
+	require.Len(t, built, 1)
+	require.Equal(t, "reviewer", built[0].AgentID)
+	require.Equal(t, config.SelectedModelTypeSmall, built[0].ModelType)
+
+	_ = runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "p", Agent: "reviewer"}, "dispatch-tool-call-slot-2")
+	require.Len(t, built, 2)
+	require.Empty(t, built[1].ModelType, "an omitted model defers to the definition's slot")
 }

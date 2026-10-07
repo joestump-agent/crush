@@ -6,4 +6,6 @@ The prompt should be a self-contained task description: the dispatched agent can
 
 Give the agent a short role ("tester", "docs writer") and, when useful, an explicit handle: the user steers a running agent by starting a message with its @handle, and the handle appears with live status in the editor's @ completions. Handles are unique among running agents — a collision with another running agent or a reserved name is suffixed automatically, and a finished agent's handle is free again for the next dispatch.
 
+Omitting agent runs the dispatch on the configured default agent (options.dispatch.default_agent, the worker definition unless configured otherwise). Pass agent — one of the dispatch agent ids in the enum — when another definition's tools, system prompt, skills, or model fit the task better. The selected definition's model slot, skills, and MCP tools all apply; model then picks large or small within that slot, and is refused for a definition pinned to an explicit model.
+
 Concurrency is capped: at most `dispatch.max_concurrent` agents (default 4) run at once, counting dispatches in flight and setups still provisioning. At the cap, a dispatch_agent call fails with an "at capacity" error and provisions nothing — wait for one to finish or cancel one with its @handle.
