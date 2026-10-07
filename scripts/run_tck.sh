@@ -72,16 +72,15 @@ done
 # The tests the must-level suite is allowed to fail — the documented
 # deviations from internal/a2a/doc.go: the artifact-content and
 # message-response sentinels presume an echo agent (DM-ART-001,
-# DM-MSG-001), and the SDK's subscribe framing differs from the TCK's
-# expectations (STREAM-SUB-003, STREAM-SUB-004). A failure outside this
-# list, or an expected one that now passes, fails the run.
+# DM-MSG-001), and the SDK's subscribe error framing differs from the
+# TCK's expectations (STREAM-SUB-004). A failure outside this list, or
+# an expected one that now passes, fails the run.
 expected='tests/compatibility/core_operations/test_artifacts.py::TestTextArtifact::test_task_has_text_artifact
 tests/compatibility/core_operations/test_artifacts.py::TestFileArtifact::test_task_has_file_artifact
 tests/compatibility/core_operations/test_artifacts.py::TestFileUrlArtifact::test_task_has_file_url_artifact
 tests/compatibility/core_operations/test_artifacts.py::TestDataArtifact::test_task_has_data_artifact
 tests/compatibility/core_operations/test_artifacts.py::TestMessageResponse::test_returns_message_with_text_part
 tests/compatibility/core_operations/test_requirements.py::test_must_requirement[STREAM-SUB-004-jsonrpc]
-tests/compatibility/core_operations/test_task_lifecycle.py::TestSubscribeLifecycle::test_subscribe_rejects_terminal_task
 tests/compatibility/jsonrpc/test_sse_streaming.py::TestSseSubscribeToTask::test_subscribe_nonexistent_task_returns_error'
 
 check_report() {

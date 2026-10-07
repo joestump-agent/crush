@@ -233,7 +233,7 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 					return
 				}
 			}
-			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateRejected,
+			yield(statusEvent(execCtx, a2aspec.TaskStateRejected,
 				agentMessage(execCtx, noAgentForContextText(execCtx.ContextID))), nil)
 			return
 		}
@@ -845,12 +845,12 @@ func (e *Executor) executeSteer(ctx context.Context, execCtx *a2asrv.ExecutorCon
 	call.OnConsumed = func(ok bool) { consumed <- ok }
 
 	if !binding.Runner.EnqueueWhenBusy(call) {
-		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateRejected,
+		yield(statusEvent(execCtx, a2aspec.TaskStateRejected,
 			agentMessage(execCtx, "agent is no longer running; task sessions are not continuable")), nil)
 		return
 	}
 
-	if !yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateWorking, nil), nil) {
+	if !yield(statusEvent(execCtx, a2aspec.TaskStateWorking, nil), nil) {
 		return
 	}
 
@@ -860,10 +860,10 @@ func (e *Executor) executeSteer(ctx context.Context, execCtx *a2asrv.ExecutorCon
 		// message stays queued for the agent to consume on its own.
 	case ok := <-consumed:
 		if ok {
-			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted,
+			yield(statusEvent(execCtx, a2aspec.TaskStateCompleted,
 				agentMessage(execCtx, "delivered")), nil)
 		} else {
-			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateFailed,
+			yield(statusEvent(execCtx, a2aspec.TaskStateFailed,
 				agentMessage(execCtx, "agent finished before the message was consumed")), nil)
 		}
 	}

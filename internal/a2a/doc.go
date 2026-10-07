@@ -118,16 +118,7 @@
 //     subscription, so the error arrives as an in-stream error event
 //     rather than a plain JSON-RPC error body — which the TCK's
 //     streaming client reads as a successfully opened stream.
-//   - Subscribe on a terminal task (tests/compatibility/core_operations/
-//     test_task_lifecycle.py::TestSubscribeLifecycle::
-//     test_subscribe_rejects_terminal_task, STREAM-SUB-003). The SDK
-//     resubscribes to a finished task by replaying its recorded
-//     terminal events instead of answering with an error; the TCK
-//     requires the error. The replay is arguably the friendlier
-//     behavior, but it is the SDK's, and fixing it means forking the
-//     JSON-RPC handler.
-//
-// Two of the TCK's findings were fixed rather than accepted, and their
+// Three of the TCK's findings were fixed rather than accepted, and their
 // upstream shapes are worth reporting to the a2a-go project (filing
 // there needs Joe's approval, so they are tracked here):
 //
@@ -141,6 +132,17 @@
 //     it.
 //   - Status timestamps (DM-SERIAL-003): the SDK stamps
 //     NewStatusUpdateEvent with a local-zone time.Now(); the wire
-//     format wants ISO 8601 with a Z suffix. The executor normalizes
-//     through its statusEvent helper.
+//     format wants ISO 8601 with a Z suffix. Every status event the
+//     executor emits — the run's lifecycle and the steer path's
+//     working/rejected/completed/failed progression alike — is built
+//     through the statusEvent helper, which normalizes the timestamp
+//     to UTC.
+//   - Subscribe on a terminal task (STREAM-SUB-003): the SDK
+//     resubscribes to a finished task by replaying its recorded
+//     terminal events, which the TCK rejects. Since #528 the suite's
+//     second-and-later messages on the shared context are served as
+//     steers, and a steer task never opens a stream of its own, so the
+//     scenario's task has no recorded stream and SubscribeToTask on it
+//     errors — which the TCK accepts. Resubscribing to a task that did
+//     stream still replays (SDK behavior, unchanged).
 package a2a
