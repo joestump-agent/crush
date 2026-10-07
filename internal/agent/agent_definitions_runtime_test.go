@@ -426,3 +426,29 @@ func TestIntersectSkills(t *testing.T) {
 	require.Equal(t, []string{"jq", "go"}, intersectSkills([]string{"jq", "rust", "go"}, []string{"go", "jq"}))
 	require.Empty(t, intersectSkills([]string{"rust"}, []string{"go"}))
 }
+
+func TestReadPromptFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "ok.md"), []byte("prompt"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "big.log"), make([]byte, maxPromptFileBytes+1), 0o644))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "prompts"), 0o755))
+
+	got, err := readPromptFile(dir, "ok.md")
+	require.NoError(t, err)
+	require.Equal(t, "prompt", got)
+
+	got, err = readPromptFile(t.TempDir(), filepath.Join(dir, "ok.md"))
+	require.NoError(t, err, "an absolute path ignores the working dir")
+	require.Equal(t, "prompt", got)
+
+	_, err = readPromptFile(dir, "big.log")
+	require.ErrorContains(t, err, "over the")
+
+	_, err = readPromptFile(dir, "prompts")
+	require.ErrorContains(t, err, "not a regular file")
+
+	_, err = readPromptFile(dir, "missing.md")
+	require.ErrorIs(t, err, os.ErrNotExist)
+}

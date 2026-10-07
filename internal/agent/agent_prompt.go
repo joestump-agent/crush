@@ -54,11 +54,11 @@ func agentPrompt(agent config.Agent, workingDir string, opts ...prompt.Option) (
 		if path == "" {
 			return nil, fmt.Errorf("agent %q: empty file: prompt reference", agent.ID)
 		}
-		content, err := os.ReadFile(filepathext.SmartJoin(workingDir, path))
+		content, err := readPromptFile(workingDir, path)
 		if err != nil {
 			return nil, fmt.Errorf("read agent prompt: %w", err)
 		}
-		return prompt.NewPrompt(agent.ID, string(content), opts...)
+		return prompt.NewPrompt(agent.ID, content, opts...)
 	default:
 		return nil, fmt.Errorf("invalid prompt %q: want builtin:<id> or file:<path>", spec)
 	}
@@ -79,11 +79,42 @@ func agentSystemPrompt(ctx context.Context, p *prompt.Prompt, agent config.Agent
 	if !ok || path == "" {
 		return "", fmt.Errorf("invalid prompt_append %q: want file:<path>", agent.PromptAppend)
 	}
-	content, err := os.ReadFile(filepathext.SmartJoin(workingDir, path))
+	content, err := readPromptFile(workingDir, path)
 	if err != nil {
 		return "", fmt.Errorf("read prompt_append: %w", err)
 	}
-	return strings.TrimRight(systemPrompt, "\n") + "\n\n" + string(content), nil
+	return strings.TrimRight(systemPrompt, "\n") + "\n\n" + content, nil
+}
+
+// maxPromptFileBytes caps a file: prompt or prompt_append (#432). The
+// file lands in every request's system prompt, so a mistyped path to a
+// log or a binary must fail instead of swallowing the context window.
+const maxPromptFileBytes = 256 << 10
+
+// readPromptFile reads a definition's file: prompt, resolved against the
+// working directory unless absolute. The file must be a regular file no
+// larger than maxPromptFileBytes.
+func readPromptFile(workingDir, path string) (string, error) {
+	full := filepathext.SmartJoin(workingDir, path)
+	// By design: the path is the user's own config value, with the same
+	// trust as options.context_paths, and reading it is the feature.
+	// codeql[go/path-injection]
+	info, err := os.Stat(full)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file", path)
+	}
+	if info.Size() > maxPromptFileBytes {
+		return "", fmt.Errorf("%s is %d bytes, over the %d-byte limit", path, info.Size(), maxPromptFileBytes)
+	}
+	// codeql[go/path-injection]
+	content, err := os.ReadFile(full)
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
 }
 
 // agentPromptOptions assembles the options an agent's prompt render
