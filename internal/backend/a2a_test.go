@@ -16,7 +16,8 @@ import (
 // once and holds a stream until its caller gives up; an unknown
 // workspace is not found (#421).
 func TestA2AHostBeforeTheHostStarts(t *testing.T) {
-	b, ws, _ := newPublishingWorkspace(t)
+	t.Parallel()
+	b, ws := newHostWorkspace(t, newHostSource())
 
 	_, err := b.A2AHost(t.Context(), ws.ID, false)
 	require.ErrorIs(t, err, ErrA2AHostNotRunning)
