@@ -217,6 +217,9 @@ func (h *DispatchHarness) Dispatch(t *testing.T, prompt string) dispatch.Dispatc
 	return decodeDispatchHandle(t, resp)
 }
 
+// ParentSessionID is the session the harness dispatches from.
+func (h *DispatchHarness) ParentSessionID() string { return h.parentID }
+
 // WaitTerminal blocks until the dispatch's registry entry is terminal
 // and returns it.
 func (h *DispatchHarness) WaitTerminal(t *testing.T, dispatchID string) dispatch.Entry {
