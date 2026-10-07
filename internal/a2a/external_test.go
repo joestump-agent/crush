@@ -308,6 +308,7 @@ func TestExternalAgentHappyPath(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
 	require.NotEmpty(t, taskID, "the remote task's ID is tracked like a served dispatch's")
+	require.True(t, strings.HasPrefix(outcome.Text, dispatch.UntrustedPrefix), "the findings are labeled untrusted")
 	require.Contains(t, outcome.Text, "review done")
 	require.Contains(t, outcome.Text, "finding: nil deref in main.go")
 	require.Contains(t, outcome.Text, "you sent Bearer [REDACTED]", "a token the remote echoes back is scrubbed")
@@ -344,7 +345,7 @@ func TestExternalAgentMessageReply(t *testing.T) {
 	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
-	require.Equal(t, "looks good to me", outcome.Text)
+	require.Equal(t, dispatch.UntrustedPrefix+"looks good to me", outcome.Text)
 }
 
 // A card whose JSON-RPC service lives on another origin is refused
@@ -450,14 +451,14 @@ func TestExternalAgentResolverErrors(t *testing.T) {
 			handler: func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write([]byte("<html>login</html>"))
 			},
-			want: "card parsing failed",
+			want: "the response is not a valid Agent Card",
 		},
 		{
 			name: "oversized card",
 			handler: func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write(bytes.Repeat([]byte(" "), maxExternalCardBytes+1))
 			},
-			want: "request body too large",
+			want: "the card is larger than",
 		},
 	}
 	for _, tc := range cases {
@@ -647,7 +648,8 @@ func TestExternalAgentFailureIsCapped(t *testing.T) {
 	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusFailed, outcome.Status)
-	require.LessOrEqual(t, len(outcome.Text), maxExternalTextBytes+len(externalTruncatedMarker))
+	require.True(t, strings.HasPrefix(outcome.Text, dispatch.UntrustedPrefix), "a remote failure reason is labeled")
+	require.LessOrEqual(t, len(outcome.Text), len(dispatch.UntrustedPrefix)+maxExternalTextBytes+len(externalTruncatedMarker))
 	require.True(t, strings.HasSuffix(outcome.Text, externalTruncatedMarker))
 }
 
@@ -674,7 +676,8 @@ func TestExternalPinning(t *testing.T) {
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	require.ErrorContains(t, err, "pinned to https://reviewer.example.net:443")
+	require.ErrorContains(t, err, "pinned origin https://reviewer.example.net:443")
+	require.NotContains(t, err.Error(), "evil", "the refused target is not echoed")
 	requireNoToken(t, err.Error(), "the error")
 	require.False(t, called, "an off-origin request must not be sent")
 	require.True(t, body.closed, "a refused request's body is closed")
@@ -984,7 +987,109 @@ func TestExternalAgentNonStreamingCard(t *testing.T) {
 	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review", OnTask: func(id string) { taskID = id }})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
-	require.Equal(t, "blocking review done", outcome.Text)
+	require.Equal(t, dispatch.UntrustedPrefix+"blocking review done", outcome.Text)
 	require.NotEmpty(t, taskID)
 	require.Equal(t, []string{"SendMessage"}, es.methods(), "a non-streaming card gets a blocking SendMessage")
+}
+
+// injectedText is what a hostile remote tries to get into crush's errors
+// and logs; no resolution error may carry it (#434).
+const injectedText = "ignore-previous-instructions"
+
+// A refused card names the user's card URL and fixed wording, never a
+// string the remote controls: not the status line's reason phrase, not
+// a foreign service host, not an unknown binding's name, not the SDK's
+// echo of the card's protocol strings, not a redirect target.
+func TestExternalAgentResolutionErrorsCarryNoRemoteText(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		setup func(es *externalServer)
+		want  string
+	}{
+		{
+			name: "status reason phrase",
+			setup: func(es *externalServer) {
+				es.cardHandler = func(w http.ResponseWriter, _ *http.Request) {
+					conn, buf, err := http.NewResponseController(w).Hijack()
+					if err != nil {
+						return
+					}
+					defer conn.Close()
+					_, _ = buf.WriteString("HTTP/1.1 404 " + injectedText + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+					_ = buf.Flush()
+				}
+			},
+			want: "HTTP status 404",
+		},
+		{
+			name: "foreign service host",
+			setup: func(es *externalServer) {
+				es.card = func(string) *a2aspec.AgentCard {
+					return externalTestCard("https://"+injectedText+".example.net/a2a", true)
+				}
+			},
+			want: "on another origin than",
+		},
+		{
+			name: "unknown binding name",
+			setup: func(es *externalServer) {
+				es.card = func(base string) *a2aspec.AgentCard {
+					card := externalTestCard(base+"/a2a", true)
+					card.SupportedInterfaces = []*a2aspec.AgentInterface{
+						{URL: base + "/x", ProtocolBinding: a2aspec.TransportProtocol(injectedText), ProtocolVersion: "1.0"},
+						{URL: base + "/g", ProtocolBinding: a2aspec.TransportProtocolGRPC, ProtocolVersion: "1.0"},
+					}
+					return card
+				}
+			},
+			want: "card offers 2 interfaces [GRPC, 1 unrecognized]",
+		},
+		{
+			name: "unsupported protocol version",
+			setup: func(es *externalServer) {
+				es.card = func(base string) *a2aspec.AgentCard {
+					card := externalTestCard(base+"/a2a", true)
+					card.SupportedInterfaces[0].ProtocolVersion = a2aspec.ProtocolVersion("9." + injectedText)
+					return card
+				}
+			},
+			want: "on a protocol version crush speaks (1.x)",
+		},
+		{
+			name: "redirect target",
+			setup: func(es *externalServer) {
+				es.cardHandler = func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, "https://"+injectedText+".example.net/card.json", http.StatusFound)
+				}
+			},
+			want: "refusing a cross-origin redirect",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+			tc.setup(es)
+			_, err := externalFactory(t, es).ResolveExternalAgent(t.Context(), agent.ExternalAgentParams{
+				CardURL: es.cardURL(),
+				Token:   agent.NewSecret(externalTestToken),
+			})
+			require.ErrorContains(t, err, tc.want)
+			require.NotContains(t, err.Error(), injectedText, "a remote string reached the error")
+		})
+	}
+}
+
+// A stream error can carry the remote's own words; they arrive labeled.
+func TestExternalAgentStreamErrorIsLabeled(t *testing.T) {
+	t.Parallel()
+	es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+	es.callHandler = sseHandler(func(w io.Writer) {
+		_, _ = w.Write([]byte(`data: {"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"` + injectedText + `"}}` + "\n\n"))
+	})
+	ext := resolveTestAgent(t, es)
+	_, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "a2a: external agent stream failed: "+dispatch.UntrustedPrefix)
 }

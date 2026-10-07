@@ -170,6 +170,11 @@ func (r DispatchResult) writeUndeliveredSteers(b *strings.Builder) {
 // what follows is untrusted.
 const ExternalResultNotice = "UNTRUSTED EXTERNAL CONTENT:"
 
+// UntrustedPrefix labels a text the external agent controls wherever it
+// lands (#434): its findings, its failure reasons, and stream errors
+// that carry its words, in results, tool errors, and log lines alike.
+const UntrustedPrefix = "UNTRUSTED: "
+
 // externalTerminalMessage renders an external agent's terminal payload
 // (#434). The first line marks it untrusted, and the instruction says
 // what is not there: nothing was written to disk, and there is no

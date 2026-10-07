@@ -284,7 +284,7 @@ func (c *coordinator) dispatchExternal(ctx context.Context, params DispatchAgent
 			slog.Warn("Failed to record dispatch start", "dispatch_id", entry.ID, "error", err)
 		}
 	}
-	slog.Debug("External dispatch started", "dispatch_id", entry.ID, "agent", agentCfg.ID, "source", ext.Source(), "endpoint", ext.Endpoint())
+	slog.Debug("External dispatch started", "dispatch_id", entry.ID, "agent", agentCfg.ID, "source", ext.Source())
 	c.startDispatchRun(func() { c.runDispatch(rootCtx, run) })
 	return fantasy.NewTextResponse(handle.Render()), nil
 }
