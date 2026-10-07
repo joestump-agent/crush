@@ -1207,8 +1207,8 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// user's disabled tools, applied last so a definition can never
 	// widen user policy. A disabled task agent takes the `agent` tool
 	// off the main agents' palettes — there is no sub-agent to run —
-	// and with no enabled dispatch agent the dispatch and message
-	// tools have nothing to act on.
+	// and with no enabled dispatch agent the dispatch, message, cancel,
+	// apply, and dismiss tools have nothing to act on.
 	allowedTools := effectiveToolNames(agent.AllowedTools, c.cfg.Config().Options.DisabledTools)
 	if taskCfg, ok := c.cfg.Config().Agents[config.AgentTask]; ok && taskCfg.Disabled {
 		allowedTools = slices.DeleteFunc(allowedTools, func(name string) bool {
@@ -1217,7 +1217,8 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	}
 	if !hasEnabledDispatchAgent(c.cfg.Config()) {
 		allowedTools = slices.DeleteFunc(allowedTools, func(name string) bool {
-			return name == DispatchAgentToolName || name == MessageAgentToolName || name == CancelDispatchToolName
+			return name == DispatchAgentToolName || name == MessageAgentToolName || name == CancelDispatchToolName ||
+				name == ApplyDispatchToolName || name == DismissDispatchToolName
 		})
 	}
 

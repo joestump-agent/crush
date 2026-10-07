@@ -346,7 +346,8 @@ How the runtime applies each field:
   - A disabled `task` removes the `agent` tool.
   - A disabled `plan` cannot be switched to.
   - With no enabled dispatch agent, the main agent loses `dispatch_agent`,
-    `message_agent` and `cancel_dispatch`.
+    `message_agent`, `cancel_dispatch`, `apply_dispatch` and
+    `dismiss_dispatch`.
   - `coder` cannot be disabled.
 
 The same configuration in `crushrc`:

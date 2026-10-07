@@ -213,6 +213,8 @@ func TestAgentDefinitionDisabled(t *testing.T) {
 		require.Contains(t, names, DispatchAgentToolName)
 		require.Contains(t, names, MessageAgentToolName)
 		require.Contains(t, names, CancelDispatchToolName)
+		require.Contains(t, names, ApplyDispatchToolName)
+		require.Contains(t, names, DismissDispatchToolName)
 	})
 
 	t.Run("a disabled task removes the agent tool", func(t *testing.T) {
@@ -228,6 +230,8 @@ func TestAgentDefinitionDisabled(t *testing.T) {
 		require.NotContains(t, names, DispatchAgentToolName)
 		require.NotContains(t, names, MessageAgentToolName)
 		require.NotContains(t, names, CancelDispatchToolName)
+		require.NotContains(t, names, ApplyDispatchToolName)
+		require.NotContains(t, names, DismissDispatchToolName)
 		require.Contains(t, names, AgentToolName)
 	})
 
