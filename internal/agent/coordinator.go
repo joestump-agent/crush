@@ -2255,7 +2255,7 @@ func (c *coordinator) runSubAgentOverA2A(ctx context.Context, params subAgentPar
 		},
 	})
 	if err != nil {
-		outcome = c.recoverSubAgentOutcome(ctx, host, params, endpoint, card, taskID, err)
+		outcome = c.recoverSubAgentOutcome(ctx, host, params, turn.sessionID, endpoint, card, taskID, err)
 	}
 	output, runErr := subAgentOutcomeFromTransport(outcome)
 	return c.finishSubAgent(ctx, turn, params.SessionID, output, runErr)
@@ -2268,8 +2268,8 @@ func (c *coordinator) runSubAgentOverA2A(ctx context.Context, params subAgentPar
 // out of scope. The canceled-or-failed task is then read back so the
 // caller maps the run's real terminal state; if even that fails, the
 // stream error stands as a failure.
-func (c *coordinator) recoverSubAgentOutcome(ctx context.Context, host DispatchHost, params subAgentParams, endpoint string, card any, taskID string, streamErr error) DispatchTransportOutcome {
-	slog.Warn("Sub-agent A2A stream failed; recovering the served run", "session_id", params.SessionID, "task_id", taskID, "error", streamErr)
+func (c *coordinator) recoverSubAgentOutcome(ctx context.Context, host DispatchHost, params subAgentParams, runSessionID string, endpoint string, card any, taskID string, streamErr error) DispatchTransportOutcome {
+	slog.Warn("Sub-agent A2A stream failed; recovering the served run", "session_id", runSessionID, "parent_session_id", params.SessionID, "task_id", taskID, "error", streamErr)
 
 	if taskID != "" {
 		recoverCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -2282,9 +2282,10 @@ func (c *coordinator) recoverSubAgentOutcome(ctx context.Context, host DispatchH
 				Reason:   "parent turn canceled",
 			}); cerr != nil {
 				// The protocol cancel is best-effort here; the direct
-				// cancel covers a host that cannot deliver it.
-				slog.Warn("Sub-agent tasks/cancel failed; canceling the runner directly", "session_id", params.SessionID, "task_id", taskID, "error", cerr)
-				params.Agent.Cancel(params.SessionID)
+				// cancel covers a host that cannot deliver it. The run
+				// lives on its task session, so the cancel names that.
+				slog.Warn("Sub-agent tasks/cancel failed; canceling the runner directly", "session_id", runSessionID, "task_id", taskID, "error", cerr)
+				params.Agent.Cancel(runSessionID)
 			}
 			if st, gerr := waitSubAgentTerminal(recoverCtx, host, endpoint, card, taskID); gerr == nil {
 				return DispatchTransportOutcome{Status: st.Status, Text: st.Text}
@@ -2292,12 +2293,12 @@ func (c *coordinator) recoverSubAgentOutcome(ctx context.Context, host DispatchH
 		} else {
 			// No canceler on the seam (a bare test fake): the direct
 			// cancel is the only way the run ends.
-			params.Agent.Cancel(params.SessionID)
+			params.Agent.Cancel(runSessionID)
 		}
 	} else {
-		// The stream died before any task was named: nothing is running
-		// server side to recover.
-		params.Agent.Cancel(params.SessionID)
+		// The stream died before any task was named: the direct cancel
+		// is a no-op if the run never started, and reaches it if it did.
+		params.Agent.Cancel(runSessionID)
 	}
 	return DispatchTransportOutcome{Status: transportStatusFailed, Text: streamErr.Error()}
 }
