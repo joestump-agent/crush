@@ -1023,18 +1023,9 @@ func (c *coordinator) buildAgent(ctx context.Context, agent config.Agent, isSubA
 		return nil, err
 	}
 
-	// An agent pinned to an explicit provider and model (#432) runs on
-	// it in the large slot; the small slot stays the user's small model
-	// for auxiliary work.
-	if agent.ModelRef != nil {
-		pinned, err := c.buildModelFromSelected(ctx, config.SelectedModel{
-			Provider: agent.ModelRef.Provider,
-			Model:    agent.ModelRef.Model,
-		}, isSubAgent)
-		if err != nil {
-			return nil, err
-		}
-		large = pinned
+	large, err = c.agentModel(ctx, agent, large, small, isSubAgent)
+	if err != nil {
+		return nil, err
 	}
 
 	largeProviderCfg, _ := c.cfg.Config().Providers.Get(large.ModelCfg.Provider)
@@ -1321,11 +1312,20 @@ func hasEnabledDispatchAgent(c *config.Config) bool {
 	return false
 }
 
+// mcpAgentTool is the slice of *tools.Tool filterMCPTools reads: the
+// tool itself plus the server and tool names it is filtered by.
+type mcpAgentTool interface {
+	fantasy.AgentTool
+	Name() string
+	MCP() string
+	MCPToolName() string
+}
+
 // filterMCPTools keeps the MCP tools an agent's definition allows
 // (#432): a nil AllowedMCP means no restriction, an empty one allows
 // no MCP tools, and entries allow a whole server or named tools on it
 // (the config resolves server:tool pairs on load).
-func filterMCPTools(agent config.Agent, mcpTools []*tools.Tool) []fantasy.AgentTool {
+func filterMCPTools[T mcpAgentTool](agent config.Agent, mcpTools []T) []fantasy.AgentTool {
 	var filtered []fantasy.AgentTool
 	for _, tool := range mcpTools {
 		if agent.AllowedMCP == nil {
@@ -1353,10 +1353,29 @@ func filterMCPTools(agent config.Agent, mcpTools []*tools.Tool) []fantasy.AgentT
 	return filtered
 }
 
+// agentModel returns the model an agent's session runs on, given the
+// configured slots (#432). The session agent runs on its large slot, so
+// an agent whose definition names the small slot gets the small model
+// there, and an agent pinned to an explicit provider and model gets the
+// pin. The small slot stays the user's small model for auxiliary work
+// either way.
+func (c *coordinator) agentModel(ctx context.Context, agent config.Agent, large, small Model, isSubAgent bool) (Model, error) {
+	switch {
+	case agent.ModelRef != nil:
+		return c.buildModelFromSelected(ctx, config.SelectedModel{
+			Provider: agent.ModelRef.Provider,
+			Model:    agent.ModelRef.Model,
+		}, isSubAgent)
+	case agent.Model == config.SelectedModelTypeSmall:
+		return small, nil
+	default:
+		return large, nil
+	}
+}
+
 // buildAgentModels resolves the configured large and small model slots.
-// An agent that carries its own model — a slot ref or an explicit
-// provider and model pin (#432) — replaces its large slot with
-// buildModelFromSelected.
+// agentModel picks which one an agent runs on, or its explicit pin
+// (#432).
 func (c *coordinator) buildAgentModels(ctx context.Context, isSubAgent bool) (Model, Model, error) {
 	largeModelCfg, ok := c.cfg.Config().Models[config.SelectedModelTypeLarge]
 	if !ok {
@@ -1820,17 +1839,22 @@ func (c *coordinator) UpdateModels(ctx context.Context) error {
 // updateAgentModels rebuilds the model and tool configuration for the
 // given agent from the current config.
 func (c *coordinator) updateAgentModels(ctx context.Context, agent SessionAgent, name string) error {
-	// build the models again so we make sure we get the latest config
-	large, small, err := c.buildAgentModels(ctx, false)
-	if err != nil {
-		return err
-	}
-	agent.SetModels(large, small)
-
 	agentCfg, ok := c.cfg.Config().Agents[name]
 	if !ok {
 		return fmt.Errorf("%w: %s", errMainAgentNotFound, name)
 	}
+
+	// build the models again so we make sure we get the latest config,
+	// keeping the agent's own slot or pin (#432)
+	large, small, err := c.buildAgentModels(ctx, false)
+	if err != nil {
+		return err
+	}
+	large, err = c.agentModel(ctx, agentCfg, large, small, false)
+	if err != nil {
+		return err
+	}
+	agent.SetModels(large, small)
 
 	tools, err := c.buildTools(ctx, agentCfg, false)
 	if err != nil {
