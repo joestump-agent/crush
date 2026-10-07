@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"charm.land/fantasy"
@@ -20,15 +21,22 @@ type ScriptedRunner struct {
 	// Delay, when non-zero, is how long Run takes before returning —
 	// wide enough for the TCK's in-flight task-state polls.
 	Delay time.Duration
+
+	// running tracks whether a scripted run is in flight, so steers can
+	// be accepted exactly while the session is busy (#351).
+	running atomic.Int32
 }
 
 var _ interface {
 	Run(context.Context, agent.SessionAgentCall) (*fantasy.AgentResult, error)
 	Cancel(sessionID string)
+	EnqueueWhenBusy(call agent.SessionAgentCall) bool
 } = (*ScriptedRunner)(nil)
 
 // Run implements a2a.Runner.
 func (r *ScriptedRunner) Run(ctx context.Context, _ agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	r.running.Add(1)
+	defer r.running.Add(-1)
 	if r.Delay > 0 {
 		select {
 		case <-ctx.Done():
@@ -45,6 +53,21 @@ func (r *ScriptedRunner) Run(ctx context.Context, _ agent.SessionAgentCall) (*fa
 
 // Cancel implements a2a.Runner: a scripted run has nothing to cancel.
 func (r *ScriptedRunner) Cancel(sessionID string) {}
+
+// EnqueueWhenBusy implements a2a.Runner: while the scripted run is in
+// flight a steer is accepted and folded into the answer already being
+// scripted — the harness has exactly one — and once Run has returned
+// the session is over, so the message is refused and the executor
+// rejects the steer's task (#351).
+func (r *ScriptedRunner) EnqueueWhenBusy(call agent.SessionAgentCall) bool {
+	if r.running.Load() == 0 {
+		return false
+	}
+	if call.OnConsumed != nil {
+		call.OnConsumed(true)
+	}
+	return true
+}
 
 // ScriptedTodos is the a2a.TodoSource the harness serves: one snapshot
 // — a two-item checklist, one item in progress — on the first

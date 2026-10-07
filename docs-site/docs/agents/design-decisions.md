@@ -59,7 +59,7 @@ current behaviour. What ships today is on
 | 2026-10-04 | **Not continuable, for now.** Delegation depth is one level. | Both | Current behaviour; [#413](https://github.com/joestump-agent/crush/issues/413) closes gaps |
 | 2026-10-04 | **Navigation.** `ctrl+]` enters and cycles. Esc and `ctrl+[` always leave inspect mode, and Esc never cancels from it. | Interaction | Planned: [#404](https://github.com/joestump-agent/crush/issues/404) |
 | 2026-10-04 | **Durable task state** in a SQLite task store. | A2A PRD | Planned: [#354](https://github.com/joestump-agent/crush/issues/354), [#355](https://github.com/joestump-agent/crush/issues/355) |
-| 2026-10-04 | **Steering, kill and progress are A2A operations.** | Interaction | Partly shipped ([#359](https://github.com/joestump-agent/crush/issues/359) typed progress metadata). Planned: [#351](https://github.com/joestump-agent/crush/issues/351), [#348](https://github.com/joestump-agent/crush/issues/348) |
+| 2026-10-04 | **Steering, kill and progress are A2A operations.** | Interaction | Partly shipped ([#359](https://github.com/joestump-agent/crush/issues/359) typed progress metadata, [#351](https://github.com/joestump-agent/crush/issues/351) steering). Planned: [#348](https://github.com/joestump-agent/crush/issues/348) |
 
 ## The 2026-10-04 decisions
 
@@ -210,7 +210,7 @@ collector. None of those can cross a process boundary. As A2A operations
 they become a message on the running context, `tasks/cancel` and typed
 `Working` events. The same code then serves a local worker, an isolated
 process and a remote agent, and the TUI becomes one more A2A client.
-Tracking: [#351](https://github.com/joestump-agent/crush/issues/351), [#348](https://github.com/joestump-agent/crush/issues/348), [#421](https://github.com/joestump-agent/crush/issues/421). The typed progress half — statically typed todo metadata under a declared extension — shipped in [#359](https://github.com/joestump-agent/crush/issues/359).
+Tracking: [#348](https://github.com/joestump-agent/crush/issues/348), [#421](https://github.com/joestump-agent/crush/issues/421). The typed progress half — statically typed todo metadata under a declared extension — shipped in [#359](https://github.com/joestump-agent/crush/issues/359). The steering half — a mid-run message as a new A2A task on the running context, terminal on the queue's consumption verdict — shipped in [#351](https://github.com/joestump-agent/crush/issues/351).
 
 ## Standing implementation choices
 

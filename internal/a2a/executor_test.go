@@ -38,14 +38,23 @@ type fakeRunner struct {
 	// for tests that need a served run slower than a transport deadline.
 	delay time.Duration
 
-	gotCall     agent.SessionAgentCall
-	ran         bool
-	canceledFor string
+	// enqueueAccepted reports what EnqueueWhenBusy answers (#351): true
+	// accepts the steer into enqueuedCalls, false refuses it the way an
+	// ended run does.
+	enqueueAccepted bool
+
+	mu            sync.Mutex
+	gotCall       agent.SessionAgentCall
+	ran           bool
+	canceledFor   string
+	enqueuedCalls []agent.SessionAgentCall
 }
 
 func (f *fakeRunner) Run(_ context.Context, call agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	f.mu.Lock()
 	f.ran = true
 	f.gotCall = call
+	f.mu.Unlock()
 	if f.panicValue != nil {
 		panic(f.panicValue)
 	}
@@ -56,6 +65,40 @@ func (f *fakeRunner) Run(_ context.Context, call agent.SessionAgentCall) (*fanta
 }
 
 func (f *fakeRunner) Cancel(sessionID string) { f.canceledFor = sessionID }
+
+// EnqueueWhenBusy answers with enqueueAccepted (#351), recording the
+// calls it accepts so a test can release them through consume.
+func (f *fakeRunner) EnqueueWhenBusy(call agent.SessionAgentCall) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.enqueueAccepted {
+		return false
+	}
+	f.enqueuedCalls = append(f.enqueuedCalls, call)
+	return true
+}
+
+// enqueued returns a copy of the calls EnqueueWhenBusy accepted.
+func (f *fakeRunner) enqueued() []agent.SessionAgentCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]agent.SessionAgentCall(nil), f.enqueuedCalls...)
+}
+
+// consume fires the oldest enqueued call's OnConsumed, the way the queue
+// would when it folds the message into a turn (true) or drops it (false).
+func (f *fakeRunner) consume(consumed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.enqueuedCalls) == 0 {
+		return
+	}
+	first := f.enqueuedCalls[0]
+	f.enqueuedCalls = f.enqueuedCalls[1:]
+	if first.OnConsumed != nil {
+		first.OnConsumed(consumed)
+	}
+}
 
 func textResult(s string) *fantasy.AgentResult {
 	return &fantasy.AgentResult{
@@ -373,6 +416,165 @@ func TestExecuteNilResultFails(t *testing.T) {
 	require.Contains(t, statusMessageText(t, evs[2]), "did not start a turn")
 }
 
+// steerOnContext returns a fresh steer message for the bound test context,
+// optionally naming the running task in ReferenceTasks the way the
+// coordinator's front door does (#351).
+func steerOnContext(text string, reference *a2aspec.TaskID) *a2aspec.Message {
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart(text))
+	if reference != nil {
+		msg.ReferenceTasks = []a2aspec.TaskID{*reference}
+	}
+	return msg
+}
+
+// TestExecuteSecondMessageSteers is the #351 contract: the first message
+// on the context is the dispatch's own turn; every later message is a
+// steer — enqueued on the running session, never run as a turn — and the
+// steer's own task completes once the queue consumed the message. The
+// steer call inherits the binding's shaping with RunID empty and Steer
+// set, and ReferenceTasks are advisory: naming the running task neither
+// helps nor blocks delivery.
+func TestExecuteSecondMessageSteers(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{result: textResult("work done"), enqueueAccepted: true}
+	exec := newBoundExecutor(runner)
+
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("do the thing"))
+	evs := collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateCompleted,
+	}, states(t, evs), "the first message starts the dispatch's own turn")
+	require.Equal(t, "do the thing", runner.gotCall.Prompt)
+
+	// The steer: a new task on the same context.
+	running := a2aspec.TaskID("task-1")
+	var evs2 []a2aspec.Event
+	for ev, err := range exec.Execute(context.Background(), newExecCtx(steerOnContext("stop writing Rust", &running))) {
+		require.NoError(t, err)
+		evs2 = append(evs2, ev)
+		if len(evs2) != 2 {
+			continue
+		}
+		// Submitted and Working are out; the call is queued. Assert its
+		// shaping and hand the queue its verdict.
+		enqueued := runner.enqueued()
+		require.Len(t, enqueued, 1, "the steer must be enqueued exactly once")
+		call := enqueued[0]
+		require.Equal(t, "sess-1", call.SessionID)
+		require.Equal(t, "stop writing Rust", call.Prompt)
+		require.Empty(t, call.RunID, "a steer folds like an injection")
+		require.True(t, call.Steer, "the persisted message is marked as a steer (#410)")
+		require.Nil(t, call.Accepted)
+		require.Nil(t, call.OnComplete)
+		require.NotNil(t, call.OnConsumed)
+		require.Equal(t, "do the thing", runner.gotCall.Prompt, "the steer must not reach Run")
+		runner.consume(true)
+	}
+
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateCompleted,
+	}, states(t, evs2), "the steer completes once its message was consumed")
+	require.Equal(t, "delivered", statusMessageText(t, evs2[2]))
+}
+
+// A steer whose message the queue dropped without running — the run was
+// canceled while the steer sat queued — fails the steer's own task: the
+// caller learns the message never reached the agent (#351).
+func TestExecuteSteerDroppedByQueueFails(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{result: textResult("work done"), enqueueAccepted: true}
+	exec := newBoundExecutor(runner)
+
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("do the thing"))
+	collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+
+	var evs []a2aspec.Event
+	for ev, err := range exec.Execute(context.Background(), newExecCtx(steerOnContext("too late", nil))) {
+		require.NoError(t, err)
+		evs = append(evs, ev)
+		if len(evs) < 2 {
+			continue
+		}
+		runner.consume(false)
+	}
+
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateFailed,
+	}, states(t, evs))
+	require.Contains(t, statusMessageText(t, evs[2]), "agent finished before the message was consumed")
+}
+
+// A steer the runner refuses — the run ended between the registry
+// lookup and the enqueue — rejects the steer's own task without ever
+// waiting on the queue (#351).
+func TestExecuteSteerRefusedWhenRunEnded(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{result: textResult("work done")}
+	exec := newBoundExecutor(runner)
+
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("do the thing"))
+	collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+
+	steer := steerOnContext("anyone there?", nil)
+	evs := collect(t, exec.Execute(context.Background(), newExecCtx(steer)))
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateRejected,
+	}, states(t, evs), "a refused steer must not reach Working")
+	require.Contains(t, statusMessageText(t, evs[1]), "no longer running")
+	require.Empty(t, runner.enqueued())
+}
+
+// A steer's attachments ride the message's non-text parts and come back
+// on the steer call, the same pipeline a typed prompt's attachments take
+// (#351).
+func TestExecuteSteerCarriesAttachments(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{result: textResult("work done"), enqueueAccepted: true}
+	exec := newBoundExecutor(runner)
+
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("do the thing"))
+	collect(t, exec.Execute(context.Background(), newExecCtx(msg)))
+
+	steer := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("see this file"))
+	steer.Parts = append(steer.Parts, &a2aspec.Part{
+		Content:   a2aspec.Raw([]byte("package main")),
+		Filename:  "main.go",
+		MediaType: "text/x-go",
+	})
+	var evs []a2aspec.Event
+	for ev, err := range exec.Execute(context.Background(), newExecCtx(steer)) {
+		require.NoError(t, err)
+		evs = append(evs, ev)
+		if len(evs) < 2 {
+			continue
+		}
+		enqueued := runner.enqueued()
+		require.Len(t, enqueued, 1)
+		require.Len(t, enqueued[0].Attachments, 1, "the file part must come back as an attachment")
+		require.Equal(t, "main.go", enqueued[0].Attachments[0].FileName)
+		require.Equal(t, "text/x-go", enqueued[0].Attachments[0].MimeType)
+		require.Equal(t, []byte("package main"), enqueued[0].Attachments[0].Content)
+		enqueued[0].OnConsumed(true)
+	}
+
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateCompleted,
+	}, states(t, evs))
+}
+
 // blockingCancelRunner blocks in Run until its kill channel fires, then
 // returns context.Canceled — a kill delivered behind the executor's back
 // unless the test calls Cancel itself.
@@ -392,6 +594,8 @@ func (f *blockingCancelRunner) Run(_ context.Context, call agent.SessionAgentCal
 func (f *blockingCancelRunner) Cancel(sessionID string) {
 	close(f.kill)
 }
+
+func (f *blockingCancelRunner) EnqueueWhenBusy(agent.SessionAgentCall) bool { return false }
 
 func TestExecuteOutOfBandCancelEmitsCanceled(t *testing.T) {
 	t.Parallel()
@@ -923,6 +1127,8 @@ func (r *inactivityRunner) Cancel(string) {
 	r.cancelCount++
 	r.mu.Unlock()
 }
+
+func (r *inactivityRunner) EnqueueWhenBusy(agent.SessionAgentCall) bool { return false }
 
 func (r *inactivityRunner) cancels() int {
 	r.mu.Lock()

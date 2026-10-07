@@ -33,6 +33,24 @@ const (
 	DispatchStatusWorking = "working"
 )
 
+// Steer outcome status tokens (#351) — the protocol-side vocabulary the
+// a2a package hands the coordinator for one steer delivery; plain
+// strings, same reason as the transport tokens above.
+const (
+	// SteerStatusWorking: the served agent accepted the message into its
+	// queue; the reply streams on the dispatch's own surfaces.
+	SteerStatusWorking = "working"
+	// SteerStatusCompleted: the steer task ran to its own Completed —
+	// the queue consumed the message.
+	SteerStatusCompleted = "completed"
+	// SteerStatusRejected: the served agent refused the message; the run
+	// has ended.
+	SteerStatusRejected = "rejected"
+	// SteerStatusFailed: the message was accepted but never consumed, or
+	// the steer task failed.
+	SteerStatusFailed = "failed"
+)
+
 // dispatchResumeBackoff is the pause before each resubscribe attempt
 // (#349): the stream just cut, so a first beat gives a flapping
 // connection a moment to settle, and the growth keeps a wedged server
@@ -624,4 +642,162 @@ func (f *ServerFactory) CancelDispatch(ctx context.Context, p agent.DispatchCanc
 var (
 	_ agent.DispatchHost     = (*ServerFactory)(nil)
 	_ agent.DispatchCanceler = (*ServerFactory)(nil)
+	_ agent.DispatchSteerer  = (*ServerFactory)(nil)
 )
+
+// SteerDispatch delivers one mid-run steer to a served dispatch (#351):
+// the protocol-native form of the in-process injection — a message on
+// the dispatch's running context — so an out-of-process agent is steered
+// exactly like an in-process one. It returns once the served agent
+// accepted the message into its queue (the stream's Working event) or
+// refused it (Rejected), and a goroutine drains the steer task's own
+// tail to its terminal state, logging a Failed outcome: the steer's
+// reply streams back on the dispatch's own surfaces, not on this call.
+func (f *ServerFactory) SteerDispatch(ctx context.Context, p agent.DispatchSteerParams) (agent.DispatchSteerOutcome, error) {
+	card, ok := p.Card.(*a2aspec.AgentCard)
+	if !ok || card == nil {
+		return agent.DispatchSteerOutcome{}, fmt.Errorf("a2a: dispatch %s has no resolvable agent card", p.Endpoint)
+	}
+	if p.ContextID == "" {
+		return agent.DispatchSteerOutcome{}, fmt.Errorf("a2a: dispatch %s has no context id", p.Endpoint)
+	}
+	if p.Text == "" {
+		return agent.DispatchSteerOutcome{}, fmt.Errorf("a2a: steer text is empty")
+	}
+	httpClient := f.httpClient
+	if httpClient == nil {
+		httpClient = f.dispatchHTTPClient()
+	}
+	ctx = f.dispatchAuthContext(ctx, p.Endpoint)
+	client, err := newDispatchClient(ctx, card, httpClient, f)
+	if err != nil {
+		return agent.DispatchSteerOutcome{}, err
+	}
+
+	req := &a2aspec.SendMessageRequest{
+		Message: a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart(p.Text)),
+	}
+	// The A2A context is the task session (#350): the served executor
+	// resolves it to the running agent and enqueues the message.
+	req.Message.ContextID = p.ContextID
+	for _, id := range p.ReferenceTaskIDs {
+		req.Message.ReferenceTasks = append(req.Message.ReferenceTasks, a2aspec.TaskID(id))
+	}
+	// Attachments ride along as raw parts (#351): the executor decodes
+	// them back into the steer call's attachments, so the editor's
+	// pasted files and long pastes steer an out-of-process agent the
+	// same way they steer an in-process one.
+	for _, att := range p.Attachments {
+		if len(att.Content) == 0 {
+			continue
+		}
+		req.Message.Parts = append(req.Message.Parts, &a2aspec.Part{
+			Content:   a2aspec.Raw(att.Content),
+			Filename:  att.FileName,
+			MediaType: att.MimeType,
+		})
+	}
+
+	// terminalSteerStatus maps a steer task's terminal state onto the
+	// steer outcome's vocabulary; ok is false for non-terminal states.
+	terminalSteerStatus := func(state a2aspec.TaskState) (string, bool) {
+		switch state {
+		case a2aspec.TaskStateCompleted:
+			return SteerStatusCompleted, true
+		case a2aspec.TaskStateFailed:
+			return SteerStatusFailed, true
+		case a2aspec.TaskStateRejected:
+			return SteerStatusRejected, true
+		case a2aspec.TaskStateCanceled:
+			// The run was killed while the steer was in flight: the
+			// message will never be consumed.
+			return SteerStatusFailed, true
+		default:
+			return "", false
+		}
+	}
+
+	var outcome agent.DispatchSteerOutcome
+	accepted := false
+	var steerTaskID a2aspec.TaskID
+	for ev, err := range client.SendStreamingMessage(ctx, req) {
+		if err != nil {
+			// A stream error after the steer was accepted is the tail
+			// drain's problem — the delivery itself succeeded. Before
+			// that, the steer never reached the agent and the error
+			// stands.
+			if accepted {
+				slog.Warn("A2A steer stream error after delivery", "endpoint", p.Endpoint, "context_id", p.ContextID, "error", err)
+				return outcome, nil
+			}
+			return agent.DispatchSteerOutcome{}, fmt.Errorf("a2a: steer stream: %w", err)
+		}
+		if steerTaskID == "" {
+			if id := ev.TaskInfo().TaskID; id != "" {
+				steerTaskID = id
+			}
+		}
+		sue, isStatus := ev.(*a2aspec.TaskStatusUpdateEvent)
+		if !isStatus {
+			continue
+		}
+		if sue.Status.State == a2aspec.TaskStateWorking {
+			if accepted {
+				continue
+			}
+			// Accepted into the queue: report success and hand the tail
+			// to a drainer. The steer task's own terminal state is
+			// bookkeeping — the reply arrives on the dispatch's own
+			// surfaces — so a Failed tail is logged, not surfaced. The
+			// drainer resumes the steer task's stream by its ID
+			// (SubscribeToTask): this call's own stream winds down with
+			// the return, and the drainer outlives it on a detached
+			// context.
+			accepted = true
+			outcome.Status = SteerStatusWorking
+			if steerTaskID != "" {
+				drainCtx := context.WithoutCancel(ctx)
+				taskID := string(steerTaskID)
+				go func() {
+					for ev, err := range client.SubscribeToTask(drainCtx, &a2aspec.SubscribeToTaskRequest{ID: a2aspec.TaskID(taskID)}) {
+						if err != nil {
+							slog.Warn("A2A steer tail drain error", "endpoint", p.Endpoint, "context_id", p.ContextID, "task_id", taskID, "error", err)
+							return
+						}
+						sue, ok := ev.(*a2aspec.TaskStatusUpdateEvent)
+						if !ok {
+							continue
+						}
+						status, terminal := terminalSteerStatus(sue.Status.State)
+						if !terminal {
+							continue
+						}
+						if status != SteerStatusCompleted {
+							slog.Warn("A2A steer did not complete after delivery",
+								"endpoint", p.Endpoint,
+								"context_id", p.ContextID,
+								"task_id", taskID,
+								"status", status,
+								"reason", statusUpdateMessageText(sue))
+						}
+						return
+					}
+				}()
+			}
+			return outcome, nil
+		}
+		status, terminal := terminalSteerStatus(sue.Status.State)
+		if !terminal {
+			continue
+		}
+		outcome.Status = status
+		if sue.Status.Message != nil {
+			outcome.Text = statusUpdateMessageText(sue)
+		}
+		return outcome, nil
+	}
+	if !accepted && outcome.Status == "" {
+		return agent.DispatchSteerOutcome{}, fmt.Errorf("a2a: steer stream ended without a status")
+	}
+	return outcome, nil
+}
