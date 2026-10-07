@@ -479,9 +479,10 @@ func TestStreamDispatchInputRequiredRoundTrip(t *testing.T) {
 
 	// The answer went back on that task: its history holds the typed
 	// answers/v1 message after the prompt.
-	client, err := newDispatchClient(t.Context(), server.Card, factory.dispatchHTTPClient())
+	client, err := newDispatchClient(t.Context(), server.Card, factory.dispatchHTTPClient(), factory)
 	require.NoError(t, err)
-	task, err := client.GetTask(t.Context(), &a2aspec.GetTaskRequest{ID: a2aspec.TaskID(taskIDs[0])})
+	authCtx := factory.dispatchAuthContext(t.Context(), server.Endpoint)
+	task, err := client.GetTask(authCtx, &a2aspec.GetTaskRequest{ID: a2aspec.TaskID(taskIDs[0])})
 	require.NoError(t, err)
 	require.Equal(t, a2aspec.TaskStateCompleted, task.Status.State)
 	answered := slices.ContainsFunc(task.History, func(msg *a2aspec.Message) bool {
