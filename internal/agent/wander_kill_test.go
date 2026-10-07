@@ -351,6 +351,15 @@ func newWanderKillFixture(t *testing.T, model *scriptedModel, dispatchedSettings
 	// TempDir removal: an unjoined turn keeps writing after the
 	// directory is gone, and on macOS the cleanup races it.
 	reapDispatchRuns(t, c)
+	return newWanderKillFixtureOnCoordinator(t, env, c, model, dispatchedSettings)
+}
+
+// newWanderKillFixtureOnCoordinator is newWanderKillFixture with the
+// coordinator supplied by the caller, for tests whose crush.json must be
+// on disk before config.Init reads it (#402). The caller joins its
+// dispatch goroutines with reapDispatchRuns.
+func newWanderKillFixtureOnCoordinator(t *testing.T, env fakeEnv, c *coordinator, model *scriptedModel, dispatchedSettings config.TodoEnforcementSettings) *wanderKillFixture {
+	t.Helper()
 
 	// The delivery run resolves the main agent's models from the config
 	// store; register the offline test provider the fake main agent
@@ -1286,4 +1295,43 @@ func TestDispatchFromTransportOutcomeKillReason(t *testing.T) {
 	})
 	require.Equal(t, dispatch.StatusFailed, plain.Status)
 	require.Contains(t, plain.Error, "user asked")
+}
+
+// TestWanderKill_ConfiguredKillEndToEnd drives the same ignored-nudges
+// kill through settings resolved from a config file (#402): the global
+// nudge threshold and the worker definition's kill block, read by
+// dispatchEnforcement, kill a run after three ignored nudges exactly
+// like the hardcoded fixture.
+func TestWanderKill_ConfiguredKillEndToEnd(t *testing.T) {
+	t.Parallel()
+	env := testEnv(t)
+	initGitRepo(t, env.workingDir)
+
+	// config.Init discovers crush.json in the working directory, so the
+	// file is in place before the coordinator builds its config.
+	require.NoError(t, os.WriteFile(filepath.Join(env.workingDir, "crush.json"), []byte(`{
+		"options": {"todo_enforcement": {"nudge_threshold": 1}},
+		"agents": {"worker": {"kill": {"after_ignored_nudges": 3}}}
+	}`), 0o644))
+	c := newDispatchTestCoordinator(t, env)
+	reapDispatchRuns(t, c)
+
+	settings := c.dispatchEnforcement()
+	require.Equal(t, 3, settings.KillAfterNudges, "the worker definition's kill rung")
+	require.Equal(t, 1, settings.NudgeThreshold, "the global nudge threshold")
+
+	model := &scriptedModel{steps: []scriptedStep{
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{toolCalls: []scriptedToolCall{{name: "probe", input: "{}"}}},
+		{text: "done"},
+	}}
+	f := newWanderKillFixtureOnCoordinator(t, env, c, model, settings)
+
+	f.runDispatchSync(t)
+
+	f.requireKilled(t, dispatch.ReasonIgnoredNudges)
+	assert.True(t, f.killHookInvoked, "the enforcement hook must have fired")
+	f.requireParentKilledDelivery(t)
 }

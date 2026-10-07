@@ -259,15 +259,18 @@ crush logs --tail 500 | grep -i 'killed'
 More symptoms are covered in
 [Multi-agent troubleshooting](/agents/troubleshooting).
 
+Thresholds can also be set per agent in the `todos` and `kill` blocks of its
+definition, with `agents.<id>.todo_enforcement` accepted as a legacy alias and
+`options.todo_enforcement` as the default
+([#402](https://github.com/joestump-agent/crush/issues/402)); see
+[Agent definitions](/agents/configuration#per-agent-overrides).
+
 :::info[Planned]
 These changes are decided but not built yet:
 
 - The kill applies only to dispatched agents. Other agents are nudged but never
   canceled ([#393](https://github.com/joestump-agent/crush/issues/393)).
 - Agents without a `todos` tool are not nudged ([#394](https://github.com/joestump-agent/crush/issues/394)).
-- Thresholds can be set per agent in the `todos` and `kill` blocks of its
-  definition (`agents.<id>.todo_enforcement` is accepted as an alias), with
-  `options.todo_enforcement` as the default ([#402](https://github.com/joestump-agent/crush/issues/402)).
 - `crushrc` gets option keys for every setting on this page ([#403](https://github.com/joestump-agent/crush/issues/403)).
 - Values mean what they say: no silent clamp at 2, negative numbers are load
   errors, and durations such as `"5m"` are accepted ([#401](https://github.com/joestump-agent/crush/issues/401)).

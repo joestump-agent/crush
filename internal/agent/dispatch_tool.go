@@ -545,7 +545,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			// and the run's watchdog both feed it; the run goroutine reads
 			// it to assemble the terminal result.
 			kill := &dispatchKill{}
-			killSettings := config.ResolveTodoEnforcement(c.cfg.Config().Options.TodoEnforcement, nil)
+			killSettings := c.dispatchEnforcement()
 			dispatched, err := builder(ctx, dispatchAgentOptions{
 				Toolchain: toolchain,
 				ModelType: modelType,
@@ -687,6 +687,21 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 	)
 }
 
+// dispatchEnforcement resolves the enforcement ladder a dispatched
+// agent runs (#402): the dispatch agent definition's todos and kill
+// blocks (the worker until #433 lets dispatch_agent choose) layered
+// over the global options, with the built-in defaults underneath. The
+// run's watchdog killSettings and the agent's own ladder read these
+// same resolved settings, so a kill threshold configured on the
+// definition trips in both places or neither.
+func (c *coordinator) dispatchEnforcement() config.TodoEnforcementSettings {
+	cfg := c.cfg.Config()
+	if worker, ok := cfg.Agents[config.AgentWorker]; ok {
+		return worker.ResolvedTodoEnforcement(cfg.Options.TodoEnforcement)
+	}
+	return config.ResolveTodoEnforcement(cfg.Options.TodoEnforcement, nil)
+}
+
 // buildDispatchedAgent constructs the agent a dispatch runs: the chosen
 // selected model (small by default), a system prompt rendered at dispatch
 // time from the dispatch template against the workspace's scoped store
@@ -725,10 +740,9 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 
 	// Prompt and tools are known at construction, so the agent's
 	// readiness latch is satisfied immediately (newSessionAgent) — no
-	// build-time goroutines to wait for. Dispatched agents are not agent
-	// definitions, so the todo enforcement ladder (#315) uses the global
-	// options: every surface that consumes their todos (the block's
-	// current-todo line, the A2A event bridge) starves without it.
+	// build-time goroutines to wait for. The todo enforcement ladder
+	// (#315) resolves from the dispatch agent definition (#402): the
+	// worker's todos and kill blocks over the global options.
 	agent := newSessionAgent(SessionAgentOptions{
 		LargeModel:           model,
 		SmallModel:           small,
@@ -743,7 +757,7 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 		Tools:                opts.Toolchain.Tools(),
 		Notify:               c.notify,
 		RunComplete:          c.runComplete,
-		TodoEnforcement:      config.ResolveTodoEnforcement(c.cfg.Config().Options.TodoEnforcement, nil),
+		TodoEnforcement:      c.dispatchEnforcement(),
 		// The dispatched agent is the one agent whose run may be killed
 		// (#316): the observers hand the reasons to the coordinator's kill
 		// state so the terminal result carries them — the ladder's
