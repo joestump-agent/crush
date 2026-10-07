@@ -98,6 +98,14 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 		return nil, fmt.Errorf("invalid dispatch configuration: %w", err)
 	}
 
+	// Validate the A2A TCP listener (#358): a listen address without
+	// both TLS files is refused — plain TCP is not supported — and the
+	// certificate, key and client CA must load, so the host never finds
+	// out at bind time.
+	if err := cfg.Options.A2A.Validate("options.a2a"); err != nil {
+		return nil, fmt.Errorf("invalid a2a configuration: %w", err)
+	}
+
 	// Validate the agent definitions structurally after all merging, so
 	// a bad agents block fails the load the same way a bad hook does.
 	if err := cfg.ValidateAgents(workingDir); err != nil {
@@ -636,6 +644,9 @@ func (c *Config) setDefaults(workingDir, dataDir string) {
 		}
 	}
 	c.Options.DataDirectory = filepath.Clean(filepathext.SmartJoin(workingDir, c.Options.DataDirectory))
+	// The A2A listener's TLS files resolve the same way (#358): stored
+	// absolute, so the host loads what validation checked.
+	c.Options.A2A.resolvePaths(workingDir)
 	if c.Providers == nil {
 		c.Providers = csync.NewMap[string, ProviderConfig]()
 	}
