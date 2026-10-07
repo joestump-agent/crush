@@ -1573,6 +1573,41 @@ func TestExecuteCancelWhileParked(t *testing.T) {
 	require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateRejected}, states(t, late))
 }
 
+// A parked task's cancel that lost the race to the parking execution's
+// exit is re-issued (#352). The first Cancel already dropped the parked
+// run, so the second finds no run record: it still ends the task
+// Canceled with the request's reason, but the own-cancel mark it sets is
+// one no Execute will ever forget. The SDK's Cleanup for the resolved
+// cancelation drops it; an execution's Cleanup leaves marks to Execute.
+func TestExecuteReissuedCancelOfParkedTask(t *testing.T) {
+	t.Parallel()
+
+	runner, exec := newAskingExecutor()
+	parkOnQuestion(t, exec)
+	cancelCtx := func() *a2asrv.ExecutorContext {
+		execCtx := parkedTaskCtx(nil)
+		execCtx.Metadata = map[string]any{CancelReasonMetadataKey: CancelReason{Reason: "hard timeout"}}
+		return execCtx
+	}
+
+	first := collect(t, exec.Cancel(t.Context(), cancelCtx()))
+	require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateCanceled}, states(t, first))
+	require.True(t, (<-runner.toolResp).IsError, "the parked tool call must return an error")
+	require.False(t, exec.ownCancel("task-1"), "the parked branch drops its own mark")
+
+	second := collect(t, exec.Cancel(t.Context(), cancelCtx()))
+	require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateCanceled}, states(t, second))
+	require.Equal(t, "hard timeout", statusMessageText(t, second[0]), "the re-issued cancel carries the reason")
+	require.True(t, exec.ownCancel("task-1"), "a cancel with no run record leaves its mark behind")
+
+	exec.Cleanup(t.Context(), parkedTaskCtx(a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("postgres"))), nil, nil)
+	require.True(t, exec.ownCancel("task-1"), "an execution's Cleanup leaves the mark to Execute")
+
+	exec.Cleanup(t.Context(), cancelCtx(), nil, nil)
+	require.False(t, exec.ownCancel("task-1"), "the resolved cancelation drops its mark")
+	require.EqualValues(t, 1, runner.runs.Load())
+}
+
 // An answer on a task with no pending question is Rejected (#352) and
 // starts nothing: neither a turn nor a steer. That holds for a task
 // whose run never asked and for one whose question was already

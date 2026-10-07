@@ -275,12 +275,15 @@ func (s *dispatchStream) answer(ctx context.Context, q agent.QuestionRequest) (*
 // cancelParked ends a parked task no answer is coming for (#352): a
 // tasks/cancel carrying the reason, on a context detached from the
 // caller's — the cancel must land even when the caller's context is what
-// ended the wait. A task that is already terminal (a kill's own
-// tasks/cancel got there first) is read back with tasks/get instead.
-// Either way its terminal state folds into the outcome.
+// ended the wait. The cancel usually arrives while the execution that
+// parked the task is still on its way out, so it goes through cancelTask,
+// which re-issues it once when it lost that race. A task that is already
+// terminal (a kill's own tasks/cancel got there first) is read back with
+// tasks/get instead. Either way its terminal state folds into the
+// outcome.
 func (s *dispatchStream) cancelParked(ctx context.Context, reason string) error {
 	ctx = context.WithoutCancel(ctx)
-	task, err := s.client.CancelTask(ctx, &a2aspec.CancelTaskRequest{
+	task, err := cancelTask(ctx, s.client, &a2aspec.CancelTaskRequest{
 		ID: s.taskID,
 		Metadata: map[string]any{
 			CancelReasonMetadataKey: CancelReason{Reason: reason},
@@ -298,6 +301,40 @@ func (s *dispatchStream) cancelParked(ctx context.Context, reason string) error 
 		return fmt.Errorf("a2a: parked task %s did not end after its cancel", s.taskID)
 	}
 	return nil
+}
+
+// cancelTask sends one tasks/cancel and re-issues it exactly once when
+// the served agent answers TaskNotCancelable (#352). For a task that is
+// not terminal, that answer means the cancel lost a race against the end
+// of the task's own execution — the race a parked task's cancel walks
+// into. The SDK unregisters an execution only after its consumer has
+// delivered the final event, input-required, to the client (a2a-go
+// v2.5.0 internal/taskexec/local_manager.go handleExecution and
+// cleanupExecution), so a client that cancels at once can find the
+// execution still registered. Such a cancel is routed into that
+// execution's event pipe, where nothing reads the executor's Canceled any
+// more, and resolves to the execution's own input-required result
+// (handleCancelWithConcurrentRun, promise.go convertToCancelationResult,
+// and the SDK's TODO at local_manager.go:391-396). By then the served
+// executor has dropped the parked run, yet the task is still
+// input-required.
+//
+// The re-issue is not a timed retry. The racing cancel waits on the
+// execution's result, which cleanupExecution signals only after it has
+// deleted the execution under the manager's lock, so when the client
+// reads TaskNotCancelable no execution is registered: the second cancel
+// takes the no-execution path (handleCancel), the executor's Canceled
+// carrying the same reason is processed, and the task ends Canceled. The
+// served host reports the race's closed-pipe variant as
+// TaskNotCancelable too (cancelRaceHandler). A task that really is not
+// cancelable — already Completed or Failed — refuses the second cancel
+// as well, and that error stands.
+func cancelTask(ctx context.Context, client *a2aclient.Client, req *a2aspec.CancelTaskRequest) (*a2aspec.Task, error) {
+	task, err := client.CancelTask(ctx, req)
+	if errors.Is(err, a2aspec.ErrTaskNotCancelable) {
+		task, err = client.CancelTask(ctx, req)
+	}
+	return task, err
 }
 
 // questionFromStatus reads the question off an input-required status
@@ -768,9 +805,11 @@ func cancelReasonFromMetadata(md map[string]any) string {
 // the protocol-native kill the direct SessionAgent cancel can never be
 // for an out-of-process agent (#72/#73). The reason rides the request as
 // declared metadata and lands on the terminal Canceled status message
-// the dispatch's stream, or any tasks/get reader, reports. An error here
-// means the cancel did not land — the caller falls back to the direct
-// cancel.
+// the dispatch's stream, or any tasks/get reader, reports. A kill that
+// lands as the task parks on a question meets the same race as a parked
+// task's own cancel (#352), so it goes through cancelTask too. An error
+// here means the cancel did not land — the caller falls back to the
+// direct cancel.
 func (f *ServerFactory) CancelDispatch(ctx context.Context, p agent.DispatchCancelParams) error {
 	card, ok := p.Card.(*a2aspec.AgentCard)
 	if !ok || card == nil {
@@ -794,7 +833,7 @@ func (f *ServerFactory) CancelDispatch(ctx context.Context, p agent.DispatchCanc
 			CancelReasonMetadataKey: CancelReason{Reason: p.Reason},
 		},
 	}
-	if _, err := client.CancelTask(ctx, req); err != nil {
+	if _, err := cancelTask(ctx, client, req); err != nil {
 		return fmt.Errorf("a2a: cancel task %s: %w", p.TaskID, err)
 	}
 	return nil

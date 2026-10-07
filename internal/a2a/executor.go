@@ -973,6 +973,30 @@ func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) 
 	}
 }
 
+var _ a2asrv.AgentExecutionCleaner = (*Executor)(nil)
+
+// Cleanup implements [a2asrv.AgentExecutionCleaner]: the SDK calls it
+// once an execution or a cancelation has resolved. A resolved
+// cancelation drops the own-cancel mark its Cancel set (#342). Execute's
+// own deferred forget covers a cancel that ended a drained run, and the
+// parked branch covers a parked one, but a cancel that found no run
+// record at all — the re-issued cancel of a parked task whose first
+// cancel already dropped the run (#352) — has neither, and no Execute
+// for that task will ever run again. Dropping the mark here is safe: the
+// SDK refuses to start an execution while a cancelation is registered,
+// and calls Cleanup before unregistering it — after any concurrent
+// execution's Execute has returned, since the cancel either waited for
+// that execution's result or found its event pipe already closed
+// (a2a-go v2.5.0 internal/taskexec/local_manager.go handleCancel and
+// handleCancelWithConcurrentRun). An execution (execCtx.Message is
+// non-nil) leaves its mark to Execute's own defer.
+func (e *Executor) Cleanup(_ context.Context, execCtx *a2asrv.ExecutorContext, _ a2aspec.SendMessageResult, _ error) {
+	if execCtx == nil || execCtx.Message != nil {
+		return
+	}
+	e.forgetCanceledTask(string(execCtx.TaskID))
+}
+
 // markOwnCancel records taskID as canceled by this executor's own Cancel.
 func (e *Executor) markOwnCancel(taskID string) {
 	e.cancelMu.Lock()
