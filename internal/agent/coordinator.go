@@ -220,6 +220,19 @@ type coordinator struct {
 	mainAgentName string
 	agents        map[string]SessionAgent
 
+	// buildsMu guards builds: the readiness latch of every agent build
+	// whose background work has not finished (#515). That work renders
+	// the system prompt, which runs git in the working directory, and
+	// nothing else joins it: every run rebuilds the tool palette, and the
+	// task sub-agent built there is only waited on if it ever runs.
+	// Teardown waits on these latches instead (waitAgentBuilds). Lazily
+	// created because tests construct the coordinator struct directly.
+	buildsMu sync.Mutex
+	builds   map[*readiness]struct{}
+	// promptBuildHook runs on an agent build's system-prompt goroutine
+	// just before the render; a test-only seam, nil in production.
+	promptBuildHook func()
+
 	cronStore *scheduler.Store
 
 	// Worktree dispatch (#61): the agent registry is created eagerly (it
@@ -1116,9 +1129,16 @@ func (c *coordinator) buildAgent(ctx context.Context, agent config.Agent, isSubA
 	// sync.WaitGroup panics on (joestump-agent/crush#298).
 	ready := newReadiness()
 	result.ready = ready
+	// The coordinator tracks the latch until the work below is done, so
+	// teardown can wait for it (#515): the prompt render runs git in the
+	// working directory, and an agent nobody runs is never waited on.
+	c.trackBuild(ready)
 
 	var build errgroup.Group
 	build.Go(func() error {
+		if c.promptBuildHook != nil {
+			c.promptBuildHook()
+		}
 		systemPrompt, err := agentSystemPrompt(initCtx, systemPromptTemplate, agent, c.cfg.WorkingDir(), large.Model.Provider(), large.Model.Model(), c.cfg)
 		if err != nil {
 			return err
@@ -1136,9 +1156,59 @@ func (c *coordinator) buildAgent(ctx context.Context, agent config.Agent, isSubA
 		return nil
 	})
 
-	go func() { ready.settle(build.Wait()) }()
+	go func() {
+		err := build.Wait()
+		// Untracked before the settle: the work is done, and a teardown
+		// that already snapshotted the latch still returns on the settle.
+		c.untrackBuild(ready)
+		ready.settle(err)
+	}()
 
 	return result, nil
+}
+
+// trackBuild records an agent build's readiness latch as in flight
+// (#515).
+func (c *coordinator) trackBuild(r *readiness) {
+	c.buildsMu.Lock()
+	defer c.buildsMu.Unlock()
+	if c.builds == nil {
+		c.builds = make(map[*readiness]struct{})
+	}
+	c.builds[r] = struct{}{}
+}
+
+// untrackBuild drops a finished build's latch (#515).
+func (c *coordinator) untrackBuild(r *readiness) {
+	c.buildsMu.Lock()
+	defer c.buildsMu.Unlock()
+	delete(c.builds, r)
+}
+
+// waitAgentBuilds blocks until no agent build's background work is in
+// flight, or ctx ends (#515). A build that starts while it waits — a run
+// that was mid-rebuild when teardown began — is waited on too. Each
+// latch is a one-shot channel, never a shared WaitGroup, so a build
+// starting during the wait cannot trip Go 1.27's reuse panic (#298).
+func (c *coordinator) waitAgentBuilds(ctx context.Context) error {
+	for {
+		c.buildsMu.Lock()
+		pending := make([]*readiness, 0, len(c.builds))
+		for r := range c.builds {
+			pending = append(pending, r)
+		}
+		c.buildsMu.Unlock()
+		if len(pending) == 0 {
+			return nil
+		}
+		for _, r := range pending {
+			select {
+			case <-r.done:
+			case <-ctx.Done():
+				return fmt.Errorf("%d agent builds still running: %w", len(pending), ctx.Err())
+			}
+		}
+	}
 }
 
 func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubAgent bool) ([]fantasy.AgentTool, error) {
@@ -1839,7 +1909,22 @@ func (c *coordinator) CancelAll() {
 	// Quitting stops dispatched agents too (#372): they run on detached
 	// contexts, so the agent cancel above never reaches them.
 	c.cancelDispatchesForShutdown()
+	// Agent builds outlive the runs that start them (#515): every run
+	// rebuilds the tool palette, and the sub-agent built there renders
+	// its system prompt — git status in the working directory — on a
+	// detached goroutine. The work cannot be canceled without killing git
+	// mid-write and leaving its index.lock behind, so shutdown waits for
+	// it, bounded like the agent and dispatch waits above.
+	ctx, cancel := context.WithTimeout(context.Background(), agentBuildShutdownWait)
+	defer cancel()
+	if err := c.waitAgentBuilds(ctx); err != nil {
+		slog.Warn("Agent build still running after shutdown wait", "error", err)
+	}
 }
+
+// agentBuildShutdownWait bounds CancelAll's wait for in-flight agent
+// builds (#515), matching sessionAgent.CancelAll's own bound.
+const agentBuildShutdownWait = 5 * time.Second
 
 func (c *coordinator) ClearQueue(sessionID string) {
 	c.currentAgent().ClearQueue(sessionID)

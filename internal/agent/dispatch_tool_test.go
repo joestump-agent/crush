@@ -909,6 +909,9 @@ func (f *fakeMainAgent) Cancel(sessionID string) { f.cancels.Add(1) }
 
 func (f *fakeMainAgent) ClearQueue(sessionID string) { f.clears.Add(1) }
 
+// CancelAll has no runs to cancel: Run returns synchronously.
+func (f *fakeMainAgent) CancelAll() {}
+
 func (f *fakeMainAgent) runCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
