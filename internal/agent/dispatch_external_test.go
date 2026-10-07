@@ -415,7 +415,7 @@ func TestExternalDispatchHardTimeout(t *testing.T) {
 	entry := waitExternalTerminal(t, c, handle.DispatchID)
 	require.Equal(t, dispatch.StatusKilled, entry.Status)
 	require.Equal(t, dispatch.ReasonHardTimeout, entry.Result.KilledReason)
-	require.Zero(t, ext.lastParams().IdleTimeout, "no idle timeout configured anywhere")
+	require.Equal(t, defaultExternalIdleTimeout, ext.lastParams().IdleTimeout, "an idle timeout configured nowhere defaults")
 }
 
 // A remote's own Canceled is its account, not a kill: even when its text
@@ -483,4 +483,22 @@ func TestExternalDispatchRefusesUnusableDefinition(t *testing.T) {
 	require.True(t, resp.IsError, "expected a tool error, got: %s", resp.Content)
 	require.Contains(t, resp.Content, `agent "reviewer" cannot be dispatched: agents.reviewer.auth.token: a bearer token is required when auth is set`)
 	require.Empty(t, host.resolutions(), "an unusable agent is never resolved")
+}
+
+// An external run is bounded by default (#434): with no idle timeout on
+// the definition or in options.todo_enforcement it gets five minutes,
+// the global option wins over that default, and only an explicit
+// transport.idle_timeout "off" drops it.
+func TestExternalKillSettingsDefaults(t *testing.T) {
+	c, _ := newDispatchToolEnv(t, &dispatchTestAgent{model: dispatchTestModel()})
+	off := config.Duration(0)
+	two := config.Duration(2 * time.Minute)
+
+	require.Equal(t, defaultExternalIdleTimeout, c.externalKillSettings(config.Agent{}).InactivityTimeout)
+	require.Equal(t, 2*time.Minute, c.externalKillSettings(config.Agent{Transport: &config.AgentTransport{IdleTimeout: &two}}).InactivityTimeout)
+	require.Zero(t, c.externalKillSettings(config.Agent{Transport: &config.AgentTransport{IdleTimeout: &off}}).InactivityTimeout)
+
+	seconds := 90
+	c.cfg.Config().Options.TodoEnforcement = &config.TodoEnforcementConfig{InactivityTimeout: &seconds}
+	require.Equal(t, 90*time.Second, c.externalKillSettings(config.Agent{}).InactivityTimeout)
 }

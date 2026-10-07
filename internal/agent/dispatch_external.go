@@ -314,21 +314,30 @@ func (c *coordinator) resolveExternalToken(agentCfg config.Agent) (Secret, error
 	return NewSecret(value), nil
 }
 
+// defaultExternalIdleTimeout bounds an external run when nothing else
+// does (#434): a remote that stays silent this long has its task
+// canceled. transport.idle_timeout "off" is the only way to drop it.
+const defaultExternalIdleTimeout = 5 * time.Minute
+
 // externalKillSettings resolves the thresholds an external dispatch runs
 // with (#434). Two apply: the hard timeout — the definition's
 // kill.timeout over options.todo_enforcement.hard_timeout — and the idle
-// timeout, carried as InactivityTimeout: transport.idle_timeout over
-// options.todo_enforcement.inactivity_timeout. The nudge ladder and the
-// todos stall window watch a local session the remote never writes to,
-// so they stay off.
+// timeout, carried as InactivityTimeout: transport.idle_timeout, else
+// options.todo_enforcement.inactivity_timeout, else
+// defaultExternalIdleTimeout, so an external run is never unbounded by
+// default. The nudge ladder and the todos stall window watch a local
+// session the remote never writes to, so they stay off.
 func (c *coordinator) externalKillSettings(agentCfg config.Agent) config.TodoEnforcementSettings {
 	resolved := c.dispatchEnforcement(agentCfg)
 	settings := config.TodoEnforcementSettings{
 		HardTimeout:       resolved.HardTimeout,
 		InactivityTimeout: resolved.InactivityTimeout,
 	}
-	if agentCfg.Transport != nil && agentCfg.Transport.IdleTimeout != nil {
+	switch {
+	case agentCfg.Transport != nil && agentCfg.Transport.IdleTimeout != nil:
 		settings.InactivityTimeout = max(time.Duration(*agentCfg.Transport.IdleTimeout), 0)
+	case settings.InactivityTimeout <= 0:
+		settings.InactivityTimeout = defaultExternalIdleTimeout
 	}
 	return settings
 }

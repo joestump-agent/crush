@@ -1093,3 +1093,27 @@ func TestExternalAgentStreamErrorIsLabeled(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "a2a: external agent stream failed: "+dispatch.UntrustedPrefix)
 }
+
+// A streaming card's calls wait at most 30 seconds for response headers,
+// as the served path does; a non-streaming card's blocking SendMessage
+// answers only at the end, so the idle timeout bounds it instead. The
+// card fetch's own transport is left alone.
+func TestExternalAgentResponseHeaderTimeout(t *testing.T) {
+	t.Parallel()
+	for _, streaming := range []bool{true, false} {
+		es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+		es.card = func(base string) *a2aspec.AgentCard {
+			card := externalTestCard(base+"/a2a", true)
+			card.Capabilities.Streaming = streaming
+			return card
+		}
+		ext := resolveTestAgent(t, es)
+		base := ext.(*externalAgent).http.Transport.(*pinnedTransport).base.(*http.Transport)
+		if streaming {
+			require.Equal(t, externalResponseHeaderTimeout, base.ResponseHeaderTimeout)
+		} else {
+			require.Zero(t, base.ResponseHeaderTimeout)
+		}
+		require.Zero(t, es.srv.Client().Transport.(*http.Transport).ResponseHeaderTimeout, "the shared base is not modified")
+	}
+}

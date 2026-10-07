@@ -56,6 +56,12 @@ const (
 	// and body included. Task calls have none: a stream lives as long as
 	// the run, bounded by the idle timeout and kill.timeout instead.
 	externalCardTimeout = 30 * time.Second
+	// externalResponseHeaderTimeout bounds the wait for a streaming
+	// call's response headers, as the served path's client does: a
+	// streaming agent answers at once and talks on the stream. A
+	// non-streaming card's blocking SendMessage answers only when the
+	// task ends, so it is left to the idle timeout instead.
+	externalResponseHeaderTimeout = 30 * time.Second
 	// externalCancelTimeout bounds the best-effort tasks/cancel sent when
 	// a stream ends without a terminal state.
 	externalCancelTimeout = 10 * time.Second
@@ -130,6 +136,19 @@ func (f *ServerFactory) externalBaseTransport(pinned origin) http.RoundTripper {
 // errNotLoopback refuses a plain-http dial that would leave the machine.
 var errNotLoopback = errors.New("a2a: refusing plain http to a host that is not a loopback address")
 
+// withResponseHeaderTimeout returns base with its response-header
+// timeout set, cloned so the card fetch's transport is left alone. A
+// base that is not an *http.Transport is returned as is.
+func withResponseHeaderTimeout(base http.RoundTripper, timeout time.Duration) http.RoundTripper {
+	t, ok := base.(*http.Transport)
+	if !ok {
+		return base
+	}
+	clone := t.Clone()
+	clone.ResponseHeaderTimeout = timeout
+	return clone
+}
+
 // loopbackOnlyDial resolves the host itself and dials it only when every
 // address it resolves to is loopback (#434), so plain http — allowed for
 // a loopback card alone — never leaves the machine.
@@ -183,9 +202,13 @@ func (f *ServerFactory) ResolveExternalAgent(ctx context.Context, p agent.Extern
 		return nil, fmt.Errorf("a2a: agent card %s declares no HTTP bearer security scheme; refusing to send the configured bearer token", source)
 	}
 
+	callBase := base
+	if card.Capabilities.Streaming {
+		callBase = withResponseHeaderTimeout(base, externalResponseHeaderTimeout)
+	}
 	httpClient := &http.Client{
 		Transport: &pinnedTransport{
-			base:          base,
+			base:          callBase,
 			origin:        pinned,
 			maxBody:       maxExternalBodyBytes,
 			maxEventBytes: maxExternalEventBytes,
