@@ -127,17 +127,28 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 	if err != nil {
 		return err
 	}
+	if err := SteerOutcomeError(msg.SessionID, outcome); err != nil {
+		return err
+	}
+	slog.Debug("Steered running agent over A2A", "session_id", msg.SessionID)
+	return nil
+}
+
+// SteerOutcomeError maps a steer's A2A outcome onto the sender's error
+// (#351): nil when the agent accepted the message, the refusal otherwise.
+// Every front door that steers a dispatched agent — message_agent, the
+// editor's @handle over the agent index (#421) — answers with it.
+func SteerOutcomeError(sessionID string, outcome DispatchSteerOutcome) error {
 	switch outcome.Status {
 	case steerStatusWorking, steerStatusCompleted:
-		slog.Debug("Steered running agent over A2A", "session_id", msg.SessionID)
 		return nil
 	case steerStatusRejected:
 		// The served agent refused the enqueue — the run ended between
-		// the registry lookup and the delivery. Same refusal as a
-		// finished dispatch.
-		return fmt.Errorf("agent %s is no longer running; dispatch a new agent instead", msg.SessionID)
+		// the lookup and the delivery. Same refusal as a finished
+		// dispatch.
+		return fmt.Errorf("agent %s is no longer running; dispatch a new agent instead", sessionID)
 	default:
-		return fmt.Errorf("agent %s: %s", msg.SessionID, outcome.Text)
+		return fmt.Errorf("agent %s: %s", sessionID, outcome.Text)
 	}
 }
 

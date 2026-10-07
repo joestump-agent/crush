@@ -154,6 +154,9 @@ type Executor struct {
 	// ended (#364). Optional; nil means terminal statuses carry no usage
 	// metadata.
 	usage func(ctx context.Context) (agent.Usage, error)
+	// onTurn is told the task that starts the dispatch's own turn (#421);
+	// nil when nothing tracks it.
+	onTurn func(taskID string)
 	// turnMu guards turnStarted (#351): one executor serves one
 	// dispatch's route, and every message on its context either starts
 	// the dispatch's own turn — the first one — or is a steer.
@@ -269,6 +272,12 @@ func WithCancelReason(fn func() string) Option {
 	return func(e *Executor) { e.cancelReason = fn }
 }
 
+// withOnTurn sets the hook told which task starts the dispatch's own
+// turn (#421): the agent index follows that task, never a steer's.
+func withOnTurn(fn func(taskID string)) Option {
+	return func(e *Executor) { e.onTurn = fn }
+}
+
 // WithUsage sets the reader for the dispatched session's final usage
 // (#364): the executor calls it once the run has ended and attaches the
 // value — stamped with the request's W3C trace ID — to every post-run
@@ -379,6 +388,11 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		if e.markTurnStarted() {
 			e.executeSteer(ctx, execCtx, binding, prompt, yield)
 			return
+		}
+		// This task is the dispatch's own (#421): say so, so the agent
+		// index follows it rather than whichever task came first.
+		if e.onTurn != nil {
+			e.onTurn(string(execCtx.TaskID))
 		}
 
 		if !yield(statusEvent(execCtx, a2aspec.TaskStateWorking, nil), nil) {
@@ -817,7 +831,12 @@ func (e *Executor) drain(ctx context.Context, execCtx *a2asrv.ExecutorContext, r
 				continue
 			}
 			run.lastTodos = slices.Clone(snap.Todos)
-			if !yield(todoStatusUpdate(execCtx, snap), nil) {
+			// Usage rides each progress event too (#421), so a watcher's
+			// token count moves while the agent works, not only at the
+			// end.
+			progress := todoStatusUpdate(execCtx, snap)
+			e.attachUsage(ctx, progress, binding.SessionID, traceIDFromContext(ctx))
+			if !yield(progress, nil) {
 				return nil, errConsumerStopped
 			}
 			if inactReset != nil {
@@ -923,14 +942,15 @@ func todoProgress(snap dispatch.TodoSnapshot) agent.TodoProgress {
 	}
 }
 
-// attachUsage stamps a terminal status update with the usage/v1 extension's
+// attachUsage stamps a status update with the usage/v1 extension's
 // payload (#364): the usage closure's reading of the dispatched session's
-// final totals, plus the request's W3C trace ID. Called only on post-run
-// terminals — a status emitted mid-run (the executor's own Cancel) carries
-// no usage, because the run's totals are not final. Every failure — the
-// closure erroring, or the value failing to encode — is logged, and the
-// status ships without metadata: usage is accounting, never a reason to
-// fail a finished run.
+// totals, plus the request's W3C trace ID. Post-run terminals carry the
+// final totals, which the parent is charged; todo progress events carry
+// the totals so far (#421), which only a watcher's display uses — the
+// client folds usage from terminal statuses alone. The executor's own
+// Cancel carries none. Every failure — the closure erroring, or the value
+// failing to encode — is logged, and the status ships without metadata:
+// usage is accounting, never a reason to fail a run.
 func (e *Executor) attachUsage(ctx context.Context, ev *a2aspec.TaskStatusUpdateEvent, sessionID, traceID string) {
 	if e.usage == nil {
 		return
@@ -939,13 +959,13 @@ func (e *Executor) attachUsage(ctx context.Context, ev *a2aspec.TaskStatusUpdate
 	// on its way out, and the totals are durable regardless.
 	usage, err := e.usage(context.WithoutCancel(ctx))
 	if err != nil {
-		slog.Warn("A2A usage collection failed; terminal status carries no usage metadata", "session_id", sessionID, "trace_id", traceID, "err", err)
+		slog.Warn("A2A usage collection failed; status carries no usage metadata", "session_id", sessionID, "trace_id", traceID, "err", err)
 		return
 	}
 	usage.TraceID = traceID
 	encoded, err := Encode(UsageExt, usage)
 	if err != nil {
-		slog.Warn("A2A usage failed to encode; terminal status carries no usage metadata", "session_id", sessionID, "trace_id", traceID, "err", err)
+		slog.Warn("A2A usage failed to encode; status carries no usage metadata", "session_id", sessionID, "trace_id", traceID, "err", err)
 		return
 	}
 	ev.SetMeta(UsageExt.URI, encoded)

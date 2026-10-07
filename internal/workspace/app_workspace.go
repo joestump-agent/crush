@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/crush/internal/a2a"
 	"github.com/charmbracelet/crush/internal/agent"
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/app"
@@ -34,15 +35,46 @@ import (
 type AppWorkspace struct {
 	app   *app.App
 	store *config.ConfigStore
+	// agentTasks follows the app's A2A host's agent index (#421): the
+	// dispatched-agent surface the TUI reads, the same wire surface a
+	// client/server TUI reads through the server.
+	agentTasks *agentTaskWatcher
 }
 
 // NewAppWorkspace creates a new AppWorkspace wrapping the given app
 // and config store.
 func NewAppWorkspace(a *app.App, store *config.ConfigStore) *AppWorkspace {
-	return &AppWorkspace{
+	w := &AppWorkspace{
 		app:   a,
 		store: store,
 	}
+	w.agentTasks = newAgentTaskWatcher(w.dialAgentIndex, w.agentClient)
+	return w
+}
+
+// dialAgentIndex reaches the app's A2A host's agent index (#421). The
+// host exists once the coder agent initializes and is up once something
+// is served; until then ready says when to look again.
+func (w *AppWorkspace) dialAgentIndex() (a2a.AgentIndexConn, bool, <-chan struct{}) {
+	host, hostReady := w.app.A2AHost()
+	if host == nil {
+		return a2a.AgentIndexConn{}, false, hostReady
+	}
+	conn, ok := host.AgentIndexConn()
+	if !ok {
+		return a2a.AgentIndexConn{}, false, host.Started()
+	}
+	return conn, true, nil
+}
+
+// agentClient returns the app's A2A host, which steers and cancels the
+// dispatches it serves over its own socket.
+func (w *AppWorkspace) agentClient() (agentClient, bool) {
+	host, _ := w.app.A2AHost()
+	if host == nil {
+		return nil, false
+	}
+	return host, true
 }
 
 // -- Sessions --
@@ -357,6 +389,33 @@ func (w *AppWorkspace) CancelDispatch(ctx context.Context, ref string) error {
 	return w.app.CancelDispatch(ctx, ref)
 }
 
+// -- Agent tasks (#421) --
+
+func (w *AppWorkspace) ListAgentTasks(sessionID string) []AgentTask {
+	w.agentTasks.start(nil)
+	return w.agentTasks.list(sessionID)
+}
+
+func (w *AppWorkspace) AgentTask(sessionID string) (AgentTask, bool) {
+	w.agentTasks.start(nil)
+	return w.agentTasks.bySession(sessionID)
+}
+
+func (w *AppWorkspace) AgentTaskByHandle(sessionID, handle string) (AgentTask, bool) {
+	w.agentTasks.start(nil)
+	return w.agentTasks.byHandle(sessionID, handle)
+}
+
+func (w *AppWorkspace) SendAgentMessage(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
+	w.agentTasks.start(nil)
+	return w.agentTasks.steer(ctx, sessionID, handle, text, attachments)
+}
+
+func (w *AppWorkspace) CancelAgentTask(ctx context.Context, ref string) error {
+	w.agentTasks.start(nil)
+	return w.agentTasks.cancelTask(ctx, ref)
+}
+
 // -- LSP --
 
 func (w *AppWorkspace) LSPStart(ctx context.Context, path string) {
@@ -609,10 +668,13 @@ func (w *AppWorkspace) MCPAuthURL(name string) string {
 // -- Lifecycle --
 
 func (w *AppWorkspace) Subscribe(program *tea.Program) {
+	// The agent index's changes reach the TUI as tea messages (#421).
+	w.agentTasks.start(program.Send)
 	w.app.Subscribe(program)
 }
 
 func (w *AppWorkspace) Shutdown() {
+	w.agentTasks.stop()
 	w.app.Shutdown()
 }
 

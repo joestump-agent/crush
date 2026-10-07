@@ -96,12 +96,59 @@ dialer maps it onto the unix socket.
 | Request | Path | Behaviour |
 | --- | --- | --- |
 | `POST` | `/agents/<dispatch id>` | JSON-RPC 2.0. `SendStreamingMessage` and `SubscribeToTask` answer as an SSE stream; every other method answers with one JSON response. |
+| `GET` | `/agents` | The agent index: see [below](#agent-index). |
 | anything else | any | `404`. The well-known card path is not served; discovery is in-memory. |
 
 Middleware in front of the route table rejects a request before any
 dispatch work runs: `403` when an `Origin` header is present, `415`
 unless `Content-Type` parses to `application/json`, and `400` unless the
 `Host` is `crush-a2a`.
+
+### Agent index
+
+The host lists the dispatches it serves at `GET /agents`
+([#421](https://github.com/joestump-agent/crush/issues/421)). This is how
+a UI meets dispatched agents over the wire rather than through the
+dispatch registry. Sub-agent turns are not listed. The index lives with
+the process: a restart starts it empty, and a finished dispatch's
+durable record stays in its session.
+
+- **A snapshot.** With `Accept: application/json`, the answer is a JSON
+  array of descriptors, oldest first.
+- **A stream.** With `Accept: text/event-stream`, the answer is an SSE
+  stream. Its first `data:` event is `{"snapshot": [...]}`, and every
+  change after it is `{"upsert": {...}}`, one descriptor at a time. An
+  idle stream carries a comment every 30 seconds. A stream that falls 256
+  events behind, or whose reader stops taking writes for 10 seconds, is
+  closed rather than holding up the agent or the host's shutdown. The
+  watcher reconnects to a fresh snapshot.
+
+A descriptor carries:
+- the dispatch ID, its endpoint, and its Agent Card;
+- its handle and role;
+- its `context_id` (the child session) and `parent_session_id`;
+- its `task_id`;
+- its `state`: `working`, `completed`, `failed` or `canceled`, and empty
+  before the task exists;
+- the latest `status_text`;
+- the latest `todos/v1` value as `progress`, and the latest `usage/v1`
+  value as `usage`;
+- `served`, and `started_at`, `updated_at` and `finished_at`;
+- a `revision` that increases with every change on the index, so a
+  watcher keeps the newer of two copies and repeats no update after a
+  reconnect.
+
+The descriptor follows the dispatch's own task only. The executor names
+that task when the dispatch's turn starts, so the tasks that steers open
+on the same context never move it, and a write that changes nothing a
+reader sees is not published. A dispatch whose route has gone down stays
+listed with `served: false` and its last state, so its `@handle` still
+resolves; the oldest are dropped beyond 500 ended dispatches.
+
+The index takes the host's checks without the content-type gate: `GET`
+only (`405` otherwise), `403` with an `Origin`, `400` unless the `Host`
+is `crush-a2a`, and the host's bearer token from the host's own user
+(`401` otherwise).
 
 ## Methods
 
@@ -250,7 +297,7 @@ streams:
 | --- | --- | --- | --- |
 | 1 | `task` | `TASK_STATE_SUBMITTED` | The new task, with its IDs. |
 | 2 | `statusUpdate` | `TASK_STATE_WORKING` | No message. The run has started. |
-| 3 | `statusUpdate` × 0..n | `TASK_STATE_WORKING` | One per todo-list change: the current todo as message text, and the typed progress under the declared `todos/v1` extension's metadata key. |
+| 3 | `statusUpdate` × 0..n | `TASK_STATE_WORKING` | One per todo-list change: the current todo as message text, the typed progress under the declared `todos/v1` extension's metadata key, and the usage so far under `usage/v1`. |
 | 4 | `artifactUpdate` × 1..n | — | The work product: the diff as chunked `text/x-diff` parts (artifact `diff`), then the typed outcome as a data part (artifact `dispatch-result`). |
 | 5 | `statusUpdate` | `TASK_STATE_COMPLETED` | The agent's final text as an agent message. |
 
@@ -310,7 +357,10 @@ A progress event looks like this:
 Every post-run terminal status — `TASK_STATE_COMPLETED`, both
 `TASK_STATE_FAILED` paths and an out-of-band `TASK_STATE_CANCELED` —
 carries the declared `usage/v1` extension's metadata key
-([#364](https://github.com/joestump-agent/crush/issues/364)):
+([#364](https://github.com/joestump-agent/crush/issues/364)). Each todo
+progress event carries it too, with the usage so far, so a watcher's
+token count moves while the agent works
+([#421](https://github.com/joestump-agent/crush/issues/421)):
 
 ```json
 {
@@ -327,8 +377,9 @@ carries the declared `usage/v1` extension's metadata key
 
 - **The totals.** The child session's cumulative token counts and cost at
   terminal time, plus the model and provider that served the dispatch.
-  Mid-run statuses — including a parent-requested cancel — carry none:
-  the totals are not final.
+  Todo progress events carry the totals so far, for watchers only: the
+  parent is charged a terminal status's usage alone. A parent-requested
+  cancel carries none, because the totals are not final.
 - **The trace id.** The parent stamps a W3C `traceparent` header on the
   dispatch call (a client interceptor sends it, the server propagator
   lifts it), and the executor echoes its trace-id segment back in

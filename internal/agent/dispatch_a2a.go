@@ -93,6 +93,14 @@ type DispatchServerParams struct {
 	// the run in input-required on each question and resolves it with
 	// the answer. Nil when the agent has no question tool.
 	Questions question.Service
+	// Listed puts the served dispatch on the host's agent index (#421),
+	// the surface a UI watches dispatched agents through. Dispatches are
+	// listed; sub-agent turns, which no UI addresses, are not.
+	Listed bool
+	// ParentSessionID is the session the dispatch was created from
+	// (#399), carried on the index so a UI scopes it to the session it
+	// shows.
+	ParentSessionID string
 }
 
 // DispatchTransportParams is one dispatch's slice of the A2A client
@@ -650,10 +658,18 @@ func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatc
 		return nil, errors.New("no A2A host is wired")
 	}
 
+	// The dispatch is listed on the host's agent index (#421), scoped to
+	// the session it was created from (#399).
+	var parentSessionID string
+	if entry, ok := reg.Get(entryID); ok {
+		parentSessionID = entry.ParentSessionID
+	}
 	endpoint, card, stop, err := starter.StartDispatchServer(ctx, DispatchServerParams{
-		DispatchID: entryID,
-		SessionID:  sessionID,
-		Runner:     runner,
+		DispatchID:      entryID,
+		SessionID:       sessionID,
+		Runner:          runner,
+		Listed:          true,
+		ParentSessionID: parentSessionID,
 		Diff: func(ctx context.Context) (string, error) {
 			entry, ok := reg.Get(entryID)
 			if !ok {

@@ -250,6 +250,32 @@ type Workspace interface {
 	// dispatched agent needs a local process.
 	CancelDispatch(ctx context.Context, ref string) error
 
+	// Agent tasks (#421)
+	//
+	// The dispatched-agent surface over A2A: every method reads or acts
+	// through the A2A host's agent index and the A2A protocol, never the
+	// dispatch registry, so both workspace modes serve it the same way.
+	// Changes reach the TUI as pubsub.Event[AgentTask] messages once
+	// Subscribe has run. The Dispatch* methods above give way to these.
+	//
+	// ListAgentTasks returns the agents dispatched from sessionID (#399),
+	// finished ones included, oldest first.
+	ListAgentTasks(sessionID string) []AgentTask
+	// AgentTask returns the agent whose child session is sessionID: the
+	// session a dispatch card is for.
+	AgentTask(sessionID string) (AgentTask, bool)
+	// AgentTaskByHandle resolves an @handle among the agents dispatched
+	// from sessionID (#313, #399).
+	AgentTaskByHandle(sessionID, handle string) (AgentTask, bool)
+	// SendAgentMessage steers the running agent dispatched from sessionID
+	// under handle (#313), with the editor's attachments (#414). A
+	// finished, unknown or foreign agent is refused.
+	SendAgentMessage(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error
+	// CancelAgentTask stops one running dispatched agent (#373) through
+	// tasks/cancel (#348); ref is a dispatch id, an @handle, or the
+	// child session id.
+	CancelAgentTask(ctx context.Context, ref string) error
+
 	// LSP
 	LSPStart(ctx context.Context, path string)
 	LSPStopAll(ctx context.Context)

@@ -567,6 +567,31 @@ func (w *ClientWorkspace) CancelDispatch(ctx context.Context, ref string) error 
 	return errors.New("canceling a dispatched agent is not available in client/server mode")
 }
 
+// The agent surface (#421) reaches the server's A2A host through the
+// server in a later change; until then a client/server TUI sees no
+// dispatched agents, and steering or canceling one says so instead of
+// failing silently.
+
+func (w *ClientWorkspace) ListAgentTasks(sessionID string) []AgentTask {
+	return nil
+}
+
+func (w *ClientWorkspace) AgentTask(sessionID string) (AgentTask, bool) {
+	return AgentTask{}, false
+}
+
+func (w *ClientWorkspace) AgentTaskByHandle(sessionID, handle string) (AgentTask, bool) {
+	return AgentTask{}, false
+}
+
+func (w *ClientWorkspace) SendAgentMessage(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
+	return errors.New("steering a dispatched agent is not available in client/server mode yet")
+}
+
+func (w *ClientWorkspace) CancelAgentTask(ctx context.Context, ref string) error {
+	return errors.New("canceling a dispatched agent is not available in client/server mode yet")
+}
+
 // -- LSP --
 
 func (w *ClientWorkspace) LSPStart(ctx context.Context, path string) {

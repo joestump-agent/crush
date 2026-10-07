@@ -130,6 +130,12 @@ type ServerParams struct {
 	// resolves it with the answer on the same task. Optional; nil means
 	// the agent cannot ask.
 	Questions QuestionSource
+	// Listed puts the route on the host's agent index (#421) with its
+	// card, handle, role and context, and tracks its task's state there.
+	Listed bool
+	// ParentSessionID is the session the dispatch was created from
+	// (#399), carried on the index.
+	ParentSessionID string
 	// TaskStore persists served tasks durably (#354) instead of the
 	// SDK's in-process default, so task state survives a restart.
 	// Optional; the production store arrives with #355. nil keeps
@@ -226,6 +232,16 @@ type ServerFactory struct {
 	// published on the host, keyed by its config id. Distinct from the
 	// route table, which also carries per-run served agents.
 	definitions map[string]*a2aspec.AgentCard
+
+	// index is the agent index (#421): one descriptor per listed
+	// dispatch, served at AgentsIndexPath.
+	index *agentIndex
+	// startedCh is closed once the host is up, so a watcher waiting to
+	// dial its index (#421) wakes instead of polling for the socket.
+	startedCh chan struct{}
+	// indexClient is the one client the index is read through (#421).
+	indexClientOnce sync.Once
+	indexClient     *http.Client
 }
 
 // route is one dispatch's slice of the host: its JSON-RPC handler and a
@@ -246,6 +262,8 @@ func NewServerFactory(dataDir string, opts ...ServerFactoryOption) *ServerFactor
 		routes:      make(map[string]*route),
 		definitions: make(map[string]*a2aspec.AgentCard),
 		creds:       a2aclient.NewInMemoryCredentialsStore(),
+		index:       newAgentIndex(),
+		startedCh:   make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(f)
@@ -307,6 +325,10 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	if p.Questions != nil {
 		opts = append(opts, WithQuestions(p.Questions))
 	}
+	if p.Listed {
+		dispatchID := p.DispatchID
+		opts = append(opts, withOnTurn(func(taskID string) { f.index.setTask(dispatchID, taskID) }))
+	}
 	opts = append(opts, withHooks(p.hooks))
 	// The call template rides the context binding (#350): the executor
 	// resolves runner, session, and shaping together, per turn.
@@ -333,6 +355,17 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	store := p.TaskStore
 	if store == nil {
 		store = f.taskStore
+	}
+	if p.Listed {
+		// A listed dispatch's task writes also move its index
+		// descriptor (#421). Without a store of its own the route gets
+		// the SDK's default, built the way the SDK builds it.
+		if store == nil {
+			store = taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
+				Authenticator: a2asrv.NewTaskStoreAuthenticator(),
+			})
+		}
+		store = &trackingStore{Store: store, index: f.index, id: p.DispatchID}
 	}
 	if store != nil {
 		handlerOpts = append(handlerOpts, a2asrv.WithTaskStore(store))
@@ -366,6 +399,17 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 		Call:      p.Call,
 		Started:   time.Now(),
 	})
+	if p.Listed {
+		f.index.add(AgentDescriptor{
+			ID:              p.DispatchID,
+			Endpoint:        endpoint,
+			Card:            card,
+			Handle:          p.Name,
+			Role:            p.Description,
+			ContextID:       p.ContextID,
+			ParentSessionID: p.ParentSessionID,
+		})
+	}
 	return &Server{Endpoint: endpoint, Card: card, factory: f, id: p.DispatchID, contextID: p.ContextID}, nil
 }
 
@@ -451,6 +495,8 @@ func (f *ServerFactory) StartDispatchServer(ctx context.Context, p agent.Dispatc
 		CancelReason:      p.CancelReason,
 		Usage:             p.Usage,
 		Questions:         p.Questions,
+		Listed:            p.Listed,
+		ParentSessionID:   p.ParentSessionID,
 	})
 	if err != nil {
 		return "", nil, nil, err
@@ -563,6 +609,9 @@ func (f *ServerFactory) Close(ctx context.Context) error {
 	srv, listener, path, done := f.httpServer, f.listener, f.sockPath, f.done
 	f.mu.Unlock()
 
+	// Index streams (#421) never end on their own; end them first, or
+	// Shutdown waits on them until ctx runs out.
+	f.index.closeAll()
 	err := srv.Shutdown(ctx)
 	if cerr := listener.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) && err == nil {
 		err = cerr
@@ -632,6 +681,7 @@ func (f *ServerFactory) ensureHost(ctx context.Context) error {
 	}
 	f.done = make(chan struct{})
 	f.started = true
+	close(f.startedCh)
 	go func() {
 		defer close(f.done)
 		// Serve always returns a non-nil error (ErrServerClosed on a
@@ -722,6 +772,12 @@ func shortHash(s string, n int) string {
 // where the platform reports it — before the executor runs. The route context
 // is injected so a Stop or Close cancels the in-flight streams it owns.
 func (f *ServerFactory) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	// The agent index (#421) is a GET with no JSON body, so it takes its
+	// own copy of the checks below rather than the content-type gate.
+	if r.URL.Path == AgentsIndexPath {
+		f.serveAgentsIndex(w, r)
+		return
+	}
 	if r.Header.Get("Origin") != "" {
 		http.Error(w, "a2a: cross-origin requests are not accepted", http.StatusForbidden)
 		return
@@ -823,6 +879,8 @@ func (f *ServerFactory) unregister(id, contextID string) {
 		rt.cancel()
 	}
 	f.contexts.Unbind(contextID)
+	// A listed dispatch stays on the index, no longer served (#421).
+	f.index.unserve(id)
 }
 
 // routeFor returns the dispatch's route under the host lock.

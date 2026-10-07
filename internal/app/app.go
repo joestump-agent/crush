@@ -100,6 +100,13 @@ type App struct {
 	// receives snapshots as tea.Msgs and renders the agent block.
 	dispatchTodos *pubsub.Broker[dispatch.TodoSnapshot]
 
+	// a2aHost is the process's A2A host, set once when the coder agent
+	// initializes; a2aHostReady is closed then. A UI watching dispatched
+	// agents over A2A (#421) dials the host's agent index through it.
+	a2aHostMu    sync.Mutex
+	a2aHost      *a2a.ServerFactory
+	a2aHostReady chan struct{}
+
 	// herdrClient reports agent state to herdr when running inside
 	// a herdr-managed pane. Nil when not in a herdr environment.
 	herdrClient *herdr.Client
@@ -146,6 +153,7 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 		agentNotifications: pubsub.NewBroker[notify.Notification](),
 		runCompletions:     pubsub.NewBroker[notify.RunComplete](),
 		dispatchTodos:      pubsub.NewBroker[dispatch.TodoSnapshot](),
+		a2aHostReady:       make(chan struct{}),
 		newCoordinator:     agent.NewCoordinator,
 	}
 
@@ -964,6 +972,9 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		slog.Error("Failed to create coder agent", "err", err)
 		return err
 	}
+	// Only the host a working coordinator dispatches through is the one
+	// a UI should watch (#421): a failed build is retried with a new one.
+	app.setA2AHost(a2aFactory)
 	// #355: close out what a crashed process left behind, before the UI
 	// loads any session. First the a2a reconcile fails orphaned served
 	// tasks and dispatch records; then the coordinator re-delivers every
@@ -987,6 +998,33 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		return a2aFactory.Close(ctx)
 	})
 	return nil
+}
+
+// setA2AHost records the process's A2A host once and wakes A2AHost's
+// waiters.
+func (app *App) setA2AHost(host *a2a.ServerFactory) {
+	app.a2aHostMu.Lock()
+	defer app.a2aHostMu.Unlock()
+	if app.a2aHost != nil {
+		return
+	}
+	if app.a2aHostReady == nil {
+		app.a2aHostReady = make(chan struct{})
+	}
+	app.a2aHost = host
+	close(app.a2aHostReady)
+}
+
+// A2AHost returns the process's A2A host (#421), or nil before the coder
+// agent has initialized; ready is closed once it is set.
+func (app *App) A2AHost() (host *a2a.ServerFactory, ready <-chan struct{}) {
+	app.a2aHostMu.Lock()
+	defer app.a2aHostMu.Unlock()
+	// An App a test built by hand has no channel yet.
+	if app.a2aHostReady == nil {
+		app.a2aHostReady = make(chan struct{})
+	}
+	return app.a2aHost, app.a2aHostReady
 }
 
 // Subscribe sends events to the TUI as tea.Msgs.

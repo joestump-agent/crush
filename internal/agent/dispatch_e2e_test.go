@@ -178,3 +178,35 @@ func TestDispatchE2EOverServerFactory(t *testing.T) {
 		})
 	}
 }
+
+// TestDispatchListedOnAgentIndexE2E: a real dispatch through the real
+// server factory is on the host's agent index (#421) with its handle,
+// its child session as the context, and the parent session it was
+// dispatched from, and the index follows it to its terminal state.
+func TestDispatchListedOnAgentIndexE2E(t *testing.T) {
+	t.Parallel()
+
+	host := a2a.NewServerFactory(t.TempDir())
+	model := agent.NewScriptedModel(agent.ScriptedStep{Text: "done"})
+	h := agent.NewDispatchHarness(t, model, config.TodoEnforcementSettings{}, host)
+	handle := h.Dispatch(t, "do the work")
+	entry := h.WaitTerminal(t, handle.DispatchID)
+	require.Equal(t, dispatch.StatusCompleted, entry.Status)
+
+	conn, ok := host.AgentIndexConn()
+	require.True(t, ok)
+	var listed a2a.AgentDescriptor
+	require.Eventually(t, func() bool {
+		descriptors, err := conn.ListAgents(t.Context())
+		if err != nil || len(descriptors) != 1 {
+			return false
+		}
+		listed = descriptors[0]
+		return listed.Terminal()
+	}, 10*time.Second, 25*time.Millisecond)
+	require.Equal(t, handle.DispatchID, listed.ID)
+	require.Equal(t, handle.Handle, listed.Handle)
+	require.Equal(t, handle.SessionID, listed.ContextID)
+	require.Equal(t, h.ParentSessionID(), listed.ParentSessionID)
+	require.Equal(t, a2a.DispatchStatusCompleted, listed.State)
+}

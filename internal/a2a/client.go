@@ -525,7 +525,12 @@ func (d *metadataDecoder) apply(outcome *agent.DispatchTransportOutcome, ev *a2a
 		if progress, ok := decoded.(*agent.TodoProgress); ok {
 			outcome.TodoProgress = progress
 		}
-		if usage, ok := decoded.(*agent.Usage); ok {
+		// Only a terminal status's usage is the run's final total, the
+		// one the parent is charged (#364). Progress events carry the
+		// totals so far for watchers (#421); a run that ends without a
+		// terminal usage — the executor's own Cancel — leaves the
+		// parent's cost unchanged rather than charging a partial reading.
+		if usage, ok := decoded.(*agent.Usage); ok && ev.Status.State.Terminal() {
 			outcome.Usage = usage
 		}
 	}
