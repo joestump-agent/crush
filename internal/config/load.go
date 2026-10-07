@@ -100,7 +100,7 @@ func Load(workingDir, dataDir string, debug bool) (*ConfigStore, error) {
 
 	// Validate the agent definitions structurally after all merging, so
 	// a bad agents block fails the load the same way a bad hook does.
-	if err := cfg.ValidateAgents(); err != nil {
+	if err := cfg.ValidateAgents(workingDir); err != nil {
 		return nil, fmt.Errorf("invalid agent definitions: %w", err)
 	}
 

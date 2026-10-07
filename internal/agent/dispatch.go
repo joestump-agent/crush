@@ -146,9 +146,12 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 		return nil, fmt.Errorf("dispatch working directory %q does not exist", opts.WorkingDir)
 	}
 
-	agentCfg, ok := c.cfg.Config().Agents[config.AgentTask]
+	workerCfg, ok := c.cfg.Config().Agents[config.AgentWorker]
 	if !ok {
-		return nil, errors.New("task agent not configured")
+		return nil, errors.New("worker agent not configured")
+	}
+	if workerCfg.Disabled {
+		return nil, errors.New("worker agent is disabled")
 	}
 
 	// Scoped config: the parent's configuration viewed from the
@@ -193,7 +196,7 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 		permissions: permissions,
 		cancel:      cancel,
 	}
-	t.tools = c.buildDispatchTools(agentCfg, t)
+	t.tools = c.buildDispatchTools(workerCfg, t)
 	return t, nil
 }
 
@@ -209,43 +212,15 @@ var dispatchCapabilityTools = []string{
 	tools.WriteToolName,
 }
 
-// dispatchWriteTools are the tools every dispatched agent gets on top of
-// the task agent's AllowedTools (#64). The task agent's default set is
-// deliberately read-only — it exists to answer research prompts — but a
-// dispatch's whole point is producing work, so bash, the edit tools,
-// write, and the todos tool the enforcement ladder needs (interaction
-// model, #315) are added to the union. The union is still bounded by the
-// parent's deny list: dispatchAllowedTools drops anything the user
-// denied, so options.disabled_tools / permissions deny hold inside a
-// dispatch (#376). Narrowing via config still works for read tools.
-var dispatchWriteTools = slices.Concat(dispatchCapabilityTools, []string{tools.TodosToolName})
-
 // dispatchAllowedTools is the allow-list a dispatched agent's tools are
-// filtered against: the task agent's allowed tools widened with
-// dispatchWriteTools (#64) and dispatchSupportTools (#384), minus
-// everything in disabled (#376).
+// filtered against: the worker definition's resolved tools (#432), minus
+// everything in disabled (#376). The definition can narrow the palette
+// but never widen user policy: disabled_tools is applied last.
 // disabled is the parent's options.disabled_tools (the list
 // permissions deny writes), never the dispatched workspace's own config,
 // which must not widen what the user denied at the top (#374).
-func dispatchAllowedTools(agentCfg config.Agent, disabled []string) []string {
-	allowed := slices.Concat(agentCfg.AllowedTools, dispatchWriteTools, dispatchSupportTools)
-	return slices.DeleteFunc(allowed, func(name string) bool {
-		return slices.Contains(disabled, name)
-	})
-}
-
-// dispatchSupportTools are the observation tools a dispatched agent gets
-// on top of the task agent's AllowedTools (#384). bash auto-backgrounds
-// any command past DefaultAutoBackgroundAfter and tells the agent to read
-// the result back with job_output (or stop it with job_kill), and
-// lsp_diagnostics is how the agent checks what the LSP thinks of an edit
-// (constructed only while the LSP tools are registered). None of them
-// writes, but without them a dispatch loses the output of any command it
-// starts: the buffer lives only in this process.
-var dispatchSupportTools = []string{
-	tools.JobOutputToolName,
-	tools.JobKillToolName,
-	tools.DiagnosticsToolName,
+func dispatchAllowedTools(workerCfg config.Agent, disabled []string) []string {
+	return effectiveToolNames(workerCfg.AllowedTools, disabled)
 }
 
 // buildDispatchTools constructs the dispatched agent's tools against the
@@ -253,14 +228,19 @@ var dispatchSupportTools = []string{
 // a directory. The parent's session-scoped services (todos) and data-dir
 // services (logs, jobs) are reused; every path-resolving tool gets the
 // workspace directory.
-func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolchain) []fantasy.AgentTool {
+func (c *coordinator) buildDispatchTools(workerCfg config.Agent, t *DispatchToolchain) []fantasy.AgentTool {
 	scoped := t.store.Config()
 	dir := t.workingDir
 
 	// Model ID for the bash tool's error attribution, same derivation as
-	// buildTools.
+	// buildTools: an explicit pin (#432) names it, otherwise the agent's
+	// slot does.
 	modelID := ""
-	if modelCfg, ok := scoped.Models[agentCfg.Model]; ok {
+	if workerCfg.ModelRef != nil {
+		if model := scoped.GetModel(workerCfg.ModelRef.Provider, workerCfg.ModelRef.Model); model != nil {
+			modelID = model.ID
+		}
+	} else if modelCfg, ok := scoped.Models[workerCfg.Model]; ok {
 		if model := scoped.GetModel(modelCfg.Provider, modelCfg.Model); model != nil {
 			modelID = model.ID
 		}
@@ -310,11 +290,10 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 		)
 	}
 
-	// The task agent's set widened with the dispatch write tools and
-	// support tools, minus the parent's deny list (#376): a dispatched
-	// agent must be able to edit, not just read (#64), and observe what
-	// it ran and wrote (#384), but a tool the user denied stays denied.
-	allowed := dispatchAllowedTools(agentCfg, c.cfg.Config().Options.DisabledTools)
+	// The worker definition's tool set (#432), minus the parent's deny
+	// list (#376): the definition narrows the palette but can never
+	// widen user policy, and a tool the user denied stays denied.
+	allowed := dispatchAllowedTools(workerCfg, c.cfg.Config().Options.DisabledTools)
 
 	var filtered []fantasy.AgentTool
 	for _, tool := range allTools {
@@ -322,6 +301,12 @@ func (c *coordinator) buildDispatchTools(agentCfg config.Agent, t *DispatchToolc
 			filtered = append(filtered, tool)
 		}
 	}
+
+	// MCP tools ride the process-wide server registry (#432): the
+	// servers are shared with the parent, not rooted at the workspace,
+	// and the worker definition's AllowedMCP decides what the
+	// dispatched agent may call.
+	filtered = append(filtered, filterMCPTools(workerCfg, tools.GetMCPTools(t.permissions, t.store, dir))...)
 
 	// Dispatched agents fire the parent's PreToolUse hooks (#377): they
 	// carry bash, edit, multiedit, and write, so a hook that blocks a

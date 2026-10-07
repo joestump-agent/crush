@@ -2,7 +2,7 @@
 id: configuration
 title: Multi-agent configuration
 sidebar_label: Configuration
-description: Every setting that affects dispatched agents and todo enforcement today, what is hard-coded, and the planned agent definitions.
+description: Every setting that affects dispatched agents and todo enforcement, and the agent definitions that configure each agent.
 ---
 
 # Multi-agent configuration
@@ -12,13 +12,13 @@ Dispatched agents, todo enforcement and every key on this page exist only in
 this fork.
 :::
 
-There are three sets of knobs today: the `options.todo_enforcement` block, the
-tool deny list, and permissions. Everything else about
-[dispatched agents](/agents/overview) is hard-coded, including their tool set,
-model choice, prompt and worktree location. The `agents` block that lets you
-define your own is specified in
-[agent definitions](#agent-definitions), and the runtime honors it from
-[#432](https://github.com/joestump-agent/crush/issues/432) on.
+Beyond the `options.todo_enforcement` block, the tool deny list and
+permissions, the `agents` block configures each agent: its model, prompt,
+tools, MCP servers, skills and context files. See
+[agent definitions](#agent-definitions). The runtime builds every agent from
+its definition ([#432](https://github.com/joestump-agent/crush/issues/432)).
+[Dispatched agents](/agents/overview) use the `worker` definition. Their
+worktree location is still hard-coded.
 
 ## What you can set today
 
@@ -27,7 +27,8 @@ define your own is specified in
 | Todo nudges and hard gate | None ([#403](https://github.com/joestump-agent/crush/issues/403)) | `options.todo_enforcement.{enabled,nudge_threshold,hard_gate}` | Every agent except `agentic_fetch` |
 | Kill thresholds | None ([#403](https://github.com/joestump-agent/crush/issues/403)) | `options.todo_enforcement.{kill_after_nudges,stall_window,hard_timeout}` | `kill_after_nudges`: every agent ([#393](https://github.com/joestump-agent/crush/issues/393)); the other two: dispatched agents |
 | Turn dispatch off | `permissions deny dispatch_agent message_agent` | `options.disabled_tools` | The main agent |
-| Dispatched-agent model | None | None | Chosen by the main agent on each call: `small` (default) or `large` |
+| Dispatched-agent model | `agent set worker --model …` | `agents.worker.model` | The worker's slot (`small` by default) unless the main agent picks `large` or `small` on the call. A `{provider, model}` pin wins over both |
+| Dispatched-agent tools | `agent set worker --tools …` | `agents.worker.tools` | The worker's allow list is the whole palette, minus your deny list |
 | Skills a dispatch gets | `option skill-path`, `option disable-skill` | `options.skills_paths`, `options.disabled_skills` | Plus the per-call `skills` argument |
 | Auto-approved tools | `permissions allow …` | `permissions.allowed_tools` | Read from the config the worktree loads (see [below](#config-the-dispatched-agent-reads)) |
 | Yolo | `--yolo` at startup | — | Dispatched agents follow the startup flag. Turning yolo off with <kbd>ctrl+y</kbd> does not reach them ([#378](https://github.com/joestump-agent/crush/issues/378)) |
@@ -221,15 +222,24 @@ Sub-agents and dispatched agents never get these tools in any case.
 ## Agent definitions
 
 :::info[Partially shipped]
-The data model works in both config formats: an `agents` block in
-`crush.json` and the `agent` builtin in `crushrc` load, validate, and
-resolve to the same definitions, and the error paths described below are
-live ([#333](https://github.com/joestump-agent/crush/issues/333),
-[#431](https://github.com/joestump-agent/crush/issues/431)). What is still
-planned: honoring per-agent model, prompt, tools and MCP access at runtime
-([#432](https://github.com/joestump-agent/crush/issues/432)), and the `agent`
-parameter on `dispatch_agent` ([#433](https://github.com/joestump-agent/crush/issues/433)). Fields the runtime does not
-honor yet load with a one-time warning.
+Both config formats work: an `agents` block in `crush.json` and the `agent`
+builtin in `crushrc` load, validate, and resolve to the same definitions
+([#333](https://github.com/joestump-agent/crush/issues/333),
+[#431](https://github.com/joestump-agent/crush/issues/431)). The runtime
+honors `model`, `prompt`, `prompt_append`, `tools`, `mcp`, `skills`,
+`context_paths` and `disabled`
+([#432](https://github.com/joestump-agent/crush/issues/432)).
+
+Still planned:
+
+- the `agent` parameter on `dispatch_agent`, which picks a dispatch agent
+  other than `worker`
+  ([#433](https://github.com/joestump-agent/crush/issues/433));
+- `runtime: a2a` agents behind an external card
+  ([#434](https://github.com/joestump-agent/crush/issues/434));
+- `workspace: none`.
+
+Fields the runtime does not honor yet load with a one-time warning.
 :::
 
 The built-ins stay: `coder`, `plan`, `task`, and a new `worker` that replaces
@@ -300,6 +310,42 @@ The rules:
   }
 }
 ```
+
+How the runtime applies each field:
+
+- **`model`.**
+  - A slot (`large` or `small`) picks that model for the agent.
+  - A `{provider, model}` pin runs the agent on that model, with your small
+    model kept for auxiliary work. Changing models in the TUI leaves pins
+    and slots in place.
+  - For dispatches, the call's `model` argument picks a slot, defaulting to
+    the worker's slot. A pinned worker ignores the argument.
+- **`prompt`.**
+  - `builtin:<id>` is one of the embedded prompts.
+  - `file:<path>` is a Go template, rendered with the same data as the
+    built-ins. Relative paths resolve against the working directory, at load
+    time and at runtime.
+  - `prompt_append` is appended verbatim after the rendered prompt.
+- **`tools`.**
+  - The worker's allow list is the dispatch palette. No write tools are
+    forced on, so a worker defined with `"@read"` is a read-only reviewer.
+  - Your `options.disabled_tools` and `permissions deny` still apply last.
+  - Dispatch is refused only when that deny list removes all of `bash`,
+    `edit`, `multiedit` and `write`.
+- **`mcp`.**
+  - A dispatch gets the MCP tools the worker's `mcp.allow` names; the
+    built-in worker has none.
+  - MCP servers are process-wide: they run in the parent's directory, not
+    in the dispatch's worktree.
+- **`skills`.** This list filters the agent's available skills. A dispatch's
+  `skills` argument can narrow the worker's list, never widen it.
+- **`context_paths`.** These replace `options.context_paths` for that agent.
+- **`disabled`.**
+  - A disabled `task` removes the `agent` tool.
+  - A disabled `plan` cannot be switched to.
+  - With no enabled dispatch agent, the main agent loses `dispatch_agent`,
+    `message_agent` and `cancel_dispatch`.
+  - `coder` cannot be disabled.
 
 The same configuration in `crushrc`:
 

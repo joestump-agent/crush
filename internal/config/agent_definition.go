@@ -12,6 +12,8 @@ import (
 
 	"charm.land/catwalk/pkg/catwalk"
 	"github.com/invopop/jsonschema"
+
+	"github.com/charmbracelet/crush/internal/filepathext"
 )
 
 // Agent ids for the built-in definitions. The worker is the dispatch
@@ -87,8 +89,8 @@ var agentToolGroups = map[string][]string{
 // config's agents key (#333). Every field is optional: a null or
 // omitted field inherits from the built-in with the same id, lists
 // replace rather than append, and "off" disables the knob it configures.
-// The resolved form lives in Agent; building agents from definitions is
-// #432, so fields the runtime does not honor yet only load and warn.
+// The resolved form lives in Agent, which the coordinator builds agents
+// from (#432); fields the runtime does not honor yet load and warn.
 type AgentDefinition struct {
 	// Role classifies the agent: main, subagent, or dispatch. It cannot
 	// be changed on a built-in, and a new id must be dispatch.
@@ -309,9 +311,14 @@ func builtinAgentDefinitions() map[string]AgentDefinition {
 			Description: strPtr("An agent that produces work in an isolated workspace."),
 			Model:       &AgentModel{Type: SelectedModelTypeSmall},
 			Prompt:      strPtr("builtin:dispatch"),
-			Tools:       &AgentTools{Allow: []string{"@read", "@write"}},
-			MCP:         &AgentMCP{Allow: []string{}},
-			Workspace:   strPtr(AgentWorkspaceWorktree),
+			// The dispatch toolset (#432): the read and write groups
+			// plus the support tools (#384) that let a dispatch observe
+			// what it ran and wrote. MCP stays off by default — the
+			// no-section dispatch set matches the pre-#432 union; widen
+			// with agents.worker.mcp.allow.
+			Tools:     &AgentTools{Allow: slices.Concat(readOnlyToolNames, writeToolNames, []string{"job_output", "job_kill", "lsp_diagnostics"})},
+			MCP:       &AgentMCP{Allow: []string{}},
+			Workspace: strPtr(AgentWorkspaceWorktree),
 		},
 	}
 }
@@ -557,7 +564,9 @@ func knownToolNames() []string {
 // It names the offending path in every error, for example
 // agents.worker.tools.allow[2]: unknown tool "x". It runs on the
 // merged config in Load, before SetupAgents, and on every reload.
-func (c *Config) ValidateAgents() error {
+// Relative file: prompts resolve against workingDir, as the runtime
+// reads them (#432).
+func (c *Config) ValidateAgents(workingDir string) error {
 	for id, def := range c.AgentDefinitions {
 		path := "agents." + id
 		if id == agentDefaultsKey {
@@ -569,7 +578,7 @@ func (c *Config) ValidateAgents() error {
 		if !agentIDPattern.MatchString(id) {
 			return fmt.Errorf("%s: id must match %s", path, agentIDPattern.String())
 		}
-		if err := validateAgentDefinition(c, id, def); err != nil {
+		if err := validateAgentDefinition(c, workingDir, id, def); err != nil {
 			return err
 		}
 	}
@@ -600,7 +609,7 @@ func isZeroDefinition(def AgentDefinition) bool {
 }
 
 // validateAgentDefinition runs the structural rules on one definition.
-func validateAgentDefinition(c *Config, id string, def AgentDefinition) error {
+func validateAgentDefinition(c *Config, workingDir, id string, def AgentDefinition) error {
 	path := "agents." + id
 	builtin, isBuiltin := builtinAgentDefinitions()[id]
 
@@ -645,10 +654,10 @@ func validateAgentDefinition(c *Config, id string, def AgentDefinition) error {
 	if err := c.validateMCPAllow(path, def.MCP); err != nil {
 		return err
 	}
-	if err := validatePrompt(path, def.Prompt, false); err != nil {
+	if err := validatePrompt(path, workingDir, def.Prompt, false); err != nil {
 		return err
 	}
-	if err := validatePrompt(path, def.PromptAppend, true); err != nil {
+	if err := validatePrompt(path, workingDir, def.PromptAppend, true); err != nil {
 		return err
 	}
 	if role != AgentRoleDispatch && def.Kill != nil {
@@ -774,8 +783,9 @@ func (c *Config) validateMCPAllow(path string, mcp *AgentMCP) error {
 }
 
 // validatePrompt checks a builtin: or file: prompt reference. A file
-// reference must exist on disk; an appended prompt must be a file.
-func validatePrompt(path string, prompt *string, appendOnly bool) error {
+// reference must exist on disk, relative to workingDir unless absolute;
+// an appended prompt must be a file.
+func validatePrompt(path, workingDir string, prompt *string, appendOnly bool) error {
 	if prompt == nil {
 		return nil
 	}
@@ -792,7 +802,9 @@ func validatePrompt(path string, prompt *string, appendOnly bool) error {
 		return nil
 	case strings.HasPrefix(value, "file:"):
 		file := strings.TrimPrefix(value, "file:")
-		if _, err := os.Stat(file); err != nil {
+		// By design: the path is the user's own config value, with the
+		// same trust as options.context_paths.
+		if _, err := os.Stat(filepathext.SmartJoin(workingDir, file)); err != nil { // codeql[go/path-injection] by design, see above
 			return fmt.Errorf("%s: prompt file %q does not exist", path, file)
 		}
 		return nil
@@ -860,7 +872,9 @@ var warnedDefinitionFields sync.Map
 // warnUnhonoredFields logs one warning per definition field the runtime
 // parses but does not honor yet, skipping values that merely restate
 // the built-in default so an untouched config starts up silent. #432
-// builds agents from definitions and retires these.
+// honored model, prompt, prompt_append, skills, context paths, tools,
+// MCP, and disabled; what remains waits on the a2a runtime (#392,
+// #434) and dispatch workspace selection.
 func warnUnhonoredFields(id string, def AgentDefinition) {
 	builtin := builtinAgentDefinitions()[id]
 	fields := []struct {
@@ -868,11 +882,6 @@ func warnUnhonoredFields(id string, def AgentDefinition) {
 		isSet bool
 	}{
 		{"runtime", orString(def.Runtime, AgentRuntimeBuiltin) == AgentRuntimeA2A},
-		{"disabled", def.Disabled != nil && *def.Disabled},
-		{"model", def.Model != nil && def.Model.Ref != nil},
-		{"prompt", def.Prompt != nil && (builtin.Prompt == nil || *def.Prompt != *builtin.Prompt)},
-		{"prompt_append", def.PromptAppend != nil},
-		{"skills", def.Skills != nil},
 		{"workspace", def.Workspace != nil && (builtin.Workspace == nil || *def.Workspace != *builtin.Workspace)},
 		{"card", def.Card != nil},
 		{"auth", def.Auth != nil},

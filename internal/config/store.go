@@ -1442,7 +1442,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	var setupErr error
 	// A bad agents block rolls the reload back the same way a failed
 	// model resolution does: nothing from the new config is published.
-	if err := cfg.ValidateAgents(); err != nil {
+	if err := cfg.ValidateAgents(s.workingDir); err != nil {
 		setupErr = fmt.Errorf("invalid agent definitions: %w", err)
 	}
 	if setupErr == nil {

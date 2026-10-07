@@ -330,9 +330,12 @@ func TestBuildDispatchToolchainRootsToolsAtWorkspaceDir(t *testing.T) {
 	// would find this instead.
 	require.NoError(t, os.WriteFile(filepath.Join(env.workingDir, "decoy.md"), []byte("parent notes"), 0o644))
 
-	agentCfg := c.cfg.Config().Agents[config.AgentTask]
-	agentCfg.AllowedTools = []string{tools.GlobToolName, tools.ViewToolName, tools.BashToolName}
-	c.cfg.Config().Agents[config.AgentTask] = agentCfg
+	workerCfg := c.cfg.Config().Agents[config.AgentWorker]
+	// A narrowed worker definition is the dispatched palette (#432):
+	// what the definition allows is what the palette holds — no union
+	// with forced write tools.
+	workerCfg.AllowedTools = []string{tools.GlobToolName, tools.ViewToolName, tools.BashToolName}
+	c.cfg.Config().Agents[config.AgentWorker] = workerCfg
 
 	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
 	require.NoError(t, err)
@@ -343,15 +346,10 @@ func TestBuildDispatchToolchainRootsToolsAtWorkspaceDir(t *testing.T) {
 	for _, tool := range tc.Tools() {
 		byName[tool.Info().Name] = tool
 	}
-	// The task agent's set is widened with the dispatch write tools
-	// (#64): a dispatched agent must be able to produce work, not just
-	// read.
-	for _, name := range dispatchWriteTools {
+	for _, name := range workerCfg.AllowedTools {
 		require.Contains(t, byName, name)
 	}
-	require.Contains(t, byName, tools.GlobToolName)
-	require.Contains(t, byName, tools.ViewToolName)
-	require.Contains(t, byName, tools.BashToolName)
+	require.NotContains(t, byName, tools.EditToolName)
 
 	globResp := runTool(t, byName[tools.GlobToolName], tools.GlobToolName, map[string]any{
 		"pattern": "**/*.md",
@@ -394,15 +392,20 @@ func TestDispatchedFileToolsContained(t *testing.T) {
 	outsideFile := filepath.Join(outsideDir, "parent_owned.go")
 	require.NoError(t, os.WriteFile(outsideFile, []byte("package main"), 0o644))
 
-	agentCfg := c.cfg.Config().Agents[config.AgentTask]
-	agentCfg.AllowedTools = []string{
+	// The worker definition is the dispatched palette (#432): every
+	// file tool under test must be on it.
+	workerCfg := c.cfg.Config().Agents[config.AgentWorker]
+	workerCfg.AllowedTools = []string{
 		tools.ViewToolName,
 		tools.GlobToolName,
 		tools.GrepToolName,
 		tools.LSToolName,
 		tools.DownloadToolName,
+		tools.WriteToolName,
+		tools.EditToolName,
+		tools.MultiEditToolName,
 	}
-	c.cfg.Config().Agents[config.AgentTask] = agentCfg
+	c.cfg.Config().Agents[config.AgentWorker] = workerCfg
 
 	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
 	require.NoError(t, err)
@@ -507,9 +510,9 @@ func TestDispatchedViewRefusesSymlinkEscape(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	agentCfg := c.cfg.Config().Agents[config.AgentTask]
-	agentCfg.AllowedTools = []string{tools.ViewToolName}
-	c.cfg.Config().Agents[config.AgentTask] = agentCfg
+	workerCfg := c.cfg.Config().Agents[config.AgentWorker]
+	workerCfg.AllowedTools = []string{tools.ViewToolName}
+	c.cfg.Config().Agents[config.AgentWorker] = workerCfg
 
 	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
 	require.NoError(t, err)
@@ -649,7 +652,13 @@ func TestDispatchToolchainHonorsDisabledTools(t *testing.T) {
 				require.NotContains(t, got, name, "denied tool %q leaked into the dispatch", name)
 			}
 			if tc.name == "default" {
-				for _, name := range dispatchWriteTools {
+				// The default worker toolset (#432): the definition's
+				// read and write groups plus the support tools.
+				for _, name := range []string{
+					tools.BashToolName, tools.EditToolName, tools.MultiEditToolName,
+					tools.WriteToolName, tools.TodosToolName,
+					tools.JobOutputToolName, tools.JobKillToolName, tools.DiagnosticsToolName,
+				} {
 					require.Contains(t, got, name, "default set lost %q", name)
 				}
 			}

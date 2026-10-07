@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/crush/internal/agent/prompt"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/stretchr/testify/require"
@@ -73,12 +72,10 @@ func TestBuildAgentReadinessSurvivesCallerCancellation(t *testing.T) {
 	mcp.ArmInit()
 	t.Cleanup(mcp.DisarmInit)
 
-	p, err := coderPrompt(prompt.WithWorkingDir(env.workingDir))
-	require.NoError(t, err)
 	agentCfg := cfg.Config().Agents[config.AgentCoder]
 
 	ctx, cancel := context.WithCancel(context.Background())
-	built, err := coord.buildAgent(ctx, p, agentCfg, false)
+	built, err := coord.buildAgent(ctx, agentCfg, false)
 	require.NoError(t, err)
 
 	// The caller goes away, mirroring an HTTP handler returning and canceling
