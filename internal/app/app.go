@@ -93,13 +93,6 @@ type App struct {
 	// instead of guessing from message finish parts.
 	runCompletions *pubsub.Broker[notify.RunComplete]
 
-	// dispatchTodos carries the per-dispatch progress snapshots the
-	// coordinator's todo collector reduces (#65). The App is the
-	// collector's first sink (DispatchTodos) and re-publishes here;
-	// setupEvents fans this broker into app.events so every TUI
-	// receives snapshots as tea.Msgs and renders the agent block.
-	dispatchTodos *pubsub.Broker[dispatch.TodoSnapshot]
-
 	// a2aHost is the process's A2A host, set once when the coder agent
 	// initializes; a2aHostReady is closed then. A UI watching dispatched
 	// agents over A2A (#421) dials the host's agent index through it.
@@ -152,7 +145,6 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 		tuiWG:              &sync.WaitGroup{},
 		agentNotifications: pubsub.NewBroker[notify.Notification](),
 		runCompletions:     pubsub.NewBroker[notify.RunComplete](),
-		dispatchTodos:      pubsub.NewBroker[dispatch.TodoSnapshot](),
 		a2aHostReady:       make(chan struct{}),
 		newCoordinator:     agent.NewCoordinator,
 	}
@@ -698,7 +690,6 @@ func (app *App) setupEvents() {
 	app.subscribeMustDeliver(ctx, "question-notifications", app.Questions.SubscribeNotifications)
 	app.subscribe(ctx, "history", app.History.Subscribe)
 	app.subscribe(ctx, "agent-notifications", app.agentNotifications.Subscribe)
-	app.subscribe(ctx, "dispatch-todos", app.dispatchTodos.Subscribe)
 	app.subscribeMustDeliver(ctx, "run-completions", app.runCompletions.Subscribe)
 	app.subscribe(ctx, "mcp", mcp.SubscribeEvents)
 	app.subscribe(ctx, "lsp", SubscribeLSPEvents)
@@ -776,64 +767,6 @@ func (app *App) InitCoderAgent(ctx context.Context) error {
 	return app.initCoderAgent(ctx, true)
 }
 
-// DispatchTodos implements dispatch.TodoSink (#65): it re-publishes each
-// reduced snapshot onto the dispatchTodos broker, which setupEvents
-// fans into the shared events stream, so every TUI receives it as a
-// tea.Msg and renders the dispatch agent block.
-func (app *App) DispatchTodos(snap dispatch.TodoSnapshot) {
-	app.dispatchTodos.Publish(pubsub.UpdatedEvent, snap)
-}
-
-// DispatchStatus returns the current progress snapshot for the
-// dispatched agent running on sessionID (#65). Delegates to the agent
-// coordinator; ok=false when no dispatch is known for the session.
-func (app *App) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
-	if app.AgentCoordinator == nil {
-		return dispatch.TodoSnapshot{}, false
-	}
-	return app.AgentCoordinator.DispatchStatus(sessionID)
-}
-
-// DispatchLive returns the snapshots of every non-terminal dispatch
-// created from sessionID (#313/#399) — the editor's live-agents @
-// completion source.
-func (app *App) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
-	if app.AgentCoordinator == nil {
-		return nil
-	}
-	return app.AgentCoordinator.DispatchLive(sessionID)
-}
-
-// DispatchByHandle resolves an @handle to its dispatch snapshot (#313),
-// finished dispatches included. A handle another session dispatched does
-// not resolve (#399).
-func (app *App) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
-	if app.AgentCoordinator == nil {
-		return dispatch.TodoSnapshot{}, false
-	}
-	return app.AgentCoordinator.DispatchByHandle(sessionID, handle)
-}
-
-// DeliverAgentMessageByHandle routes an editor @handle message and its
-// attachments (#414) to the running dispatched agent's injection queue
-// (#312/#313). A handle another session dispatched refuses (#399).
-func (app *App) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
-	if app.AgentCoordinator == nil {
-		return errors.New("no agent coordinator")
-	}
-	return app.AgentCoordinator.DeliverAgentMessageByHandle(ctx, sessionID, handle, text, attachments)
-}
-
-// CancelDispatch stops one dispatched agent on demand (#373): the ref
-// resolves through the dispatch registry as a dispatch ID, an @handle,
-// or the dispatched agent's child session ID.
-func (app *App) CancelDispatch(ctx context.Context, ref string) error {
-	if app.AgentCoordinator == nil {
-		return errors.New("no agent coordinator")
-	}
-	return app.AgentCoordinator.CancelDispatch(ctx, ref)
-}
-
 // DeleteSession deletes a session and every descendant session in one
 // transaction (#418). It refuses while a dispatch is still running from
 // the session or from any descendant, because the cascade would delete
@@ -861,7 +794,7 @@ func (app *App) DeleteSession(ctx context.Context, id string) error {
 		queue = next
 	}
 	for _, sessionID := range ids {
-		if len(app.DispatchLive(sessionID)) > 0 {
+		if app.AgentCoordinator != nil && len(app.AgentCoordinator.DispatchLive(sessionID)) > 0 {
 			return errors.New("an agent dispatched from this session is still running; cancel it first")
 		}
 	}
@@ -923,10 +856,6 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		RunComplete: app.runCompletions,
 		Skills:      app.Skills,
 		Interactive: interactive,
-		// #65: the app is the todo collector's first sink, bridging
-		// snapshots to the TUI. #174's A2A TaskStatusUpdateEvent bridge
-		// attaches as a second sink over the same reduction.
-		DispatchSinks: []dispatch.TodoSink{app},
 		// #70: every dispatch is registered on the process-wide A2A host
 		// for in-memory discovery and served over its unix socket. This
 		// is the one execution path (#347): without it dispatches are

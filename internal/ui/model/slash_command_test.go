@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/charmbracelet/crush/internal/dispatch"
-
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/ui/textarea"
 
@@ -28,10 +26,9 @@ type slashCommandWorkspace struct {
 
 func (w *slashCommandWorkspace) AgentIsReady() bool { return w.ready }
 
-// DispatchLive reports no live dispatches: the slash-command stub has no
-// dispatch registry (#313's completion source stays empty in these
-// tests).
-func (w *slashCommandWorkspace) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
+// ListAgentTasks reports no dispatched agents: the slash-command stub has
+// no agent surface (#313's completion source stays empty in these tests).
+func (w *slashCommandWorkspace) ListAgentTasks(sessionID string) []workspace.AgentTask {
 	return nil
 }
 

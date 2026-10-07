@@ -8,8 +8,10 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/ui/chat"
 	"github.com/charmbracelet/crush/internal/ui/completions"
 	"github.com/charmbracelet/crush/internal/ui/util"
+	"github.com/charmbracelet/crush/internal/workspace"
 )
 
 // handleTokenChars are the bytes a @handle token may contain. Deliberately
@@ -139,43 +141,62 @@ func mentionHandles(prompt string) []string {
 
 // AgentCardAttachment renders the agent-card attachment for one mentioned
 // dispatched agent (#313): a live agent gets its status card (handle,
-// status, current todo, session pointer, workspace); a finished agent gets
-// the read-only transcript card (findings and diff summary from the
-// terminal result) so "what did @tester find?" answers without a
-// continuation. Mentioning never routes: the parent turn keeps the text.
-func AgentCardAttachment(snap dispatch.TodoSnapshot) message.Attachment {
-	entry := snap.Entry
+// status, current todo, session pointer); a finished agent gets the
+// read-only transcript card so "what did @tester find?" answers without a
+// continuation. Its findings and diff summary come from terminal, the
+// record the run stamped on the dispatch card's tool result (#410), and
+// when that is not at hand, from the agent's final status text (#421).
+// Mentioning never routes: the parent turn keeps the text.
+func AgentCardAttachment(task workspace.AgentTask, terminal *dispatch.DispatchResult) message.Attachment {
 	var b strings.Builder
-	if entry.Status.IsTerminal() {
+	if task.Status.IsTerminal() {
 		b.WriteString("Read-only agent card (the agent has finished; its session is not continuable — dispatch a new agent to continue this work).\n\n")
 	} else {
 		b.WriteString("Live agent card (address it mid-run with the message_agent tool or by leading your message with @handle).\n\n")
 	}
-	b.WriteString("Handle: @" + entry.Handle + "\n")
-	if entry.Role != "" {
-		b.WriteString("Role: " + entry.Role + "\n")
+	b.WriteString("Handle: @" + task.Handle + "\n")
+	if task.Role != "" {
+		b.WriteString("Role: " + task.Role + "\n")
 	}
-	b.WriteString("Status: " + string(entry.Status) + "\n")
-	if !entry.Status.IsTerminal() && snap.CurrentTodo != "" {
-		b.WriteString("Current todo: " + snap.CurrentTodo + "\n")
+	b.WriteString("Status: " + string(task.Status) + "\n")
+	if !task.Status.IsTerminal() && task.CurrentTodo != "" {
+		b.WriteString("Current todo: " + task.CurrentTodo + "\n")
 	}
-	if entry.SessionID != "" {
-		b.WriteString("Session: " + entry.SessionID + "\n")
+	if task.SessionID != "" {
+		b.WriteString("Session: " + task.SessionID + "\n")
 	}
-	if entry.Result != nil {
-		if entry.Result.KeyFindings != "" {
-			b.WriteString("\nKey findings:\n" + entry.Result.KeyFindings + "\n")
+	switch {
+	case terminal != nil:
+		if terminal.KeyFindings != "" {
+			b.WriteString("\nKey findings:\n" + terminal.KeyFindings + "\n")
 		}
-		if entry.Result.DiffSummary != "" {
-			b.WriteString("\nDiff summary:\n" + entry.Result.DiffSummary + "\n")
+		if terminal.DiffSummary != "" {
+			b.WriteString("\nDiff summary:\n" + terminal.DiffSummary + "\n")
 		}
+	case task.Status.IsTerminal() && task.StatusText != "":
+		b.WriteString("\nFinal status:\n" + task.StatusText + "\n")
 	}
 	return message.Attachment{
-		FileName: "agent-" + entry.Handle + ".md",
+		FileName: "agent-" + task.Handle + ".md",
 		MimeType: "text/markdown",
 		Content:  []byte(b.String()),
 		Kind:     message.AttachmentKindAgentCard,
 	}
+}
+
+// dispatchTerminalResult returns the terminal record the run stamped on
+// the dispatch card for the child session sessionID (#410), when that
+// card is in the loaded transcript.
+func (m *UI) dispatchTerminalResult(sessionID string) *dispatch.DispatchResult {
+	_, toolCallID, ok := m.com.Workspace.ParseAgentToolSessionID(sessionID)
+	if !ok {
+		return nil
+	}
+	block, ok := m.chat.MessageItem(toolCallID).(*chat.DispatchToolMessageItem)
+	if !ok {
+		return nil
+	}
+	return block.TerminalResult()
 }
 
 // agentMentionAttachments builds the agent-card attachments for every
@@ -199,14 +220,14 @@ func (m *UI) agentMentionAttachments(prompt string) []message.Attachment {
 		if seen[slug] {
 			continue
 		}
-		snap, ok := m.com.Workspace.DispatchByHandle(m.currentSessionID(), slug)
+		task, ok := m.com.Workspace.AgentTaskByHandle(m.currentSessionID(), slug)
 		if !ok {
 			// Not a dispatch: a file mention, a typo, or prose. The
 			// normal prompt path handles @file tokens.
 			continue
 		}
 		seen[slug] = true
-		cards = append(cards, AgentCardAttachment(snap))
+		cards = append(cards, AgentCardAttachment(task, m.dispatchTerminalResult(task.SessionID)))
 	}
 	return cards
 }
@@ -230,7 +251,7 @@ func (m *UI) routeLeadingAgentHandle(prompt string, attachments []message.Attach
 	// Handles are stored slugged; resolve through the slug so the user's
 	// casing never matters, exactly like the message_agent tool path.
 	handle = dispatch.HandleSlug(handle)
-	snap, found := m.com.Workspace.DispatchByHandle(m.currentSessionID(), handle)
+	task, found := m.com.Workspace.AgentTaskByHandle(m.currentSessionID(), handle)
 	if !found {
 		// Not a dispatch handle: most likely a file mention, an unknown
 		// bare token, or a typo. The normal prompt path owns it, whatever
@@ -240,10 +261,10 @@ func (m *UI) routeLeadingAgentHandle(prompt string, attachments []message.Attach
 	if rest == "" {
 		return util.ReportWarn("Nothing to send @handle — write the message after the handle, e.g. \"@" + handle + " stop writing Rust\"."), true, false
 	}
-	if snap.Entry.Status.IsTerminal() {
-		return util.ReportError(fmt.Errorf("agent @%s finished (%s); task sessions are never continuable — dispatch a new agent instead", handle, snap.Entry.Status)), true, false
+	if task.Terminal() {
+		return util.ReportError(fmt.Errorf("agent @%s finished (%s); task sessions are never continuable — dispatch a new agent instead", handle, task.Status)), true, false
 	}
-	if err := m.com.Workspace.DeliverAgentMessageByHandle(context.Background(), m.currentSessionID(), handle, rest, attachments); err != nil {
+	if err := m.com.Workspace.SendAgentMessage(context.Background(), m.currentSessionID(), handle, rest, attachments); err != nil {
 		return util.ReportError(err), true, false
 	}
 	// The steer and the agent's response appear on its dispatch block in
@@ -256,25 +277,25 @@ func (m *UI) routeLeadingAgentHandle(prompt string, attachments []message.Attach
 // completions (#313): handle, and a "role · status · current todo" detail
 // with a status dot. Live agents only — finished handles never appear.
 func (m *UI) agentCompletionValues() []completions.AgentCompletionValue {
-	live := m.com.Workspace.DispatchLive(m.currentSessionID())
-	if len(live) == 0 {
+	tasks := m.com.Workspace.ListAgentTasks(m.currentSessionID())
+	if len(tasks) == 0 {
 		return nil
 	}
-	out := make([]completions.AgentCompletionValue, 0, len(live))
-	for _, snap := range live {
-		if snap.Entry.Handle == "" {
+	out := make([]completions.AgentCompletionValue, 0, len(tasks))
+	for _, task := range tasks {
+		if task.Handle == "" || task.Terminal() {
 			continue
 		}
 		var parts []string
-		if snap.Entry.Role != "" {
-			parts = append(parts, snap.Entry.Role)
+		if task.Role != "" {
+			parts = append(parts, task.Role)
 		}
-		parts = append(parts, dispatchStateDot(snap.Entry.Status), completionStateLabel(snap.Entry.Status))
-		if snap.CurrentTodo != "" {
-			parts = append(parts, snap.CurrentTodo)
+		parts = append(parts, dispatchStateDot(task.Status), completionStateLabel(task.Status))
+		if task.CurrentTodo != "" {
+			parts = append(parts, task.CurrentTodo)
 		}
 		out = append(out, completions.AgentCompletionValue{
-			Handle: snap.Entry.Handle,
+			Handle: task.Handle,
 			Detail: strings.Join(parts, " · "),
 		})
 	}

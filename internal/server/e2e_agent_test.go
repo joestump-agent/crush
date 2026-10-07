@@ -215,10 +215,6 @@ func (c *scriptedCoordinator) CancelAll() {
 	}
 }
 
-func (c *scriptedCoordinator) CancelDispatch(context.Context, string) error {
-	return errors.New("not implemented")
-}
-
 func (c *scriptedCoordinator) IsBusy() bool                                  { return false }
 func (c *scriptedCoordinator) IsSessionBusy(string) bool                     { return false }
 func (c *scriptedCoordinator) QueuedPrompts(string) int                      { return 0 }
@@ -751,22 +747,10 @@ func TestE2E_CancelOfActiveRunAlsoCancelsAcceptedFollowUp(t *testing.T) {
 	require.False(t, gotEnd, "the accepted follow-up must not stream model output after the cancel")
 }
 
-func (c *scriptedCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
-	return dispatch.TodoSnapshot{}, false
-}
-
 func (c *scriptedCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
 	return errors.New("not implemented")
 }
 
 func (c *scriptedCoordinator) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	return nil
-}
-
-func (c *scriptedCoordinator) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
-	return dispatch.TodoSnapshot{}, false
-}
-
-func (c *scriptedCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
-	return errors.New("not implemented")
 }

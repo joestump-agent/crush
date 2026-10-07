@@ -28,9 +28,11 @@ A2A message on the running context
 ([#351](https://github.com/joestump-agent/crush/issues/351)), and a
 dispatched agent's question pauses its task in `input-required` until the
 answer arrives on the same task
-([#352](https://github.com/joestump-agent/crush/issues/352));
-permissions, kill, progress to the UI and result delivery still happen
-in-process, outside the protocol.
+([#352](https://github.com/joestump-agent/crush/issues/352)). The TUI
+follows, steers and cancels agents through the host's agent index and the
+protocol ([#421](https://github.com/joestump-agent/crush/issues/421));
+permissions, kill and result delivery still happen in-process, outside the
+protocol.
 
 ## The pieces
 
@@ -49,10 +51,13 @@ in-process, outside the protocol.
    ^                          |
    | SSE events               | session saves (todos, usage)
    |                          v
- A2A client             Todo collector --+--> app broker --> agent block (TUI)
-   |                                     +--> Executor (Working events)
+ A2A client             Todo collector -----> Executor (Working events)
+   |
    v
  DispatchResult --> hidden follow-up turn on the parent session
+
+ A2A host agent index (GET /agents: task state, todos, usage)
+   ---> workspace agent surface ---> agent block, @handle, cancel (TUI)
 
  Outside the protocol (direct Go calls):
    @handle / message_agent ---> injection queue ---> SessionAgent.EnqueueWhenBusy
@@ -63,18 +68,18 @@ in-process, outside the protocol.
 | Component | Source | Role |
 | --- | --- | --- |
 | Coordinator | [`internal/agent/dispatch_tool.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch_tool.go) | Implements the `dispatch_agent` tool and owns each run's lifecycle. |
-| Workspace and dispatch registry | [`internal/dispatch/workspace.go`](https://github.com/joestump-agent/crush/blob/main/internal/dispatch/workspace.go) | Creates and diffs worktrees, and keeps the one in-memory registry that handles, discovery and the UI read. |
+| Workspace and dispatch registry | [`internal/dispatch/workspace.go`](https://github.com/joestump-agent/crush/blob/main/internal/dispatch/workspace.go) | Creates and diffs worktrees, and keeps the one in-memory registry that handles and discovery read. |
 | Dispatch toolchain | [`internal/agent/dispatch.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch.go) | Builds worktree-rooted tools, scoped config, LSP and permissions, plus the permission bridge. |
 | A2A server and card | [`internal/a2a/server.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/server.go), [`agentcard.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/agentcard.go) | One JSON-RPC host per process on a `0600` unix socket; routes `/agents/<dispatch id>` per dispatch. |
 | Executor | [`internal/a2a/executor.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/executor.go) | Maps one `SessionAgent.Run` onto A2A task states and events. |
 | A2A client | [`internal/a2a/client.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/client.go), [`internal/agent/dispatch_a2a.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch_a2a.go) | Sends the prompt and consumes the stream to a terminal state. |
 | Injection queue | [`internal/agent/dispatch_inject.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch_inject.go) | Delivers mid-run messages to a running dispatch. |
-| Todo collector | [`internal/dispatch/todo.go`](https://github.com/joestump-agent/crush/blob/main/internal/dispatch/todo.go) | Reduces session saves and registry events into progress snapshots. |
+| Todo collector | [`internal/dispatch/todo.go`](https://github.com/joestump-agent/crush/blob/main/internal/dispatch/todo.go) | Reduces session saves and registry events into progress snapshots for the executor. |
+| Agent surface | [`internal/a2a/agents_index.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/agents_index.go), [`internal/workspace/agent_task_watcher.go`](https://github.com/joestump-agent/crush/blob/main/internal/workspace/agent_task_watcher.go) | Lists the host's dispatches and follows their tasks; the TUI reads, steers and cancels through it, in process or through the server ([#421](https://github.com/joestump-agent/crush/issues/421)). |
 | Nudge ladder and wander kill | [`internal/agent/todo_enforcement.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/todo_enforcement.go), `dispatch_tool.go` | Enforces todos and cancels runaway runs. |
 | Result payload | [`internal/dispatch/result.go`](https://github.com/joestump-agent/crush/blob/main/internal/dispatch/result.go) | Defines the `DispatchResult` JSON the main agent reads. |
 
-The app wires the A2A server factory and the UI sink into the coordinator
-at startup ([`internal/app/app.go`](https://github.com/joestump-agent/crush/blob/main/internal/app/app.go)).
+The app wires the A2A server factory into the coordinator at startup ([`internal/app/app.go`](https://github.com/joestump-agent/crush/blob/main/internal/app/app.go)).
 `dispatch_agent` and `message_agent` are registered only for top-level
 agents. Sub-agents and dispatched agents get neither, so delegation is one
 level deep.

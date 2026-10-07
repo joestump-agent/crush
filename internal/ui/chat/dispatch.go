@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/ui/styles"
+	"github.com/charmbracelet/crush/internal/workspace"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -20,11 +21,11 @@ import (
 // Dispatch Agent Tool
 // -----------------------------------------------------------------------------
 
-// DispatchSnapshotSetter is implemented by the dispatch agent block; the
-// UI model feeds it live snapshots from the dispatch-todos event stream
-// (#65).
-type DispatchSnapshotSetter interface {
-	SetDispatchSnapshot(snap dispatch.TodoSnapshot)
+// AgentTaskSetter is implemented by the dispatch agent block; the UI
+// model feeds it the dispatched agent's live state from the workspace's
+// agent surface (#65, #421).
+type AgentTaskSetter interface {
+	SetAgentTask(task workspace.AgentTask)
 }
 
 // DispatchToolMessageItem is the agent block for a dispatch_agent tool
@@ -38,12 +39,14 @@ type DispatchToolMessageItem struct {
 	*baseToolMessageItem
 
 	nestedTools []ToolMessageItem
-	// snapshot is the latest collector snapshot; nil until one arrives.
-	snapshot *dispatch.TodoSnapshot
+	// task is the dispatched agent's latest live state from the agent
+	// surface (#421); nil until one arrives.
+	task *workspace.AgentTask
 	// fallback is the dispatch state parsed from the persisted tool
-	// result (the running handle) when no live snapshot has arrived —
-	// a reloaded session, client/server mode, or a dispatch from an
-	// earlier process. Its state is static by definition.
+	// result: the running handle, or the terminal result the run stamps
+	// on it when it ends (#410). With no live state — a dispatch from an
+	// earlier process — the running handle is static by definition; a
+	// terminal result is the durable record either way.
 	fallback *dispatch.DispatchResult
 	// steers records the mid-run messages injected into the running
 	// agent (#312) and the agent's latest reply to each, as observed on
@@ -69,9 +72,9 @@ type dispatchSteer struct {
 }
 
 var (
-	_ ToolMessageItem        = (*DispatchToolMessageItem)(nil)
-	_ NestedToolContainer    = (*DispatchToolMessageItem)(nil)
-	_ DispatchSnapshotSetter = (*DispatchToolMessageItem)(nil)
+	_ ToolMessageItem     = (*DispatchToolMessageItem)(nil)
+	_ NestedToolContainer = (*DispatchToolMessageItem)(nil)
+	_ AgentTaskSetter     = (*DispatchToolMessageItem)(nil)
 )
 
 // NewDispatchToolMessageItem creates a new [DispatchToolMessageItem].
@@ -110,20 +113,20 @@ func (d *DispatchToolMessageItem) SetResult(res *message.ToolResult) {
 	d.fallback = parseDispatchResult(res)
 }
 
-// SetDispatchSnapshot stores the latest collector snapshot (#65) and
-// bumps the item so the card re-renders.
-func (d *DispatchToolMessageItem) SetDispatchSnapshot(snap dispatch.TodoSnapshot) {
-	d.snapshot = &snap
+// SetAgentTask stores the dispatched agent's latest live state (#65,
+// #421) and bumps the item so the card re-renders.
+func (d *DispatchToolMessageItem) SetAgentTask(task workspace.AgentTask) {
+	d.task = &task
 	d.clearCache()
 	d.Bump()
 }
 
 // DispatchSessionID returns the dispatched agent's task session ID —
-// live from the snapshot, else from the persisted handle — which the UI
-// uses to seed the card from the registry on session load.
+// live from the agent surface, else from the persisted handle — which
+// the UI uses to seed the card on session load.
 func (d *DispatchToolMessageItem) DispatchSessionID() string {
-	if d.snapshot != nil {
-		return d.snapshot.Entry.SessionID
+	if d.task != nil {
+		return d.task.SessionID
 	}
 	if d.fallback != nil {
 		return d.fallback.SessionID
@@ -180,14 +183,17 @@ func (d *DispatchToolMessageItem) AddNestedTool(tool ToolMessageItem) {
 	d.Bump()
 }
 
-// dispatchStatus resolves the dispatch lifecycle state to render: live
-// from the collector snapshot, else the state recorded in the persisted
-// running handle, else queued while the tool call is still open. live
-// reports whether the state comes from the registry and can still
-// change.
+// dispatchStatus resolves the dispatch lifecycle state to render: the
+// terminal result stamped on the persisted tool result, which is final;
+// else the live state from the agent surface; else the state recorded in
+// the persisted running handle; else queued while the tool call is still
+// open. live reports whether the state can still change.
 func (d *DispatchToolMessageItem) dispatchStatus() (dispatch.Status, bool) {
-	if d.snapshot != nil {
-		return d.snapshot.Entry.Status, true
+	if d.fallback != nil && isTerminalDispatchStatus(d.fallback.Status) {
+		return d.fallback.Status, false
+	}
+	if d.task != nil {
+		return d.task.Status, !d.task.Terminal()
 	}
 	if d.fallback != nil {
 		return d.fallback.Status, false
@@ -197,12 +203,10 @@ func (d *DispatchToolMessageItem) dispatchStatus() (dispatch.Status, bool) {
 
 // IsLive reports whether the dispatched agent is believed to be running
 // right now, judged from in-memory state only so the UI can enumerate
-// live agents without probing the workspace (#314): a registry snapshot
-// that has not reached a terminal state, or a tool call that has not
-// returned its running handle yet. A card seeded only from its persisted
-// handle is static by definition and never reports live: the run may
-// have ended, and in client/server mode the registry lives in another
-// process.
+// live agents without probing the workspace (#314): live state that has
+// not reached a terminal state, or a tool call that has not returned its
+// running handle yet. A card seeded only from its persisted handle is
+// static by definition and never reports live: the run may have ended.
 func (d *DispatchToolMessageItem) IsLive() bool {
 	status, live := d.dispatchStatus()
 	if !live {
@@ -211,13 +215,11 @@ func (d *DispatchToolMessageItem) IsLive() bool {
 	return !isTerminalDispatchStatus(status)
 }
 
-// terminalResult returns the terminal DispatchResult to render as the
-// durable record, from the registry snapshot or, failing that, the
-// persisted handle.
-func (d *DispatchToolMessageItem) terminalResult() *dispatch.DispatchResult {
-	if d.snapshot != nil && isTerminalDispatchStatus(d.snapshot.Entry.Status) {
-		return d.snapshot.Entry.Result
-	}
+// TerminalResult returns the terminal DispatchResult to render as the
+// durable record: the one the run stamps on the persisted tool result
+// when it ends (#410). Nil until it lands, even when the live state has
+// already gone terminal.
+func (d *DispatchToolMessageItem) TerminalResult() *dispatch.DispatchResult {
 	if d.fallback != nil && isTerminalDispatchStatus(d.fallback.Status) {
 		return d.fallback
 	}
@@ -292,13 +294,13 @@ func (d *DispatchToolMessageItem) RebuildSteers(msgs []message.Message) {
 }
 
 // elapsed returns the dispatch's run time: FinishedAt - StartedAt once
-// terminal, time since start while running. Timestamps live on the
-// registry entry, so a stale fallback state has none.
+// terminal, time since start while running. Timestamps come with the
+// live state, so a stale fallback state has none.
 func (d *DispatchToolMessageItem) elapsed() (time.Duration, bool) {
-	if d.snapshot == nil {
+	if d.task == nil {
 		return 0, false
 	}
-	start, end := d.snapshot.Entry.StartedAt, d.snapshot.Entry.FinishedAt
+	start, end := d.task.StartedAt, d.task.FinishedAt
 	if start.IsZero() {
 		return 0, false
 	}
@@ -431,7 +433,7 @@ type DispatchToolRenderContext struct {
 func (r *DispatchToolRenderContext) RenderTool(sty *styles.Styles, width int, opts *ToolRenderOpts) string {
 	cappedWidth := cappedMessageWidth(width)
 	d := r.dispatch
-	if opts.IsPending() && d.snapshot == nil {
+	if opts.IsPending() && d.task == nil {
 		return pendingTool(sty, "Dispatch", opts.Anim, opts.Compact)
 	}
 
@@ -494,7 +496,7 @@ func (r *DispatchToolRenderContext) RenderTool(sty *styles.Styles, width int, op
 	// result's findings and diff stat. It never clears or collapses;
 	// drill-in is #314's job, so the body expands with the item's
 	// existing expand toggle.
-	if terminal := d.terminalResult(); terminal != nil {
+	if terminal := d.TerminalResult(); terminal != nil {
 		body := renderDispatchTerminal(sty, terminal, cappedWidth-toolBodyLeftPaddingTotal, opts.ExpandedContent)
 		return joinToolParts(result, body)
 	}
@@ -507,7 +509,7 @@ func (r *DispatchToolRenderContext) RenderTool(sty *styles.Styles, width int, op
 // dispatch state is known.
 func (d *DispatchToolMessageItem) statusParams() []string {
 	status, _ := d.dispatchStatus()
-	if d.snapshot == nil && d.fallback == nil {
+	if d.task == nil && d.fallback == nil {
 		return nil
 	}
 	var parts []string
@@ -515,7 +517,7 @@ func (d *DispatchToolMessageItem) statusParams() []string {
 		parts = append(parts, handle)
 	}
 	killedReason := ""
-	if terminal := d.terminalResult(); terminal != nil {
+	if terminal := d.TerminalResult(); terminal != nil {
 		killedReason = terminal.KilledReason
 	}
 	parts = append(parts, dispatchStateLabel(status, killedReason))
@@ -525,18 +527,18 @@ func (d *DispatchToolMessageItem) statusParams() []string {
 	if tokens := d.totalTokens(); tokens > 0 {
 		parts = append(parts, formatDispatchTokens(tokens)+" tokens")
 	}
-	if d.snapshot != nil && d.snapshot.TodoTotal > 0 {
-		parts = append(parts, fmt.Sprintf("%d/%d todos", d.snapshot.TodoCompleted, d.snapshot.TodoTotal))
+	if d.task != nil && d.task.TodoTotal > 0 {
+		parts = append(parts, fmt.Sprintf("%d/%d todos", d.task.TodoCompleted, d.task.TodoTotal))
 	}
 	return []string{strings.Join(parts, " · ")}
 }
 
 // handleLabel returns the dispatch's @handle for the status line;
-// handles are assigned at dispatch (#313). The live snapshot is
+// handles are assigned at dispatch (#313). The live state is
 // authoritative; a reloaded session falls back to the persisted handle.
 func (d *DispatchToolMessageItem) handleLabel() string {
-	if d.snapshot != nil {
-		return d.snapshot.Entry.Handle
+	if d.task != nil && d.task.Handle != "" {
+		return d.task.Handle
 	}
 	if d.fallback != nil {
 		return d.fallback.Handle
@@ -546,20 +548,20 @@ func (d *DispatchToolMessageItem) handleLabel() string {
 
 // totalTokens returns the dispatched session's token usage so far.
 func (d *DispatchToolMessageItem) totalTokens() int64 {
-	if d.snapshot == nil {
+	if d.task == nil {
 		return 0
 	}
-	return d.snapshot.PromptTokens + d.snapshot.CompletionTokens
+	return d.task.PromptTokens + d.task.CompletionTokens
 }
 
 // activityLine renders the dispatched agent's current todo as the
 // one-line activity, using the todo list's idiom. Only a live
 // non-terminal dispatch has a meaningful current todo.
 func (d *DispatchToolMessageItem) activityLine(sty *styles.Styles, width int) string {
-	if d.snapshot == nil || d.snapshot.CurrentTodo == "" || isTerminalDispatchStatus(d.snapshot.Entry.Status) {
+	if d.task == nil || d.task.CurrentTodo == "" || d.task.Terminal() {
 		return ""
 	}
-	text := ansi.Truncate(d.snapshot.CurrentTodo, width-2, "…")
+	text := ansi.Truncate(d.task.CurrentTodo, width-2, "…")
 	return sty.Tool.TodoInProgressIcon.Render(styles.ArrowRightIcon+" ") +
 		sty.Tool.TodoJustStarted.Render(text)
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/ui/anim"
 	"github.com/charmbracelet/crush/internal/ui/styles"
+	"github.com/charmbracelet/crush/internal/workspace"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/exp/golden"
 	"github.com/stretchr/testify/require"
@@ -73,23 +74,33 @@ func runningHandle(t *testing.T, status dispatch.Status) *message.ToolResult {
 	return &message.ToolResult{ToolCallID: "call-dispatch-1", Content: string(b)}
 }
 
-// The live card composes from a collector snapshot: state, elapsed,
-// tokens, todo ratio, and the current todo as the one-line activity,
-// next to the dispatched task.
-func TestDispatchCardRendersLiveSnapshot(t *testing.T) {
+// terminalStamp is the persisted tool result once the run has stamped
+// its terminal DispatchResult into Metadata (#410): the running handle
+// stays in Content.
+func terminalStamp(t *testing.T, terminal dispatch.DispatchResult) *message.ToolResult {
+	t.Helper()
+	b, err := json.Marshal(terminal)
+	require.NoError(t, err)
+	result := runningHandle(t, dispatch.StatusRunning)
+	result.Metadata = string(b)
+	return result
+}
+
+// The live card composes from the agent's live state (#421): state,
+// elapsed, tokens, todo ratio, and the current todo as the one-line
+// activity, next to the dispatched task.
+func TestDispatchCardRendersLiveState(t *testing.T) {
 	t.Parallel()
 
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
-	// Pin the clock 30s past the snapshot's start so the elapsed
+	// Pin the clock 30s past the agent's start so the elapsed
 	// assertion is deterministic (#428).
 	item.now = func() time.Time { return fixedTestTime.Add(30 * time.Second) }
-	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
-		Entry: dispatch.Entry{
-			ID:        "dispatch-1",
-			SessionID: "msg$$call-dispatch-1",
-			Status:    dispatch.StatusRunning,
-			StartedAt: fixedTestTime,
-		},
+	item.SetAgentTask(workspace.AgentTask{
+		DispatchID:       "dispatch-1",
+		SessionID:        "msg$$call-dispatch-1",
+		Status:           dispatch.StatusRunning,
+		StartedAt:        fixedTestTime,
 		CurrentTodo:      "wiring up form validation",
 		TodoCompleted:    1,
 		TodoTotal:        3,
@@ -114,12 +125,10 @@ func TestDispatchCardRendersQueuedState(t *testing.T) {
 	t.Parallel()
 
 	item := newDispatchItem(t, nil)
-	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
-		Entry: dispatch.Entry{
-			ID:        "dispatch-1",
-			SessionID: "msg$$call-dispatch-1",
-			Status:    dispatch.StatusProvisioned,
-		},
+	item.SetAgentTask(workspace.AgentTask{
+		DispatchID: "dispatch-1",
+		SessionID:  "msg$$call-dispatch-1",
+		Status:     dispatch.StatusProvisioned,
 	})
 
 	out := dispatchTestRender(t, item, dispatchToolOpts(nil, true))
@@ -128,32 +137,35 @@ func TestDispatchCardRendersQueuedState(t *testing.T) {
 }
 
 // On completion the block stays as the durable record: the findings
-// summary and the diff stat from the terminal DispatchResult, and no
-// spinner.
+// summary and the diff stat from the terminal DispatchResult the run
+// stamps on the tool result (#410), and no spinner. The live state ends
+// the card first; the record fills in when the stamp lands.
 func TestDispatchCardCompletionIsDurable(t *testing.T) {
 	t.Parallel()
 
 	started := fixedTestTime
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
-	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
-		Entry: dispatch.Entry{
-			ID:         "dispatch-1",
-			SessionID:  "msg$$call-dispatch-1",
-			Status:     dispatch.StatusCompleted,
-			StartedAt:  started,
-			FinishedAt: started.Add(74 * time.Second),
-			Result: &dispatch.DispatchResult{
-				DispatchID:  "dispatch-1",
-				Status:      dispatch.StatusCompleted,
-				KeyFindings: "Added validation and two tests.",
-				DiffSummary: "internal/ui/login.go | +12 -3\n\n+func validate()",
-			},
-		},
+	item.SetAgentTask(workspace.AgentTask{
+		DispatchID:    "dispatch-1",
+		SessionID:     "msg$$call-dispatch-1",
+		Status:        dispatch.StatusCompleted,
+		StartedAt:     started,
+		FinishedAt:    started.Add(74 * time.Second),
 		TodoCompleted: 3,
 		TodoTotal:     3,
 	})
-
 	out := dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), false))
+	require.Contains(t, out, "complete", "the live state ends the card before the stamp lands")
+	require.False(t, item.Spinning())
+
+	stamp := terminalStamp(t, dispatch.DispatchResult{
+		DispatchID:  "dispatch-1",
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "Added validation and two tests.",
+		DiffSummary: "internal/ui/login.go | +12 -3\n\n+func validate()",
+	})
+	item.SetResult(stamp)
+	out = dispatchTestRender(t, item, dispatchToolOpts(stamp, false))
 
 	require.Contains(t, out, "complete")
 	require.Contains(t, out, "1m14s")
@@ -167,17 +179,15 @@ func TestDispatchCardFailureShowsError(t *testing.T) {
 	t.Parallel()
 
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
-	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
-		Entry: dispatch.Entry{
-			ID:        "dispatch-1",
-			SessionID: "msg$$call-dispatch-1",
-			Status:    dispatch.StatusFailed,
-			Result: &dispatch.DispatchResult{
-				Status: dispatch.StatusFailed,
-				Error:  "provider timeout",
-			},
-		},
+	item.SetAgentTask(workspace.AgentTask{
+		DispatchID: "dispatch-1",
+		SessionID:  "msg$$call-dispatch-1",
+		Status:     dispatch.StatusFailed,
 	})
+	item.SetResult(terminalStamp(t, dispatch.DispatchResult{
+		Status: dispatch.StatusFailed,
+		Error:  "provider timeout",
+	}))
 
 	out := dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), false))
 	require.Contains(t, out, "failed")
@@ -229,6 +239,25 @@ func TestDispatchCardPrefersTerminalMetadata(t *testing.T) {
 	require.Equal(t, "msg$$call-dispatch-1", item.DispatchSessionID())
 }
 
+// The stamped terminal record is final: it wins over live state that
+// disagrees — a gone host's agent the surface can only mark failed
+// (#421) — and nothing advances the card after it.
+func TestDispatchCardTerminalStampWinsOverLiveState(t *testing.T) {
+	t.Parallel()
+
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	item.SetAgentTask(workspace.AgentTask{DispatchID: "dispatch-1", SessionID: "msg$$call-dispatch-1", Status: dispatch.StatusFailed})
+	stamp := terminalStamp(t, dispatch.DispatchResult{
+		DispatchID: "dispatch-1", Status: dispatch.StatusCompleted, KeyFindings: "Added validation.",
+	})
+	item.SetResult(stamp)
+
+	out := dispatchTestRender(t, item, dispatchToolOpts(stamp, false))
+	require.Contains(t, out, "complete")
+	require.NotContains(t, out, "failed")
+	require.False(t, item.IsLive())
+}
+
 // A result arriving live re-parses the handle.
 func TestDispatchCardSetResultReparsesHandle(t *testing.T) {
 	t.Parallel()
@@ -273,12 +302,10 @@ func TestDispatchCardRendersSteerConversation(t *testing.T) {
 	t.Parallel()
 
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
-	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
-		Entry: dispatch.Entry{
-			ID:        "dispatch-1",
-			SessionID: "msg$$call-dispatch-1",
-			Status:    dispatch.StatusRunning,
-		},
+	item.SetAgentTask(workspace.AgentTask{
+		DispatchID: "dispatch-1",
+		SessionID:  "msg$$call-dispatch-1",
+		Status:     dispatch.StatusRunning,
 	})
 
 	item.AddSteer("stop writing Rust and use Go")
@@ -367,17 +394,15 @@ func TestDispatchCardKeepsSteersOnCompletion(t *testing.T) {
 	t.Parallel()
 
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
-	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
-		Entry: dispatch.Entry{
-			ID:        "dispatch-1",
-			SessionID: "msg$$call-dispatch-1",
-			Status:    dispatch.StatusCompleted,
-			Result: &dispatch.DispatchResult{
-				Status:      dispatch.StatusCompleted,
-				KeyFindings: "Switched to Go.",
-			},
-		},
+	item.SetAgentTask(workspace.AgentTask{
+		DispatchID: "dispatch-1",
+		SessionID:  "msg$$call-dispatch-1",
+		Status:     dispatch.StatusCompleted,
 	})
+	item.SetResult(terminalStamp(t, dispatch.DispatchResult{
+		Status:      dispatch.StatusCompleted,
+		KeyFindings: "Switched to Go.",
+	}))
 	item.AddSteer("stop writing Rust")
 	item.UpdateSteerAnswer("assistant-1", "switched")
 
@@ -395,8 +420,8 @@ func TestDispatchCardSteerAnswerWithoutSteer(t *testing.T) {
 	require.Empty(t, item.Steers())
 }
 
-// The status line shows the @handle (#313): from the live snapshot when
-// one has arrived, else from the persisted running handle.
+// The status line shows the @handle (#313): from the live state when it
+// has arrived, else from the persisted running handle.
 func TestDispatchCardShowsHandle(t *testing.T) {
 	t.Parallel()
 
@@ -410,11 +435,9 @@ func TestDispatchCardShowsHandle(t *testing.T) {
 	out := dispatchTestRender(t, item, dispatchToolOpts(result, false))
 	require.Contains(t, out, "tester")
 
-	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
-		Entry: dispatch.Entry{ID: "dispatch-1", SessionID: "msg$$call-dispatch-1", Handle: "tester-2", Status: dispatch.StatusRunning},
-	})
+	item.SetAgentTask(workspace.AgentTask{DispatchID: "dispatch-1", SessionID: "msg$$call-dispatch-1", Handle: "tester-2", Status: dispatch.StatusRunning})
 	out = dispatchTestRender(t, item, dispatchToolOpts(result, false))
-	require.Contains(t, out, "tester-2", "the live snapshot's handle wins over the persisted one")
+	require.Contains(t, out, "tester-2", "the live state's handle wins over the persisted one")
 }
 
 // The card label distinguishes a user cancel (#373) from the other kill
@@ -477,18 +500,16 @@ func TestDispatchCardCanceledLabel(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
 			item.now = func() time.Time { return fixedTestTime.Add(30 * time.Second) }
-			item.SetDispatchSnapshot(dispatch.TodoSnapshot{
-				Entry: dispatch.Entry{
-					ID:        "dispatch-1",
-					SessionID: "msg$$call-dispatch-1",
-					Status:    dispatch.StatusKilled,
-					StartedAt: fixedTestTime,
-					Result: &dispatch.DispatchResult{
-						Status:       dispatch.StatusKilled,
-						KilledReason: tt.killedReason,
-					},
-				},
+			item.SetAgentTask(workspace.AgentTask{
+				DispatchID: "dispatch-1",
+				SessionID:  "msg$$call-dispatch-1",
+				Status:     dispatch.StatusKilled,
+				StartedAt:  fixedTestTime,
 			})
+			item.SetResult(terminalStamp(t, dispatch.DispatchResult{
+				Status:       dispatch.StatusKilled,
+				KilledReason: tt.killedReason,
+			}))
 			out := dispatchTestRender(t, item, dispatchToolOpts(nil, false))
 			require.Contains(t, out, tt.want)
 		})
@@ -500,12 +521,10 @@ func TestDispatchCardCanceledLabel(t *testing.T) {
 func newSteerCard(t *testing.T, steerText string, expanded bool) *DispatchToolMessageItem {
 	t.Helper()
 	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
-	item.SetDispatchSnapshot(dispatch.TodoSnapshot{
-		Entry: dispatch.Entry{
-			ID:        "dispatch-1",
-			SessionID: "msg$$call-dispatch-1",
-			Status:    dispatch.StatusRunning,
-		},
+	item.SetAgentTask(workspace.AgentTask{
+		DispatchID: "dispatch-1",
+		SessionID:  "msg$$call-dispatch-1",
+		Status:     dispatch.StatusRunning,
 	})
 	item.AddSteer(steerText)
 	if expanded {

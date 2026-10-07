@@ -76,10 +76,7 @@ func (s *runCoordinator) BeginAccepted(sessionID string) *agent.AcceptedRun {
 }
 func (s *runCoordinator) Cancel(string) {}
 func (s *runCoordinator) CancelAll()    {}
-func (s *runCoordinator) CancelDispatch(context.Context, string) error {
-	return errors.New("not implemented")
-}
-func (s *runCoordinator) IsBusy() bool { return s.busy }
+func (s *runCoordinator) IsBusy() bool  { return s.busy }
 func (s *runCoordinator) IsSessionBusy(string) bool {
 	return false
 }
@@ -242,22 +239,10 @@ func TestPostAgent_DetachesRequestContext(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
-func (s *runCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
-	return dispatch.TodoSnapshot{}, false
-}
-
 func (s *runCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
 	return errors.New("not implemented")
 }
 
 func (s *runCoordinator) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	return nil
-}
-
-func (s *runCoordinator) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
-	return dispatch.TodoSnapshot{}, false
-}
-
-func (s *runCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
-	return errors.New("not implemented")
 }

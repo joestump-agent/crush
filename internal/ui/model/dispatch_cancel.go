@@ -49,9 +49,9 @@ func (m *UI) focusedLiveDispatchSessionID() string {
 // cancelDispatchAgent kills the dispatched agent behind the given child
 // session ID (#373) and reports the outcome the way the parent agent
 // reports: errors surface as error toasts, success as an info toast. The
-// card itself flips to "canceled" when the registry snapshot lands.
+// card itself flips to "canceled" when the agent surface reports it.
 func (m *UI) cancelDispatchAgent(sessionID string) tea.Cmd {
-	if err := m.com.Workspace.CancelDispatch(context.Background(), sessionID); err != nil {
+	if err := m.com.Workspace.CancelAgentTask(context.Background(), sessionID); err != nil {
 		return util.ReportError(err)
 	}
 	return util.ReportInfo(fmt.Sprintf("Canceling dispatched agent %s", sessionID))

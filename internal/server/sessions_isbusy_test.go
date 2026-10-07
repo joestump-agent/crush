@@ -42,10 +42,7 @@ func (s *stubCoordinator) BeginAccepted(sessionID string) *agent.AcceptedRun {
 }
 func (s *stubCoordinator) Cancel(string) {}
 func (s *stubCoordinator) CancelAll()    {}
-func (s *stubCoordinator) CancelDispatch(context.Context, string) error {
-	return errors.New("not implemented")
-}
-func (s *stubCoordinator) IsBusy() bool { return false }
+func (s *stubCoordinator) IsBusy() bool  { return false }
 func (s *stubCoordinator) IsSessionBusy(id string) bool {
 	return s.busy[id]
 }
@@ -345,22 +342,10 @@ func TestSessionGetIncludesAttachedClients(t *testing.T) {
 	require.Equal(t, 1, got.AttachedClients)
 }
 
-func (s *stubCoordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
-	return dispatch.TodoSnapshot{}, false
-}
-
 func (s *stubCoordinator) DeliverAgentMessage(ctx context.Context, msg agent.AgentMessage) error {
 	return errors.New("not implemented")
 }
 
 func (s *stubCoordinator) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
 	return nil
-}
-
-func (s *stubCoordinator) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
-	return dispatch.TodoSnapshot{}, false
-}
-
-func (s *stubCoordinator) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
-	return errors.New("not implemented")
 }

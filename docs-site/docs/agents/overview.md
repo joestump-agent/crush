@@ -64,10 +64,7 @@ main agent passes it on.
 
 :::warning[Known issue]
 `crush run` offers `dispatch_agent`, but exits when the main agent's turn ends.
-Any running dispatch is torn down and its result never arrives ([#387](https://github.com/joestump-agent/crush/issues/387)). In
-[client/server mode](/features/server-and-workspaces) (`CRUSH_CLIENT_SERVER=1`)
-the agent block is static, the @ completions list no agents, and a leading
-`@handle` goes to the main agent as an ordinary prompt ([#421](https://github.com/joestump-agent/crush/issues/421), [#419](https://github.com/joestump-agent/crush/issues/419)).
+Any running dispatch is torn down and its result never arrives ([#387](https://github.com/joestump-agent/crush/issues/387)).
 :::
 
 ## The four surfaces
