@@ -164,6 +164,7 @@ type Server struct {
 	id        string
 	contextID string
 	stopOnce  sync.Once
+	stopped   chan struct{}
 	stopErr   error
 }
 
@@ -183,6 +184,7 @@ const servedRunStopWait = 5 * time.Second
 // than once; the host keeps serving the other dispatches.
 func (s *Server) Stop(ctx context.Context) error {
 	s.stopOnce.Do(func() {
+		defer close(s.stopped)
 		s.factory.unregister(s.id, s.contextID)
 		if _, ok := ctx.Deadline(); !ok {
 			var cancel context.CancelFunc
@@ -194,6 +196,9 @@ func (s *Server) Stop(ctx context.Context) error {
 			s.stopErr = err
 		}
 	})
+	// stopOnce only serializes the first call: a second caller returns
+	// from Do at once, so it waits here rather than racing on stopErr.
+	<-s.stopped
 	return s.stopErr
 }
 
@@ -431,7 +436,7 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 			ParentSessionID: p.ParentSessionID,
 		})
 	}
-	return &Server{Endpoint: endpoint, Card: card, factory: f, executor: executor, id: p.DispatchID, contextID: p.ContextID}, nil
+	return &Server{Endpoint: endpoint, Card: card, factory: f, executor: executor, id: p.DispatchID, contextID: p.ContextID, stopped: make(chan struct{})}, nil
 }
 
 // cancelRaceHandler reports the SDK's two outcomes of one race the same
