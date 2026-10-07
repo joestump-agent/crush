@@ -348,6 +348,7 @@ func TestExternalDispatchUnresolvedToken(t *testing.T) {
 	resp := runDispatchToolCall(t, c.dispatchTool(), DispatchAgentParams{Prompt: "p", Agent: "reviewer"})
 	require.True(t, resp.IsError)
 	require.Contains(t, resp.Content, `agent "reviewer": auth.token resolved to an empty value`)
+	require.Zero(t, c.heldDispatchSlots(), "a refused token gives its slot back")
 	require.Empty(t, host.resolutions())
 }
 
@@ -501,4 +502,75 @@ func TestExternalKillSettingsDefaults(t *testing.T) {
 	seconds := 90
 	c.cfg.Config().Options.TodoEnforcement = &config.TodoEnforcementConfig{InactivityTimeout: &seconds}
 	require.Equal(t, 90*time.Second, c.externalKillSettings(config.Agent{}).InactivityTimeout)
+}
+
+// The concurrency cap is checked before the token is resolved (#434),
+// as a built-in dispatch checks it before provisioning: a call refused
+// at capacity never runs the token's command.
+func TestExternalDispatchReservesSlotBeforeToken(t *testing.T) {
+	t.Setenv(externalTestTokenEnv, externalTestTokenValue)
+	ext := newFakeExternalAgent(untilKilled)
+	c, host, _ := newExternalDispatchEnv(t, `{
+		"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "`+externalTestCardURL+`",
+			"auth": {"type": "bearer", "token": "$`+externalTestTokenEnv+`"}},
+		"broken": {"role": "dispatch", "runtime": "a2a", "card": "`+externalTestCardURL+`",
+			"auth": {"type": "bearer", "token": "$CRUSH_TEST_UNSET_TOKEN_VARIABLE"}}
+	}`, ext)
+	limit := 1
+	c.cfg.Config().Options.Dispatch = &config.DispatchOptions{MaxConcurrent: &limit}
+	tool := c.dispatchTool()
+
+	running := decodeDispatchHandle(t, runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "p", Agent: "reviewer"}, "slot-call-1"))
+	<-ext.started
+
+	resp := runDispatchToolCallAs(t, tool, DispatchAgentParams{Prompt: "p", Agent: "broken"}, "slot-call-2")
+	require.True(t, resp.IsError)
+	require.Contains(t, resp.Content, "dispatch at capacity", "the cap answers before the token is resolved")
+	require.Len(t, host.resolutions(), 1)
+
+	require.NoError(t, c.CancelDispatch(t.Context(), running.DispatchID))
+	waitExternalTerminal(t, c, running.DispatchID)
+}
+
+// The token resolves on the tool call's context (#434): a call that has
+// ended does not go on to run the token's command.
+func TestResolveExternalTokenUsesCallContext(t *testing.T) {
+	t.Parallel()
+	c, _ := newDispatchToolEnv(t, &dispatchTestAgent{model: dispatchTestModel()})
+	token := "$(printf resolved-token)"
+	agentCfg := config.Agent{ID: "reviewer", Auth: &config.AgentAuth{Token: &token}}
+
+	secret, err := c.resolveExternalToken(t.Context(), agentCfg)
+	require.NoError(t, err)
+	require.Equal(t, "resolved-token", secret.Reveal())
+
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = c.resolveExternalToken(ended, agentCfg)
+	require.ErrorContains(t, err, `agent "reviewer": auth.token did not resolve`)
+}
+
+// A token command's stderr goes to the log, never into the tool error
+// the model reads (#434). Not parallel: it captures the default logger.
+func TestResolveExternalTokenKeepsStderrInLog(t *testing.T) {
+	var logs bytes.Buffer
+	var logsMu sync.Mutex
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		logsMu.Lock()
+		defer logsMu.Unlock()
+		return logs.Write(p)
+	}), nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	c, _ := newDispatchToolEnv(t, &dispatchTestAgent{model: dispatchTestModel()})
+	token := "$(printf stderr-detail-9f2 >&2; exit 3)"
+	_, err := c.resolveExternalToken(t.Context(), config.Agent{ID: "reviewer", Auth: &config.AgentAuth{Token: &token}})
+	require.ErrorContains(t, err, `agent "reviewer": auth.token did not resolve`)
+	require.NotContains(t, err.Error(), "stderr-detail-9f2", "the command's stderr must stay out of the tool error")
+
+	logsMu.Lock()
+	defer logsMu.Unlock()
+	require.Contains(t, logs.String(), "External agent token did not resolve")
+	require.Contains(t, logs.String(), "stderr-detail-9f2", "the reason is in the log")
 }

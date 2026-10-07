@@ -178,17 +178,20 @@ func (c *coordinator) dispatchExternal(ctx context.Context, params DispatchAgent
 	if !ok || resolver == nil {
 		return fantasy.NewTextErrorResponse("dispatch unavailable: the A2A host cannot reach external agents"), nil
 	}
-	token, err := c.resolveExternalToken(agentCfg)
-	if err != nil {
-		return fantasy.NewTextErrorResponse(err.Error()), nil
-	}
 
+	// The cap first, like a built-in dispatch (#390): a call refused at
+	// capacity must not have run the token's command.
 	reserved, running := c.reserveDispatchSlot()
 	if !reserved {
 		limit := c.cfg.Config().Options.GetDispatchMaxConcurrent()
 		return fantasy.NewTextErrorResponse(fmt.Sprintf(
 			"dispatch at capacity: %d agents are already running (dispatch.max_concurrent=%d); wait for one to finish or cancel one",
 			running, limit)), nil
+	}
+	token, err := c.resolveExternalToken(ctx, agentCfg)
+	if err != nil {
+		c.releaseDispatchSlot()
+		return fantasy.NewTextErrorResponse(err.Error()), nil
 	}
 
 	ext, err := resolver.ResolveExternalAgent(ctx, ExternalAgentParams{CardURL: agentCfg.Card, Token: token})
@@ -292,10 +295,11 @@ func (c *coordinator) dispatchExternal(ctx context.Context, params DispatchAgent
 // resolveExternalToken resolves a runtime a2a definition's auth.token at
 // dispatch time (#434), through the config's variable resolver: the
 // same $VAR and $(cmd) expansion every other config credential gets,
-// rerun per dispatch so a rotated token is picked up. The value lives
-// only in the returned Secret; errors name the agent and, from the
-// resolver, the reference as written, never a resolved value.
-func (c *coordinator) resolveExternalToken(agentCfg config.Agent) (Secret, error) {
+// rerun per dispatch so a rotated token is picked up, and bounded by the
+// tool call's context. The value lives only in the returned Secret. A
+// failure's details — a command's stderr among them — go to the log
+// only: the error names the agent and nothing the command printed.
+func (c *coordinator) resolveExternalToken(ctx context.Context, agentCfg config.Agent) (Secret, error) {
 	if agentCfg.Auth == nil || agentCfg.Auth.Token == nil {
 		return Secret{}, nil
 	}
@@ -303,9 +307,16 @@ func (c *coordinator) resolveExternalToken(agentCfg config.Agent) (Secret, error
 	if resolver == nil {
 		return Secret{}, fmt.Errorf("agent %q: no variable resolver to resolve auth.token", agentCfg.ID)
 	}
-	value, err := resolver.ResolveValue(*agentCfg.Auth.Token)
+	var value string
+	var err error
+	if withCtx, ok := resolver.(config.ContextVariableResolver); ok {
+		value, err = withCtx.ResolveValueContext(ctx, *agentCfg.Auth.Token)
+	} else {
+		value, err = resolver.ResolveValue(*agentCfg.Auth.Token)
+	}
 	if err != nil {
-		return Secret{}, fmt.Errorf("agent %q: resolve auth.token: %w", agentCfg.ID, err)
+		slog.Warn("External agent token did not resolve", "agent", agentCfg.ID, "error", err)
+		return Secret{}, fmt.Errorf("agent %q: auth.token did not resolve; the log has the reason", agentCfg.ID)
 	}
 	value = strings.TrimSpace(value)
 	if value == "" {
