@@ -23,14 +23,15 @@ import (
 
 // Prompt represents a template-based prompt generator.
 type Prompt struct {
-	name        string
-	template    string
-	now         func() time.Time
-	platform    string
-	workingDir  string
-	skillFilter []string
-	a2ui        bool
-	scheduling  bool
+	name         string
+	template     string
+	now          func() time.Time
+	platform     string
+	workingDir   string
+	skillFilter  []string
+	contextPaths []string
+	a2ui         bool
+	scheduling   bool
 }
 
 type PromptDat struct {
@@ -84,6 +85,16 @@ func WithWorkingDir(workingDir string) Option {
 func WithSkills(names []string) Option {
 	return func(p *Prompt) {
 		p.skillFilter = names
+	}
+}
+
+// WithContextPaths replaces the config's context_paths for this
+// prompt's render. An agent definition that sets context_paths (#432)
+// renders the agent's own context files instead of the global options'
+// paths; the default (nil or empty) keeps the config's paths.
+func WithContextPaths(paths []string) Option {
+	return func(p *Prompt) {
+		p.contextPaths = paths
 	}
 }
 
@@ -225,7 +236,11 @@ func (p *Prompt) promptData(ctx context.Context, provider, model string, store *
 	platform := cmp.Or(p.platform, runtime.GOOS)
 
 	cfg := store.Config()
-	contextFiles := loadContextFiles(cfg.Options.ContextPaths, store)
+	contextPaths := cfg.Options.ContextPaths
+	if len(p.contextPaths) > 0 {
+		contextPaths = p.contextPaths
+	}
+	contextFiles := loadContextFiles(contextPaths, store)
 	globalContextFiles := loadContextFiles(cfg.Options.GlobalContextPaths, store)
 
 	// Discover and load skills metadata.

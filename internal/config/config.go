@@ -1020,7 +1020,9 @@ type Agent struct {
 	//  if the string array is nil, all tools from the AllowedMCP are available
 	AllowedMCP map[string][]string `json:"allowed_mcp,omitempty"`
 
-	// Overrides the context paths for this agent
+	// ContextPaths overrides options.context_paths for this agent's
+	// prompt (#432). Nil inherits the global paths at render time, so a
+	// dispatch renders the workspace's own context files.
 	ContextPaths []string `json:"context_paths,omitempty"`
 
 	// TodoEnforcement overrides the global todo enforcement settings
@@ -1029,34 +1031,31 @@ type Agent struct {
 
 	// The fields below come from the agent's definition (#333). They are
 	// resolved runtime values, not config: no config file loads them.
-	// Until #432 builds agents from definitions, the ones marked as such
-	// are carried and warned about instead of honored.
 	//
 	// Role classifies the agent: main, subagent, or dispatch.
 	Role string `json:"-"`
-	// Runtime selects the execution path: builtin or a2a. Not honored
-	// until #392 and #432.
+	// Runtime selects the execution path: builtin or a2a. Only builtin
+	// is honored; a2a waits on #392 and #434.
 	Runtime string `json:"-"`
-	// Prompt is builtin:<id> or file:<path>. Not honored until #432.
+	// Prompt is builtin:<id> or file:<path> (#432).
 	Prompt string `json:"-"`
-	// PromptAppend is a file:<path> appended to the prompt. Not honored
-	// until #432.
+	// PromptAppend is a file:<path> appended to the prompt (#432).
 	PromptAppend string `json:"-"`
 	// ModelRef pins an explicit provider and model, overriding the
-	// large/small slot. Not honored until #432.
+	// large/small slot (#432).
 	ModelRef *AgentModelRef `json:"-"`
-	// Skills lists skill names for the agent. Not honored until #432.
+	// Skills lists skill names for the agent (#432).
 	Skills []string `json:"-"`
-	// Workspace selects dispatch isolation: worktree or none. Not
-	// honored until #432.
+	// Workspace selects dispatch isolation: worktree or none. Only
+	// worktree is honored: dispatches always run in a worktree.
 	Workspace string `json:"-"`
 	// Card is the external Agent Card URL for runtime a2a agents. Not
-	// honored until #432 and #434.
+	// honored until #392 and #434.
 	Card string `json:"-"`
 	// Auth configures bearer auth for runtime a2a agents. Not honored
-	// until #432 and #434.
+	// until #392 and #434.
 	Auth *AgentAuth `json:"-"`
-	// Transport tunes an a2a agent's connection. Not honored until #432.
+	// Transport tunes an a2a agent's connection. Not honored until #392.
 	Transport *AgentTransport `json:"-"`
 }
 
@@ -1473,11 +1472,6 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 		modelRef = def.Model.Ref
 	}
 
-	contextPaths := def.ContextPaths
-	if contextPaths == nil {
-		contextPaths = c.Options.ContextPaths
-	}
-
 	return Agent{
 		ID:              id,
 		Name:            orString(def.Name, id),
@@ -1486,7 +1480,7 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 		Model:           modelType,
 		AllowedTools:    allowedTools,
 		AllowedMCP:      expandMCPAllow(mcpAllow),
-		ContextPaths:    contextPaths,
+		ContextPaths:    def.ContextPaths,
 		TodoEnforcement: todoEnforcementFromDefinition(enforcementDef),
 		Role:            definitionRole(id, def),
 		Runtime:         orString(def.Runtime, AgentRuntimeBuiltin),

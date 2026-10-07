@@ -73,7 +73,7 @@ func TestAgentDefinitions_BuiltinsResolveLikeToday(t *testing.T) {
 	require.Equal(t, "An agent that helps with executing coding tasks.", coder.Description)
 	require.Equal(t, config.SelectedModelTypeLarge, coder.Model)
 	require.Nil(t, coder.AllowedMCP, "coder sees every MCP server")
-	require.Equal(t, cfg.Options.ContextPaths, coder.ContextPaths)
+	require.Nil(t, coder.ContextPaths, "an unset definition inherits options.context_paths at render time")
 	require.Contains(t, coder.AllowedTools, "bash")
 	require.Contains(t, coder.AllowedTools, "view")
 	require.Equal(t, config.AgentRoleMain, coder.Role)
@@ -124,9 +124,12 @@ func TestAgentDefinitions_BuiltinsResolveLikeToday(t *testing.T) {
 		"edit",
 		"glob",
 		"grep",
+		"job_kill",
+		"job_output",
 		"ls",
 		"lsp_call_hierarchy",
 		"lsp_definition",
+		"lsp_diagnostics",
 		"lsp_symbols",
 		"multiedit",
 		"semantic_search",
@@ -677,4 +680,24 @@ func TestAgentDefinitions_TodoEnforcementAliasOnNonDispatch(t *testing.T) {
 		"the alias's kill knob is dropped on a non-dispatch agent")
 	require.Equal(t, 2, resolvedKill(cfg, config.AgentCoder),
 		"the kill rung stays at the default on a non-dispatch agent")
+}
+
+// TestAgentDefinitions_RelativePromptFileResolvesAgainstWorkingDir pins
+// that load-time validation finds a relative file: prompt where the
+// runtime reads it (#432): under the working directory, not the
+// process's current directory.
+func TestAgentDefinitions_RelativePromptFileResolvesAgainstWorkingDir(t *testing.T) {
+	workDir, dataDir := isolateReloadEnv(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(workDir, "prompts"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(workDir, "prompts", "worker.md"), []byte("extra"), 0o644))
+
+	globalDir := os.Getenv("CRUSH_GLOBAL_CONFIG")
+	require.NoError(t, os.MkdirAll(globalDir, 0o755))
+	body := agentsBaseConfig[:len(agentsBaseConfig)-1] +
+		`,"agents":{"worker":{"prompt_append":"file:prompts/worker.md"}}}`
+	require.NoError(t, os.WriteFile(filepath.Join(globalDir, "crush.json"), []byte(body), 0o600))
+
+	store, err := config.Load(workDir, dataDir, false)
+	require.NoError(t, err)
+	require.Equal(t, "file:prompts/worker.md", store.Config().Agents[config.AgentWorker].PromptAppend)
 }
