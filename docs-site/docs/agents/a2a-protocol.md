@@ -17,11 +17,12 @@ exactly what is on the wire today, so you can debug it, read logs against
 it, or plan against it. How the server fits into a dispatch is on
 [Architecture](./architecture.md).
 
-:::warning[Mostly an internal interface]
-Crush's own coordinator is the primary client. An external A2A client can
-only reach the host through the opt-in [TCP listener](#tcp-listener),
-which requires TLS and authenticates every call. A dispatch's endpoint
-exists only while that dispatch runs, and the UI does not show it.
+:::warning[Internal interface]
+Crush's own coordinator is the only client that can drive a run. The
+opt-in [TCP listener](#tcp-listener) requires TLS and authenticates every
+call, but it exposes no local dispatch or sub-agent run yet. A dispatch's
+endpoint exists only while that dispatch runs, and the UI does not show
+it.
 :::
 
 ## At a glance
@@ -163,19 +164,21 @@ host judges those as the client sent them.
 
 ## TCP listener
 
-The host can also listen on TCP, so an A2A client on another host or in
-another sandbox can reach Crush's agents
-([#358](https://github.com/joestump-agent/crush/issues/358)). It is off
-unless you set a listen address, and it only speaks TLS: a listen address
-without both a certificate and a key fails the load with
+The host can also listen on TCP
+([#358](https://github.com/joestump-agent/crush/issues/358)). This is the
+transport groundwork for agents on other hosts or in other sandboxes.
+Nothing a remote client can call is served on it yet: see
+[Local runs stay local](#local-runs-stay-local). It is off unless you set a
+listen address, and it only speaks TLS. A listen address without both a
+certificate and a key fails the load with
 `a2a.listen requires tls_cert and tls_key; plain TCP is not supported`.
 
 ```bash
 # crushrc
 option a2a-listen 127.0.0.1:7443
-option a2a-tls-cert certs/a2a.pem
-option a2a-tls-key certs/a2a-key.pem
-option a2a-client-ca certs/clients-ca.pem   # optional: require client certificates
+option a2a-tls-cert ~/.config/crush/certs/a2a.pem
+option a2a-tls-key ~/.config/crush/certs/a2a-key.pem
+option a2a-client-ca ~/.config/crush/certs/clients-ca.pem   # optional: require client certificates
 ```
 
 ```json
@@ -183,9 +186,9 @@ option a2a-client-ca certs/clients-ca.pem   # optional: require client certifica
   "options": {
     "a2a": {
       "listen": "127.0.0.1:7443",
-      "tls_cert": "certs/a2a.pem",
-      "tls_key": "certs/a2a-key.pem",
-      "client_ca": "certs/clients-ca.pem"
+      "tls_cert": "~/.config/crush/certs/a2a.pem",
+      "tls_key": "~/.config/crush/certs/a2a-key.pem",
+      "client_ca": "~/.config/crush/certs/clients-ca.pem"
     }
   }
 }
@@ -198,42 +201,63 @@ option a2a-client-ca certs/clients-ca.pem   # optional: require client certifica
 | `options.a2a.tls_key` | `option a2a-tls-key` | PEM private key for the certificate. |
 | `options.a2a.client_ca` | `option a2a-client-ca` | Optional PEM CA certificates. When set, every client must present a certificate signed by one of them (mutual TLS). |
 
-Relative paths resolve against the working directory and `~` expands to
-your home directory. At load the certificate and key must load as a pair,
-and `client_ca` must hold at least one PEM certificate, or the load fails
-and names the key. Certificate provisioning, including ACME, is up to you.
+The three file paths must be absolute or start with `~/`. A relative path
+fails the load: the listener usually lives in your global config, and a
+relative path would resolve against whichever project Crush runs in. At load
+the certificate and key must also load as a pair, and `client_ca` must hold
+at least one PEM certificate, or the load fails and names the key.
+Certificate provisioning, including ACME, is up to you.
 
 How the listener behaves:
 
-- **Same routes, same middleware.** It serves every `/agents/<id>` route the
-  socket serves, with the same `Origin`, `Content-Type` and version checks.
-  TLS 1.2 is the minimum. Plain HTTP to the port gets a `400` from the TLS
-  server and never reaches a route.
+- **Authentication first.** TCP has no peer credentials, so a TCP call is
+  never treated as the host's own user. Every request must arrive on a
+  connection whose client certificate was verified against `client_ca`, or
+  carry the host's bearer token. Anything else gets a `401` before its body
+  is read or its route is looked up, so every path answers alike. The
+  rejection is logged at warning level with the peer's address, never the
+  credential it offered. Failed TLS handshakes are logged too.
+- **Without `client_ca`.** The bearer token is then the only way in, and it
+  never leaves the process. No remote client can authenticate, and Crush
+  logs a warning at startup when such a listener is reachable beyond
+  loopback.
+- **Same routes, same middleware.** An authenticated request reaches the
+  same `/agents/<id>` routes the socket serves, with the same `Origin`,
+  `Content-Type` and version checks. TLS 1.2 is the minimum. A request body
+  is capped at 32 MiB, enough for a message carrying several full-size
+  attachments. An idle keep-alive connection is closed after two minutes.
+  Plain HTTP to the port fails at the TLS layer and never reaches a route.
 - **Host check.** The `Host` header must be the listen address (as
   configured, or with the port the kernel picked for `:0`) or a DNS or IP
   name in the server certificate's subject alternative names, at any port.
   Anything else is a `400`.
-- **Authentication.** TCP has no peer credentials, so a TCP call is never
-  treated as the host's own user. It must carry the host's bearer token, or —
-  with `client_ca` — arrive on a connection whose client certificate was
-  verified, which authenticates it on its own. Without `client_ca` the
-  bearer token is the only way in, and it never leaves the process, so in
-  practice remote clients need `client_ca`. A certificate holder's tasks are
-  stored under the certificate's subject, so it only sees its own tasks.
-  Agent-definition routes, which the socket serves without credentials,
-  require the same authentication over TCP.
+- **Identity.** A certificate holder is identified by the certificate's
+  issuer and subject, and its tasks are stored under that identity.
+  Holders of certificates with the same issuer and subject share their
+  tasks; anyone else's are invisible to them.
 - **Cards.** While the listener runs, every card lists its HTTPS interface
   second, after the socket one: `https://<host:port>/agents/<id>`. The host is
-  the configured one; a wildcard listen address advertises the
-  certificate's first DNS name instead. With `client_ca` the card also
-  declares the `crush-mtls` scheme. Crush's own dispatch client keeps
-  dialing the socket.
-- **Lifetime.** The listener starts with the host and closes with it when
-  Crush shuts down, draining in-flight requests the same way the socket
-  does. If it cannot start, for example
-  because the port is taken, Crush logs the error and keeps serving the
-  socket alone; cards then list no HTTPS interface. Changing the settings
-  takes a restart.
+  the configured one. With a wildcard listen address it is the server
+  certificate's first DNS name that is not itself a wildcard, else its first
+  IP address. With neither, the cards list no HTTPS interface and Crush logs
+  a warning. With `client_ca` the card also declares the `crush-mtls`
+  scheme. Crush's own dispatch client keeps dialing the socket.
+- **Lifetime.** The listener starts with the host and shuts down with it,
+  alongside the socket. Connections that have not sent a request are closed
+  at once, and a request still running at the shutdown deadline is cut. If
+  the listener cannot start, for example because the port is taken, Crush
+  logs the error and keeps serving the socket alone; cards then list no
+  HTTPS interface. Changing the settings takes a restart.
+
+### Local runs stay local
+
+The TCP listener exposes no local dispatch or sub-agent run. Every run
+Crush starts in this process belongs to the local user, and a TCP call
+that names its context gets the same rejection as an unknown context:
+`no running agent for context <id>`. It can neither message, steer, answer
+nor cancel it, even with a valid credential. Agents that remote clients can
+call arrive with the peer registry
+([#334](https://github.com/joestump-agent/crush/issues/334)).
 
 ## Methods
 
@@ -668,8 +692,10 @@ restriction is the socket, layered under the credential:
   ([#358](https://github.com/joestump-agent/crush/issues/358)).
 - **TCP callers.** A TCP connection carries no peer credentials, so a TCP
   call is never treated as the local user: it needs the bearer token or,
-  with `client_ca`, a client certificate the handshake verified. Its
-  `Host` must be the listen address or a name in the server certificate.
+  with `client_ca`, a client certificate the handshake verified, checked
+  before its body is read. Its `Host` must be the listen address or a name
+  in the server certificate. Even authenticated, it reaches no local run
+  ([Local runs stay local](#local-runs-stay-local)).
 - **Browsers.** The host rejects cross-origin requests (`403`), non-JSON
   bodies including the CORS-simple `text/plain` POST (`415`), and a
   `Host` other than the internal `crush-a2a` label on the socket, or one

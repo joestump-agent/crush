@@ -32,7 +32,7 @@ worktree location is still hard-coded.
 | Skills a dispatch gets | `option skill-path`, `option disable-skill` | `options.skills_paths`, `options.disabled_skills` | Plus the per-call `skills` argument |
 | Auto-approved tools | `permissions allow …` | `permissions.allowed_tools` | Read from the config the worktree loads (see [below](#config-the-dispatched-agent-reads)) |
 | Yolo | `--yolo` at startup | — | Dispatched agents follow the startup flag. Turning yolo off with <kbd>ctrl+y</kbd> does not reach them ([#378](https://github.com/joestump-agent/crush/issues/378)) |
-| A2A TCP listener | `option a2a-listen`, `a2a-tls-cert`, `a2a-tls-key`, `a2a-client-ca` | `options.a2a.{listen,tls_cert,tls_key,client_ca}` | The process's A2A host, beside its unix socket. TLS only: plain TCP fails the load. See [TCP listener](./a2a-protocol.md#tcp-listener) ([#358](https://github.com/joestump-agent/crush/issues/358)) |
+| A2A TCP listener | `option a2a-listen`, `a2a-tls-cert`, `a2a-tls-key`, `a2a-client-ca` | `options.a2a.{listen,tls_cert,tls_key,client_ca}` | The process's A2A host, beside its unix socket. TLS only: plain TCP and relative certificate paths fail the load. It exposes no local run yet. See [TCP listener](./a2a-protocol.md#tcp-listener) ([#358](https://github.com/joestump-agent/crush/issues/358)) |
 
 ## Todo enforcement settings
 

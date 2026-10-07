@@ -523,7 +523,9 @@ These keys configure the A2A host's optional TCP listener, which lives under
 `options.a2a` in the JSON form. It serves TLS only: `a2a-listen` without both
 `a2a-tls-cert` and `a2a-tls-key` fails the load with
 `a2a.listen requires tls_cert and tls_key; plain TCP is not supported`.
-Relative paths resolve against the working directory. See
+Each `PATH` must be absolute or start with `~/`; a relative path fails the
+load. Without `a2a-client-ca` only this process's own bearer token is
+accepted, so no remote client can authenticate. See
 [TCP listener](/agents/a2a-protocol#tcp-listener) for how it serves and
 authenticates.
 
@@ -536,8 +538,8 @@ authenticates.
 
 ```bash
 option a2a-listen 127.0.0.1:7443
-option a2a-tls-cert certs/a2a.pem
-option a2a-tls-key certs/a2a-key.pem
+option a2a-tls-cert ~/.config/crush/certs/a2a.pem
+option a2a-tls-key ~/.config/crush/certs/a2a-key.pem
 ```
 
 ### `option reset`
