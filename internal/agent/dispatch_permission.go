@@ -37,8 +37,11 @@ func (c *coordinator) answerDispatchPermission(ctx context.Context, run dispatch
 		}
 	}()
 
+	// The session is the run's own, never the one the request names: the
+	// parent's session grants and auto-approval are keyed on it, and the
+	// request crossed the wire from the served agent.
 	allowed, err := c.permissions.Request(ctx, permission.CreatePermissionRequest{
-		SessionID:   req.SessionID,
+		SessionID:   run.sessionID,
 		ToolCallID:  req.ToolCallID,
 		ToolName:    req.ToolName,
 		Description: labelDispatchPermission(req.Description, handle),

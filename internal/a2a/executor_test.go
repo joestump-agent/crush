@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1816,6 +1817,11 @@ func TestExecutePermissionParksAndResumes(t *testing.T) {
 		{name: "plain text denies", answer: func(*testing.T) *a2aspec.Message {
 			return a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("yes please"))
 		}},
+		{name: "an allow that does not name the extension denies", answer: func(t *testing.T) *a2aspec.Message {
+			msg := decisionMessage(t, true)
+			msg.Extensions = nil
+			return msg
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1888,18 +1894,45 @@ func verdictFor(t *testing.T, runner *requestingRunner, call string) permissionV
 	return v
 }
 
+// denyRecorder is a PermissionSource that records which requests were
+// denied before passing the denial on.
+type denyRecorder struct {
+	PermissionSource
+
+	mu     sync.Mutex
+	denied []string
+}
+
+func (d *denyRecorder) Deny(req permission.PermissionRequest) bool {
+	d.mu.Lock()
+	d.denied = append(d.denied, req.ID)
+	d.mu.Unlock()
+	return d.PermissionSource.Deny(req)
+}
+
+func (d *denyRecorder) deniedIDs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.denied)
+}
+
 // Canceling a task parked on a permission request denies the request and
-// ends the task Canceled (#353): the tool call gets a denial, and a late
-// decision is Rejected.
+// ends the task Canceled (#353): the parked request is denied by ID, the
+// tool call is never granted — it gets the denial or the canceled run's
+// context error, whichever lands first — and a late decision is Rejected.
 func TestExecuteCancelWhileParkedOnPermission(t *testing.T) {
 	t.Parallel()
 
-	runner, exec := newRequestingExecutor(t, "make test")
+	svc := permission.NewPermissionService(t.TempDir(), false, nil)
+	runner := newRequestingRunner(svc, "make test")
+	recorder := &denyRecorder{PermissionSource: svc}
+	exec := newBoundExecutor(runner, WithPermissions(recorder))
 	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("run the tests"))
-	parkedPermission(t, collect(t, exec.Execute(t.Context(), newExecCtx(msg))))
+	parked := parkedPermission(t, collect(t, exec.Execute(t.Context(), newExecCtx(msg))))
 
 	evs := collect(t, exec.Cancel(t.Context(), parkedTaskCtx(nil)))
 	require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateCanceled}, states(t, evs))
+	require.Equal(t, []string{parked.ID}, recorder.deniedIDs(), "the parked request is denied")
 
 	v := <-runner.verdicts
 	require.False(t, v.granted, "a canceled task's parked request must not be granted")

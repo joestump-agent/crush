@@ -133,7 +133,8 @@ var _ PermissionSource = permission.Service(nil)
 // A permission request from one of the agent's tools parks the run the
 // same way (#353): input-required carries the request as a typed
 // DataPart, and the decision on the parked task grants or denies it.
-// Parallel tool calls park one request at a time, oldest first.
+// Parallel tool calls park one request at a time: the scoped service
+// publishes the next request only once the parked one is decided.
 type Executor struct {
 	// contexts resolves the A2A context ID onto the dispatch binding the
 	// turn runs against (#350). The host owns the registry; the binding
@@ -252,8 +253,8 @@ type taskRun struct {
 	// draining the record. Guarded by the executor's runsMu.
 	pending *question.Request
 	// permCh is the run's permission subscription (#353); nil without a
-	// permission source. Requests raised while the run is parked wait in
-	// it, so they park one at a time, oldest first.
+	// permission source. The scoped service publishes one request at a
+	// time, so the run parks on one request at a time.
 	permCh <-chan pubsub.Event[permission.PermissionRequest]
 	// pendingPermission is the permission request the run is parked on
 	// (#353), like pending for a question. At most one of the two is
@@ -638,9 +639,11 @@ func (e *Executor) decidePermission(msg *a2aspec.Message, req permission.Permiss
 }
 
 // permissionAllowed reports whether msg carries a permission-decisions/v1
-// DataPart that allows the request (#353).
+// DataPart that allows the request (#353). The message must name the
+// extension: a DataPart that merely decodes to {"allow": true} under some
+// other extension never grants.
 func permissionAllowed(msg *a2aspec.Message) bool {
-	if msg == nil {
+	if msg == nil || !slices.Contains(msg.Extensions, PermissionDecisionExtensionURI) {
 		return false
 	}
 	for _, part := range msg.Parts {
@@ -1028,9 +1031,8 @@ func (e *Executor) drain(ctx context.Context, execCtx *a2asrv.ExecutorContext, r
 			}
 			// A tool asked for permission (#353): park the run on the
 			// request exactly like a question. The tool call stays
-			// blocked in the scoped service until the decision; a
-			// request raised meanwhile waits in permCh for the next
-			// drain, so parallel requests park one at a time.
+			// blocked in the scoped service until the decision, and the
+			// service holds any parallel request back until then.
 			e.parkPermission(run, ev.Payload)
 			if !yield(permissionRequiredStatus(execCtx, ev.Payload), nil) {
 				return nil, errConsumerStopped

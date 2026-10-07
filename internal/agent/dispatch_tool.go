@@ -296,8 +296,8 @@ func (c *coordinator) registerLiveDispatch(id string, live *liveDispatch) {
 }
 
 // teardownLiveDispatch ends one dispatch: cancel the root, drop the live
-// record, and close done so waiters observe the teardown. Unknown IDs (a dispatch that never
-// registered, or a second teardown) are a no-op.
+// record, and close done so waiters observe the teardown. Unknown IDs (a
+// dispatch that never registered, or a second teardown) are a no-op.
 func (c *coordinator) teardownLiveDispatch(id string) {
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
@@ -658,8 +658,9 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 
 			// The dispatch outlives the turn that started it: its root
 			// context is detached from the tool call's, so the run bound
-			// to the root (#371) survives the turn's end. runDispatch's teardown cancels it, and every
-			// setup-failure path below does too. Not derived from
+			// to the root (#371) survives the turn's end. runDispatch's
+			// teardown cancels it, and every setup-failure path below
+			// does too. Not derived from
 			// c.dispatchCtx: in server mode that is still the request
 			// context (#419).
 			rootCtx, rootCancel := context.WithCancel(context.WithoutCancel(ctx))
