@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/crush/internal/agent/prompt"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/stretchr/testify/require"
@@ -57,11 +56,9 @@ func newGateTestCoordinator(t *testing.T, interactive bool, configure ...func(*c
 		fn(coord)
 	}
 
-	p, err := coderPrompt(prompt.WithWorkingDir(env.workingDir))
-	require.NoError(t, err)
 	agentCfg := cfg.Config().Agents[config.AgentCoder]
 
-	agent, err := coord.buildAgent(context.Background(), p, agentCfg, false)
+	agent, err := coord.buildAgent(context.Background(), agentCfg, false)
 	require.NoError(t, err)
 	coord.mainAgent = agent
 	coord.mainAgentName = config.AgentCoder

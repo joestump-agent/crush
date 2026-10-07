@@ -175,6 +175,10 @@ Field guide:
 | `role` | `main`, `subagent`, or `dispatch`. A new agent must be `dispatch`. |
 | `runtime` | `builtin` (in process) or `a2a` (an external [Agent Card](https://a2a-protocol.org)). |
 | `model` | `"large"`, `"small"`, or `{ "provider": "...", "model": "..." }`. |
+| `prompt` | `builtin:<id>` (`coder`, `plan`, `task`, `dispatch`) or `file:<path>`, a Go template; relative paths resolve against the working directory. |
+| `prompt_append` | `file:<path>`, appended verbatim after the rendered prompt. |
+| `skills` | Skill names the agent sees. A dispatch's `skills` argument can narrow the worker's list, never widen it. |
+| `disabled` | `true` turns a built-in off: `task` removes the `agent` tool, `plan` cannot be switched to, and `worker` removes the dispatch tools. `coder` cannot be disabled. |
 | `tools` | `allow` and `deny` lists; entries are tool names, `@read`, `@write`, or `*`. Effective tools are allow minus deny minus `options.disabled_tools`, so a definition can narrow but never widen your tool policy. |
 | `mcp` | `allow` list; entries are `*`, a server id from `mcp`, or `server:tool`. |
 | `todos` | `nudge`, `nudge_after_tool_calls`, `hard_gate` (see [Todo enforcement](/agents/todo-enforcement)). |
@@ -186,10 +190,14 @@ An `a2a` agent is defined by its external card, so it may only set `role`,
 `name`, `description`, `disabled`, `card`, `auth`, `workspace` (must be
 `none`), `transport`, and `kill` (only `timeout`).
 
-Fields the runtime parses but does not act on yet (`model` pins, `prompt`,
-`skills`, `workspace`, and the `a2a` machinery) load with a one-time warning.
-They are carried for the multi-agent epic: #432 wires agents to these
-definitions, #433 adds the agent parameter, and #434 fetches external cards.
+The runtime builds every agent from its definition
+([#432](https://github.com/joestump-agent/crush/issues/432)). Fields it parses
+but does not act on yet load with a one-time warning: `workspace: none`, and
+the `a2a` machinery (`runtime: a2a`, `card`, `auth`, `transport`).
+[#433](https://github.com/joestump-agent/crush/issues/433) adds the agent
+parameter to `dispatch_agent`, and
+[#434](https://github.com/joestump-agent/crush/issues/434) fetches external
+cards.
 The `agent` builtin defines the same block from `crushrc`
 ([#431](https://github.com/joestump-agent/crush/issues/431)).
 
