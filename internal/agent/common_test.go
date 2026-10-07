@@ -99,7 +99,12 @@ func testEnvAtDir(t *testing.T, workingDir string) fakeEnv {
 	lspClients := csync.NewMap[string, *lsp.Client]()
 
 	t.Cleanup(func() {
-		conn.Close()
+		require.NoError(t, conn.Close())
+		// Close closes only idle connections; one a run left checked
+		// out keeps crush.db open, and Windows then fails TempDir's
+		// cleanup.
+		require.Zero(t, conn.Stats().OpenConnections,
+			"a DB connection was still checked out when the test closed the database")
 	})
 
 	return fakeEnv{
