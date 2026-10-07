@@ -147,6 +147,29 @@ type DispatchCanceler interface {
 	CancelDispatch(ctx context.Context, params DispatchCancelParams) error
 }
 
+// AgentDefinitionCard is one agent definition's stable card (#392): the
+// identity the per-process A2A host publishes for it, one card per
+// agent, whether or not the definition's entry point routes its turns
+// through the runtime yet. ID is the definition's config id ("coder",
+// "plan", "task", "worker", or a user-defined one) and doubles as the
+// card's route — /agents/<ID> — on the process host.
+type AgentDefinitionCard struct {
+	ID          string
+	Name        string
+	Description string
+}
+
+// AgentCatalog is the card-listing half of the A2A host (#392):
+// publish one stable card per agent definition on the per-process
+// host. Implemented by the production a2a.ServerFactory; coordinators
+// assert to it and skip publishing when the wired host does not
+// implement it — the seam's test fakes mostly don't.
+type AgentCatalog interface {
+	// PublishAgentDefinition serves the definition's card at
+	// /agents/<ID>. Publishing an already-published ID is a no-op.
+	PublishAgentDefinition(ctx context.Context, card AgentDefinitionCard) error
+}
+
 // DispatchTaskStatus is the observed state of one dispatched task
 // (#349). Status is "working" while the task is still in flight and
 // otherwise the terminal outcome vocabulary — "completed", "failed",
