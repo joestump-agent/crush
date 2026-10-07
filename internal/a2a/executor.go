@@ -22,6 +22,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/session"
@@ -75,6 +76,22 @@ type QuestionSource interface {
 // Compile-time proof that a question service is a QuestionSource.
 var _ QuestionSource = question.Service(nil)
 
+// PermissionSource is the dispatched agent's scoped permission service
+// (#353): its tools request approval through it, the executor watches its
+// requests while draining the run and parks the run in input-required on
+// one, and a decision on the parked task grants or denies it. Yolo and the
+// allowlists resolve inside the service, so only requests that need a
+// person are ever published. A nil source leaves requests to whoever else
+// subscribes; the run lifecycle is unchanged.
+type PermissionSource interface {
+	Subscribe(ctx context.Context) <-chan pubsub.Event[permission.PermissionRequest]
+	Grant(req permission.PermissionRequest) bool
+	Deny(req permission.PermissionRequest) bool
+}
+
+// Compile-time proof that a permission service is a PermissionSource.
+var _ PermissionSource = permission.Service(nil)
+
 // Executor adapts a Crush [agent.SessionAgent] to the [a2asrv.AgentExecutor]
 // interface: it runs one dispatched agent turn, maps the run lifecycle onto
 // A2A task states (submitted -> working -> completed/failed), and emits the git
@@ -110,8 +127,13 @@ var _ QuestionSource = question.Service(nil)
 // taskId names that parked task is the answer — not a steer — and
 // resumes the same run on the same task. The two are told apart
 // explicitly: a message naming a task in input-required is an answer
-// (Rejected when no question is pending on it), and any other message on
+// (Rejected when nothing is pending on it), and any other message on
 // the context goes down the turn-or-steer path above.
+//
+// A permission request from one of the agent's tools parks the run the
+// same way (#353): input-required carries the request as a typed
+// DataPart, and the decision on the parked task grants or denies it.
+// Parallel tool calls park one request at a time, oldest first.
 type Executor struct {
 	// contexts resolves the A2A context ID onto the dispatch binding the
 	// turn runs against (#350). The host owns the registry; the binding
@@ -126,6 +148,9 @@ type Executor struct {
 	// questions is the dispatched agent's question service (#352); nil
 	// means the agent cannot ask and runs never park.
 	questions QuestionSource
+	// permissions is the dispatched agent's scoped permission service
+	// (#353); nil means no permission request ever parks a run.
+	permissions PermissionSource
 	// inactivityTimeout is the A2A-level backstop (#360): a run that
 	// yields no events for this long while in flight is canceled by
 	// the executor and failed with the reason. Zero (the default)
@@ -226,6 +251,14 @@ type taskRun struct {
 	// exactly while the task is in input-required and no execution is
 	// draining the record. Guarded by the executor's runsMu.
 	pending *question.Request
+	// permCh is the run's permission subscription (#353); nil without a
+	// permission source. Requests raised while the run is parked wait in
+	// it, so they park one at a time, oldest first.
+	permCh <-chan pubsub.Event[permission.PermissionRequest]
+	// pendingPermission is the permission request the run is parked on
+	// (#353), like pending for a question. At most one of the two is
+	// set. Guarded by the executor's runsMu.
+	pendingPermission *permission.PermissionRequest
 }
 
 // Option configures an [Executor].
@@ -252,6 +285,13 @@ func WithTodos(source TodoSource) Option {
 // runs never park.
 func WithQuestions(source QuestionSource) Option {
 	return func(e *Executor) { e.questions = source }
+}
+
+// WithPermissions sets the dispatched agent's scoped permission service
+// (#353): a request on it parks the run in input-required, and a decision
+// on the parked task grants or denies it.
+func WithPermissions(source PermissionSource) Option {
+	return func(e *Executor) { e.permissions = source }
 }
 
 // WithInactivityTimeout sets the A2A-level backstop (#360): while the
@@ -509,24 +549,32 @@ func awaitsAnswer(execCtx *a2asrv.ExecutorContext) bool {
 	return execCtx.StoredTask != nil && execCtx.StoredTask.Status.State == a2aspec.TaskStateInputRequired
 }
 
-// executeAnswer resumes a run parked on a question (#352): the message's
-// answers resolve the agent's pending question — a typed answers/v1
-// DataPart, or the message text as a free-text answer — the task goes
-// back to Working, and the same run record drains on to a terminal state
-// or the next question. A task with no question pending is Rejected:
-// nothing is waiting for an answer, and no turn or steer is started.
+// executeAnswer resumes a run parked on a question (#352) or a
+// permission request (#353): the message's answers resolve the agent's
+// pending question — a typed answers/v1 DataPart, or the message text as
+// a free-text answer — and its permission-decisions/v1 DataPart decides a
+// pending request. The task goes back to Working, and the same run record
+// drains on to a terminal state or the next pause. A task with nothing
+// pending is Rejected: nothing is waiting for an answer, and no turn or
+// steer is started.
 func (e *Executor) executeAnswer(ctx context.Context, execCtx *a2asrv.ExecutorContext, binding ContextBinding, traceID string, yield func(a2aspec.Event, error) bool) {
-	run, req, ok := e.unpark(string(execCtx.TaskID))
+	run, parked, ok := e.unpark(string(execCtx.TaskID))
 	if !ok {
 		yield(statusEvent(execCtx, a2aspec.TaskStateRejected,
-			agentMessage(execCtx, "no question is pending on this task")), nil)
+			agentMessage(execCtx, "no question or permission request is pending on this task")), nil)
 		return
 	}
-	if !e.questions.Answer(questionAnswers(execCtx.Message, req)) {
-		// The question was withdrawn before the answer arrived — the
-		// agent's ask ended with its context — and the run moved on; the
-		// drain below reports wherever it went.
-		slog.Debug("A2A answer arrived after the question was withdrawn",
+	var resolved bool
+	if parked.permission != nil {
+		resolved = e.decidePermission(execCtx.Message, *parked.permission)
+	} else {
+		resolved = e.questions.Answer(questionAnswers(execCtx.Message, *parked.question))
+	}
+	if !resolved {
+		// The question or request was withdrawn before the answer
+		// arrived — the tool call ended with its context — and the run
+		// moved on; the drain below reports wherever it went.
+		slog.Debug("A2A answer arrived after the request was withdrawn",
 			"context_id", execCtx.ContextID,
 			"task_id", string(execCtx.TaskID),
 			"trace_id", traceID)
@@ -546,20 +594,106 @@ func (e *Executor) park(run *taskRun, req question.Request) {
 	run.pending = &req
 }
 
-// unpark takes the question the task's run is parked on (#352), handing
-// the record to the answer's execution. ok is false when no record is
-// parked under taskID: none ever asked, it was answered already, or a
+// parkPermission records the permission request the run is waiting on
+// (#353).
+func (e *Executor) parkPermission(run *taskRun, req permission.PermissionRequest) {
+	e.runsMu.Lock()
+	defer e.runsMu.Unlock()
+	run.pendingPermission = &req
+}
+
+// parkedOn is what a parked run waits on (#352, #353): exactly one of
+// question and permission is set.
+type parkedOn struct {
+	question   *question.Request
+	permission *permission.PermissionRequest
+}
+
+// unpark takes what the task's run is parked on (#352, #353), handing the
+// record to the answer's execution. ok is false when no record is parked
+// under taskID: nothing was ever asked, it was answered already, or a
 // cancel took it.
-func (e *Executor) unpark(taskID string) (*taskRun, question.Request, bool) {
+func (e *Executor) unpark(taskID string) (*taskRun, parkedOn, bool) {
 	e.runsMu.Lock()
 	defer e.runsMu.Unlock()
 	run := e.runs[taskID]
-	if run == nil || run.pending == nil {
-		return nil, question.Request{}, false
+	if run == nil || (run.pending == nil && run.pendingPermission == nil) {
+		return nil, parkedOn{}, false
 	}
-	req := *run.pending
-	run.pending = nil
-	return run, req, true
+	parked := parkedOn{question: run.pending, permission: run.pendingPermission}
+	run.pending, run.pendingPermission = nil, nil
+	return run, parked, true
+}
+
+// decidePermission resolves the permission request a run was parked on
+// (#353) with the decision msg carries, and reports whether the request
+// was still pending. Only an explicit allow grants it: a deny, or a
+// missing or undecodable decision, denies it, so a malformed answer can
+// never approve a tool call.
+func (e *Executor) decidePermission(msg *a2aspec.Message, req permission.PermissionRequest) bool {
+	if permissionAllowed(msg) {
+		return e.permissions.Grant(req)
+	}
+	return e.permissions.Deny(req)
+}
+
+// permissionAllowed reports whether msg carries a permission-decisions/v1
+// DataPart that allows the request (#353).
+func permissionAllowed(msg *a2aspec.Message) bool {
+	if msg == nil {
+		return false
+	}
+	for _, part := range msg.Parts {
+		if part == nil {
+			continue
+		}
+		data, ok := part.Content.(a2aspec.Data)
+		if !ok {
+			continue
+		}
+		decoded, err := DecodeValue(PermissionDecisionExt, data.Value)
+		if err != nil {
+			slog.Warn("A2A permission decision failed to decode; denying", "err", err)
+			continue
+		}
+		if decision, ok := decoded.(*agent.PermissionDecision); ok {
+			return decision.Allow
+		}
+	}
+	return false
+}
+
+// permissionRequiredStatus parks the task on a tool's permission request
+// (#353): an input-required status whose message carries a one-line
+// summary for a reader and the typed permissions/v1 payload as a
+// DataPart, with the extension named on the message.
+func permissionRequiredStatus(execCtx *a2asrv.ExecutorContext, req permission.PermissionRequest) *a2aspec.TaskStatusUpdateEvent {
+	text := "Permission required: " + req.ToolName
+	if req.Description != "" {
+		text += ": " + req.Description
+	}
+	parts := []*a2aspec.Part{a2aspec.NewTextPart(text)}
+	prompt := agent.PermissionPrompt{
+		ID:          req.ID,
+		SessionID:   req.SessionID,
+		ToolCallID:  req.ToolCallID,
+		ToolName:    req.ToolName,
+		Description: req.Description,
+		Action:      req.Action,
+		Params:      req.Params,
+		Path:        req.Path,
+	}
+	if encoded, err := Encode(PermissionExt, prompt); err != nil {
+		// The extension stays named on the message, so the client still
+		// knows it is a permission request; without the payload it
+		// denies.
+		slog.Warn("A2A permission request failed to encode; input-required carries text only", "err", err)
+	} else {
+		parts = append(parts, a2aspec.NewDataPart(encoded))
+	}
+	msg := a2aspec.NewMessageForTask(a2aspec.MessageRoleAgent, execCtx, parts...)
+	msg.Extensions = []string{PermissionExtensionURI}
+	return statusEvent(execCtx, a2aspec.TaskStateInputRequired, msg)
 }
 
 // inputRequiredStatus parks the task on the agent's question (#352): an
@@ -682,6 +816,11 @@ func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext
 		// right away is never published to nobody.
 		run.questionCh = e.questions.Subscribe(runCtx)
 	}
+	if e.permissions != nil {
+		// Subscribed before the run starts, for the same reason: a
+		// request published to no subscriber would strand its tool call.
+		run.permCh = e.permissions.Subscribe(runCtx)
+	}
 	e.runsMu.Lock()
 	if e.runs == nil {
 		e.runs = make(map[string]*taskRun)
@@ -740,18 +879,27 @@ func (e *Executor) releaseRun(run *taskRun) {
 // cancelRun cancels the run recorded under taskID, if any: the
 // executor's Cancel ends the run's own context, not only the runner's
 // session, so a run whose runner ignores the session cancel still stops.
-// A run parked on a question (#352) has no execution draining it, so
-// its record is dropped here; parked reports that case. The question's
-// ask ends with the run's context, and the tool call returns an error.
+// A run parked on a question (#352) or a permission request (#353) has
+// no execution draining it, so its record is dropped here; parked reports
+// that case. The question's ask ends with the run's context, and the tool
+// call returns an error; the permission request is denied.
 func (e *Executor) cancelRun(taskID string) (parked bool) {
 	e.runsMu.Lock()
 	run := e.runs[taskID]
-	if run != nil && run.pending != nil {
+	var denied *permission.PermissionRequest
+	if run != nil && (run.pending != nil || run.pendingPermission != nil) {
 		parked = true
-		run.pending = nil
+		denied = run.pendingPermission
+		run.pending, run.pendingPermission = nil, nil
 		delete(e.runs, taskID)
 	}
 	e.runsMu.Unlock()
+	if denied != nil {
+		// A canceled task's parked permission request is denied (#353),
+		// so its tool call returns a denial rather than waiting on the
+		// context below.
+		e.permissions.Deny(*denied)
+	}
 	if run != nil {
 		run.cancel()
 	}
@@ -862,6 +1010,29 @@ func (e *Executor) drain(ctx context.Context, execCtx *a2asrv.ExecutorContext, r
 			// drain, so a parked run waits on a human without either.
 			e.park(run, ev.Payload)
 			if !yield(inputRequiredStatus(execCtx, ev.Payload), nil) {
+				return nil, errConsumerStopped
+			}
+			if e.hooks.parked != nil {
+				e.hooks.parked()
+			}
+			return nil, errParked
+		case ev, ok := <-run.permCh:
+			if !ok {
+				run.permCh = nil
+				continue
+			}
+			select {
+			case out := <-run.done:
+				return out.result, out.err
+			default:
+			}
+			// A tool asked for permission (#353): park the run on the
+			// request exactly like a question. The tool call stays
+			// blocked in the scoped service until the decision; a
+			// request raised meanwhile waits in permCh for the next
+			// drain, so parallel requests park one at a time.
+			e.parkPermission(run, ev.Payload)
+			if !yield(permissionRequiredStatus(execCtx, ev.Payload), nil) {
 				return nil, errConsumerStopped
 			}
 			if e.hooks.parked != nil {

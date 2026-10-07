@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -152,12 +153,22 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 		if s.outcome.Status != "" {
 			return s.outcome, nil
 		}
-		parked := s.question
-		if parked == nil {
+		var next *a2aspec.SendMessageRequest
+		var err error
+		switch {
+		case s.permission != nil:
+			// A permission request (#353) is decided like a question is
+			// answered: on the same task, by the parent's handler.
+			parked := s.permission
+			s.permission = nil
+			next, err = s.decide(ctx, parked)
+		case s.question != nil:
+			parked := *s.question
+			s.question = nil
+			next, err = s.answer(ctx, parked)
+		default:
 			return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: dispatch stream ended without a terminal state")
 		}
-		s.question = nil
-		next, err := s.answer(ctx, *parked)
 		if err != nil {
 			return agent.DispatchTransportOutcome{}, err
 		}
@@ -183,6 +194,11 @@ type dispatchStream struct {
 	// input-required status or task snapshot, cleared by any later
 	// non-terminal state; nil when the stream ended any other way.
 	question *agent.QuestionRequest
+	// permission is the permission request the task is parked on (#353),
+	// tracked like question; at most one of the two is set. A request
+	// whose typed payload did not decode parks as a non-nil prompt with
+	// no tool name, and is denied.
+	permission *agent.PermissionPrompt
 }
 
 // consume folds one stream's events into the dispatch's state. A stream
@@ -194,7 +210,7 @@ type dispatchStream struct {
 func (s *dispatchStream) consume(ctx context.Context, events iter.Seq2[a2aspec.Event, error]) error {
 	for ev, err := range events {
 		if err != nil {
-			if s.outcome.Status != "" || s.question != nil {
+			if s.outcome.Status != "" || s.question != nil || s.permission != nil {
 				return nil
 			}
 			if s.taskID == "" {
@@ -231,19 +247,75 @@ func (s *dispatchStream) consume(ctx context.Context, events iter.Seq2[a2aspec.E
 	return nil
 }
 
-// noteQuestion tracks whether the task is parked on a question (#352):
-// an input-required status parks it with the question it carries, and
-// any later non-terminal status means the run moved on.
+// noteQuestion tracks whether the task is parked, and on what (#352,
+// #353): an input-required status naming the permissions/v1 extension
+// parks it on a permission request, any other input-required status on
+// the question it carries, and any later non-terminal status means the
+// run moved on.
 func (s *dispatchStream) noteQuestion(status a2aspec.TaskStatus) {
-	switch {
-	case s.outcome.Status != "":
-		s.question = nil
-	case status.State == a2aspec.TaskStateInputRequired:
-		q := questionFromStatus(status.Message)
-		s.question = &q
-	default:
-		s.question = nil
+	s.question, s.permission = nil, nil
+	if s.outcome.Status != "" || status.State != a2aspec.TaskStateInputRequired {
+		return
 	}
+	if status.Message != nil && slices.Contains(status.Message.Extensions, PermissionExtensionURI) {
+		p := permissionFromStatus(status.Message)
+		s.permission = &p
+		return
+	}
+	q := questionFromStatus(status.Message)
+	s.question = &q
+}
+
+// permissionFromStatus decodes the permissions/v1 payload of a parked
+// task's status message (#353). A message without a decodable payload
+// yields a prompt with no tool name, which decide denies.
+func permissionFromStatus(msg *a2aspec.Message) agent.PermissionPrompt {
+	if msg != nil {
+		for _, part := range msg.Parts {
+			if part == nil {
+				continue
+			}
+			data, ok := part.Content.(a2aspec.Data)
+			if !ok {
+				continue
+			}
+			decoded, err := DecodeValue(PermissionExt, data.Value)
+			if err != nil {
+				slog.Warn("A2A permission request failed to decode", "err", err)
+				continue
+			}
+			if req, ok := decoded.(*agent.PermissionPrompt); ok && req.ToolName != "" {
+				return *req
+			}
+		}
+	}
+	return agent.PermissionPrompt{}
+}
+
+// decide gets the parked permission request decided (#353) and returns
+// the message that sends the decision on the same task. Without a
+// handler, or for a request whose payload did not decode, the request is
+// denied. When no decision is coming — the handler failed, a kill ended
+// its wait — the parked task is canceled with the error's text as the
+// reason, its terminal state folded, and the returned request is nil.
+func (s *dispatchStream) decide(ctx context.Context, req *agent.PermissionPrompt) (*a2aspec.SendMessageRequest, error) {
+	var allow bool
+	if s.params.OnPermissionRequired != nil && req.ToolName != "" {
+		var err error
+		allow, err = s.params.OnPermissionRequired(ctx, *req)
+		if err != nil {
+			return nil, s.cancelParked(ctx, err.Error())
+		}
+	}
+	encoded, err := Encode(PermissionDecisionExt, agent.PermissionDecision{Allow: allow})
+	if err != nil {
+		return nil, s.cancelParked(ctx, err.Error())
+	}
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewDataPart(encoded))
+	msg.TaskID = s.taskID
+	msg.ContextID = s.params.ContextID
+	msg.Extensions = []string{PermissionDecisionExtensionURI}
+	return &a2aspec.SendMessageRequest{Message: msg}, nil
 }
 
 // answer gets the parked question answered (#352) and returns the
@@ -427,9 +499,9 @@ func (s *dispatchStream) resume(ctx context.Context) error {
 }
 
 // ended reports whether the stream reached its end: a terminal state, or
-// a pause on a question (#352).
+// a pause on a question (#352) or a permission request (#353).
 func (s *dispatchStream) ended() bool {
-	return s.outcome.Status != "" || s.question != nil
+	return s.outcome.Status != "" || s.question != nil || s.permission != nil
 }
 
 // consumeResubscription subscribes to the task's event stream and folds

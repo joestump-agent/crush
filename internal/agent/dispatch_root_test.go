@@ -43,8 +43,8 @@ func (b *blockingDispatchAgent) runContext() context.Context {
 }
 
 // recordingPermissionService counts Request calls on the parent service,
-// so a test can tell a live bridge (which forwards every scoped request)
-// from a dead one (which forwards nothing).
+// so a test can tell whether a dispatched agent's request reached the
+// parent at all.
 type recordingPermissionService struct {
 	permission.Service
 
@@ -65,12 +65,12 @@ func (r *recordingPermissionService) requestCalls() int {
 	return r.calls
 }
 
-// bridgeFixture is a coordinator wired for bridge tests: the parent
-// permission service does not skip requests (unlike testEnv's), the
-// dispatched-agent builder is a fake that captures the toolchain, and the
-// dispatched agent blocks until released. The parent turn is already over
-// when the fixture returns: the tool call's context is canceled.
-type bridgeFixture struct {
+// liveDispatchFixture is a coordinator with one dispatch running: the
+// parent permission service does not skip requests (unlike testEnv's),
+// the dispatched-agent builder is a fake that captures the toolchain, and
+// the dispatched agent blocks until released. The parent turn is already
+// over when the fixture returns: the tool call's context is canceled.
+type liveDispatchFixture struct {
 	c         *coordinator
 	parent    *recordingPermissionService
 	toolchain *DispatchToolchain
@@ -80,18 +80,18 @@ type bridgeFixture struct {
 	releaseOnce sync.Once
 }
 
-func (f *bridgeFixture) releaseAgent() {
+func (f *liveDispatchFixture) releaseAgent() {
 	f.releaseOnce.Do(func() { close(f.agent.release) })
 }
 
-func newBridgeFixture(t *testing.T) *bridgeFixture {
+func newLiveDispatchFixture(t *testing.T) *liveDispatchFixture {
 	t.Helper()
 
 	env := testEnv(t)
 	initGitRepo(t, env.workingDir)
 	c := newDispatchTestCoordinator(t, env)
 
-	f := &bridgeFixture{
+	f := &liveDispatchFixture{
 		c: c,
 		parent: &recordingPermissionService{
 			Service: permission.NewPermissionService(t.TempDir(), false, nil),
@@ -133,16 +133,24 @@ func newBridgeFixture(t *testing.T) *bridgeFixture {
 	require.NotNil(t, f.toolchain, "builder never captured the toolchain")
 
 	// The parent turn ends as soon as the tool call returns: the
-	// dispatched run and its bridge must not.
+	// dispatched run must not.
 	cancel()
+
+	// The served run subscribes to the scoped permission service before
+	// it starts (#353): once the agent is in its turn, a request raised
+	// on the scoped service parks the run.
+	require.Eventually(t, func() bool { return f.agent.runContext() != nil },
+		10*time.Second, 10*time.Millisecond, "the dispatched run never started")
 	return f
 }
 
 // A scoped permission request raised after the dispatch tool call's
-// context is canceled still reaches the parent's subscribers, and the
-// parent's grant resolves it (#371).
-func TestDispatchPermissionBridgeGrantAfterTurnEnds(t *testing.T) {
-	f := newBridgeFixture(t)
+// context is canceled still reaches the parent's subscribers (#371): the
+// served executor parks the run on it, and the parent's transport puts it
+// through the parent's approval flow, labeled with the dispatch's handle
+// (#353). The parent's grant resolves it.
+func TestDispatchPermissionPromptGrantAfterTurnEnds(t *testing.T) {
+	f := newLiveDispatchFixture(t)
 
 	sub := f.parent.Subscribe(t.Context())
 	allowedCh := make(chan error, 1)
@@ -164,6 +172,8 @@ func TestDispatchPermissionBridgeGrantAfterTurnEnds(t *testing.T) {
 	select {
 	case ev := <-sub:
 		require.Equal(t, "scoped-grant", ev.Payload.ToolCallID)
+		require.Equal(t, "@"+f.handle.Handle+": Execute command: make test", ev.Payload.Description,
+			"the parent's request names the dispatch that asked")
 		require.True(t, f.parent.Grant(ev.Payload), "parent grant did not resolve the pending request")
 	case <-time.After(10 * time.Second):
 		t.Fatal("scoped request never reached the parent after the turn ended")
@@ -178,9 +188,9 @@ func TestDispatchPermissionBridgeGrantAfterTurnEnds(t *testing.T) {
 }
 
 // The deny path mirrors the grant: the parent's verdict resolves the
-// scoped request as denied (#371).
-func TestDispatchPermissionBridgeDenyAfterTurnEnds(t *testing.T) {
-	f := newBridgeFixture(t)
+// scoped request as denied (#371, #353).
+func TestDispatchPermissionPromptDenyAfterTurnEnds(t *testing.T) {
+	f := newLiveDispatchFixture(t)
 
 	sub := f.parent.Subscribe(t.Context())
 	allowedCh := make(chan bool, 1)
@@ -213,11 +223,10 @@ func TestDispatchPermissionBridgeDenyAfterTurnEnds(t *testing.T) {
 }
 
 // When the dispatched run returns, its teardown cancels the dispatch's
-// root (the bridge exits with it), drops the live record, and a later
-// scoped request fails with a context error instead of stranding a
-// waiter (#371).
+// root, drops the live record, and a later scoped request fails with a
+// context error instead of stranding a waiter (#371).
 func TestDispatchTeardownCancelsRootAndDropsRecord(t *testing.T) {
-	f := newBridgeFixture(t)
+	f := newLiveDispatchFixture(t)
 
 	require.Eventually(t, func() bool {
 		f.c.dispatchMu.Lock()
@@ -258,9 +267,9 @@ func TestDispatchTeardownCancelsRootAndDropsRecord(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
-// A setup failure after the root exists cancels it: the bridge dies with
-// the dispatch, so the parent never sees a forwarded request and the
-// scoped waiter resolves with a context error (#371).
+// A setup failure after the root exists cancels it: nothing serves the
+// dispatch, so the parent never sees a request and the scoped waiter
+// resolves with a context error (#371).
 func TestDispatchSetupFailureCancelsRoot(t *testing.T) {
 	env := testEnv(t)
 	initGitRepo(t, env.workingDir)

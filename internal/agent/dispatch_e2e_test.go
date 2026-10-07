@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/a2a"
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/stretchr/testify/require"
@@ -214,4 +216,63 @@ func TestDispatchListedOnAgentIndexE2E(t *testing.T) {
 	require.Equal(t, handle.SessionID, listed.ContextID)
 	require.Equal(t, h.ParentSessionID(), listed.ParentSessionID)
 	require.Equal(t, a2a.DispatchStatusCompleted, listed.State)
+}
+
+// TestDispatchPermissionPromptE2E runs #353 through the real server
+// factory: the dispatched agent's bash call requests permission on its
+// scoped service, the served executor parks the run in input-required,
+// the parent's transport puts the request through the parent's own
+// permission service — labeled with the handle, typed params intact —
+// and the parent's verdict decides whether the command runs.
+func TestDispatchPermissionPromptE2E(t *testing.T) {
+	t.Parallel()
+
+	for _, grant := range []bool{true, false} {
+		name := "deny keeps the command from running"
+		if grant {
+			name = "grant runs the command"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			model := agent.NewScriptedModel(
+				agent.ScriptedStep{ToolCalls: []agent.ScriptedToolCall{{
+					Name:  "bash",
+					Input: `{"command":"touch granted.txt","description":"create the marker"}`,
+				}}},
+				agent.ScriptedStep{Text: "done"},
+			)
+			h := agent.NewDispatchHarness(t, model, config.TodoEnforcementSettings{}, a2a.NewServerFactory(t.TempDir()))
+			parent := h.PromptingPermissions(t)
+			requests := parent.Subscribe(t.Context())
+
+			handle := h.Dispatch(t, "create the marker")
+
+			select {
+			case ev := <-requests:
+				require.Equal(t, tools.BashToolName, ev.Payload.ToolName)
+				require.True(t, strings.HasPrefix(ev.Payload.Description, "@"+handle.Handle+": "),
+					"the request names the dispatch, got %q", ev.Payload.Description)
+				params, ok := ev.Payload.Params.(tools.BashPermissionsParams)
+				require.True(t, ok, "params cross the wire typed, got %T", ev.Payload.Params)
+				require.Equal(t, "touch granted.txt", params.Command)
+				if grant {
+					require.True(t, parent.Grant(ev.Payload))
+				} else {
+					require.True(t, parent.Deny(ev.Payload))
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("the dispatched agent's permission request never reached the parent")
+			}
+
+			entry := h.WaitTerminal(t, handle.DispatchID)
+			require.Equal(t, dispatch.StatusCompleted, entry.Status)
+			_, err := os.Stat(filepath.Join(entry.Path, "granted.txt"))
+			if grant {
+				require.NoError(t, err, "a granted command runs")
+			} else {
+				require.True(t, os.IsNotExist(err), "a denied command must not run")
+			}
+		})
+	}
 }

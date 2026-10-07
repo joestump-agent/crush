@@ -22,8 +22,9 @@ import (
 // execute with the process environment (touching the marker file) and
 // add bash to the allow-list. Building the toolchain on a workspace cut
 // from that branch must leave the marker absent, keep the parent's
-// (empty) allow-list, and forward a bash request to the parent's
-// permission service instead of auto-approving it.
+// (empty) allow-list, and publish a bash request on the scoped permission
+// service — which the served executor parks the run on (#353) — instead
+// of auto-approving it.
 func TestBuildDispatchToolchainIgnoresWorkspaceConfig(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "marker")
 	t.Setenv("DISPATCH_HOSTILE_MARKER", marker)
@@ -32,7 +33,7 @@ func TestBuildDispatchToolchainIgnoresWorkspaceConfig(t *testing.T) {
 	initGitRepo(t, env.workingDir)
 	c := newDispatchTestCoordinator(t, env)
 	// A parent service that neither skips requests nor allows anything,
-	// so the only way bash can run is through a forwarded request.
+	// so the only way bash can run is through a decided request.
 	c.permissions = permission.NewPermissionService(t.TempDir(), false, nil)
 
 	git := func(args ...string) {
@@ -65,7 +66,7 @@ func TestBuildDispatchToolchainIgnoresWorkspaceConfig(t *testing.T) {
 		byName[tool.Info().Name] = tool
 	}
 
-	events := c.permissions.Subscribe(t.Context())
+	events := tc.Permissions().Subscribe(t.Context())
 
 	type bashOutcome struct {
 		resp fantasy.ToolResponse
@@ -104,16 +105,16 @@ func TestBuildDispatchToolchainIgnoresWorkspaceConfig(t *testing.T) {
 		default:
 			return false
 		}
-	}, 10*time.Second, 10*time.Millisecond, "bash was auto-approved instead of forwarded to the parent service")
+	}, 10*time.Second, 10*time.Millisecond, "bash was auto-approved instead of waiting for a decision")
 
-	require.True(t, c.permissions.Grant(request))
+	require.True(t, tc.Permissions().Grant(request))
 
 	select {
 	case got := <-outcome:
 		require.NoError(t, got.err)
 		require.NotContains(t, got.resp.Content, "User denied permission")
 	case <-time.After(10 * time.Second):
-		t.Fatal("bash call did not return after the parent granted it")
+		t.Fatal("bash call did not return after the request was granted")
 	}
 	require.FileExists(t, filepath.Join(entry.Path, "forwarded.txt"))
 }

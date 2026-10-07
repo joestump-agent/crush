@@ -179,8 +179,40 @@ func (f *runnerTransport) lastServed() DispatchServerParams {
 	return f.served[len(f.served)-1]
 }
 
-func (f *runnerTransport) StreamDispatch(ctx context.Context, _ DispatchTransportParams) (DispatchTransportOutcome, error) {
+func (f *runnerTransport) StreamDispatch(ctx context.Context, tp DispatchTransportParams) (DispatchTransportOutcome, error) {
 	params := f.lastServed()
+	if params.Permissions != nil {
+		// Stand in for the served executor's permission prompts (#353):
+		// every request on the scoped service goes to the transport's
+		// OnPermissionRequired, and its decision resolves the request.
+		// Subscribed before the run starts, like the executor.
+		relayCtx, stopRelay := context.WithCancel(ctx)
+		defer stopRelay()
+		requests := params.Permissions.Subscribe(relayCtx)
+		go func() {
+			for ev := range requests {
+				req := ev.Payload
+				allow := false
+				if tp.OnPermissionRequired != nil {
+					allow, _ = tp.OnPermissionRequired(relayCtx, PermissionPrompt{
+						ID:          req.ID,
+						SessionID:   req.SessionID,
+						ToolCallID:  req.ToolCallID,
+						ToolName:    req.ToolName,
+						Description: req.Description,
+						Action:      req.Action,
+						Params:      req.Params,
+						Path:        req.Path,
+					})
+				}
+				if allow {
+					params.Permissions.Grant(req)
+				} else {
+					params.Permissions.Deny(req)
+				}
+			}
+		}()
+	}
 	result, err := params.Runner.Run(ctx, params.Call)
 	switch {
 	case errors.Is(err, context.Canceled):
@@ -274,7 +306,7 @@ func dispatchTestUsage(c *coordinator, sessionID string) func(context.Context) (
 // goroutine.
 func serveDispatchRun(t *testing.T, c *coordinator, run dispatchRun) {
 	t.Helper()
-	stop, err := c.startDispatchServer(context.Background(), run.provider, run.reg, run.entry.ID, run.sessionID, "tester", "dispatch test", run.agent, nil, run.call(c), run.killSettings.InactivityTimeout, run.kill.current, dispatchTestUsage(c, run.sessionID), nil)
+	stop, err := c.startDispatchServer(context.Background(), run.provider, run.reg, run.entry.ID, run.sessionID, "tester", "dispatch test", run.agent, nil, run.call(c), run.killSettings.InactivityTimeout, run.kill.current, dispatchTestUsage(c, run.sessionID), nil, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		if stop != nil {
@@ -690,7 +722,9 @@ func TestDispatchToolchainHonorsDisabledTools(t *testing.T) {
 // A dispatched agent must follow the parent service's live yolo state,
 // not the startup snapshot it was built under (#378): built while the
 // parent skips requests, a runtime toggle to prompting mode must make
-// the next dispatched request surface on the parent and wait for it.
+// the next dispatched request wait for a decision. It is published on
+// the scoped service, where the served executor parks the run on it
+// (#353) and the parent's transport puts it to the parent's user.
 func TestDispatchPermissionFollowsParentSkipOffToggle(t *testing.T) {
 	env := testEnv(t)
 	c := newDispatchTestCoordinator(t, env)
@@ -700,7 +734,7 @@ func TestDispatchPermissionFollowsParentSkipOffToggle(t *testing.T) {
 	require.NoError(t, err)
 	defer tc.Close(t.Context())
 
-	parentEvents := env.permissions.Subscribe(t.Context())
+	scopedEvents := tc.permissions.Subscribe(t.Context())
 	env.permissions.SetSkipRequests(false)
 
 	type outcome struct {
@@ -720,27 +754,27 @@ func TestDispatchPermissionFollowsParentSkipOffToggle(t *testing.T) {
 	}()
 
 	select {
-	case ev := <-parentEvents:
+	case ev := <-scopedEvents:
 		require.Equal(t, "call-378", ev.Payload.ToolCallID)
-		require.True(t, env.permissions.Grant(ev.Payload), "parent grant should resolve the request")
+		require.True(t, tc.permissions.Grant(ev.Payload), "a grant should resolve the request")
 	case res := <-resCh:
-		t.Fatalf("dispatched request resolved without the parent: granted=%v err=%v", res.granted, res.err)
+		t.Fatalf("dispatched request resolved without a decision: granted=%v err=%v", res.granted, res.err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the dispatched request to surface on the parent")
+		t.Fatal("timed out waiting for the dispatched request to be published")
 	}
 
 	select {
 	case res := <-resCh:
 		require.NoError(t, res.err)
-		require.True(t, res.granted, "parent grant should reach the dispatched waiter")
+		require.True(t, res.granted, "the grant should reach the dispatched waiter")
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for the dispatched request to resolve")
 	}
 }
 
 // The other direction (#378): built in prompting mode, a runtime toggle
-// to skip must auto-approve the next dispatched request, and the parent
-// sees no request event.
+// to skip must auto-approve the next dispatched request without
+// publishing it, so nothing parks the run (#353).
 func TestDispatchPermissionFollowsParentSkipOnToggle(t *testing.T) {
 	env := testEnv(t)
 	env.permissions = permission.NewPermissionService(env.workingDir, false, nil)
@@ -751,7 +785,7 @@ func TestDispatchPermissionFollowsParentSkipOnToggle(t *testing.T) {
 	require.NoError(t, err)
 	defer tc.Close(t.Context())
 
-	parentEvents := env.permissions.Subscribe(t.Context())
+	scopedEvents := tc.permissions.Subscribe(t.Context())
 	env.permissions.SetSkipRequests(true)
 
 	granted, err := tc.permissions.Request(t.Context(), permission.CreatePermissionRequest{
@@ -764,10 +798,11 @@ func TestDispatchPermissionFollowsParentSkipOnToggle(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, granted, "toggled-on parent should auto-approve dispatched requests")
 
-	time.Sleep(250 * time.Millisecond)
+	// Publishing is synchronous inside Request, so a request it had
+	// published would already be waiting here.
 	select {
-	case ev := <-parentEvents:
-		t.Fatalf("parent saw an unexpected request event: %v", ev.Payload)
+	case ev := <-scopedEvents:
+		t.Fatalf("an auto-approved request was published: %v", ev.Payload)
 	default:
 	}
 }

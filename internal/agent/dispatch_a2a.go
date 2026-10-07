@@ -15,6 +15,8 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/internal/proto"
 	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/skills"
 )
@@ -101,6 +103,12 @@ type DispatchServerParams struct {
 	// (#399), carried on the index so a UI scopes it to the session it
 	// shows.
 	ParentSessionID string
+	// Permissions is the dispatched agent's scoped permission service
+	// (#353), the one its tools request approval through: the served
+	// executor parks the run in input-required on each request that
+	// reaches a prompt and resolves it with the decision. Nil for a run
+	// whose tools share the parent's own service.
+	Permissions permission.Service
 }
 
 // DispatchTransportParams is one dispatch's slice of the A2A client
@@ -129,6 +137,13 @@ type DispatchTransportParams struct {
 	// coming; the transport cancels the parked task with the error's
 	// text as the reason. Nil answers with UnattendedQuestionAnswer.
 	OnInputRequired func(ctx context.Context, req QuestionRequest) (QuestionAnswer, error)
+	// OnPermissionRequired decides a permission request the served agent
+	// parked its run on (#353): the transport calls it when the task
+	// enters input-required with a permissions/v1 payload, sends the
+	// decision on the same task, and keeps consuming. An error means no
+	// decision is coming; the transport cancels the parked task with the
+	// error's text as the reason. Nil denies every request.
+	OnPermissionRequired func(ctx context.Context, req PermissionPrompt) (bool, error)
 }
 
 // GetDispatchTaskParams is one A2A task query (#349): the served
@@ -348,6 +363,22 @@ type QuestionRequest question.Request
 // the question it answers by ID.
 type QuestionAnswer struct {
 	Answers []question.Answer `json:"answers"`
+}
+
+// PermissionPrompt is the statically typed payload of the permissions/v1
+// extension (#353): a dispatched agent's permission request, carried as a
+// DataPart on the input-required status message that parks its run. It is
+// the wire shape the client/server API already uses, whose JSON decoding
+// restores each tool's typed params by tool name, so the parent's approval
+// dialog renders a request that crossed the wire like a local one.
+type PermissionPrompt = proto.PermissionRequest
+
+// PermissionDecision is the statically typed payload of the
+// permission-decisions/v1 extension (#353): the verdict on a parked
+// permission request, carried as a DataPart on the follow-up message to
+// the same task. Anything but an explicit allow denies.
+type PermissionDecision struct {
+	Allow bool `json:"allow"`
 }
 
 // NoInteractiveUserAnswer is what a dispatched agent's question is
@@ -580,15 +611,20 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 		OnInputRequired: func(ctx context.Context, req QuestionRequest) (QuestionAnswer, error) {
 			return c.answerDispatchQuestion(ctx, run, entry.Handle, req)
 		},
+		// A permission request the served agent parked on (#353) goes
+		// through the parent's approval flow, labeled with the handle.
+		OnPermissionRequired: func(ctx context.Context, req PermissionPrompt) (bool, error) {
+			return c.answerDispatchPermission(ctx, run, entry.Handle, req)
+		},
 	})
 	if err != nil {
 		slog.Error("Dispatch A2A stream failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "context_id", run.sessionID, "trace_id", traceID, "error", err)
 		// The served task runs on a detached context (#344): a stream
 		// error before a terminal state leaves the agent running
 		// unsupervised with its result headed for the trash. Cancel it
-		// now, before the run's teardown closes the toolchain and the
-		// permission bridge, and wait — bounded — for the run to end so
-		// teardown never orphans a live agent.
+		// now, before the run's teardown closes the toolchain, and wait
+		// — bounded — for the run to end so teardown never orphans a
+		// live agent.
 		c.cancelOrphanedDispatchRun(ctx, run)
 		outcome = DispatchTransportOutcome{
 			Status: transportStatusFailed,
@@ -651,8 +687,10 @@ func (c *coordinator) a2aHost() DispatchHost {
 // discovery surface. A start failure is a dispatch failure (#347): the
 // caller tears the dispatch down and reports the tool error; nothing
 // ever runs unserved. questions is the dispatched agent's own question
-// service (#352), nil when it has no question tool.
-func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string, usage func(ctx context.Context) (Usage, error), questions question.Service) (stop func(), err error) {
+// service (#352), nil when it has no question tool; permissions is its
+// scoped permission service (#353), whose requests the served executor
+// parks the run on.
+func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string, usage func(ctx context.Context) (Usage, error), questions question.Service, permissions permission.Service) (stop func(), err error) {
 	starter := c.a2aHost()
 	if starter == nil {
 		return nil, errors.New("no A2A host is wired")
@@ -686,6 +724,7 @@ func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatc
 		CancelReason:      cancelReason,
 		Usage:             usage,
 		Questions:         questions,
+		Permissions:       permissions,
 	})
 	if err != nil {
 		return nil, err
