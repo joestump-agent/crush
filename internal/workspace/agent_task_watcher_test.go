@@ -278,7 +278,7 @@ func TestAgentTaskWatcherRefusesSteerBeforeTheTurn(t *testing.T) {
 	env.waitFor(t, func(task AgentTask) bool { return task.DispatchID == "dispatch-1" })
 
 	err := env.watcher.steer(t.Context(), "parent-1", "tester", "too early", nil)
-	require.EqualError(t, err, "no running agent for session child-session; dispatch one first")
+	require.EqualError(t, err, "agent child-session is not ready for messages yet; send the message again in a moment")
 	select {
 	case <-env.runner.started:
 		t.Fatal("a refused steer started the dispatch's turn")

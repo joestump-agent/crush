@@ -1789,3 +1789,160 @@ func TestStopRunsHonorsContext(t *testing.T) {
 		close(runner.unwind)
 	})
 }
+
+// steeringRunner holds its turn until released, then ends it with the
+// fake's result and error; steers it accepts wait in the fake's queue
+// until consumed, or until ClearQueue drops them unread the way the
+// session agent does (#398).
+type steeringRunner struct {
+	fakeRunner
+	started chan struct{}
+	release chan struct{}
+}
+
+func newSteeringRunner(result *fantasy.AgentResult, err error, accept bool) *steeringRunner {
+	return &steeringRunner{
+		fakeRunner: fakeRunner{result: result, err: err, enqueueAccepted: accept},
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+}
+
+func (r *steeringRunner) Run(context.Context, agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	close(r.started)
+	<-r.release
+	return r.result, r.err
+}
+
+func (r *steeringRunner) ClearQueue(string) {
+	for len(r.enqueued()) > 0 {
+		r.consume(false)
+	}
+}
+
+// drainEvents collects a sequence's events off the test goroutine.
+func drainEvents(seq iter.Seq2[a2aspec.Event, error]) []a2aspec.Event {
+	var evs []a2aspec.Event
+	for ev, err := range seq {
+		if err != nil {
+			break
+		}
+		evs = append(evs, ev)
+	}
+	return evs
+}
+
+// undeliveredSteers decodes the undelivered-steers/v1 value on a status.
+func undeliveredSteers(t *testing.T, ev a2aspec.Event) []string {
+	t.Helper()
+	raw, ok := statusUpdate(t, ev).Meta()[UndeliveredSteersExt.URI]
+	if !ok {
+		return nil
+	}
+	decoded, err := DecodeValue(UndeliveredSteersExt, raw)
+	require.NoError(t, err)
+	return decoded.(*agent.UndeliveredSteers).Steers
+}
+
+// A steer accepted while the run is working, which the run then never
+// reads because it fails, is named on the run's Failed status, and the
+// steer's own task fails (#398). A steer the run did read is not.
+func TestExecuteUndeliveredSteersOnFailedRun(t *testing.T) {
+	t.Parallel()
+
+	runner := newSteeringRunner(nil, errors.New("provider exploded"), true)
+	exec := newBoundExecutor(runner)
+
+	mainEvs := make(chan []a2aspec.Event, 1)
+	go func() {
+		msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("do the thing"))
+		mainEvs <- drainEvents(exec.Execute(context.Background(), newExecCtx(msg)))
+	}()
+	<-runner.started
+
+	steer := func(text string) chan []a2aspec.Event {
+		out := make(chan []a2aspec.Event, 1)
+		before := len(runner.enqueued())
+		go func() { out <- drainEvents(exec.Execute(context.Background(), newExecCtx(steerOnContext(text, nil)))) }()
+		require.Eventually(t, func() bool { return len(runner.enqueued()) == before+1 },
+			10*time.Second, 5*time.Millisecond, "the steer was never enqueued")
+		return out
+	}
+	read := steer("read me")
+	runner.consume(true)
+	unread := steer("also update the docs")
+
+	close(runner.release)
+	evs := <-mainEvs
+	last := evs[len(evs)-1]
+	require.Equal(t, a2aspec.TaskStateFailed, statusUpdate(t, last).Status.State)
+	require.Equal(t, []string{"also update the docs"}, undeliveredSteers(t, last),
+		"only the steer the run never read is named")
+
+	readEvs := <-read
+	require.Equal(t, a2aspec.TaskStateCompleted, statusUpdate(t, readEvs[len(readEvs)-1]).Status.State)
+	unreadEvs := <-unread
+	require.Equal(t, a2aspec.TaskStateFailed, statusUpdate(t, unreadEvs[len(unreadEvs)-1]).Status.State)
+	require.Contains(t, statusMessageText(t, unreadEvs[len(unreadEvs)-1]), "agent finished before the message was consumed")
+}
+
+// A run whose steers were all read reports none (#398).
+func TestExecuteNoUndeliveredSteersWhenAllRead(t *testing.T) {
+	t.Parallel()
+
+	runner := newSteeringRunner(textResult("work done"), nil, true)
+	exec := newBoundExecutor(runner)
+	mainEvs := make(chan []a2aspec.Event, 1)
+	go func() {
+		msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("do the thing"))
+		mainEvs <- drainEvents(exec.Execute(context.Background(), newExecCtx(msg)))
+	}()
+	<-runner.started
+	steerEvs := make(chan []a2aspec.Event, 1)
+	go func() {
+		steerEvs <- drainEvents(exec.Execute(context.Background(), newExecCtx(steerOnContext("folded in", nil))))
+	}()
+	require.Eventually(t, func() bool { return len(runner.enqueued()) == 1 }, 10*time.Second, 5*time.Millisecond)
+	runner.consume(true)
+	<-steerEvs
+
+	close(runner.release)
+	evs := <-mainEvs
+	last := evs[len(evs)-1]
+	require.Equal(t, a2aspec.TaskStateCompleted, statusUpdate(t, last).Status.State)
+	require.Nil(t, undeliveredSteers(t, last))
+}
+
+// A steer the runner refuses while the run is still live — its session
+// not busy yet — is refused as not ready, with the typed reason, never as
+// a finished run (#398). Once the run has returned the refusal is final.
+func TestExecuteSteerRefusedNotReadyWhileRunLive(t *testing.T) {
+	t.Parallel()
+
+	runner := newSteeringRunner(textResult("work done"), nil, false)
+	exec := newBoundExecutor(runner)
+	mainEvs := make(chan []a2aspec.Event, 1)
+	go func() {
+		msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("do the thing"))
+		mainEvs <- drainEvents(exec.Execute(context.Background(), newExecCtx(msg)))
+	}()
+	<-runner.started
+
+	evs := collect(t, exec.Execute(context.Background(), newExecCtx(steerOnContext("too early", nil))))
+	refused := statusUpdate(t, evs[len(evs)-1])
+	require.Equal(t, a2aspec.TaskStateRejected, refused.Status.State)
+	require.Contains(t, statusMessageText(t, evs[len(evs)-1]), "not ready for messages yet")
+	raw, ok := refused.Meta()[SteerRefusalExt.URI]
+	require.True(t, ok, "the refusal carries its typed reason")
+	decoded, err := DecodeValue(SteerRefusalExt, raw)
+	require.NoError(t, err)
+	require.Equal(t, agent.SteerRefusalNotReady, decoded.(*agent.SteerRefusal).Reason)
+
+	close(runner.release)
+	<-mainEvs
+	evs = collect(t, exec.Execute(context.Background(), newExecCtx(steerOnContext("too late", nil))))
+	ended := statusUpdate(t, evs[len(evs)-1])
+	require.Contains(t, statusMessageText(t, evs[len(evs)-1]), "no longer running")
+	_, ok = ended.Meta()[SteerRefusalExt.URI]
+	require.False(t, ok, "a finished run's refusal carries no retry reason")
+}

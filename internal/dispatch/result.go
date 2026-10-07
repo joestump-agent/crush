@@ -90,6 +90,11 @@ type DispatchResult struct {
 	// kept here, in turn order, rather than replacing KeyFindings.
 	// Empty when no such steer landed.
 	SteerReplies []string `json:"steer_replies,omitempty"`
+	// UndeliveredSteers are the steers the dispatched agent accepted but
+	// never consumed before its run ended (#398): a run that ends with an
+	// error, or is canceled, leaves its queued messages unread. Empty
+	// when every accepted steer reached the agent.
+	UndeliveredSteers []string `json:"undelivered_steers,omitempty"`
 	// DiffSummary is the condensed work product: a per-file change stat
 	// followed by the diff itself, truncated at MaxDiffLines. Populated
 	// on completion and on kill (the salvageable work product); a
@@ -127,12 +132,24 @@ func (r DispatchResult) TerminalMessage() string {
 		// so the instruction points the parent at the
 		// re-dispatch-or-dismiss decision instead of plain review.
 		fmt.Fprintf(&b, "A dispatched agent was killed (reason: %q; dispatch %s, branch %s). Its workspace is preserved: nothing was discarded, and cleanup still waits on your decision. The agent's last state and the salvageable diff are below. Decide whether to re-dispatch the task or dismiss the workspace (git worktree remove and branch delete).\n\n", r.KilledReason, r.DispatchID, r.Branch)
+		r.writeUndeliveredSteers(&b)
 		b.WriteString(r.Render())
 		return b.String()
 	}
 	fmt.Fprintf(&b, "A dispatched agent finished with status %q (dispatch %s, branch %s). Its result is below. Review the diff and decide whether to merge or dismiss it — the dispatch never merges itself. The workspace and its branch are preserved until the work is applied or dismissed; uncommitted changes count as part of the work, so cleanup waits on your decision and nothing was discarded at exit.\n\n", r.Status, r.DispatchID, r.Branch)
+	r.writeUndeliveredSteers(&b)
 	b.WriteString(r.Render())
 	return b.String()
+}
+
+// writeUndeliveredSteers adds one line naming the steers the agent never
+// read (#398), so the parent does not assume a message it was told was
+// queued ever reached the agent. Nothing is written when there are none.
+func (r DispatchResult) writeUndeliveredSteers(b *strings.Builder) {
+	if len(r.UndeliveredSteers) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "%d message(s) sent to this agent while it ran were accepted but never reached it before its run ended; they are listed under undelivered_steers.\n\n", len(r.UndeliveredSteers))
 }
 
 // SummarizeDiff condenses a unified diff (Workspace.Diff's output) into

@@ -330,9 +330,9 @@ func TestDeliverAgentMessageOrderingAndConcurrency(t *testing.T) {
 
 // A registry entry that is still running but has no server behind it yet
 // — the window between the dispatch handle being returned and the A2A
-// server stamping its endpoint on the entry (#426) — must refuse as "no
-// running agent", not claim the agent finished with a running status and
-// send the caller off to dispatch a duplicate.
+// server stamping its endpoint on the entry (#426) — must refuse as an
+// agent that is starting (#398), never claim it finished or send the
+// caller off to dispatch a duplicate.
 func TestDeliverAgentMessageRunningWithoutTargetIsNotFinished(t *testing.T) {
 	agent := newGatedDispatchAgent()
 	c, _ := newInjectionEnv(t, agent)
@@ -348,8 +348,9 @@ func TestDeliverAgentMessageRunningWithoutTargetIsNotFinished(t *testing.T) {
 		e.AgentCard = nil
 	}))
 	err := c.DeliverAgentMessage(t.Context(), AgentMessage{SessionID: handle.SessionID, Text: "hi"})
-	require.ErrorContains(t, err, "no running agent for session")
+	require.ErrorContains(t, err, "is not ready for messages yet; send the message again in a moment")
 	require.NotContains(t, err.Error(), "finished")
+	require.NotContains(t, err.Error(), "dispatch a new agent")
 
 	agent.release()
 }
@@ -751,11 +752,11 @@ func TestDeliverAgentMessageStartupWindow(t *testing.T) {
 		return err
 	}
 
-	// Before the run is busy: refused, nothing queued. The branch's
-	// current wording ("no longer running; dispatch a new agent instead")
-	// is misleading here — the agent is starting, not finished — so this
-	// test pins the behavior, not the wording.
-	require.Error(t, deliver("early steer"))
+	// Before the run is busy: refused, nothing queued, and the refusal
+	// says the agent is not ready yet rather than finished (#398).
+	err := deliver("early steer")
+	require.ErrorContains(t, err, "is not ready for messages yet; send the message again in a moment")
+	require.NotContains(t, err.Error(), "dispatch a new agent")
 	require.Empty(t, agent.injected(), "a pre-busy delivery must not queue")
 
 	// Release startGate: Run marks the session busy and parks in the

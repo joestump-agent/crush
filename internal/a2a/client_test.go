@@ -491,6 +491,92 @@ func TestStreamDispatchInputRequiredRoundTrip(t *testing.T) {
 	require.True(t, answered, "the answer is a user message on the same task")
 }
 
+// startSteeringServer serves a run that holds its turn until released
+// (#398).
+func startSteeringServer(t *testing.T, runner *steeringRunner) (*ServerFactory, *Server) {
+	t.Helper()
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-steered",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+	return factory, server
+}
+
+// Over the wire (#398): a steer the run accepted but never read, because
+// the run failed, reaches the dispatch's outcome as UndeliveredSteers.
+func TestStreamDispatchReportsUndeliveredSteers(t *testing.T) {
+	runner := newSteeringRunner(nil, errors.New("provider exploded"), true)
+	factory, server := startSteeringServer(t, runner)
+
+	type result struct {
+		outcome agent.DispatchTransportOutcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := factory.StreamDispatch(context.Background(), agent.DispatchTransportParams{
+			Endpoint:  server.Endpoint,
+			Card:      server.Card,
+			Prompt:    "do the work",
+			ContextID: "dispatch-session",
+		})
+		done <- result{outcome, err}
+	}()
+	<-runner.started
+
+	steer, err := factory.SteerDispatch(t.Context(), agent.DispatchSteerParams{
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		ContextID: "dispatch-session",
+		Text:      "also update the docs",
+	})
+	require.NoError(t, err)
+	require.Equal(t, SteerStatusWorking, steer.Status, "the steer was accepted into the queue")
+
+	close(runner.release)
+	got := <-done
+	require.NoError(t, got.err)
+	require.Equal(t, DispatchStatusFailed, got.outcome.Status)
+	require.Equal(t, []string{"also update the docs"}, got.outcome.UndeliveredSteers)
+}
+
+// A steer refused while the run is live carries the not-ready reason to
+// the caller (#398).
+func TestSteerDispatchNotReadyReason(t *testing.T) {
+	runner := newSteeringRunner(textResult("done"), nil, false)
+	factory, server := startSteeringServer(t, runner)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = factory.StreamDispatch(context.Background(), agent.DispatchTransportParams{
+			Endpoint:  server.Endpoint,
+			Card:      server.Card,
+			Prompt:    "do the work",
+			ContextID: "dispatch-session",
+		})
+	}()
+	<-runner.started
+
+	steer, err := factory.SteerDispatch(t.Context(), agent.DispatchSteerParams{
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		ContextID: "dispatch-session",
+		Text:      "too early",
+	})
+	require.NoError(t, err)
+	require.Equal(t, SteerStatusRejected, steer.Status)
+	require.Equal(t, agent.SteerRefusalNotReady, steer.Reason)
+
+	close(runner.release)
+	<-done
+}
+
 // A question no answer is coming for (#352) — OnInputRequired failed,
 // as it does when a kill ends the parent's wait — cancels the parked
 // task with the error's text as the reason: the stream's outcome is
