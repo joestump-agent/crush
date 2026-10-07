@@ -247,10 +247,10 @@ type coordinator struct {
 	// teardown. Guarded by dispatchMu; #372 (cancel at shutdown) and
 	// #373 (user-initiated cancel) build on it.
 	liveDispatches map[string]*liveDispatch
-	// shuttingDown is set when CancelAll's dispatch phase begins (#372):
-	// while it is set, a finishing dispatch still records its terminal
-	// result and status in the registry, but deliverDispatchResult
-	// starts no parent turn.
+	// shuttingDown is set when CancelAll begins (#372): while it is set,
+	// a finishing dispatch still records its terminal result and status
+	// in the registry, but neither deliverDispatchResult nor the
+	// run-end flush starts a parent turn.
 	shuttingDown atomic.Bool
 	// dispatchShutdownWait bounds the shared wait CancelAll gives the
 	// live dispatches' graceful agent.Cancel to finish each run (#372);
@@ -1891,6 +1891,12 @@ func (c *coordinator) Cancel(sessionID string) {
 }
 
 func (c *coordinator) CancelAll() {
+	// Shutdown begins before any run is canceled (#372). Canceling the
+	// main agent ends its runs, every run end fires the pending-result
+	// flush, and a dispatch can finish while that cancel waits. Raised
+	// any later, the flag lets either one start a delivery turn against
+	// a coordinator that is canceling everything.
+	c.shuttingDown.Store(true)
 	c.currentAgent().CancelAll()
 	// Quitting stops dispatched agents too (#372): they run on detached
 	// contexts, so the agent cancel above never reaches them.
