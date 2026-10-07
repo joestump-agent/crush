@@ -222,18 +222,16 @@ builtin in `crushrc` load, validate, and resolve to the same definitions
 [#431](https://github.com/joestump-agent/crush/issues/431)). The runtime
 honors `model`, `prompt`, `prompt_append`, `tools`, `mcp`, `skills`,
 `context_paths` and `disabled`
-([#432](https://github.com/joestump-agent/crush/issues/432)).
+([#432](https://github.com/joestump-agent/crush/issues/432)). The `agent`
+parameter on `dispatch_agent` picks a dispatch agent other than `worker`
+([#433](https://github.com/joestump-agent/crush/issues/433)), and a
+`runtime: a2a` dispatch agent runs behind an external Agent Card with
+`workspace: none`
+([#434](https://github.com/joestump-agent/crush/issues/434); see
+[External agents](#external-agents)).
 
-Still planned:
-
-- the `agent` parameter on `dispatch_agent`, which picks a dispatch agent
-  other than `worker`
-  ([#433](https://github.com/joestump-agent/crush/issues/433));
-- `runtime: a2a` agents behind an external card
-  ([#434](https://github.com/joestump-agent/crush/issues/434));
-- `workspace: none`.
-
-Fields the runtime does not honor yet load with a one-time warning.
+Still planned: `workspace: none` for builtin dispatch agents, which always
+run in a worktree today. Setting it loads with a one-time warning.
 :::
 
 The built-ins stay: `coder`, `plan`, `task`, and a new `worker` that replaces
@@ -292,8 +290,8 @@ The rules:
       "card": "https://reviewer.example.net/.well-known/agent-card.json",
       "auth": { "type": "bearer", "token": "$REVIEWER_TOKEN" },
       "workspace": "none",
-      "transport": { "protocol": "jsonrpc", "idle_timeout": "2m" },
-      "permissions": { "artifacts": "review" }
+      "transport": { "idle_timeout": "2m" },
+      "kill": { "timeout": "30m" }
     }
   },
   "options": {
@@ -369,3 +367,110 @@ In this design, per-agent thresholds are the `todos` and `kill` blocks inside
 each definition. `agents.<id>.todo_enforcement` is accepted as a legacy alias
 for them ([#402](https://github.com/joestump-agent/crush/issues/402)), and
 `options.todo_enforcement` stays as the global default.
+
+### External agents
+
+A `runtime: a2a` definition points a dispatch agent at an
+[A2A Agent Card](https://a2a-protocol.org) hosted somewhere else: a reviewer
+your team runs, or a third-party agent
+([#434](https://github.com/joestump-agent/crush/issues/434)). The main agent
+dispatches to it like any other dispatch agent, with
+`dispatch_agent {agent: "reviewer"}`, and the run goes through the same A2A
+client as the built-ins: the remote task's ID is tracked, and a dropped
+stream is resumed.
+
+In `crushrc`:
+
+```bash
+agent add reviewer --role dispatch --runtime a2a \
+  --card https://reviewer.example.net/.well-known/agent-card.json \
+  --bearer '$REVIEWER_TOKEN' --workspace none \
+  --idle-timeout 2m --timeout 30m
+```
+
+The same agent in `crush.json`:
+
+```json
+{
+  "agents": {
+    "reviewer": {
+      "role": "dispatch",
+      "runtime": "a2a",
+      "card": "https://reviewer.example.net/.well-known/agent-card.json",
+      "auth": { "type": "bearer", "token": "$REVIEWER_TOKEN" },
+      "workspace": "none",
+      "transport": { "idle_timeout": "2m" },
+      "kill": { "timeout": "30m" }
+    }
+  }
+}
+```
+
+The fields:
+
+| Field | Meaning |
+| --- | --- |
+| `card` | Required. The card's URL. It must be `https`; plain `http` is allowed only for `localhost` and loopback addresses. A URL with no path, or `/`, fetches `/.well-known/agent-card.json`. Credentials in the URL are a load error. |
+| `auth` | Optional. `type` is `bearer`, the only type. `token` is required with it, and is usually a `$VAR` or `$(cmd)` reference. `--bearer` in `crushrc` accepts only a reference, never a literal token. |
+| `workspace` | `none`, the default and the only value. An external agent never touches your disk. |
+| `transport.idle_timeout` | How long the agent's stream may stay silent before Crush cancels its task. Unset falls back to `options.todo_enforcement.inactivity_timeout`; `0` or `off` disables it. |
+| `kill.timeout` | The hard timeout for the whole run. Unset falls back to `options.todo_enforcement.hard_timeout`. It is the only `kill` field an external agent may set. |
+| `name`, `description`, `disabled`, `role` | As for any agent. `role` must be `dispatch`. |
+
+`model`, `prompt`, `tools`, `mcp`, `skills` and the other local fields are load
+errors on an external agent: the card defines it. The `dispatch_agent` call
+refuses `model`, `skills` and `branch` for the same reason.
+
+What happens on each dispatch:
+
+1. **The token is resolved.** `auth.token` goes through the same `$VAR` and
+   `$(cmd)` resolver as the rest of your config, on every dispatch, so a
+   rotated token is picked up. A reference that resolves to nothing fails the
+   call.
+2. **The card is fetched and checked.** The fetch carries no credentials, has
+   10-second dial and 30-second total timeouts, caps the card at 1 MiB, and
+   never follows a redirect to another origin. Crush then needs a JSON-RPC
+   interface on the card URL's own origin and, when `auth` is set, an HTTP
+   bearer security scheme. Anything else fails the call with an error that
+   names the card.
+3. **The prompt is sent.** It goes out as a new task, with no context ID of
+   Crush's own. No worktree, branch, toolchain or local agent is created. The
+   dispatch still gets a registry entry, a handle and a role, so its agent
+   block and `@handle` show up as usual.
+4. **The result is delivered.** The terminal result carries `source`, the card
+   URL. Its first line tells the main agent that the content came from an
+   external agent and is untrusted.
+
+#### Trust model
+
+An external agent is someone else's code. Crush treats its card and its
+output as data, and never lets it steer where your credentials go:
+
+- **Credentials go to one origin.** The token is attached only to requests to
+  the card URL's origin (scheme, host and port). Every request off that origin
+  is refused before it is sent. That covers a card whose service URL points
+  elsewhere, which is refused before any request carries the token, and a
+  redirect to another host.
+- **The token is never echoed.** It is not logged, persisted, or put in the
+  registry, the result, or an error. If the remote echoes it back, it is
+  scrubbed to `[REDACTED]`. Crush's own host token never rides an external
+  call.
+- **Output is untrusted text.** Findings and errors are stripped of control
+  characters, such as terminal escapes and bidirectional overrides, and capped
+  at 32 KiB. Artifacts are read as text and never applied to disk. There is no
+  diff, and the agent's self-reported usage is not added to your session's
+  cost.
+- **No questions, no permissions.** If the agent asks for input or
+  authentication, Crush does not forward the request. It cancels the remote
+  task and fails the dispatch, saying why. Write the prompt so the agent does
+  not need to ask.
+- **Kills are `tasks/cancel`.** Cancel, the hard timeout, the idle timeout and
+  Crush exiting each end the stream and send `tasks/cancel` with the reason.
+  The dispatch ends `killed` with that reason.
+
+Steering is not supported: a message to the agent's `@handle`, or
+`message_agent`, fails with "steering external agents is not supported yet".
+A Crush dispatch folds a steer into its running turn and streams the reply
+back, but A2A gives a third-party agent no such contract. The same message
+would start a second task there, and nothing would read its reply. Cancel
+the agent and dispatch again with the new instructions instead.
