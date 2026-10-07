@@ -98,8 +98,7 @@ func readPromptFile(workingDir, path string) (string, error) {
 	full := filepathext.SmartJoin(workingDir, path)
 	// By design: the path is the user's own config value, with the same
 	// trust as options.context_paths, and reading it is the feature.
-	// codeql[go/path-injection]
-	info, err := os.Stat(full)
+	info, err := os.Stat(full) // codeql[go/path-injection] by design, see above
 	if err != nil {
 		return "", err
 	}
@@ -109,8 +108,7 @@ func readPromptFile(workingDir, path string) (string, error) {
 	if info.Size() > maxPromptFileBytes {
 		return "", fmt.Errorf("%s is %d bytes, over the %d-byte limit", path, info.Size(), maxPromptFileBytes)
 	}
-	// codeql[go/path-injection]
-	content, err := os.ReadFile(full)
+	content, err := os.ReadFile(full) // codeql[go/path-injection] by design, see above
 	if err != nil {
 		return "", err
 	}

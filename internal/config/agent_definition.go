@@ -804,8 +804,7 @@ func validatePrompt(path, workingDir string, prompt *string, appendOnly bool) er
 		file := strings.TrimPrefix(value, "file:")
 		// By design: the path is the user's own config value, with the
 		// same trust as options.context_paths.
-		// codeql[go/path-injection]
-		if _, err := os.Stat(filepathext.SmartJoin(workingDir, file)); err != nil {
+		if _, err := os.Stat(filepathext.SmartJoin(workingDir, file)); err != nil { // codeql[go/path-injection] by design, see above
 			return fmt.Errorf("%s: prompt file %q does not exist", path, file)
 		}
 		return nil
