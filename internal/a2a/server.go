@@ -135,6 +135,8 @@ type ServerParams struct {
 	// Optional; the production store arrives with #355. nil keeps
 	// today's in-memory behavior.
 	TaskStore taskstore.Store
+	// hooks are the executor's test-only seams; zero in production.
+	hooks executorHooks
 }
 
 // Server is one dispatched agent's slice of the process-wide A2A host
@@ -297,6 +299,7 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	if p.Questions != nil {
 		opts = append(opts, WithQuestions(p.Questions))
 	}
+	opts = append(opts, withHooks(p.hooks))
 	// The call template rides the context binding (#350): the executor
 	// resolves runner, session, and shaping together, per turn.
 	executor := NewExecutor(f.contexts, p.ContextID, opts...)

@@ -516,6 +516,198 @@ func TestStreamDispatchUnansweredQuestionCancels(t *testing.T) {
 	require.EqualValues(t, 1, runner.runs.Load())
 }
 
+// cancelGateRunner is an asking runner that holds the first tasks/cancel
+// inside the executor (#352): the executor's Cancel calls the runner's
+// Cancel before it yields Canceled, so the first call closes entered and
+// waits on resume. Later calls pass straight through.
+type cancelGateRunner struct {
+	*askingRunner
+	entered chan struct{}
+	resume  chan struct{}
+	once    sync.Once
+}
+
+func (r *cancelGateRunner) Cancel(string) {
+	first := false
+	r.once.Do(func() { first = true })
+	if first {
+		close(r.entered)
+		<-r.resume
+	}
+}
+
+// parkedCancelRace is one served asking agent whose execution the test
+// can hold at the points where a parked task's cancel races it (#352).
+type parkedCancelRace struct {
+	factory *ServerFactory
+	server  *Server
+	runner  *cancelGateRunner
+	// release lets the parked execution's producer return; until then
+	// the SDK keeps the execution registered and its event pipe open.
+	release chan struct{}
+	// canceled is closed once the first Cancel has yielded its Canceled.
+	canceled chan struct{}
+	// named is closed once the stream named the task; id holds it.
+	named chan struct{}
+	id    string
+	// releaseProducer and resumeCancel close release and the runner's
+	// resume, once.
+	releaseProducer func()
+	resumeCancel    func()
+}
+
+// task waits for the stream to name the task and returns its ID.
+func (r *parkedCancelRace) task() a2aspec.TaskID {
+	<-r.named
+	return a2aspec.TaskID(r.id)
+}
+
+// onTask is the stream's OnTask: it records the task the stream named.
+func (r *parkedCancelRace) onTask(taskID string) {
+	r.id = taskID
+	close(r.named)
+}
+
+// startParkedCancelRace serves an asking agent with the executor's
+// parked and canceled seams installed. Everything the test holds is let
+// go on cleanup, so a failed assertion never wedges the host's shutdown.
+func startParkedCancelRace(t *testing.T) *parkedCancelRace {
+	t.Helper()
+	svc := question.NewService()
+	race := &parkedCancelRace{
+		runner: &cancelGateRunner{
+			askingRunner: newAskingRunner(svc),
+			entered:      make(chan struct{}),
+			resume:       make(chan struct{}),
+		},
+		release:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		named:    make(chan struct{}),
+	}
+	var canceledOnce sync.Once
+	race.factory = NewServerFactory(t.TempDir())
+	server, err := race.factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-race",
+		Runner:     race.runner,
+		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
+		Questions:  svc,
+		hooks: executorHooks{
+			parked:   func() { <-race.release },
+			canceled: func() { canceledOnce.Do(func() { close(race.canceled) }) },
+		},
+	})
+	require.NoError(t, err)
+	race.server = server
+	t.Cleanup(func() { _ = race.factory.Close(context.Background()) })
+	var releaseOnce, resumeOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(race.release) })
+		resumeOnce.Do(func() { close(race.runner.resume) })
+	})
+	race.releaseProducer = func() { releaseOnce.Do(func() { close(race.release) }) }
+	race.resumeCancel = func() { resumeOnce.Do(func() { close(race.runner.resume) }) }
+	return race
+}
+
+// The race a parked task's cancel walks into (#352), forced in both of
+// its SDK outcomes. The client cancels as soon as it reads
+// input-required, and the SDK unregisters the execution that parked the
+// task only after delivering that event, so the cancel can find the
+// execution still registered. The SDK then routes it into that
+// execution's event pipe, where the executor's Canceled is never
+// processed: the executor drops the parked run, yet the task stays
+// input-required. Either the pipe was still open and the cancel resolves
+// to the execution's input-required result (TaskNotCancelable), or the
+// execution closed its pipe first and the write fails (queue closed —
+// the outcome CI hit). The parked seam holds the execution's producer,
+// so the execution stays registered for exactly as long as each case
+// needs. In both, the client re-issues the cancel once, it lands on the
+// no-execution path, and the task ends Canceled with the reason.
+func TestStreamDispatchParkedCancelRace(t *testing.T) {
+	tests := []struct {
+		name string
+		// interleave runs once the stream started; it lets the parked
+		// execution go at the point that forces the case.
+		interleave func(t *testing.T, race *parkedCancelRace)
+	}{
+		{
+			name: "cancel resolves to the parked state",
+			interleave: func(_ *testing.T, race *parkedCancelRace) {
+				race.resumeCancel()
+				// The first cancel's Canceled is in the still-open pipe
+				// of the parked execution, whose consumer has stopped.
+				<-race.canceled
+				race.releaseProducer()
+			},
+		},
+		{
+			name: "cancel finds the pipe closed",
+			interleave: func(t *testing.T, race *parkedCancelRace) {
+				// The first cancel has reached the executor; its
+				// Canceled is not written yet.
+				<-race.runner.entered
+				race.releaseProducer()
+				// A message naming the task is held by the SDK until the
+				// parked execution has unregistered — and so closed its
+				// pipe — then refused, because the cancel is still in
+				// progress. That refusal is the proof the execution is
+				// gone before the Canceled is written.
+				client, err := newDispatchClient(t.Context(), race.server.Card, race.factory.dispatchHTTPClient(), race.factory)
+				require.NoError(t, err)
+				msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("barrier"))
+				msg.TaskID = race.task()
+				msg.ContextID = "dispatch-session"
+				_, err = client.SendMessage(race.factory.dispatchAuthContext(t.Context(), race.server.Endpoint), &a2aspec.SendMessageRequest{Message: msg})
+				require.ErrorContains(t, err, "task cancelation is in progress")
+				race.resumeCancel()
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			race := startParkedCancelRace(t)
+
+			type result struct {
+				outcome agent.DispatchTransportOutcome
+				err     error
+			}
+			done := make(chan result, 1)
+			go func() {
+				outcome, err := race.factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+					Endpoint:  race.server.Endpoint,
+					Card:      race.server.Card,
+					Prompt:    "set up the schema",
+					ContextID: "dispatch-session",
+					OnTask:    race.onTask,
+					OnInputRequired: func(context.Context, agent.QuestionRequest) (agent.QuestionAnswer, error) {
+						return agent.QuestionAnswer{}, errors.New("wander kill: hard timeout")
+					},
+				})
+				done <- result{outcome, err}
+			}()
+
+			tt.interleave(t, race)
+			res := <-done
+			require.NoError(t, res.err)
+			require.Equal(t, DispatchStatusCanceled, res.outcome.Status)
+			require.Equal(t, "wander kill: hard timeout", res.outcome.Text)
+
+			resp := <-race.runner.toolResp
+			require.True(t, resp.IsError, "the parked tool call must return an error")
+			require.EqualValues(t, 1, race.runner.runs.Load())
+
+			// The server's own record agrees: the task ended Canceled.
+			client, err := newDispatchClient(t.Context(), race.server.Card, race.factory.dispatchHTTPClient(), race.factory)
+			require.NoError(t, err)
+			authCtx := race.factory.dispatchAuthContext(t.Context(), race.server.Endpoint)
+			task, err := client.GetTask(authCtx, &a2aspec.GetTaskRequest{ID: race.task()})
+			require.NoError(t, err)
+			require.Equal(t, a2aspec.TaskStateCanceled, task.Status.State)
+		})
+	}
+}
+
 // CancelDispatch without a resolvable card or task ID is an error, not
 // a silent success — the caller's fallback depends on it.
 func TestCancelDispatchRejectsUnusableParams(t *testing.T) {
