@@ -303,11 +303,11 @@ The rules:
       "permissions": { "artifacts": "review" }
     }
   },
-  "dispatch": {
-    "default_agent": "worker",
-    "max_concurrent": 4,
-    "worktrees_dir": ".crush/worktrees",
-    "main_agent": "coder"
+  "options": {
+    "dispatch": {
+      "default_agent": "worker",
+      "max_concurrent": 4
+    }
   }
 }
 ```
@@ -319,8 +319,10 @@ How the runtime applies each field:
   - A `{provider, model}` pin runs the agent on that model, with your small
     model kept for auxiliary work. Changing models in the TUI leaves pins
     and slots in place.
-  - For dispatches, the call's `model` argument picks a slot, defaulting to
-    the worker's slot. A pinned worker ignores the argument.
+  - For dispatches, the call's `agent` argument names the definition to run —
+    omitting it takes `options.dispatch.default_agent`. The call's `model`
+    argument picks a slot, defaulting to the selected agent's slot; a pinned
+    definition refuses the argument instead of ignoring it.
 - **`prompt`.**
   - `builtin:<id>` is one of the embedded prompts.
   - `file:<path>` is a Go template, rendered with the same data as the
@@ -330,6 +332,9 @@ How the runtime applies each field:
 - **`tools`.**
   - The worker's allow list is the dispatch palette. No write tools are
     forced on, so a worker defined with `"@read"` is a read-only reviewer.
+  - An enabled `coder`, `plan`, or dispatch agent whose definition resolves
+    to no tools fails at load. Your deny lists are policy, not definition
+    errors: they keep their runtime behavior.
   - Your `options.disabled_tools` and `permissions deny` still apply last.
   - Dispatch is refused only when that deny list removes all of `bash`,
     `edit`, `multiedit` and `write`.

@@ -30,7 +30,7 @@ the diff and decide what to keep.
 | Runs | In the foreground; the main agent waits | In the background; the tool returns immediately |
 | Tools | Read-only research tools | Read tools plus `bash`, `edit`, `multiedit`, `write`, and `todos` |
 | Works in | Your checkout, uncommitted changes included | Its own worktree on a `crush-dispatch-<id>` branch, cut from a commit |
-| Model | The large model | The **small** model, unless the main agent asks for `large` |
+| Model | The large model | The dispatch agent's model slot — **small** by default, overridable with the call's `model` argument |
 | Reachable mid-run | No | Yes, by its @handle |
 | Result | The tool result, in the same turn | A follow-up turn on the main agent when it finishes |
 
@@ -162,17 +162,6 @@ dispatched agents get `dispatch_agent` or `message_agent`. See
 
 :::info[Planned]
 TCP plus TLS as an opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)). The runtime is spreading across the entry points one PR at a time ([#392](https://github.com/joestump-agent/crush/issues/392)): dispatched agents and the `agentic_fetch` sub-agent run on it today; the `agent` sub-agents, plan and task agents, cron, channels and the main coder follow.
-:::
-
-:::info[Partially shipped]
-Agent definitions: the built-in `coder`, `plan`, `task`, and a new `worker`
-agent for dispatch become overridable defaults you can extend. The
-`crush.json` data model and its validation are live
-([#333](https://github.com/joestump-agent/crush/issues/333)), the `agent`
-builtin defines them from `crushrc`
-([#431](https://github.com/joestump-agent/crush/issues/431)); still planned:
-an `agent`
-parameter on `dispatch_agent` to choose one ([#433](https://github.com/joestump-agent/crush/issues/433)).
 :::
 
 ## Turning it off
