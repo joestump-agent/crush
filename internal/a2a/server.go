@@ -1,11 +1,14 @@
 package a2a
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"mime"
 	"net"
@@ -19,9 +22,11 @@ import (
 	"time"
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/a2aproject/a2a-go/v2/a2aext"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
+	"github.com/a2aproject/a2a-go/v2/errordetails"
 
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/config"
@@ -162,9 +167,11 @@ func (s *Server) Stop(_ context.Context) error {
 // at <data dir>/a2a/<pid>.sock (0700 directory, 0600 socket), started
 // lazily on the first [ServerFactory.StartServer], with a mutex-guarded
 // route table mapping /agents/<dispatch id> onto each dispatch's
-// JSON-RPC handler. It implements the agent package's
-// [agent.DispatchHost] seam, which is how the dependency stays
-// one-way: a2a imports agent, never the reverse.
+// JSON-RPC handler. The host also holds the per-process bearer token
+// served calls must carry (#357) and the credential store the dispatch
+// client's auth interceptor reads it from. It implements the agent
+// package's [agent.DispatchHost] seam, which is how the dependency
+// stays one-way: a2a imports agent, never the reverse.
 type ServerFactory struct {
 	dataDir string
 
@@ -174,6 +181,15 @@ type ServerFactory struct {
 	// time, so a run's end — which unbinds — is visible to the very next
 	// message.
 	contexts *ContextRegistry
+
+	// token is the host's per-process bearer token (#357), generated
+	// when the socket binds, read by the host auth interceptor through
+	// authToken and attached to dispatch calls by the client side.
+	token string
+
+	// creds scopes the host token per dispatch session for the client
+	// side's [a2aclient.AuthInterceptor] (#357).
+	creds *a2aclient.InMemoryCredentialsStore
 
 	// httpClient, when set, replaces the factory's unix-socket dispatch
 	// client in StreamDispatch — the test injection seam (#344), used
@@ -203,7 +219,12 @@ type route struct {
 // NewServerFactory returns the production server factory rooted at
 // dataDir, where the host socket and its directory are created.
 func NewServerFactory(dataDir string, opts ...ServerFactoryOption) *ServerFactory {
-	f := &ServerFactory{dataDir: dataDir, contexts: NewContextRegistry(), routes: make(map[string]*route)}
+	f := &ServerFactory{
+		dataDir:  dataDir,
+		contexts: NewContextRegistry(),
+		routes:   make(map[string]*route),
+		creds:    a2aclient.NewInMemoryCredentialsStore(),
+	}
 	for _, opt := range opts {
 		opt(f)
 	}
@@ -270,6 +291,16 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	// reason-bearing Failed is expected to land first; this only fires
 	// for a wedged executor, and writes its own causeless Failed.
 	var handlerOpts []a2asrv.RequestHandlerOption
+	// Capability checks (TCK VER-*/CORE-CAP-*): operations the card
+	// does not declare answer the spec's error codes — GetExtendedAgentCard
+	// answers UnsupportedOperationError (-32004), not the SDK's
+	// not-configured (-32007) — and streaming/push stay gated on what
+	// the card declares. The card is read-only once built.
+	handlerOpts = append(handlerOpts, a2asrv.WithCapabilityChecks(&card.Capabilities))
+	// The auth interceptor (#357): every served call carries the host's
+	// bearer token and arrives from the host's own user, or it is
+	// rejected before the executor runs.
+	handlerOpts = append(handlerOpts, a2asrv.WithCallInterceptors(&hostAuthenticator{factory: f}))
 	if p.InactivityTimeout > 0 {
 		handlerOpts = append(handlerOpts, a2asrv.WithAgentInactivityTimeout(p.InactivityTimeout+time.Minute))
 	}
@@ -395,8 +426,10 @@ func (f *ServerFactory) Close(ctx context.Context) error {
 // and, on the temp-dir fallback, a hash of the data directory — so a
 // stale file always belongs to a dead process and plain removal before
 // the bind is safe; no live-server probing is needed. The socket is
-// chmod-ed 0600 right after the bind (non-Windows), so only the same
-// user can reach the unauthenticated JSON-RPC surface (#346).
+// chmod-ed 0600 right after the bind (non-Windows) and a per-process
+// bearer token is minted for it (#357): only a caller holding the token
+// — and, where the platform reports peer credentials, only one running
+// as the same user — reaches the JSON-RPC surface.
 func (f *ServerFactory) ensureHost(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -426,11 +459,23 @@ func (f *ServerFactory) ensureHost(ctx context.Context) error {
 		}
 	}
 
+	// The bearer token is minted when the host binds (#357): 32 bytes
+	// of crypto/rand held only in memory, never persisted or logged.
+	token, err := newHostToken()
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+
 	f.sockPath = path
 	f.listener = listener
+	f.token = token
 	f.httpServer = &http.Server{
 		Handler:           http.HandlerFunc(f.serveHTTP),
 		ReadHeaderTimeout: 30 * time.Second,
+		// The connection context carries the socket peer's uid, where
+		// the platform reports one, for the auth interceptor (#357).
+		ConnContext: withPeerCredentials,
 	}
 	f.done = make(chan struct{})
 	f.started = true
@@ -514,13 +559,15 @@ func shortHash(s string, n int) string {
 }
 
 // serveHTTP is the host's single root handler (#346): middleware first,
-// rejecting cross-origin, non-JSON and wrong-host requests before any
-// dispatch work runs, then the route table maps /agents/<dispatch id>
-// onto that dispatch's JSON-RPC handler. The middleware exists because
-// the served surface is unauthenticated (#357 adds auth): a browser page
-// can CSRF a text/plain POST at any loopback port, DNS-rebind its Host,
-// and fold text into a running agent's turn. The route context is
-// injected so a Stop or Close cancels the in-flight streams it owns.
+// rejecting cross-origin, non-JSON, wrong-host and unsupported-protocol-version
+// requests before any dispatch work runs, then the route table maps
+// /agents/<dispatch id> onto that dispatch's JSON-RPC handler. The middleware
+// exists because a browser page can CSRF a text/plain POST at any loopback
+// port, DNS-rebind its Host, and fold text into a running agent's turn;
+// requests that pass it still have to authenticate (#357): the route's call
+// interceptor demands the host's bearer token — and the socket peer's own uid
+// where the platform reports it — before the executor runs. The route context
+// is injected so a Stop or Close cancels the in-flight streams it owns.
 func (f *ServerFactory) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Origin") != "" {
 		http.Error(w, "a2a: cross-origin requests are not accepted", http.StatusForbidden)
@@ -534,6 +581,10 @@ func (f *ServerFactory) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "a2a: unexpected Host", http.StatusBadRequest)
 		return
 	}
+	if v := r.Header.Get(a2aspec.SvcParamVersion); v != "" && v != string(a2aspec.Version) {
+		writeVersionNotSupported(w, r)
+		return
+	}
 
 	id := strings.TrimPrefix(r.URL.Path, agentsPathPrefix)
 	if id == "" || strings.Contains(id, "/") {
@@ -545,7 +596,53 @@ func (f *ServerFactory) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	rt.handler.ServeHTTP(w, r.WithContext(rt.ctx))
+	// The route context replaces the request's connection context, so
+	// the socket peer's uid the ConnContext hook read (#357) is copied
+	// across the swap before it serves.
+	serveCtx := rt.ctx
+	if uid, ok := peerUIDFromContext(r.Context()); ok {
+		serveCtx = context.WithValue(serveCtx, peerUIDContextKey{}, uid)
+	}
+	rt.handler.ServeHTTP(w, r.WithContext(serveCtx))
+}
+
+// writeVersionNotSupported answers a request carrying an A2A-Version the
+// host does not serve with the spec's VersionNotSupportedError envelope
+// (-32009), before the SDK handler runs: the answer is a plain JSON-RPC
+// error even when the request asked for a stream, so a client cannot miss
+// the rejection inside SSE framing.
+func writeVersionNotSupported(w http.ResponseWriter, r *http.Request) {
+	id := json.RawMessage("null")
+	if body, err := io.ReadAll(r.Body); err == nil {
+		var req struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if json.Unmarshal(body, &req) == nil && len(req.ID) > 0 {
+			id = req.ID
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	info := errordetails.NewErrorInfo(
+		a2aspec.ErrorReason(a2aspec.ErrVersionNotSupported),
+		"a2a-protocol.org",
+		map[string]string{"timestamp": time.Now().UTC().Format(time.RFC3339)},
+	)
+	envelope := struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Error   struct {
+			Code    int               `json:"code"`
+			Message string            `json:"message"`
+			Data    []json.RawMessage `json:"data,omitempty"`
+		} `json:"error"`
+	}{JSONRPC: "2.0", ID: id}
+	envelope.Error.Code = -32009
+	envelope.Error.Message = a2aspec.ErrVersionNotSupported.Error()
+	if data, err := json.Marshal(info); err == nil {
+		envelope.Error.Data = []json.RawMessage{data}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(envelope)
 }
 
 // register adds the dispatch's route with a context that dies with it.
@@ -591,11 +688,26 @@ func (f *ServerFactory) socketPath() string {
 	return f.sockPath
 }
 
+// authToken returns the host's bearer token (#357); empty before the
+// first StartServer binds the socket.
+func (f *ServerFactory) authToken() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.token
+}
+
 // SocketPath is socketPath's exported form: a caller customizing its
 // own dispatch client through WithHTTPClient (#344) dials this path to
 // stay on the host's socket instead of the endpoint's routing label.
 func (f *ServerFactory) SocketPath() string {
 	return f.socketPath()
+}
+
+// AuthToken is authToken's exported form: an in-process caller proxying
+// the host — the TCK harness (#363) — injects it as the bearer
+// credential the card's security scheme demands.
+func (f *ServerFactory) AuthToken() string {
+	return f.authToken()
 }
 
 // Resolve returns the AgentCard and endpoint a dispatch registry entry

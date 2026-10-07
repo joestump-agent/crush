@@ -64,12 +64,15 @@ var dispatchResumeBackoff = []time.Duration{250 * time.Millisecond, time.Second,
 // Every client carries the traceparent interceptor (#364): calls whose
 // context holds a W3C traceparent send it as a request header, and calls
 // whose context does not (cancels from kill paths, task queries) go out
-// without one. Extra options (the extension-activation interceptor) ride
-// along.
-func newDispatchClient(ctx context.Context, card *a2aspec.AgentCard, httpClient *http.Client, opts ...a2aclient.FactoryOption) (*a2aclient.Client, error) {
+// without one. The auth interceptor is always attached (#357): it reads
+// the host token from the factory's credential store under the
+// dispatch's session id and stamps it on every call, as the card's
+// security requirements demand. Extra options (the extension-activation
+// interceptor) ride along.
+func newDispatchClient(ctx context.Context, card *a2aspec.AgentCard, httpClient *http.Client, f *ServerFactory, opts ...a2aclient.FactoryOption) (*a2aclient.Client, error) {
 	opts = append([]a2aclient.FactoryOption{
 		a2aclient.WithJSONRPCTransport(httpClient),
-		a2aclient.WithCallInterceptors(&traceparentInterceptor{}),
+		a2aclient.WithCallInterceptors(&traceparentInterceptor{}, &a2aclient.AuthInterceptor{Service: f.creds}),
 	}, opts...)
 	client, err := a2aclient.NewFromCard(ctx, card, opts...)
 	if err != nil {
@@ -113,7 +116,10 @@ func (f *ServerFactory) StreamDispatch(ctx context.Context, p agent.DispatchTran
 	// the stream's status updates. The traceparent interceptor rides on
 	// every client this package builds (#364).
 	decoder := newMetadataDecoder(card)
-	client, err := newDispatchClient(ctx, card, httpClient, a2aclient.WithCallInterceptors(a2aext.NewActivator(decoder.activatedURIs()...)))
+	// The dispatch's calls authenticate (#357): the session-scoped
+	// bearer token rides every request this client makes.
+	ctx = f.dispatchAuthContext(ctx, p.Endpoint)
+	client, err := newDispatchClient(ctx, card, httpClient, f, a2aclient.WithCallInterceptors(a2aext.NewActivator(decoder.activatedURIs()...)))
 	if err != nil {
 		return agent.DispatchTransportOutcome{}, err
 	}
@@ -472,6 +478,18 @@ func statusUpdateMessageText(ev *a2aspec.TaskStatusUpdateEvent) string {
 	return b.String()
 }
 
+// dispatchAuthContext stamps the session id the dispatch client's auth
+// interceptor looks up and stores this host's token under it (#357):
+// the SDK's AuthInterceptor requires an [a2aclient.SessionID] on the
+// context and fetches the credential per (session, scheme) pair. The
+// endpoint doubles as the session id — unique per dispatch, stable
+// across resume and cancel.
+func (f *ServerFactory) dispatchAuthContext(ctx context.Context, endpoint string) context.Context {
+	sid := a2aclient.SessionID(endpoint)
+	f.creds.Set(sid, bearerSchemeName, a2aclient.AuthCredential(f.authToken()))
+	return a2aclient.AttachSessionID(ctx, sid)
+}
+
 // dispatchHTTPClient builds the HTTP client dispatch streams dial
 // through: its transport maps every dial onto the factory's unix socket,
 // ignoring the resolved address, so the card's http://crush-a2a endpoint
@@ -528,7 +546,8 @@ func (f *ServerFactory) GetDispatchTask(ctx context.Context, p agent.GetDispatch
 	if httpClient == nil {
 		httpClient = f.dispatchHTTPClient()
 	}
-	client, err := newDispatchClient(ctx, card, httpClient)
+	ctx = f.dispatchAuthContext(ctx, p.Endpoint)
+	client, err := newDispatchClient(ctx, card, httpClient, f)
 	if err != nil {
 		return agent.DispatchTaskStatus{}, err
 	}
@@ -601,7 +620,8 @@ func (f *ServerFactory) CancelDispatch(ctx context.Context, p agent.DispatchCanc
 	if httpClient == nil {
 		httpClient = f.dispatchHTTPClient()
 	}
-	client, err := newDispatchClient(ctx, card, httpClient)
+	ctx = f.dispatchAuthContext(ctx, p.Endpoint)
+	client, err := newDispatchClient(ctx, card, httpClient, f)
 	if err != nil {
 		return err
 	}
@@ -648,7 +668,8 @@ func (f *ServerFactory) SteerDispatch(ctx context.Context, p agent.DispatchSteer
 	if httpClient == nil {
 		httpClient = f.dispatchHTTPClient()
 	}
-	client, err := newDispatchClient(ctx, card, httpClient)
+	ctx = f.dispatchAuthContext(ctx, p.Endpoint)
+	client, err := newDispatchClient(ctx, card, httpClient, f)
 	if err != nil {
 		return agent.DispatchSteerOutcome{}, err
 	}

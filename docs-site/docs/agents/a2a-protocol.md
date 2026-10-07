@@ -208,8 +208,8 @@ A progress event looks like this:
         "completed": 1,
         "total": 2,
         "todos": [
-          { "content": "Read pkg/x", "status": "completed", "active_form": "Reading pkg/x" },
-          { "content": "Write tests", "status": "in_progress", "active_form": "Writing table-driven tests" }
+          { "content": "Read pkg/x", "status": "completed", "activeForm": "Reading pkg/x" },
+          { "content": "Write tests", "status": "in_progress", "activeForm": "Writing table-driven tests" }
         ]
       }
     }
@@ -217,7 +217,7 @@ A progress event looks like this:
 }
 ```
 
-- **Message text.** The first `in_progress` todo's `active_form`, else its
+- **Message text.** The first `in_progress` todo's `activeForm`, else its
   `content`. With nothing in progress, the text is `N/M completed`.
 - **The `todos/v1` extension value.** A `TodoProgress` object: `current`
   (the in-progress todo's active form or content, empty when none),
@@ -245,10 +245,10 @@ carries the declared `usage/v1` extension's metadata key
   "https://crush.charm.land/ext/usage/v1": {
     "model": "claude-opus-5",
     "provider": "anthropic",
-    "prompt_tokens": 1200,
-    "completion_tokens": 340,
+    "promptTokens": 1200,
+    "completionTokens": 340,
     "cost": 0.042,
-    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+    "traceId": "4bf92f3577b34da6a3ce929d0e0e4736"
   }
 }
 ```
@@ -260,7 +260,7 @@ carries the declared `usage/v1` extension's metadata key
 - **The trace id.** The parent stamps a W3C `traceparent` header on the
   dispatch call (a client interceptor sends it, the server propagator
   lifts it), and the executor echoes its trace-id segment back in
-  `trace_id`, so server-side dispatch logs and the parent's client call
+  `traceId`, so server-side dispatch logs and the parent's client call
   share one correlation id. When the parent sent none, the server mints
   one for its own logs.
 - **Failure.** If the totals cannot be read, the status ships without
@@ -285,8 +285,8 @@ diff grows. It is sent in full: the coordinator's line and byte cuts are
 applied later, when it builds `diff_summary`.
 
 **`dispatch-result`.** Emitted on every completed run, with or without a
-diff. One data part carries the typed outcome: `diff_bytes`,
-`files_changed`, and `diff_error` when the diff could not be captured. A
+diff. One data part carries the typed outcome: `diffBytes`,
+`filesChanged`, and `diffError` when the diff could not be captured. A
 diff error does not fail the run: the task still completes, and the error
 rides the result.
 
@@ -303,7 +303,7 @@ rides the result.
 
 | Stream outcome | `DispatchResult` |
 | --- | --- |
-| `TASK_STATE_COMPLETED` | `completed`. `key_findings` is the message text. `diff_summary` comes from the `diff` artifact: `(no changes)` when it is empty, `(diff unavailable: …)` when the result artifact carries a `diff_error`. |
+| `TASK_STATE_COMPLETED` | `completed`. `key_findings` is the message text. `diff_summary` comes from the `diff` artifact: `(no changes)` when it is empty, `(diff unavailable: …)` when the result artifact carries a `diffError`. |
 | `TASK_STATE_FAILED`, `TASK_STATE_REJECTED` | `failed`. `error` is the message text. |
 | `TASK_STATE_CANCELED` | A status message that is a kill reason (#316) maps through the kill assembly: `killed`, with that reason. Anything else is `failed`, with `error` "dispatch canceled: …". |
 | Stream error the resume cannot recover | `failed`, with `error` "a2a: dispatch stream: …". |
@@ -368,15 +368,22 @@ A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/c
   question tool, and permission prompts use an in-process bridge
   ([#352](https://github.com/joestump-agent/crush/issues/352), [#353](https://github.com/joestump-agent/crush/issues/353)).
 - **Durable task state.** A restart loses every task ([#354](https://github.com/joestump-agent/crush/issues/354)).
-- **Authentication** of any kind ([#357](https://github.com/joestump-agent/crush/issues/357)).
 
 ## Security model
 
-:::warning[Unauthenticated by design, reach-restricted today]
-The served surface carries no authentication yet
-([#357](https://github.com/joestump-agent/crush/issues/357)). The reach
-restriction is the socket, not a credential:
+:::info[Bearer-authenticated, socket-reachable]
+Every served call must carry the host's bearer token, declared on the
+card as a `crush-bearer` HTTP bearer `securitySchemes` entry
+([#357](https://github.com/joestump-agent/crush/issues/357)). The dispatch
+client attaches it automatically; anything else is rejected with the
+JSON-RPC unauthenticated error before the handler runs. The reach
+restriction is the socket, layered under the credential:
 
+- **The credential.** Each host mints 32 bytes of `crypto/rand` at bind
+  time and holds it only in memory — never persisted, never logged. The
+  check is constant-time. Where the platform reports socket peer
+  credentials, the peer must also be the host's own OS user, and tasks
+  are stored under that identity.
 - **Who can reach it.** Only processes running as the same OS user: the
   socket is `0600` inside a `0700` directory under the data directory
   (a per-user temp dir when the path would overflow the socket length
@@ -386,10 +393,10 @@ restriction is the socket, not a credential:
   bodies including the CORS-simple `text/plain` POST (`415`), and a
   `Host` other than the internal `crush-a2a` label (`400`), so a web
   page cannot fold a prompt into a running dispatch.
-- **What a caller can do.** A same-user process can still `SendMessage`
-  a write-capable agent with the dispatch's permission policy; with yolo
-  on, that includes unprompted `bash`. Auth lands with
-  [#357](https://github.com/joestump-agent/crush/issues/357).
+
+A same-user process can no longer steer a dispatch: without the token,
+which only the host process holds, every call is rejected. TCP with
+mutual TLS remains planned ([#358](https://github.com/joestump-agent/crush/issues/358)).
 
 To turn dispatch off, run `permissions deny dispatch_agent`.
 :::
