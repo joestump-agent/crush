@@ -1195,3 +1195,38 @@ func TestExternalAgentScrubsTokenAtTheCut(t *testing.T) {
 		require.NotContains(t, outcome.Text, externalTestToken[:minDanglingToken], "%s: a token prefix survived the cut", prompt)
 	}
 }
+
+// A task ID crush would record — in the registry, the durable record,
+// log lines — must be at most 256 printable characters (#434); a stream
+// naming any other is refused before the ID goes anywhere.
+func TestExternalAgentRefusesBadTaskID(t *testing.T) {
+	t.Parallel()
+	for name, id := range map[string]string{
+		"too long":   strings.Repeat("t", maxTaskIDRunes+1),
+		"escape":     "task\x1b[2J",
+		"zero width": "task\u200bid",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+			event, err := json.Marshal(a2aspec.StreamResponse{Event: &a2aspec.Task{
+				ID:        a2aspec.TaskID(id),
+				ContextID: "ctx-1",
+				Status:    a2aspec.TaskStatus{State: a2aspec.TaskStateWorking},
+			}})
+			require.NoError(t, err)
+			es.callHandler = sseHandler(func(w io.Writer) {
+				_, _ = fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":%s}\n\n", event)
+			})
+			ext := resolveTestAgent(t, es)
+
+			var named []string
+			_, err = ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review", OnTask: func(id string) { named = append(named, id) }})
+			require.ErrorIs(t, err, errInvalidTaskID)
+			require.Empty(t, named, "a refused ID is never recorded")
+		})
+	}
+	require.True(t, validTaskID(a2aspec.TaskID(strings.Repeat("t", maxTaskIDRunes))))
+	require.True(t, validTaskID("0c8f0d3e-6c9b-4c61-9f6e-0b7d6e2b1a77"))
+	require.False(t, validTaskID("task\xff"), "JSON cannot carry it, but a raw ID must be valid UTF-8 too")
+}

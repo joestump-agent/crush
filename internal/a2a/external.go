@@ -628,6 +628,10 @@ func (a *externalAgent) Stream(ctx context.Context, p agent.ExternalDispatchPara
 			Text:          refusal,
 			WorkingEvents: s.outcome.WorkingEvents,
 		}, nil
+	case errors.Is(err, errInvalidTaskID):
+		// Refused before the ID was recorded: nothing to cancel by it,
+		// and the error is crush's own words.
+		return agent.DispatchTransportOutcome{}, err
 	case err != nil:
 		// The stream is gone and resume could not bring it back: the
 		// remote task would run on unsupervised, its result unread.
