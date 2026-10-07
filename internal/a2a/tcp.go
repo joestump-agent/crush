@@ -25,6 +25,24 @@ const a2aTLSConfigPath = "options.a2a"
 // TLS listener (#358).
 const defaultHTTPSPort = "443"
 
+// maxTCPRequestBody caps a TCP request body (#358). The SDK decodes a
+// JSON-RPC body whole, in memory, before anything else runs, so the cap
+// bounds what even an authenticated peer can make the host buffer. It is
+// sized for the largest legitimate request, a steer carrying pasted
+// attachments: the TUI caps one attachment at 5 MB, base64 inside the
+// JSON inflates that by 4/3 to about 6.7 MB, and 32 MiB holds four
+// full-size attachments plus the prompt and the envelope.
+const maxTCPRequestBody = 32 << 20
+
+// tcpReadHeaderTimeout bounds the TLS handshake and the request headers
+// on the TCP listener (#358); net/http applies it to both.
+const tcpReadHeaderTimeout = 30 * time.Second
+
+// tcpIdleTimeout closes a keep-alive TCP connection that has carried no
+// request for this long (#358). A stream is an active request, so it is
+// never cut by it.
+const tcpIdleTimeout = 2 * time.Minute
+
 // WithTCPListener configures the host's optional TCP listener (#358):
 // when opts sets a listen address, the host also serves every route over
 // TLS on that address, beside its unix socket. Plain TCP is never
@@ -108,6 +126,13 @@ type tcpHost struct {
 	// mutualTLS reports that client certificates are required and
 	// verified against client_ca.
 	mutualTLS bool
+
+	// maxBody caps a request body (maxTCPRequestBody; tests lower it).
+	maxBody int64
+
+	// logger receives the listener's audit lines: rejected requests and,
+	// through the server's ErrorLog, failed handshakes.
+	logger *slog.Logger
 }
 
 var _ hostListener = (*tcpHost)(nil)
@@ -139,22 +164,27 @@ func startTCPHost(ctx context.Context, f *ServerFactory, opts *config.A2AOptions
 		bound:     raw.Addr().String(),
 		leaf:      leaf,
 		mutualTLS: tlsCfg.ClientAuth == tls.RequireAndVerifyClientCert,
+		maxBody:   maxTCPRequestBody,
+		logger:    f.log(),
 	}
 	t.advertised = advertisedAddr(t.listen, t.bound, leaf)
 	t.server = &http.Server{
 		Handler:           http.HandlerFunc(t.serveHTTP),
-		ReadHeaderTimeout: 30 * time.Second,
-		// Failed handshakes — a scanner, a client without a certificate,
-		// plain HTTP — go to the debug log, not to stderr under the TUI.
-		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelDebug),
+		ReadHeaderTimeout: tcpReadHeaderTimeout,
+		IdleTimeout:       tcpIdleTimeout,
+		// Failed handshakes — a scanner, a client without a certificate
+		// or with one from another CA, plain HTTP — are audit lines with
+		// the peer's address, logged rather than written to stderr under
+		// the TUI.
+		ErrorLog: slog.NewLogLogger(t.logger.Handler(), slog.LevelInfo),
 	}
 	go func() {
 		defer close(t.done)
 		if err := t.server.Serve(t.listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("A2A TCP listener died early", "error", err)
+			t.logger.Error("A2A TCP listener died early", "error", err)
 		}
 	}()
-	slog.Info("A2A host listening on TCP", "addr", t.bound, "url", t.baseURL(), "mutual_tls", t.mutualTLS)
+	t.logger.Info("A2A host listening on TCP", "addr", t.bound, "url", t.baseURL(), "mutual_tls", t.mutualTLS)
 	return t, nil
 }
 
@@ -191,10 +221,55 @@ func (t *tcpHost) close(ctx context.Context) error {
 	return err
 }
 
-// serveHTTP is the TCP listener's root handler: the factory's middleware
-// and route table, with this listener's Host check and caller (#358).
+// serveHTTP is the TCP listener's root handler (#358). It authenticates
+// first, from the connection and the headers alone: a request without a
+// verified client certificate or the bearer token is answered 401 before
+// a byte of its body is read and before the route table is consulted, so
+// an unauthenticated peer can neither make the host decode a body nor
+// tell a live route from an unknown one. An authenticated request's body
+// is capped, then it takes the factory's middleware and route table with
+// this listener's Host check and caller.
 func (t *tcpHost) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if !t.authenticated(r) {
+		reason := "no credential"
+		if len(r.Header.Values(bearerAuthorizationHeader)) > 0 {
+			reason = "invalid bearer token"
+		}
+		// The audit line names the peer and why, never the credential.
+		t.logger.Warn("A2A TCP request rejected: unauthenticated",
+			"remote", r.RemoteAddr, "reason", reason, "mutual_tls", t.mutualTLS)
+		w.Header().Set("WWW-Authenticate", `Bearer realm="crush-a2a"`)
+		// Closing the connection keeps net/http from draining the
+		// unread body for keep-alive after the handler returns.
+		w.Header().Set("Connection", "close")
+		http.Error(w, "a2a: unauthenticated", http.StatusUnauthorized)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, t.maxBody)
 	t.factory.serveRequest(w, r, t)
+}
+
+// authenticated is the TCP listener's gate (#358): a client certificate
+// the handshake verified against client_ca, or exactly one Authorization
+// header carrying the host's bearer token, compared in constant time.
+// The route's call interceptor checks again after the body is decoded.
+func (t *tcpHost) authenticated(r *http.Request) bool {
+	if t.verifiedCert(r) != nil {
+		return true
+	}
+	return authDecision{
+		token:         t.factory.authToken(),
+		authorization: r.Header.Values(bearerAuthorizationHeader),
+	}.tokenMatches()
+}
+
+// verifiedCert returns the client certificate the handshake verified
+// against client_ca, or nil without mutual TLS or a verified chain.
+func (t *tcpHost) verifiedCert(r *http.Request) *x509.Certificate {
+	if !t.mutualTLS || r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.VerifiedChains[0]) == 0 {
+		return nil
+	}
+	return r.TLS.VerifiedChains[0][0]
 }
 
 // hostAllowed implements [hostListener] (#358): a Host is accepted when
@@ -219,9 +294,9 @@ func (t *tcpHost) hostAllowed(host string) bool {
 // carries the client certificate the handshake verified, if any.
 func (t *tcpHost) serveContext(routeCtx context.Context, r *http.Request) context.Context {
 	var peer remotePeer
-	if t.mutualTLS && r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
+	if cert := t.verifiedCert(r); cert != nil {
 		peer.certVerified = true
-		peer.certIdentity = certIdentity(r.TLS.VerifiedChains[0][0])
+		peer.certIdentity = certIdentity(cert)
 	}
 	return context.WithValue(routeCtx, remotePeerContextKey{}, peer)
 }

@@ -341,7 +341,8 @@ func TestTCPListenerRejectsPlainHTTP(t *testing.T) {
 // Without a token a TCP call is rejected (#358): there are no peer
 // credentials to fall back on, so the call is never treated as the
 // host's own user — on a dispatch route or on a definition route, which
-// the socket serves without credentials.
+// the socket serves without credentials. The listener answers 401 before
+// the JSON-RPC layer sees the request.
 func TestTCPListenerRequiresBearerToken(t *testing.T) {
 	t.Parallel()
 
@@ -356,15 +357,12 @@ func TestTCPListenerRequiresBearerToken(t *testing.T) {
 		"no token":    "",
 		"wrong token": "not-the-token",
 	} {
-		_, rpcErr := sendOverTCP(t, client, server.Card.SupportedInterfaces[1].URL, token, "")
-		require.NotNil(t, rpcErr, "%s must be rejected", name)
-		require.Equal(t, -31401, rpcErr.Code, "%s must map to UNAUTHENTICATED", name)
+		for _, url := range []string{server.Card.SupportedInterfaces[1].URL, base + agentsPathPrefix + "coder"} {
+			status, _, _ := postOverTCP(t, client, url, token, sendMessageBody(t, "dispatch-session", "run the task"))
+			require.Equal(t, http.StatusUnauthorized, status, "%s on %s must be rejected", name, url)
+		}
 	}
 	require.False(t, runner.ran, "an unauthenticated TCP call must not reach the runner")
-
-	_, rpcErr := sendOverTCP(t, client, base+agentsPathPrefix+"coder", "", "")
-	require.NotNil(t, rpcErr, "a definition route over TCP must authenticate")
-	require.Equal(t, -31401, rpcErr.Code)
 
 	task, rpcErr := sendOverTCP(t, client, base+agentsPathPrefix+"coder", factory.authToken(), "")
 	require.Nil(t, rpcErr, "the token passes a definition route over TCP")

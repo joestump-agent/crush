@@ -61,6 +61,11 @@ const a2aSocketDirName = "a2a"
 // requests to a dispatch's JSON-RPC handler.
 const agentsPathPrefix = "/agents/"
 
+// versionProbeLimit bounds how much of a request body the
+// unsupported-version answer reads to echo the request id (#358): far
+// more than any envelope's id needs, far less than a body worth buffering.
+const versionProbeLimit = 64 << 10
+
 // traceparentHeader is the W3C Trace Context header the dispatch client
 // sends and the server propagator lifts into the request context (#364).
 const traceparentHeader = "traceparent"
@@ -253,6 +258,10 @@ type ServerFactory struct {
 	// tcpOpts configures the optional TLS-only TCP listener (#358),
 	// started with the socket; nil keeps the host on its socket alone.
 	tcpOpts *config.A2AOptions
+
+	// logger, when set, replaces slog.Default for the TCP listener's
+	// lines (#358) — the test seam for its audit log.
+	logger *slog.Logger
 
 	mu         sync.Mutex
 	started    bool
@@ -905,17 +914,19 @@ func (f *ServerFactory) serveRequest(w http.ResponseWriter, r *http.Request, l h
 // host does not serve with the spec's VersionNotSupportedError envelope
 // (-32009), before the SDK handler runs: the answer is a plain JSON-RPC
 // error even when the request asked for a stream, so a client cannot miss
-// the rejection inside SSE framing.
+// the rejection inside SSE framing. Only the first versionProbeLimit
+// bytes are read for the request id (#358): a larger body answers with
+// a null id rather than being buffered whole.
 func writeVersionNotSupported(w http.ResponseWriter, r *http.Request) {
 	id := json.RawMessage("null")
-	if body, err := io.ReadAll(r.Body); err == nil {
+	if body, err := io.ReadAll(io.LimitReader(r.Body, versionProbeLimit)); err == nil {
 		var req struct {
 			ID json.RawMessage `json:"id"`
 		}
 		if json.Unmarshal(body, &req) == nil && len(req.ID) > 0 {
 			id = req.ID
 		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
 	}
 	info := errordetails.NewErrorInfo(
 		a2aspec.ErrorReason(a2aspec.ErrVersionNotSupported),
@@ -995,6 +1006,15 @@ func (f *ServerFactory) tcpEndpoint(id string) (string, bool) {
 		return "", false
 	}
 	return f.tcp.baseURL() + agentsPathPrefix + id, f.tcp.mutualTLS
+}
+
+// log returns the logger the TCP listener writes to: the injected one,
+// or slog.Default.
+func (f *ServerFactory) log() *slog.Logger {
+	if f.logger != nil {
+		return f.logger
+	}
+	return slog.Default()
 }
 
 // tcpAddr returns the address the TCP listener bound (#358); empty when
