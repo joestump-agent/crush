@@ -231,20 +231,17 @@ read-only and can't be continued; dispatch a new agent instead.
 
 ## Client/server mode
 
-In [client/server mode](/features/server-and-workspaces)
-(`CRUSH_CLIENT_SERVER=1`), the dispatch registry and message queue live in the
-server, and no API exposes them yet.
+In [client/server mode](/features/server-and-workspaces#dispatched-agents-against-a-server)
+(`CRUSH_CLIENT_SERVER=1`), every surface on this page works as it does in
+process ([#421](https://github.com/joestump-agent/crush/issues/421)). The TUI
+follows the server's dispatched agents over A2A, through the server's proxy to
+the workspace's agent host:
+- the agent block updates live;
+- the @ completions list running agents;
+- a leading `@handle` steers the agent;
+- mentions attach a card;
+- <kbd>ctrl+x</kbd> cancels an agent.
 
-| Surface | Behavior |
-| --- | --- |
-| Agent block | Static: the handle saved at dispatch, never updated |
-| @ completions | No agents |
-| Leading @handle | Sent to the main agent as an ordinary prompt, without warning |
-| Mentions | No card |
-| Inspect mode | A selected block opens, but there are no live agents to cycle |
-| Sessions tree | Works |
-
-:::info[Planned]
-The TUI becomes an A2A client of the per-process A2A host, so status, steering,
-and cancellation work the same in both modes ([#421](https://github.com/joestump-agent/crush/issues/421)).
-:::
+A finished agent's card carries its findings once the run has stamped its
+result on the dispatch card. Until then it carries the agent's final status
+text.

@@ -14,7 +14,6 @@ import (
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/commands"
 	"github.com/charmbracelet/crush/internal/config"
-	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
@@ -215,48 +214,13 @@ type Workspace interface {
 	// History
 	ListSessionHistory(ctx context.Context, sessionID string) ([]history.File, error)
 
-	// Dispatch
-	//
-	// DispatchStatus returns the current progress snapshot for the
-	// dispatched agent running on sessionID — the task session a
-	// dispatch_agent tool call created (#65). ok=false when no dispatch
-	// is known: in-process dispatches from an earlier process, or any
-	// dispatch in client/server mode (the registry lives in the server
-	// process; surfacing it over the wire is later work). Callers render
-	// the block from its persisted tool result in that case.
-	DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool)
-	// DispatchLive returns the snapshots of every non-terminal dispatch
-	// created from sessionID (#313/#399): the editor's live-agents @
-	// completion source. Empty in client/server mode, where the registry
-	// lives in the server process.
-	DispatchLive(sessionID string) []dispatch.TodoSnapshot
-	// DispatchByHandle resolves an @handle to its dispatch snapshot
-	// (#313), finished dispatches included. ok=false when no dispatch
-	// carries the handle, when another session dispatched it (#399), or
-	// in client/server mode.
-	DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool)
-	// DeliverAgentMessageByHandle routes the editor's leading @handle
-	// message and its attachments (#414) to the running dispatched
-	// agent's injection queue (#312 / #313). A finished, unknown, or
-	// foreign-session handle returns a refusal error (#399); in
-	// client/server mode it reports that dispatch steering needs a
-	// local process.
-	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error
-	// CancelDispatch stops one dispatched agent on demand (#373): the
-	// ref resolves through the dispatch registry as a dispatch ID, an
-	// @handle, or the dispatched agent's child session ID — the ID a
-	// dispatch card carries. Unknown and finished dispatches return a
-	// refusal error; in client/server mode it reports that canceling a
-	// dispatched agent needs a local process.
-	CancelDispatch(ctx context.Context, ref string) error
-
 	// Agent tasks (#421)
 	//
 	// The dispatched-agent surface over A2A: every method reads or acts
 	// through the A2A host's agent index and the A2A protocol, never the
 	// dispatch registry, so both workspace modes serve it the same way.
 	// Changes reach the TUI as pubsub.Event[AgentTask] messages once
-	// Subscribe has run. The Dispatch* methods above give way to these.
+	// Subscribe has run.
 	//
 	// ListAgentTasks returns the agents dispatched from sessionID (#399),
 	// finished ones included, oldest first.

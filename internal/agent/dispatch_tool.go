@@ -1017,8 +1017,8 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	watchStop()
 
 	// Record the terminal payload before the terminal status so the
-	// terminal entry event carries it: the completed agent block (#65)
-	// renders its durable record from the registry.
+	// terminal entry event carries it to every registry reader: handle
+	// resolution, message_agent and the todo collector.
 	run.reg.SetResult(run.entry.ID, terminal)
 	run.reg.SetStatus(run.entry.ID, terminal.Status)
 	// The durable record (#355): the terminal payload lands in SQLite so
@@ -1034,7 +1034,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// Stamp the terminal result onto the parent's persisted dispatch_agent
 	// tool result (#410): the card's durable record after a restart or in
 	// client/server mode, where the in-memory registry is unreachable.
-	c.persistDispatchTerminalResult(ctx, run, terminal)
+	c.persistDispatchTerminalResult(ctx, run.parentSessionID, run.sessionID, c.dispatchPersistWindow, terminal)
 
 	// Cost propagation (#364): a served dispatch reports its usage on
 	// the wire, and the parent applies it with one atomic UPDATE — no
@@ -1065,30 +1065,32 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 //
 // The parent turn persists the tool result after dispatchTool returns,
 // and the run is launched before that, so a run that ends almost
-// instantly can race the write. The wait is bounded: on giveup the
-// terminal record stays only in the registry and the delivery turn,
-// logged at Warn.
-func (c *coordinator) persistDispatchTerminalResult(ctx context.Context, run dispatchRun, terminal dispatch.DispatchResult) {
-	_, toolCallID, ok := c.sessions.ParseAgentToolSessionID(run.sessionID)
+// instantly can race the write: the result is looked for until window
+// runs out, and a zero window looks once. On giveup the terminal record
+// stays only in the durable record and the delivery turn, logged at
+// Warn. sessionID is the dispatched agent's child session, which names
+// the tool call; parentSessionID holds the tool result.
+func (c *coordinator) persistDispatchTerminalResult(ctx context.Context, parentSessionID, sessionID string, window time.Duration, terminal dispatch.DispatchResult) {
+	_, toolCallID, ok := c.sessions.ParseAgentToolSessionID(sessionID)
 	if !ok {
-		slog.Warn("Cannot persist dispatch terminal result: session is not an agent tool session", "session_id", run.sessionID, "dispatch_id", run.entry.ID)
+		slog.Warn("Cannot persist dispatch terminal result: session is not an agent tool session", "session_id", sessionID, "dispatch_id", terminal.DispatchID)
 		return
 	}
 	b, err := json.Marshal(terminal)
 	if err != nil {
-		slog.Warn("Failed to encode dispatch terminal result", "dispatch_id", run.entry.ID, "error", err)
+		slog.Warn("Failed to encode dispatch terminal result", "dispatch_id", terminal.DispatchID, "error", err)
 		return
 	}
 	metadata := string(b)
 
-	deadline := time.Now().Add(c.dispatchPersistWindow)
+	deadline := time.Now().Add(window)
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		msgs, err := c.messages.List(ctx, run.parentSessionID)
+		msgs, err := c.messages.List(ctx, parentSessionID)
 		if err != nil {
-			slog.Warn("Failed to list parent session for dispatch terminal result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "error", err)
+			slog.Warn("Failed to list parent session for dispatch terminal result", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID, "error", err)
 			return
 		}
 		for i, msg := range msgs {
@@ -1109,7 +1111,7 @@ func (c *coordinator) persistDispatchTerminalResult(ctx context.Context, run dis
 				continue
 			}
 			if err := c.messages.Update(ctx, msgs[i]); err != nil {
-				slog.Warn("Failed to persist dispatch terminal result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "error", err)
+				slog.Warn("Failed to persist dispatch terminal result", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID, "error", err)
 				return
 			}
 			// The service may debounce updates; flush so any later read
@@ -1120,7 +1122,7 @@ func (c *coordinator) persistDispatchTerminalResult(ctx context.Context, run dis
 			return
 		}
 		if !time.Now().Before(deadline) {
-			slog.Warn("Gave up waiting for the parent's dispatch tool result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "tool_call_id", toolCallID, "waited", c.dispatchPersistWindow)
+			slog.Warn("Gave up waiting for the parent's dispatch tool result", "parent_session", parentSessionID, "dispatch_id", terminal.DispatchID, "tool_call_id", toolCallID, "waited", window)
 			return
 		}
 		select {
@@ -1674,57 +1676,16 @@ func (c *coordinator) dispatchWorkspaceProvider() (*dispatch.GitWorktreeProvider
 	return c.dispatchProvider, c.dispatchProviderErr
 }
 
-// DispatchStatus returns the current progress snapshot for the
-// dispatched agent running on sessionID (#65). It backs the UI's
-// seed-on-load path: a reloaded session's persisted dispatch_agent
-// result is the running handle, and this is how the block learns the
-// dispatch's real state without waiting for the next event.
-//
-// When the collector has no snapshot — a restart emptied the in-memory
-// registry — the durable record (#355) answers instead, so a block
-// whose run reached a terminal state renders that state instead of a
-// forever-working stale handle.
-func (c *coordinator) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
-	c.dispatchMu.Lock()
-	collector := c.dispatchCollector
-	records := c.dispatchRecords
-	c.dispatchMu.Unlock()
-	if collector != nil {
-		if snapshot, ok := collector.Snapshot(sessionID); ok {
-			return snapshot, true
-		}
-	}
-	if records == nil {
-		return dispatch.TodoSnapshot{}, false
-	}
-	result, status, ok := records.SnapshotRecord(sessionID)
-	if !ok {
-		return dispatch.TodoSnapshot{}, false
-	}
-	entry := dispatch.Entry{
-		ID:        result.DispatchID,
-		Path:      result.WorkspacePath,
-		Branch:    result.Branch,
-		SessionID: sessionID,
-		Handle:    result.Handle,
-		Status:    status,
-	}
-	if status.IsTerminal() {
-		result.Status = status
-		entry.Result = &result
-	}
-	return dispatch.TodoSnapshot{Entry: entry}, true
-}
-
 // ReconcileDispatchDeliveries re-delivers the terminal dispatch
 // payloads a previous process finished but never delivered (#355).
 // Every terminal record without a delivered stamp whose parent session
-// still exists goes through deliverDispatchResult — #388's
-// pending-delivery machinery, so the delivered stamp lands only when
-// the payload reaches the parent: the delivery turn succeeds, or its
-// call, queued behind a busy parent, is consumed. A parent session
-// that no longer exists drops the payload permanently: nobody can ever
-// receive it, and the row's terminal state still seeds the UI. Called
+// still exists has its terminal result stamped on the parent's
+// dispatch_agent tool result, so the reloaded card renders it (#410),
+// then goes through deliverDispatchResult — #388's pending-delivery
+// machinery, so the delivered stamp lands only when the payload reaches
+// the parent: the delivery turn succeeds, or its call, queued behind a
+// busy parent, is consumed. A parent session that no longer exists
+// drops the payload permanently: nobody can ever receive it. Called
 // from the app at startup, after a2a.ReconcileOrphanedTasks and before
 // the UI loads sessions.
 func (c *coordinator) ReconcileDispatchDeliveries(ctx context.Context) {
@@ -1748,6 +1709,11 @@ func (c *coordinator) ReconcileDispatchDeliveries(ctx context.Context) {
 			continue
 		}
 		slog.Info("Re-delivering dispatch result left undelivered by a restart", "parent_session", u.ParentSessionID, "dispatch_id", u.Result.DispatchID)
+		// The run that would have stamped its card died with the last
+		// process, so the stamp is made here: it is the durable record a
+		// reloaded card renders, in either workspace mode (#410, #421).
+		// The parent's tool result was written long ago, so one look.
+		c.persistDispatchTerminalResult(ctx, u.ParentSessionID, u.Result.SessionID, 0, u.Result)
 		c.deliverDispatchResult(ctx, u.ParentSessionID, u.Result)
 	}
 }

@@ -1292,9 +1292,8 @@ func (s *agentSink) until(t *testing.T, cond func(dispatch.TodoSnapshot) bool) d
 // Progress flows end to end (#65): the collector — created with the
 // registry on the first dispatch — reduces the dispatched session's
 // saves and the registry's transitions into snapshots for every sink,
-// the terminal snapshot carries the DispatchResult, and DispatchStatus
-// answers a pull for the session so a reloaded UI can re-attach.
-func TestDispatchProgressFlowsToSinksAndDispatchStatus(t *testing.T) {
+// and the terminal snapshot carries the DispatchResult.
+func TestDispatchProgressFlowsToSinks(t *testing.T) {
 	dispatched := &dispatchTestAgent{
 		model:  dispatchTestModel(),
 		result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
@@ -1332,24 +1331,12 @@ func TestDispatchProgressFlowsToSinksAndDispatchStatus(t *testing.T) {
 	require.Equal(t, int64(900), reduced.PromptTokens)
 	require.Equal(t, int64(100), reduced.CompletionTokens)
 
-	// The terminal snapshot carries the DispatchResult, and the pull
-	// answers with the same durable record.
+	// The terminal snapshot carries the DispatchResult.
 	terminal := sink.until(t, func(s dispatch.TodoSnapshot) bool {
 		return s.Entry.SessionID == handle.SessionID && s.Entry.Status == dispatch.StatusCompleted
 	})
 	require.NotNil(t, terminal.Entry.Result)
 	require.Equal(t, "done", terminal.Entry.Result.KeyFindings)
-
-	pulled, ok := c.DispatchStatus(handle.SessionID)
-	require.True(t, ok)
-	require.Equal(t, dispatch.StatusCompleted, pulled.Entry.Status)
-	require.NotNil(t, pulled.Entry.Result)
-	require.Equal(t, "done", pulled.Entry.Result.KeyFindings)
-	require.Equal(t, "fixing the bug", pulled.CurrentTodo)
-
-	// Unknown sessions report not-found, not a zero snapshot.
-	_, ok = c.DispatchStatus("no-such-session")
-	require.False(t, ok)
 }
 
 // With every write tool denied there is nothing a dispatch can do

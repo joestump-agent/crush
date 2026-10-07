@@ -148,11 +148,6 @@ type Coordinator interface {
 	Model() Model
 	UpdateModels(ctx context.Context) error
 	GenerateTitle(ctx context.Context, sessionID, prompt string)
-	// DispatchStatus returns the current progress snapshot for the
-	// dispatched agent running on sessionID (#65) — the task session a
-	// dispatch_agent tool call created. ok=false when no dispatch is
-	// known for the session.
-	DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool)
 	// DeliverAgentMessage delivers a message to the dispatched agent
 	// running on the message's session as its next input (#312) — the
 	// transport-agnostic injection seam shared by the message_agent tool,
@@ -161,28 +156,10 @@ type Coordinator interface {
 	// a message whose FromSessionID does not own the dispatch (#399).
 	DeliverAgentMessage(ctx context.Context, msg AgentMessage) error
 	// DispatchLive returns the snapshots of every non-terminal dispatch
-	// created from sessionID (#313/#399) — the editor's live-agents @
-	// completion source. Finished handles and other sessions' dispatches
-	// never appear.
+	// created from sessionID (#313/#399): a session with one still
+	// running cannot be deleted. Finished handles and other sessions'
+	// dispatches never appear.
 	DispatchLive(sessionID string) []dispatch.TodoSnapshot
-	// DispatchByHandle resolves an @handle to its dispatch snapshot
-	// (#313), finished dispatches included; the caller decides what a
-	// finished handle means. A handle dispatched from another session
-	// does not resolve (#399).
-	DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool)
-	// DeliverAgentMessageByHandle delivers a message and its
-	// attachments (#414) to the running dispatched agent carrying
-	// handle (#313) — the editor's leading @handle routing. A
-	// finished, unknown, or foreign-session handle refuses cleanly
-	// (#399).
-	DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error
-	// CancelDispatch stops one dispatched agent on demand (#373): the
-	// ref resolves through the registry as a dispatch ID, an @handle, or
-	// the dispatched agent's child session ID. The dispatch ends killed
-	// with reason "canceled by user" and its workspace is preserved; the
-	// parent's run is untouched. An unknown ref, a finished dispatch, or
-	// a ref with no live run in this process is an error.
-	CancelDispatch(ctx context.Context, ref string) error
 }
 
 // liveDispatch is the coordinator's record of one running dispatch

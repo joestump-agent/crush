@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -12,12 +13,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// agentMentionWorkspace stubs the dispatch surfaces (#313) the routing
-// and completion code reads: a handle registry keyed by handle, a live
-// list, and a recording delivery sink.
+// agentMentionWorkspace stubs the agent surface (#313, #421) the routing
+// and completion code reads: agents keyed by handle and a recording
+// delivery sink.
 type agentMentionWorkspace struct {
 	slashCommandWorkspace
-	byHandle   map[string]dispatch.TodoSnapshot
+	byHandle   map[string]workspace.AgentTask
 	delivered  []deliveredMessage
 	deliverErr error
 	agentRuns  int
@@ -28,30 +29,40 @@ type deliveredMessage struct {
 	attachments           []message.Attachment
 }
 
-func (w *agentMentionWorkspace) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
-	var out []dispatch.TodoSnapshot
-	for _, snap := range w.byHandle {
-		if !snap.Entry.Status.IsTerminal() && snap.Entry.ParentSessionID == sessionID {
-			out = append(out, snap)
+func (w *agentMentionWorkspace) ListAgentTasks(sessionID string) []workspace.AgentTask {
+	var out []workspace.AgentTask
+	for _, task := range w.byHandle {
+		if task.ParentSessionID == sessionID {
+			out = append(out, task)
 		}
 	}
 	return out
 }
 
-func (w *agentMentionWorkspace) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
-	snap, ok := w.byHandle[handle]
-	if !ok || snap.Entry.ParentSessionID != sessionID {
-		return dispatch.TodoSnapshot{}, false
+func (w *agentMentionWorkspace) AgentTaskByHandle(sessionID, handle string) (workspace.AgentTask, bool) {
+	task, ok := w.byHandle[handle]
+	if !ok || task.ParentSessionID != sessionID {
+		return workspace.AgentTask{}, false
 	}
-	return snap, ok
+	return task, ok
 }
 
-func (w *agentMentionWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
+func (w *agentMentionWorkspace) SendAgentMessage(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	if w.deliverErr != nil {
 		return w.deliverErr
 	}
 	w.delivered = append(w.delivered, deliveredMessage{session: sessionID, handle: handle, text: text, attachments: attachments})
 	return nil
+}
+
+// ParseAgentToolSessionID splits a child session ID into its message and
+// tool call IDs, the way the session service names them.
+func (w *agentMentionWorkspace) ParseAgentToolSessionID(sessionID string) (string, string, bool) {
+	parts := strings.Split(sessionID, "$$")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 // AgentRun records a parent-turn start; a routed or refused steer must
@@ -74,33 +85,26 @@ func newAgentMentionUI(ws *agentMentionWorkspace) *UI {
 // its dispatches carry it as their parent.
 const testMentionSession = "sess-mention-parent"
 
-func runningSnapshot(handle, role string) dispatch.TodoSnapshot {
-	return dispatch.TodoSnapshot{
-		Entry: dispatch.Entry{
-			ID:              "dispatch-" + handle,
-			SessionID:       "msg$$call-" + handle,
-			ParentSessionID: testMentionSession,
-			Handle:          handle,
-			Role:            role,
-			Status:          dispatch.StatusRunning,
-		},
-		CurrentTodo: "wiring form validation",
+func runningTask(handle, role string) workspace.AgentTask {
+	return workspace.AgentTask{
+		DispatchID:      "dispatch-" + handle,
+		SessionID:       "msg$$call-" + handle,
+		ParentSessionID: testMentionSession,
+		Handle:          handle,
+		Role:            role,
+		Status:          dispatch.StatusRunning,
+		CurrentTodo:     "wiring form validation",
 	}
 }
 
-func finishedSnapshot(handle string) dispatch.TodoSnapshot {
-	return dispatch.TodoSnapshot{
-		Entry: dispatch.Entry{
-			ID:              "dispatch-" + handle,
-			SessionID:       "msg$$call-" + handle,
-			ParentSessionID: testMentionSession,
-			Handle:          handle,
-			Status:          dispatch.StatusCompleted,
-			Result: &dispatch.DispatchResult{
-				Status:      dispatch.StatusCompleted,
-				KeyFindings: "Switched to Go.",
-			},
-		},
+func finishedTask(handle string) workspace.AgentTask {
+	return workspace.AgentTask{
+		DispatchID:      "dispatch-" + handle,
+		SessionID:       "msg$$call-" + handle,
+		ParentSessionID: testMentionSession,
+		Handle:          handle,
+		Status:          dispatch.StatusCompleted,
+		StatusText:      "Switched to Go.",
 	}
 }
 
@@ -168,12 +172,14 @@ func TestMentionHandles(t *testing.T) {
 	require.Equal(t, []string{"tester"}, mentionHandles("line one\n@tester on the next line"))
 }
 
-// AgentCardAttachment composes the live card from a running snapshot and
-// the read-only transcript card from a terminal one.
+// AgentCardAttachment composes the live card from a running agent and
+// the read-only transcript card from a finished one: its findings come
+// from the stamped terminal record when the card has it, else from the
+// agent's final status text (#421).
 func TestAgentCardAttachment(t *testing.T) {
 	t.Parallel()
 
-	live := AgentCardAttachment(runningSnapshot("tester", "writes tests"))
+	live := AgentCardAttachment(runningTask("tester", "writes tests"), nil)
 	require.Equal(t, message.AttachmentKindAgentCard, live.Kind)
 	require.Contains(t, string(live.Content), "@tester")
 	require.Contains(t, string(live.Content), "writes tests")
@@ -181,10 +187,24 @@ func TestAgentCardAttachment(t *testing.T) {
 	require.Contains(t, string(live.Content), "msg$$call-tester")
 	require.Contains(t, string(live.Content), "Live agent card")
 
-	done := AgentCardAttachment(finishedSnapshot("tester"))
+	done := AgentCardAttachment(finishedTask("tester"), nil)
 	require.Contains(t, string(done.Content), "not continuable")
 	require.Contains(t, string(done.Content), "Switched to Go.")
 	require.Contains(t, string(done.Content), "Read-only agent card")
+
+	recorded := AgentCardAttachment(finishedTask("tester"), &dispatch.DispatchResult{
+		Status: dispatch.StatusCompleted, KeyFindings: "Added validation.", DiffSummary: "login.go | +12 -3",
+	})
+	require.Contains(t, string(recorded.Content), "Added validation.")
+	require.Contains(t, string(recorded.Content), "login.go | +12 -3")
+	require.NotContains(t, string(recorded.Content), "Switched to Go.", "the record wins over the final status text")
+
+	// A stamped record is final even when the live state lags behind it.
+	lagging := AgentCardAttachment(runningTask("tester", "writes tests"), &dispatch.DispatchResult{
+		Status: dispatch.StatusCompleted, KeyFindings: "Added validation.",
+	})
+	require.Contains(t, string(lagging.Content), "Read-only agent card")
+	require.NotContains(t, string(lagging.Content), "Current todo")
 }
 
 // The leading @handle routes to the agent's injection queue and consumes
@@ -196,9 +216,9 @@ func TestRouteLeadingAgentHandle(t *testing.T) {
 	t.Parallel()
 
 	atts := []message.Attachment{{FileName: "note.txt", MimeType: "text/plain", Content: []byte("hello")}}
-	ws := &agentMentionWorkspace{byHandle: map[string]dispatch.TodoSnapshot{
-		"tester": runningSnapshot("tester", "writes tests"),
-		"done":   finishedSnapshot("done"),
+	ws := &agentMentionWorkspace{byHandle: map[string]workspace.AgentTask{
+		"tester": runningTask("tester", "writes tests"),
+		"done":   finishedTask("done"),
 	}}
 	m := newAgentMentionUI(ws)
 
@@ -266,8 +286,8 @@ func TestRouteLeadingAgentHandle(t *testing.T) {
 func TestRouteLeadingAgentHandleCaseInsensitive(t *testing.T) {
 	t.Parallel()
 
-	ws := &agentMentionWorkspace{byHandle: map[string]dispatch.TodoSnapshot{
-		"tester": runningSnapshot("tester", "writes tests"),
+	ws := &agentMentionWorkspace{byHandle: map[string]workspace.AgentTask{
+		"tester": runningTask("tester", "writes tests"),
 	}}
 	m := newAgentMentionUI(ws)
 
@@ -286,9 +306,9 @@ func TestRouteLeadingAgentHandleCaseInsensitive(t *testing.T) {
 func TestAgentMentionAttachments(t *testing.T) {
 	t.Parallel()
 
-	ws := &agentMentionWorkspace{byHandle: map[string]dispatch.TodoSnapshot{
-		"tester": runningSnapshot("tester", "writes tests"),
-		"done":   finishedSnapshot("done"),
+	ws := &agentMentionWorkspace{byHandle: map[string]workspace.AgentTask{
+		"tester": runningTask("tester", "writes tests"),
+		"done":   finishedTask("done"),
 	}}
 	m := newAgentMentionUI(ws)
 
@@ -312,9 +332,9 @@ func TestAgentMentionAttachments(t *testing.T) {
 func TestAgentCompletionValues(t *testing.T) {
 	t.Parallel()
 
-	ws := &agentMentionWorkspace{byHandle: map[string]dispatch.TodoSnapshot{
-		"tester": runningSnapshot("tester", "writes tests"),
-		"done":   finishedSnapshot("done"),
+	ws := &agentMentionWorkspace{byHandle: map[string]workspace.AgentTask{
+		"tester": runningTask("tester", "writes tests"),
+		"done":   finishedTask("done"),
 	}}
 	m := newAgentMentionUI(ws)
 
@@ -333,9 +353,9 @@ func TestAgentCompletionValues(t *testing.T) {
 func TestAgentMentionOtherSessionInvisible(t *testing.T) {
 	t.Parallel()
 
-	foreign := runningSnapshot("foreign", "other session's agent")
-	foreign.Entry.ParentSessionID = "sess-other-session"
-	ws := &agentMentionWorkspace{byHandle: map[string]dispatch.TodoSnapshot{
+	foreign := runningTask("foreign", "other session's agent")
+	foreign.ParentSessionID = "sess-other-session"
+	ws := &agentMentionWorkspace{byHandle: map[string]workspace.AgentTask{
 		"foreign": foreign,
 	}}
 	m := newAgentMentionUI(ws)
@@ -365,8 +385,8 @@ func TestSubmitLeadingHandleDeliversAttachments(t *testing.T) {
 		{FileName: "screenshot.png", MimeType: "image/png", Content: []byte("png")},
 		{FileName: "notes.txt", MimeType: "text/plain", Content: []byte("notes")},
 	}
-	ws := &agentMentionWorkspace{byHandle: map[string]dispatch.TodoSnapshot{
-		"tester": runningSnapshot("tester", "writes tests"),
+	ws := &agentMentionWorkspace{byHandle: map[string]workspace.AgentTask{
+		"tester": runningTask("tester", "writes tests"),
 	}}
 	m := newAgentMentionSubmitUI(ws)
 	for _, att := range atts {
@@ -394,7 +414,7 @@ func TestSubmitLeadingHandleDeliversAttachments(t *testing.T) {
 func TestSubmitLeadingHandleRefusalRestoresEditor(t *testing.T) {
 	t.Parallel()
 
-	newCase := func(t *testing.T, byHandle map[string]dispatch.TodoSnapshot) (*UI, *agentMentionWorkspace, message.Attachment) {
+	newCase := func(t *testing.T, byHandle map[string]workspace.AgentTask) (*UI, *agentMentionWorkspace, message.Attachment) {
 		t.Helper()
 		ws := &agentMentionWorkspace{byHandle: byHandle}
 		m := newAgentMentionSubmitUI(ws)
@@ -405,7 +425,7 @@ func TestSubmitLeadingHandleRefusalRestoresEditor(t *testing.T) {
 
 	t.Run("finished agent", func(t *testing.T) {
 		t.Parallel()
-		m, ws, att := newCase(t, map[string]dispatch.TodoSnapshot{"done": finishedSnapshot("done")})
+		m, ws, att := newCase(t, map[string]workspace.AgentTask{"done": finishedTask("done")})
 		m.textarea.SetValue("@done one more thing")
 
 		m.handleKeyPressMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -418,7 +438,7 @@ func TestSubmitLeadingHandleRefusalRestoresEditor(t *testing.T) {
 
 	t.Run("delivery error", func(t *testing.T) {
 		t.Parallel()
-		m, ws, att := newCase(t, map[string]dispatch.TodoSnapshot{"tester": runningSnapshot("tester", "writes tests")})
+		m, ws, att := newCase(t, map[string]workspace.AgentTask{"tester": runningTask("tester", "writes tests")})
 		ws.deliverErr = context.DeadlineExceeded
 		m.mentionAttachments = map[string][]string{"@notes.txt": {"notes-key"}}
 		m.discardedMentions = map[string]bool{"old.txt": true}
@@ -436,7 +456,7 @@ func TestSubmitLeadingHandleRefusalRestoresEditor(t *testing.T) {
 
 	t.Run("no message", func(t *testing.T) {
 		t.Parallel()
-		m, ws, att := newCase(t, map[string]dispatch.TodoSnapshot{"tester": runningSnapshot("tester", "writes tests")})
+		m, ws, att := newCase(t, map[string]workspace.AgentTask{"tester": runningTask("tester", "writes tests")})
 		m.textarea.SetValue("@tester")
 
 		m.handleKeyPressMsg(tea.KeyPressMsg{Code: tea.KeyEnter})

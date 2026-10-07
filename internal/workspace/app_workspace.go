@@ -15,7 +15,6 @@ import (
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/commands"
 	"github.com/charmbracelet/crush/internal/config"
-	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
@@ -365,28 +364,6 @@ func (w *AppWorkspace) FileTrackerListReadFiles(ctx context.Context, sessionID s
 
 func (w *AppWorkspace) ListSessionHistory(ctx context.Context, sessionID string) ([]history.File, error) {
 	return w.app.History.ListBySession(ctx, sessionID)
-}
-
-// -- Dispatch --
-
-func (w *AppWorkspace) DispatchStatus(sessionID string) (dispatch.TodoSnapshot, bool) {
-	return w.app.DispatchStatus(sessionID)
-}
-
-func (w *AppWorkspace) DispatchLive(sessionID string) []dispatch.TodoSnapshot {
-	return w.app.DispatchLive(sessionID)
-}
-
-func (w *AppWorkspace) DispatchByHandle(sessionID, handle string) (dispatch.TodoSnapshot, bool) {
-	return w.app.DispatchByHandle(sessionID, handle)
-}
-
-func (w *AppWorkspace) DeliverAgentMessageByHandle(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
-	return w.app.DeliverAgentMessageByHandle(ctx, sessionID, handle, text, attachments)
-}
-
-func (w *AppWorkspace) CancelDispatch(ctx context.Context, ref string) error {
-	return w.app.CancelDispatch(ctx, ref)
 }
 
 // -- Agent tasks (#421) --

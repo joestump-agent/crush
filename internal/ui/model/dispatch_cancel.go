@@ -3,9 +3,10 @@ package model
 // Canceling a dispatched agent from the UI (#373): ctrl+x ends one
 // dispatched agent's run. The target is the dispatch being viewed in
 // inspect mode, or the selected chat item when it is a live dispatch
-// card. The kill goes through the workspace's CancelDispatch, which
-// refuses unknown or already-finished dispatches; the card flips to
-// "canceled" once the registry reports the killed result.
+// card. The kill goes through the workspace's CancelAgentTask — A2A
+// tasks/cancel (#421) — which refuses unknown, finished and not yet
+// started agents; the card flips to "canceled" once the agent surface
+// reports it.
 
 import (
 	"context"
@@ -49,9 +50,9 @@ func (m *UI) focusedLiveDispatchSessionID() string {
 // cancelDispatchAgent kills the dispatched agent behind the given child
 // session ID (#373) and reports the outcome the way the parent agent
 // reports: errors surface as error toasts, success as an info toast. The
-// card itself flips to "canceled" when the registry snapshot lands.
+// card itself flips to "canceled" when the agent surface reports it.
 func (m *UI) cancelDispatchAgent(sessionID string) tea.Cmd {
-	if err := m.com.Workspace.CancelDispatch(context.Background(), sessionID); err != nil {
+	if err := m.com.Workspace.CancelAgentTask(context.Background(), sessionID); err != nil {
 		return util.ReportError(err)
 	}
 	return util.ReportInfo(fmt.Sprintf("Canceling dispatched agent %s", sessionID))

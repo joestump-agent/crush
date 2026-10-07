@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,16 +18,14 @@ import (
 )
 
 // fakeRecordStore stands in for the coordinator's durable dispatch
-// records (#355): it answers the redelivery list and the session
-// snapshots from seeded memory, and records the stamps it is given.
+// records (#355): it answers the redelivery list from seeded memory and
+// records the stamps it is given.
 type fakeRecordStore struct {
 	mu sync.Mutex
 	// undelivered is what UndeliveredTerminal answers.
 	undelivered []dispatch.UndeliveredDispatch
 	// delivered records every RecordDelivered dispatch ID in order.
 	delivered []string
-	// snapshots answers SnapshotRecord by dispatched session ID.
-	snapshots map[string]dispatch.DispatchResult
 	// errors, when set, fails every read with it.
 	err error
 }
@@ -53,18 +52,19 @@ func (f *fakeRecordStore) UndeliveredTerminal() ([]dispatch.UndeliveredDispatch,
 	return append([]dispatch.UndeliveredDispatch(nil), f.undelivered...), nil
 }
 
-func (f *fakeRecordStore) SnapshotRecord(sessionID string) (dispatch.DispatchResult, dispatch.Status, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	result, ok := f.snapshots[sessionID]
-	if !ok {
-		return dispatch.DispatchResult{}, "", false
-	}
-	return result, result.Status, true
-}
-
 func TestReconcileDispatchDeliveries(t *testing.T) {
 	c, main, parentID := newDeliveryEnv(t)
+	// The parent's dispatch_agent tool result still holds the running
+	// handle: the run that would have stamped it died with the process.
+	card, err := c.messages.Create(t.Context(), parentID, message.CreateMessageParams{
+		Role: message.Tool,
+		Parts: []message.ContentPart{message.ToolResult{
+			ToolCallID: "call-alive",
+			Name:       DispatchAgentToolName,
+			Content:    `{"dispatch_id":"d-alive","status":"running"}`,
+		}},
+	})
+	require.NoError(t, err)
 	records := &fakeRecordStore{
 		undelivered: []dispatch.UndeliveredDispatch{
 			{
@@ -72,7 +72,7 @@ func TestReconcileDispatchDeliveries(t *testing.T) {
 				Result: dispatch.DispatchResult{
 					DispatchID:  "d-alive",
 					Branch:      "crush-dispatch-d-alive",
-					SessionID:   "s-alive",
+					SessionID:   "msg-alive$$call-alive",
 					Status:      dispatch.StatusCompleted,
 					KeyFindings: "finished before the crash",
 				},
@@ -85,7 +85,6 @@ func TestReconcileDispatchDeliveries(t *testing.T) {
 				},
 			},
 		},
-		snapshots: map[string]dispatch.DispatchResult{},
 	}
 	c.dispatchRecords = records
 
@@ -103,6 +102,16 @@ func TestReconcileDispatchDeliveries(t *testing.T) {
 	require.Contains(t, run.Prompt, `"dispatch_id": "d-alive"`)
 	require.Contains(t, run.Prompt, `"key_findings": "finished before the crash"`)
 
+	// The reconcile stamped the terminal result on the card's tool
+	// result, the durable record a reloaded card renders (#410, #421).
+	stamped, err := c.messages.Get(t.Context(), card.ID)
+	require.NoError(t, err)
+	var terminal dispatch.DispatchResult
+	require.NoError(t, json.Unmarshal([]byte(stamped.ToolResults()[0].Metadata), &terminal))
+	require.Equal(t, "d-alive", terminal.DispatchID)
+	require.Equal(t, dispatch.StatusCompleted, terminal.Status)
+	require.Equal(t, `{"dispatch_id":"d-alive","status":"running"}`, stamped.ToolResults()[0].Content, "the handle the model saw is untouched")
+
 	require.Eventually(t, func() bool {
 		records.mu.Lock()
 		defer records.mu.Unlock()
@@ -119,37 +128,6 @@ func TestReconcileDispatchDeliveriesNilRecords(t *testing.T) {
 
 	c.ReconcileDispatchDeliveries(t.Context())
 	require.Zero(t, main.runCount())
-}
-
-// The UI seed (#355): with no collector snapshot — a restart emptied
-// the in-memory registry — DispatchStatus falls back to the stored
-// terminal record, so the block renders failed or completed instead of
-// a forever-working stale handle. A session with no record answers
-// not-ok, keeping the static stale-handle behavior.
-func TestDispatchStatusFallsBackToStoredRecord(t *testing.T) {
-	c, _, _ := newDeliveryEnv(t)
-	c.dispatchRecords = &fakeRecordStore{
-		snapshots: map[string]dispatch.DispatchResult{
-			"s-crashed": {
-				DispatchID:    "d-crashed",
-				Branch:        "crush-dispatch-d-crashed",
-				WorkspacePath: "/ws/crashed",
-				SessionID:     "s-crashed",
-				Status:        dispatch.StatusFailed,
-				Error:         "crush restarted; workspace preserved at /ws/crashed",
-			},
-		},
-	}
-
-	snapshot, ok := c.DispatchStatus("s-crashed")
-	require.True(t, ok)
-	require.Equal(t, dispatch.StatusFailed, snapshot.Entry.Status)
-	require.NotNil(t, snapshot.Entry.Result)
-	require.Equal(t, "d-crashed", snapshot.Entry.Result.DispatchID)
-	require.Contains(t, snapshot.Entry.Result.Error, "crush restarted")
-
-	_, ok = c.DispatchStatus("s-unknown")
-	require.False(t, ok)
 }
 
 // newAgentRecordStore opens the production record store (#355) over a

@@ -28,7 +28,7 @@ import (
 	"github.com/charmbracelet/crush/internal/workspace"
 )
 
-// cancelDispatchWorkspace records CancelDispatch calls so tests can pin
+// cancelDispatchWorkspace records CancelAgentTask calls so tests can pin
 // which session the binding targeted. Unimplemented methods panic through
 // the embedded interface, like the other model-test workspaces.
 type cancelDispatchWorkspace struct {
@@ -38,7 +38,7 @@ type cancelDispatchWorkspace struct {
 	cancelErr   error
 }
 
-func (w *cancelDispatchWorkspace) CancelDispatch(_ context.Context, sessionID string) error {
+func (w *cancelDispatchWorkspace) CancelAgentTask(_ context.Context, sessionID string) error {
 	w.cancelCalls = append(w.cancelCalls, sessionID)
 	return w.cancelErr
 }
@@ -86,14 +86,12 @@ func dispatchCardItem(t *testing.T, childSessionID string, status dispatch.Statu
 		Finished: true,
 	}, &message.ToolResult{ToolCallID: "call-dispatch-1", Content: string(b)}, false)
 	if !status.IsTerminal() {
-		// A card is only "live" from a registry snapshot: the fallback
-		// running handle alone is static by definition.
-		item.SetDispatchSnapshot(dispatch.TodoSnapshot{
-			Entry: dispatch.Entry{
-				ID:        handle.DispatchID,
-				SessionID: childSessionID,
-				Status:    status,
-			},
+		// A card is only "live" from the agent surface's state: the
+		// fallback running handle alone is static by definition.
+		item.SetAgentTask(workspace.AgentTask{
+			DispatchID: handle.DispatchID,
+			SessionID:  childSessionID,
+			Status:     status,
 		})
 	}
 	return item

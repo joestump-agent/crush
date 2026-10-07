@@ -197,10 +197,11 @@ result, and stamped delivered when the parent's delivery turn succeeds.
 On startup, before the UI loads any session, reconcile fails every task
 and dispatch record whose owning process died — the dispatch error names
 the preserved workspace — and re-delivers every terminal result the
-parent never received. A reloaded agent block renders the stored
-terminal state instead of a forever-working stale handle; the persisted
-tool result carries the same terminal record
-([#410](https://github.com/joestump-agent/crush/issues/410)).
+parent never received, stamping it on the parent's persisted
+`dispatch_agent` tool result as it goes. That stamp is the terminal
+record a reloaded agent block renders, in process or against a server,
+instead of a forever-working stale handle
+([#410](https://github.com/joestump-agent/crush/issues/410), [#421](https://github.com/joestump-agent/crush/issues/421)).
 
 Tracking: [#354](https://github.com/joestump-agent/crush/issues/354), [#355](https://github.com/joestump-agent/crush/issues/355), [#410](https://github.com/joestump-agent/crush/issues/410).
 
