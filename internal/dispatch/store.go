@@ -41,10 +41,6 @@ type DispatchRecords interface {
 	// UndeliveredTerminal returns every terminal record whose payload
 	// was never delivered to its parent — the restart redelivery list.
 	UndeliveredTerminal() ([]UndeliveredDispatch, error)
-	// SnapshotRecord returns the row for the dispatched agent running
-	// on sessionID, whatever its state. The bool is false when no row
-	// exists or it cannot be read.
-	SnapshotRecord(sessionID string) (DispatchResult, Status, bool)
 }
 
 // UndeliveredDispatch is one terminal record whose payload never
@@ -155,7 +151,9 @@ func (s *SQLiteRecordStore) UndeliveredTerminal() ([]UndeliveredDispatch, error)
 	return undelivered, nil
 }
 
-// SnapshotRecord implements [DispatchRecords].
+// SnapshotRecord returns the row for the dispatched agent running on
+// sessionID, whatever its state. The bool is false when no row exists
+// or it cannot be read.
 func (s *SQLiteRecordStore) SnapshotRecord(sessionID string) (DispatchResult, Status, bool) {
 	ctx := context.WithoutCancel(context.Background())
 	row, err := s.q.GetA2ADispatchBySession(ctx, sessionID)

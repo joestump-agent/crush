@@ -305,6 +305,12 @@ func (d *DispatchToolMessageItem) elapsed() (time.Duration, bool) {
 		return 0, false
 	}
 	if end.IsZero() {
+		// An agent that ended with no finish time — its route went down
+		// before its task did — has no end to measure to: show none
+		// rather than a clock that keeps running.
+		if status, _ := d.dispatchStatus(); isTerminalDispatchStatus(status) {
+			return 0, false
+		}
 		now := d.now
 		if now == nil {
 			now = time.Now
@@ -516,9 +522,14 @@ func (d *DispatchToolMessageItem) statusParams() []string {
 	if handle := d.handleLabel(); handle != "" {
 		parts = append(parts, handle)
 	}
+	// The kill reason is the stamped record's; until it lands, a live
+	// state that ended killed carries the reason as its status text, so
+	// a user cancel reads "canceled" at once (#373, #421).
 	killedReason := ""
 	if terminal := d.TerminalResult(); terminal != nil {
 		killedReason = terminal.KilledReason
+	} else if d.task != nil && d.task.Status == dispatch.StatusKilled {
+		killedReason = d.task.StatusText
 	}
 	parts = append(parts, dispatchStateLabel(status, killedReason))
 	if elapsed, ok := d.elapsed(); ok {

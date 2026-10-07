@@ -258,6 +258,44 @@ func TestDispatchCardTerminalStampWinsOverLiveState(t *testing.T) {
 	require.False(t, item.IsLive())
 }
 
+// An agent that ended without a finish time — a gone host's, marked
+// unserved — shows no elapsed time rather than one that keeps growing
+// (#421).
+func TestDispatchCardEndedWithoutFinishTimeHidesElapsed(t *testing.T) {
+	t.Parallel()
+
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	item.now = func() time.Time { return fixedTestTime.Add(3 * time.Hour) }
+	item.SetAgentTask(workspace.AgentTask{
+		DispatchID: "dispatch-1",
+		SessionID:  "msg$$call-dispatch-1",
+		Status:     dispatch.StatusFailed,
+		StartedAt:  fixedTestTime,
+	})
+
+	out := dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), false))
+	require.Contains(t, out, "failed")
+	require.NotContains(t, out, "3h00m")
+}
+
+// A user cancel reads "canceled" as soon as the live state ends killed,
+// before the stamped record lands (#373, #421).
+func TestDispatchCardCanceledBeforeTheStamp(t *testing.T) {
+	t.Parallel()
+
+	item := newDispatchItem(t, runningHandle(t, dispatch.StatusRunning))
+	item.SetAgentTask(workspace.AgentTask{
+		DispatchID: "dispatch-1",
+		SessionID:  "msg$$call-dispatch-1",
+		Status:     dispatch.StatusKilled,
+		StatusText: dispatch.ReasonCanceled,
+	})
+
+	out := dispatchTestRender(t, item, dispatchToolOpts(runningHandle(t, dispatch.StatusRunning), false))
+	require.Contains(t, out, "canceled")
+	require.NotContains(t, out, "killed")
+}
+
 // A result arriving live re-parses the handle.
 func TestDispatchCardSetResultReparsesHandle(t *testing.T) {
 	t.Parallel()
@@ -505,6 +543,7 @@ func TestDispatchCardCanceledLabel(t *testing.T) {
 				SessionID:  "msg$$call-dispatch-1",
 				Status:     dispatch.StatusKilled,
 				StartedAt:  fixedTestTime,
+				FinishedAt: fixedTestTime.Add(30 * time.Second),
 			})
 			item.SetResult(terminalStamp(t, dispatch.DispatchResult{
 				Status:       dispatch.StatusKilled,

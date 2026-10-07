@@ -148,8 +148,11 @@ func mentionHandles(prompt string) []string {
 // when that is not at hand, from the agent's final status text (#421).
 // Mentioning never routes: the parent turn keeps the text.
 func AgentCardAttachment(task workspace.AgentTask, terminal *dispatch.DispatchResult) message.Attachment {
+	// A stamped record is final even when the live state has not caught
+	// up with it.
+	finished := task.Status.IsTerminal() || terminal != nil
 	var b strings.Builder
-	if task.Status.IsTerminal() {
+	if finished {
 		b.WriteString("Read-only agent card (the agent has finished; its session is not continuable — dispatch a new agent to continue this work).\n\n")
 	} else {
 		b.WriteString("Live agent card (address it mid-run with the message_agent tool or by leading your message with @handle).\n\n")
@@ -159,7 +162,7 @@ func AgentCardAttachment(task workspace.AgentTask, terminal *dispatch.DispatchRe
 		b.WriteString("Role: " + task.Role + "\n")
 	}
 	b.WriteString("Status: " + string(task.Status) + "\n")
-	if !task.Status.IsTerminal() && task.CurrentTodo != "" {
+	if !finished && task.CurrentTodo != "" {
 		b.WriteString("Current todo: " + task.CurrentTodo + "\n")
 	}
 	if task.SessionID != "" {

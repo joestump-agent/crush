@@ -198,6 +198,13 @@ func TestAgentCardAttachment(t *testing.T) {
 	require.Contains(t, string(recorded.Content), "Added validation.")
 	require.Contains(t, string(recorded.Content), "login.go | +12 -3")
 	require.NotContains(t, string(recorded.Content), "Switched to Go.", "the record wins over the final status text")
+
+	// A stamped record is final even when the live state lags behind it.
+	lagging := AgentCardAttachment(runningTask("tester", "writes tests"), &dispatch.DispatchResult{
+		Status: dispatch.StatusCompleted, KeyFindings: "Added validation.",
+	})
+	require.Contains(t, string(lagging.Content), "Read-only agent card")
+	require.NotContains(t, string(lagging.Content), "Current todo")
 }
 
 // The leading @handle routes to the agent's injection queue and consumes

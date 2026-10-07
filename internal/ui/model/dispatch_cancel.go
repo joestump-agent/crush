@@ -3,9 +3,10 @@ package model
 // Canceling a dispatched agent from the UI (#373): ctrl+x ends one
 // dispatched agent's run. The target is the dispatch being viewed in
 // inspect mode, or the selected chat item when it is a live dispatch
-// card. The kill goes through the workspace's CancelDispatch, which
-// refuses unknown or already-finished dispatches; the card flips to
-// "canceled" once the registry reports the killed result.
+// card. The kill goes through the workspace's CancelAgentTask — A2A
+// tasks/cancel (#421) — which refuses unknown, finished and not yet
+// started agents; the card flips to "canceled" once the agent surface
+// reports it.
 
 import (
 	"context"
