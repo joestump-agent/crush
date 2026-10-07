@@ -284,13 +284,19 @@ func TestExternalDispatchCompletesWithoutWorkspace(t *testing.T) {
 	logsMu.Lock()
 	captured := logs.String()
 	logsMu.Unlock()
+	require.Contains(t, captured, "External dispatch started",
+		"the code under test must have logged for the logs check to mean anything")
+	reviewer := c.cfg.Config().Agents["reviewer"]
+	require.NotNil(t, reviewer.Auth)
 	for what, text := range map[string]string{
-		"the handle":      resp.Content,
-		"the entry":       fmt.Sprintf("%+v", entry),
+		"the handle": resp.Content,
+		// Dereferenced: %+v of the entry alone prints its Result as a
+		// pointer, which would never hold the token.
+		"the entry":       fmt.Sprintf("%+v %+v", entry, *entry.Result),
 		"the result":      entry.Result.Render(),
 		"the delivery":    msg,
 		"the logs":        captured,
-		"the definitions": fmt.Sprintf("%+v", c.cfg.Config().Agents["reviewer"]),
+		"the definitions": fmt.Sprintf("%+v %s", reviewer, *reviewer.Auth.Token),
 	} {
 		require.NotContains(t, text, externalTestTokenValue, "the token leaked into %s", what)
 	}
