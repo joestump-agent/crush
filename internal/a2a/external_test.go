@@ -847,3 +847,24 @@ func TestExternalAgentPlainHTTPMustResolveToLoopback(t *testing.T) {
 	ext.Close()
 	require.Equal(t, int32(1), requests.Load())
 }
+
+// Of several JSON-RPC interfaces on the card's origin, the one on the
+// protocol's major version 1 is picked, even when an older one is listed
+// first.
+func TestExternalAgentPrefersV1Interface(t *testing.T) {
+	t.Parallel()
+	es, _ := newExternalServer(t, func(_ context.Context, execCtx *a2asrv.ExecutorContext, yield func(a2aspec.Event, error) bool) {
+		yield(a2aspec.NewMessage(a2aspec.MessageRoleAgent, a2aspec.NewTextPart("ok")), nil)
+	})
+	es.card = func(base string) *a2aspec.AgentCard {
+		card := externalTestCard(base+"/a2a", true)
+		legacy := &a2aspec.AgentInterface{URL: base + "/v03", ProtocolBinding: a2aspec.TransportProtocolJSONRPC, ProtocolVersion: "0.3"}
+		card.SupportedInterfaces = append([]*a2aspec.AgentInterface{legacy}, card.SupportedInterfaces...)
+		return card
+	}
+	ext := resolveTestAgent(t, es)
+	require.Equal(t, es.srv.URL+"/a2a", ext.Endpoint())
+	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+}

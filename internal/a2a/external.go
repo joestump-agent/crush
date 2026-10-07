@@ -223,12 +223,14 @@ func fetchExternalCard(ctx context.Context, base http.RoundTripper, pinned origi
 	return card, nil
 }
 
-// selectExternalInterface picks the card's first JSON-RPC interface on
-// the card URL's origin. A card whose JSON-RPC service lives only on
-// another origin is refused: the request, and its credential, go where
-// the user pointed, or nowhere.
+// selectExternalInterface picks a JSON-RPC interface on the card URL's
+// origin, preferring the first whose protocol version is 1.x — the major
+// version crush speaks — over an earlier one on another version. A card
+// whose JSON-RPC service lives only on another origin is refused: the
+// request, and its credential, go where the user pointed, or nowhere.
 func selectExternalInterface(card *a2aspec.AgentCard, pinned origin, source string) (*a2aspec.AgentInterface, error) {
 	var offered []string
+	var candidates []*a2aspec.AgentInterface
 	foreign := ""
 	for _, iface := range card.SupportedInterfaces {
 		if iface == nil {
@@ -250,13 +252,28 @@ func selectExternalInterface(card *a2aspec.AgentCard, pinned origin, source stri
 		}
 		selected := *iface
 		selected.ProtocolBinding = a2aspec.TransportProtocolJSONRPC
-		return &selected, nil
+		candidates = append(candidates, &selected)
+	}
+	for _, iface := range candidates {
+		if protocolMajor(iface.ProtocolVersion) == protocolMajor(a2aspec.Version) {
+			return iface, nil
+		}
+	}
+	if len(candidates) > 0 {
+		return candidates[0], nil
 	}
 	if foreign != "" {
 		return nil, fmt.Errorf("a2a: agent card %s names its JSON-RPC service on another origin (%s); refusing it so a tampered card cannot redirect requests or credentials", source, untrustedText(foreign, agent.Secret{}))
 	}
 	return nil, fmt.Errorf("a2a: agent card %s offers no supported transport: want %s on %s, card offers [%s]",
 		source, a2aspec.TransportProtocolJSONRPC, pinned, untrustedText(strings.Join(offered, ", "), agent.Secret{}))
+}
+
+// protocolMajor returns a protocol version's major component: "1" for
+// "1.0", "v1.2" or "1".
+func protocolMajor(version a2aspec.ProtocolVersion) string {
+	major, _, _ := strings.Cut(strings.TrimPrefix(strings.TrimSpace(string(version)), "v"), ".")
+	return major
 }
 
 // declaresBearerScheme reports whether the card declares an HTTP bearer
