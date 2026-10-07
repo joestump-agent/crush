@@ -136,11 +136,12 @@ type SessionAgentCall struct {
 	// dequeued to run as its own turn — and false exactly once when a
 	// queue-removal path dropped it without running (a cancel covering
 	// it, or an explicit queue clear). The A2A executor's steer path
-	// waits on it to turn the enqueue into a terminal task state; a
-	// run that ends with the call still queued fires nothing, and that
-	// stranded case is #398's. enqueueCall preserves it across
-	// queueing; every fire site is nil-safe and fires at most once per
-	// call.
+	// waits on it to turn the enqueue into a terminal task state, and a
+	// queued dispatch delivery stamps its durable records delivered on
+	// true (#355); a run that ends with the call still queued fires
+	// nothing, and that stranded case is #398's. enqueueCall preserves
+	// it across queueing; every fire site is nil-safe and fires at most
+	// once per call.
 	OnConsumed func(consumed bool)
 	// Accepted, when non-nil, is the accept reservation taken by
 	// BeginAccepted before the call was dispatched onto a goroutine
@@ -1773,6 +1774,12 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 	}
 	firstQueuedMessage := queuedMessages[0]
 	a.messageQueue.Set(sessionID, queuedMessages[1:])
+	// The dequeued call starts its own turn, exactly as at Run's
+	// handoff: tell its OnConsumed waiter the message was consumed
+	// (#351). A queued dispatch delivery stamps its durable record on
+	// this verdict (#355); without it, a delivery queued behind a
+	// summary would be re-delivered on every restart.
+	firstQueuedMessage.consume(true)
 	_, qErr := a.Run(ctx, firstQueuedMessage)
 	return qErr
 }

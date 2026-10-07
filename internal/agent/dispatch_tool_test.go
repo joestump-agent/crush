@@ -881,14 +881,20 @@ type fakeMainAgent struct {
 	busy atomic.Bool
 	// failures makes the next N Run calls fail, driving the retry path.
 	failures atomic.Int64
-	cancels  atomic.Int64
-	clears   atomic.Int64
+	// queue makes Run answer as the busy branch does: the call is
+	// recorded as if enqueued, and Run returns nil, nil.
+	queue   atomic.Bool
+	cancels atomic.Int64
+	clears  atomic.Int64
 }
 
 func (f *fakeMainAgent) Run(_ context.Context, call SessionAgentCall) (*fantasy.AgentResult, error) {
 	f.mu.Lock()
 	f.runs = append(f.runs, call)
 	f.mu.Unlock()
+	if f.queue.Load() {
+		return nil, nil
+	}
 	if f.failures.Add(-1) >= 0 {
 		return nil, errors.New("delivery boom")
 	}

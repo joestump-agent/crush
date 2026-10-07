@@ -58,7 +58,7 @@ current behaviour. What ships today is on
 | 2026-10-04 | **Handle lifetime is run lifetime.** Handles are scoped to the session tree. | Both | Planned: [#399](https://github.com/joestump-agent/crush/issues/399) |
 | 2026-10-04 | **Not continuable, for now.** Delegation depth is one level. | Both | Current behaviour; [#413](https://github.com/joestump-agent/crush/issues/413) closes gaps |
 | 2026-10-04 | **Navigation.** `ctrl+]` enters and cycles. Esc and `ctrl+[` always leave inspect mode, and Esc never cancels from it. | Interaction | Planned: [#404](https://github.com/joestump-agent/crush/issues/404) |
-| 2026-10-04 | **Durable task state** in a SQLite task store. | A2A PRD | Planned: [#354](https://github.com/joestump-agent/crush/issues/354), [#355](https://github.com/joestump-agent/crush/issues/355) |
+| 2026-10-04 | **Durable task state** in a SQLite task store. | A2A PRD | Shipped: the store ([#354](https://github.com/joestump-agent/crush/issues/354)) and startup reconcile ([#355](https://github.com/joestump-agent/crush/issues/355)) |
 | 2026-10-04 | **Steering, kill and progress are A2A operations.** | Interaction | Partly shipped ([#359](https://github.com/joestump-agent/crush/issues/359) typed progress metadata, [#351](https://github.com/joestump-agent/crush/issues/351) steering). Planned: [#348](https://github.com/joestump-agent/crush/issues/348) |
 
 ## The 2026-10-04 decisions
@@ -190,15 +190,17 @@ Tracking: [#404](https://github.com/joestump-agent/crush/issues/404).
 
 ### Durable task state
 
-Each server uses the SDK's in-memory task store, and the registry is an
-in-memory map. A restart therefore loses every dispatch, and reloaded agent
-blocks show "working" forever. The fix is a SQLite implementation of the
-SDK's task store, with its optimistic-concurrency contract, plus a
-workspaces table. With them, startup can:
-
-- fail tasks whose owner died;
-- deliver results the parent never received;
-- render stored terminal states.
+Served tasks live in the SQLite task store ([#354](https://github.com/joestump-agent/crush/issues/354)),
+and every dispatch leaves one durable record ([#355](https://github.com/joestump-agent/crush/issues/355)):
+a row in `a2a_dispatches` written at start, updated with the terminal
+result, and stamped delivered when the parent's delivery turn succeeds.
+On startup, before the UI loads any session, reconcile fails every task
+and dispatch record whose owning process died — the dispatch error names
+the preserved workspace — and re-delivers every terminal result the
+parent never received. A reloaded agent block renders the stored
+terminal state instead of a forever-working stale handle; the persisted
+tool result carries the same terminal record
+([#410](https://github.com/joestump-agent/crush/issues/410)).
 
 Tracking: [#354](https://github.com/joestump-agent/crush/issues/354), [#355](https://github.com/joestump-agent/crush/issues/355), [#410](https://github.com/joestump-agent/crush/issues/410).
 

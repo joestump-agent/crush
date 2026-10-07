@@ -650,3 +650,48 @@ func TestOnConsumedTrueOnDequeuedTurn(t *testing.T) {
 	require.Equal(t, 4, model.stepsCount(),
 		"the work turn and the RunID call's own turn each serve two steps")
 }
+
+// TestOnConsumedTrueOnSummarizeDequeue covers Summarize's fire site: a
+// call queued while the session summarized is dequeued into its own turn
+// once the summary lands, and reports consumed exactly once, with true,
+// as Run's handoff does (#351). The call is a system delivery, the kind
+// whose durable record stamps on that verdict (#355).
+func TestOnConsumedTrueOnSummarizeDequeue(t *testing.T) {
+	t.Parallel()
+
+	sa, env := newStreamTestAgent(t)
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+
+	// A finished turn gives the summary something to summarize.
+	_, err = sa.Run(t.Context(), SessionAgentCall{SessionID: sess.ID, Prompt: "history", NonInteractive: true})
+	require.NoError(t, err)
+
+	// Queued while the summary ran, exactly as Run's busy branch leaves
+	// a delivery that found the session summarizing.
+	var rec consumedRecorder
+	sa.enqueueCall(SessionAgentCall{
+		SessionID:         sess.ID,
+		Prompt:            "dispatch payload queued behind the summary",
+		HiddenUserMessage: true,
+		NonInteractive:    true,
+		systemDelivery:    true,
+		OnConsumed:        rec.record,
+	})
+
+	require.NoError(t, sa.Summarize(t.Context(), sess.ID, nil, nil))
+
+	require.Equal(t, []bool{true}, rec.verdicts(),
+		"a call Summarize dequeues must report consumed exactly once, with true")
+	queued, _ := sa.messageQueue.Get(sess.ID)
+	require.Empty(t, queued)
+	msgs, err := env.messages.List(t.Context(), sess.ID)
+	require.NoError(t, err)
+	var ran bool
+	for _, msg := range msgs {
+		if msg.Role == message.User && strings.Contains(msg.Content().Text, "dispatch payload queued behind the summary") {
+			ran = true
+		}
+	}
+	require.True(t, ran, "the dequeued call must have run as its own turn")
+}

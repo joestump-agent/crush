@@ -22,3 +22,23 @@ func SystemDeliveryFromContext(ctx context.Context) bool {
 	v, _ := ctx.Value(systemDeliveryKey{}).(bool)
 	return v
 }
+
+// deliveryConsumedKey carries a delivery turn's queue-verdict hook.
+type deliveryConsumedKey struct{}
+
+// withDeliveryConsumed attaches fn as the OnConsumed hook of the
+// delivery turn run from ctx (#355). A delivery that finds the parent
+// busy is queued as a system-delivery call, and only the queue knows
+// when it reaches the parent: fn receives the queue's verdict through
+// the call's OnConsumed (#351). Unexported, so only the delivery path
+// in this package can set it.
+func withDeliveryConsumed(ctx context.Context, fn func(consumed bool)) context.Context {
+	return context.WithValue(ctx, deliveryConsumedKey{}, fn)
+}
+
+// deliveryConsumedFromContext returns the hook withDeliveryConsumed
+// attached to ctx, or nil.
+func deliveryConsumedFromContext(ctx context.Context) func(consumed bool) {
+	fn, _ := ctx.Value(deliveryConsumedKey{}).(func(consumed bool))
+	return fn
+}

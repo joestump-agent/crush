@@ -886,7 +886,22 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 	// #346: every dispatch is served over the process-wide A2A host on a
 	// per-process 0600 unix socket, rooted at the data directory; the
 	// same factory dials the dispatches it serves.
-	a2aFactory := a2a.NewServerFactory(app.config.Config().Options.DataDirectory)
+	// #355: the host's default task store is the durable SQLite store
+	// over the shared session database, stamped with this process's host
+	// ID so startup reconcile can attribute rows; the same ID stamps the
+	// dispatch records the coordinator writes. Stores wire only with a
+	// database handle; tests build the App without one and keep the
+	// pre-#355 in-memory behavior.
+	hostID := a2a.HostID()
+	a2aFactoryOpts := []a2a.ServerFactoryOption{}
+	if app.conn != nil {
+		a2aFactoryOpts = append(a2aFactoryOpts, a2a.WithTaskStore(a2a.NewSQLiteStore(app.conn, hostID, nil)))
+	}
+	a2aFactory := a2a.NewServerFactory(app.config.Config().Options.DataDirectory, a2aFactoryOpts...)
+	var dispatchRecords dispatch.DispatchRecords
+	if app.conn != nil {
+		dispatchRecords = dispatch.NewSQLiteRecordStore(app.conn, hostID)
+	}
 	coordinatorOpts := agent.CoordinatorOptions{
 		Config:      app.config,
 		Sessions:    app.Sessions,
@@ -909,6 +924,11 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		// is the one execution path (#347): without it dispatches are
 		// refused.
 		DispatchHost: a2aFactory,
+		// #355: dispatches persist durable records over the same session
+		// database, so a restart can fail orphaned runs and re-deliver
+		// finished-but-undelivered results. nil without a database keeps
+		// every record write a no-op.
+		DispatchRecords: dispatchRecords,
 	}
 
 	// Semantic search is opt-in: only wire the store and client when an
@@ -943,6 +963,24 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 	if err != nil {
 		slog.Error("Failed to create coder agent", "err", err)
 		return err
+	}
+	// #355: close out what a crashed process left behind, before the UI
+	// loads any session. First the a2a reconcile fails orphaned served
+	// tasks and dispatch records; then the coordinator re-delivers every
+	// terminal result the previous process never delivered. Both are
+	// log-only on error: reconcile must not break startup, and rows it
+	// could not touch are retried on the next start.
+	if app.conn != nil {
+		if report, err := a2a.ReconcileOrphanedTasks(app.globalCtx, app.conn, hostID, nil); err != nil {
+			slog.Warn("A2A orphan reconcile failed; rows are retried on the next start", "error", err)
+		} else if report.FailedTasks > 0 || report.FailedDispatches > 0 {
+			slog.Info("A2A orphan reconcile closed out rows from dead processes", "failed_tasks", report.FailedTasks, "failed_dispatches", report.FailedDispatches)
+		}
+		if reconciler, ok := app.AgentCoordinator.(interface {
+			ReconcileDispatchDeliveries(ctx context.Context)
+		}); ok {
+			reconciler.ReconcileDispatchDeliveries(app.globalCtx)
+		}
 	}
 	// #346: the A2A host (and its socket file) dies with the app.
 	app.cleanupFuncs = append(app.cleanupFuncs, func(ctx context.Context) error {

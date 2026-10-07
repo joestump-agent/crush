@@ -60,6 +60,18 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.deleteSessionMessagesStmt, err = db.PrepareContext(ctx, deleteSessionMessages); err != nil {
 		return nil, fmt.Errorf("error preparing query DeleteSessionMessages: %w", err)
 	}
+	if q.failA2ADispatchStmt, err = db.PrepareContext(ctx, failA2ADispatch); err != nil {
+		return nil, fmt.Errorf("error preparing query FailA2ADispatch: %w", err)
+	}
+	if q.finishA2ADispatchStmt, err = db.PrepareContext(ctx, finishA2ADispatch); err != nil {
+		return nil, fmt.Errorf("error preparing query FinishA2ADispatch: %w", err)
+	}
+	if q.getA2ADispatchStmt, err = db.PrepareContext(ctx, getA2ADispatch); err != nil {
+		return nil, fmt.Errorf("error preparing query GetA2ADispatch: %w", err)
+	}
+	if q.getA2ADispatchBySessionStmt, err = db.PrepareContext(ctx, getA2ADispatchBySession); err != nil {
+		return nil, fmt.Errorf("error preparing query GetA2ADispatchBySession: %w", err)
+	}
 	if q.getA2ATaskStmt, err = db.PrepareContext(ctx, getA2ATask); err != nil {
 		return nil, fmt.Errorf("error preparing query GetA2ATask: %w", err)
 	}
@@ -141,20 +153,35 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listNewFilesStmt, err = db.PrepareContext(ctx, listNewFiles); err != nil {
 		return nil, fmt.Errorf("error preparing query ListNewFiles: %w", err)
 	}
+	if q.listNonTerminalA2ADispatchesStmt, err = db.PrepareContext(ctx, listNonTerminalA2ADispatches); err != nil {
+		return nil, fmt.Errorf("error preparing query ListNonTerminalA2ADispatches: %w", err)
+	}
+	if q.listNonTerminalA2ATasksStmt, err = db.PrepareContext(ctx, listNonTerminalA2ATasks); err != nil {
+		return nil, fmt.Errorf("error preparing query ListNonTerminalA2ATasks: %w", err)
+	}
 	if q.listSessionReadFilesStmt, err = db.PrepareContext(ctx, listSessionReadFiles); err != nil {
 		return nil, fmt.Errorf("error preparing query ListSessionReadFiles: %w", err)
 	}
 	if q.listSessionsStmt, err = db.PrepareContext(ctx, listSessions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListSessions: %w", err)
 	}
+	if q.listUndeliveredA2ADispatchesStmt, err = db.PrepareContext(ctx, listUndeliveredA2ADispatches); err != nil {
+		return nil, fmt.Errorf("error preparing query ListUndeliveredA2ADispatches: %w", err)
+	}
 	if q.listUserMessagesBySessionStmt, err = db.PrepareContext(ctx, listUserMessagesBySession); err != nil {
 		return nil, fmt.Errorf("error preparing query ListUserMessagesBySession: %w", err)
+	}
+	if q.markA2ADispatchDeliveredStmt, err = db.PrepareContext(ctx, markA2ADispatchDelivered); err != nil {
+		return nil, fmt.Errorf("error preparing query MarkA2ADispatchDelivered: %w", err)
 	}
 	if q.recordFileReadStmt, err = db.PrepareContext(ctx, recordFileRead); err != nil {
 		return nil, fmt.Errorf("error preparing query RecordFileRead: %w", err)
 	}
 	if q.renameSessionStmt, err = db.PrepareContext(ctx, renameSession); err != nil {
 		return nil, fmt.Errorf("error preparing query RenameSession: %w", err)
+	}
+	if q.setA2ADispatchTaskStmt, err = db.PrepareContext(ctx, setA2ADispatchTask); err != nil {
+		return nil, fmt.Errorf("error preparing query SetA2ADispatchTask: %w", err)
 	}
 	if q.setSessionChannelStmt, err = db.PrepareContext(ctx, setSessionChannel); err != nil {
 		return nil, fmt.Errorf("error preparing query SetSessionChannel: %w", err)
@@ -173,6 +200,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.updateSessionTitleAndUsageStmt, err = db.PrepareContext(ctx, updateSessionTitleAndUsage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateSessionTitleAndUsage: %w", err)
+	}
+	if q.upsertA2ADispatchStmt, err = db.PrepareContext(ctx, upsertA2ADispatch); err != nil {
+		return nil, fmt.Errorf("error preparing query UpsertA2ADispatch: %w", err)
 	}
 	return &q, nil
 }
@@ -237,6 +267,26 @@ func (q *Queries) Close() error {
 	if q.deleteSessionMessagesStmt != nil {
 		if cerr := q.deleteSessionMessagesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing deleteSessionMessagesStmt: %w", cerr)
+		}
+	}
+	if q.failA2ADispatchStmt != nil {
+		if cerr := q.failA2ADispatchStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing failA2ADispatchStmt: %w", cerr)
+		}
+	}
+	if q.finishA2ADispatchStmt != nil {
+		if cerr := q.finishA2ADispatchStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing finishA2ADispatchStmt: %w", cerr)
+		}
+	}
+	if q.getA2ADispatchStmt != nil {
+		if cerr := q.getA2ADispatchStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getA2ADispatchStmt: %w", cerr)
+		}
+	}
+	if q.getA2ADispatchBySessionStmt != nil {
+		if cerr := q.getA2ADispatchBySessionStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getA2ADispatchBySessionStmt: %w", cerr)
 		}
 	}
 	if q.getA2ATaskStmt != nil {
@@ -374,6 +424,16 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listNewFilesStmt: %w", cerr)
 		}
 	}
+	if q.listNonTerminalA2ADispatchesStmt != nil {
+		if cerr := q.listNonTerminalA2ADispatchesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listNonTerminalA2ADispatchesStmt: %w", cerr)
+		}
+	}
+	if q.listNonTerminalA2ATasksStmt != nil {
+		if cerr := q.listNonTerminalA2ATasksStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listNonTerminalA2ATasksStmt: %w", cerr)
+		}
+	}
 	if q.listSessionReadFilesStmt != nil {
 		if cerr := q.listSessionReadFilesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listSessionReadFilesStmt: %w", cerr)
@@ -384,9 +444,19 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listSessionsStmt: %w", cerr)
 		}
 	}
+	if q.listUndeliveredA2ADispatchesStmt != nil {
+		if cerr := q.listUndeliveredA2ADispatchesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listUndeliveredA2ADispatchesStmt: %w", cerr)
+		}
+	}
 	if q.listUserMessagesBySessionStmt != nil {
 		if cerr := q.listUserMessagesBySessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listUserMessagesBySessionStmt: %w", cerr)
+		}
+	}
+	if q.markA2ADispatchDeliveredStmt != nil {
+		if cerr := q.markA2ADispatchDeliveredStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing markA2ADispatchDeliveredStmt: %w", cerr)
 		}
 	}
 	if q.recordFileReadStmt != nil {
@@ -397,6 +467,11 @@ func (q *Queries) Close() error {
 	if q.renameSessionStmt != nil {
 		if cerr := q.renameSessionStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing renameSessionStmt: %w", cerr)
+		}
+	}
+	if q.setA2ADispatchTaskStmt != nil {
+		if cerr := q.setA2ADispatchTaskStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing setA2ADispatchTaskStmt: %w", cerr)
 		}
 	}
 	if q.setSessionChannelStmt != nil {
@@ -427,6 +502,11 @@ func (q *Queries) Close() error {
 	if q.updateSessionTitleAndUsageStmt != nil {
 		if cerr := q.updateSessionTitleAndUsageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateSessionTitleAndUsageStmt: %w", cerr)
+		}
+	}
+	if q.upsertA2ADispatchStmt != nil {
+		if cerr := q.upsertA2ADispatchStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing upsertA2ADispatchStmt: %w", cerr)
 		}
 	}
 	return err
@@ -480,6 +560,10 @@ type Queries struct {
 	deleteSessionStmt                    *sql.Stmt
 	deleteSessionFilesStmt               *sql.Stmt
 	deleteSessionMessagesStmt            *sql.Stmt
+	failA2ADispatchStmt                  *sql.Stmt
+	finishA2ADispatchStmt                *sql.Stmt
+	getA2ADispatchStmt                   *sql.Stmt
+	getA2ADispatchBySessionStmt          *sql.Stmt
 	getA2ATaskStmt                       *sql.Stmt
 	getAverageResponseTimeStmt           *sql.Stmt
 	getFileStmt                          *sql.Stmt
@@ -507,17 +591,23 @@ type Queries struct {
 	listMessagesBySessionStmt            *sql.Stmt
 	listMessagesBySessionFromSummaryStmt *sql.Stmt
 	listNewFilesStmt                     *sql.Stmt
+	listNonTerminalA2ADispatchesStmt     *sql.Stmt
+	listNonTerminalA2ATasksStmt          *sql.Stmt
 	listSessionReadFilesStmt             *sql.Stmt
 	listSessionsStmt                     *sql.Stmt
+	listUndeliveredA2ADispatchesStmt     *sql.Stmt
 	listUserMessagesBySessionStmt        *sql.Stmt
+	markA2ADispatchDeliveredStmt         *sql.Stmt
 	recordFileReadStmt                   *sql.Stmt
 	renameSessionStmt                    *sql.Stmt
+	setA2ADispatchTaskStmt               *sql.Stmt
 	setSessionChannelStmt                *sql.Stmt
 	updateA2ATaskStmt                    *sql.Stmt
 	updateA2ATaskIfVersionStmt           *sql.Stmt
 	updateMessageStmt                    *sql.Stmt
 	updateSessionStmt                    *sql.Stmt
 	updateSessionTitleAndUsageStmt       *sql.Stmt
+	upsertA2ADispatchStmt                *sql.Stmt
 }
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
@@ -536,6 +626,10 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		deleteSessionStmt:                    q.deleteSessionStmt,
 		deleteSessionFilesStmt:               q.deleteSessionFilesStmt,
 		deleteSessionMessagesStmt:            q.deleteSessionMessagesStmt,
+		failA2ADispatchStmt:                  q.failA2ADispatchStmt,
+		finishA2ADispatchStmt:                q.finishA2ADispatchStmt,
+		getA2ADispatchStmt:                   q.getA2ADispatchStmt,
+		getA2ADispatchBySessionStmt:          q.getA2ADispatchBySessionStmt,
 		getA2ATaskStmt:                       q.getA2ATaskStmt,
 		getAverageResponseTimeStmt:           q.getAverageResponseTimeStmt,
 		getFileStmt:                          q.getFileStmt,
@@ -563,16 +657,22 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listMessagesBySessionStmt:            q.listMessagesBySessionStmt,
 		listMessagesBySessionFromSummaryStmt: q.listMessagesBySessionFromSummaryStmt,
 		listNewFilesStmt:                     q.listNewFilesStmt,
+		listNonTerminalA2ADispatchesStmt:     q.listNonTerminalA2ADispatchesStmt,
+		listNonTerminalA2ATasksStmt:          q.listNonTerminalA2ATasksStmt,
 		listSessionReadFilesStmt:             q.listSessionReadFilesStmt,
 		listSessionsStmt:                     q.listSessionsStmt,
+		listUndeliveredA2ADispatchesStmt:     q.listUndeliveredA2ADispatchesStmt,
 		listUserMessagesBySessionStmt:        q.listUserMessagesBySessionStmt,
+		markA2ADispatchDeliveredStmt:         q.markA2ADispatchDeliveredStmt,
 		recordFileReadStmt:                   q.recordFileReadStmt,
 		renameSessionStmt:                    q.renameSessionStmt,
+		setA2ADispatchTaskStmt:               q.setA2ADispatchTaskStmt,
 		setSessionChannelStmt:                q.setSessionChannelStmt,
 		updateA2ATaskStmt:                    q.updateA2ATaskStmt,
 		updateA2ATaskIfVersionStmt:           q.updateA2ATaskIfVersionStmt,
 		updateMessageStmt:                    q.updateMessageStmt,
 		updateSessionStmt:                    q.updateSessionStmt,
 		updateSessionTitleAndUsageStmt:       q.updateSessionTitleAndUsageStmt,
+		upsertA2ADispatchStmt:                q.upsertA2ADispatchStmt,
 	}
 }
