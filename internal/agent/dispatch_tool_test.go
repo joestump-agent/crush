@@ -698,7 +698,14 @@ func TestSweepDispatchOnCoordinatorEnd(t *testing.T) {
 	tool := c.dispatchTool()
 
 	ctx, cancel := context.WithCancel(t.Context())
-	go c.sweepDispatchOnDone(ctx)
+	// The sweep goroutine is joined before the test returns: its git
+	// commands keep running in the test's repository after the registry
+	// empties, and the TempDir removal must not race them.
+	swept := make(chan struct{})
+	go func() {
+		defer close(swept)
+		c.sweepDispatchOnDone(ctx)
+	}()
 
 	resp := runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "do work"})
 	handle := decodeDispatchHandle(t, resp)
@@ -719,6 +726,11 @@ func TestSweepDispatchOnCoordinatorEnd(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(c.dispatchRegistry().List()) == 0
 	}, 10*time.Second, 50*time.Millisecond)
+	select {
+	case <-swept:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the session-end sweep did not finish")
+	}
 }
 
 // buildDispatchedAgent constructs a real dispatched agent offline: the
