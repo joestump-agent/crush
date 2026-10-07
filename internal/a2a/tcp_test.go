@@ -18,6 +18,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -176,6 +178,19 @@ func startTCPDispatch(t *testing.T, opts *config.A2AOptions, runner *fakeRunner)
 	return factory, server
 }
 
+// bindRemote clears LocalOnly on a served dispatch's context binding —
+// the shape a remotely callable agent from the peer registry (#334) will
+// have — so a test can drive a full run over the TCP listener. Every
+// binding StartServer makes is local-only (#358).
+func bindRemote(t *testing.T, factory *ServerFactory, contextID string) {
+	t.Helper()
+	binding, ok := factory.contexts.Lookup(contextID)
+	require.True(t, ok)
+	require.True(t, binding.LocalOnly, "StartServer binds local-only")
+	binding.LocalOnly = false
+	factory.contexts.Bind(contextID, binding)
+}
+
 // rpcError is the JSON-RPC error a rejected call answers with.
 type rpcError struct {
 	Code    int    `json:"code"`
@@ -285,6 +300,7 @@ func TestTCPListenerServesDispatchOverTLS(t *testing.T) {
 	pki := newTestPKI(t)
 	runner := &fakeRunner{result: textResult("done over tls")}
 	factory, server := startTCPDispatch(t, pki.listenerOptions(), runner)
+	bindRemote(t, factory, "dispatch-session")
 
 	addr := factory.tcpAddr()
 	require.NotEmpty(t, addr)
@@ -378,6 +394,7 @@ func TestTCPListenerRejectsWrongHost(t *testing.T) {
 	pki := newTestPKI(t)
 	runner := &fakeRunner{result: textResult("done")}
 	factory, server := startTCPDispatch(t, pki.listenerOptions(), runner)
+	bindRemote(t, factory, "dispatch-session")
 	client := pki.httpsClient(t, nil)
 	url := server.Card.SupportedInterfaces[1].URL
 	_, port, err := net.SplitHostPort(factory.tcpAddr())
@@ -412,7 +429,8 @@ func TestTCPListenerMutualTLS(t *testing.T) {
 	opts := pki.listenerOptions()
 	opts.ClientCA = pki.caFile
 	runner := &fakeRunner{result: textResult("done")}
-	_, server := startTCPDispatch(t, opts, runner)
+	factory, server := startTCPDispatch(t, opts, runner)
+	bindRemote(t, factory, "dispatch-session")
 	url := server.Card.SupportedInterfaces[1].URL
 
 	require.Contains(t, server.Card.SecuritySchemes, mtlsSchemeName, "the card declares mutual TLS")
@@ -448,6 +466,78 @@ func TestTCPListenerMutualTLS(t *testing.T) {
 	require.Nil(t, listResp.Error)
 	require.Len(t, listResp.Result.Tasks, 1)
 	require.Equal(t, task.ID, listResp.Result.Tasks[0].ID)
+}
+
+// steerCountingRunner is a paced runner that counts the steers and
+// cancels it is offered, refusing every steer.
+type steerCountingRunner struct {
+	*pacedRunner
+	steers  atomic.Int32
+	cancels atomic.Int32
+}
+
+func (r *steerCountingRunner) EnqueueWhenBusy(agent.SessionAgentCall) bool {
+	r.steers.Add(1)
+	return false
+}
+
+func (r *steerCountingRunner) Cancel(string) { r.cancels.Add(1) }
+
+// The TCP listener exposes no local run (#358): an authenticated remote
+// caller that knows a live local dispatch's context ID gets the same
+// rejection as an unknown context, and the local run is untouched — no
+// steer reaches it and it is not canceled.
+func TestTCPListenerCannotReachLocalContexts(t *testing.T) {
+	t.Parallel()
+
+	pki := newTestPKI(t)
+	opts := pki.listenerOptions()
+	opts.ClientCA = pki.caFile
+	runner := &steerCountingRunner{pacedRunner: newPacedRunner("local done")}
+	release := sync.OnceFunc(func() { close(runner.release) })
+	factory := NewServerFactory(t.TempDir(), WithTCPListener(opts))
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-1",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+	t.Cleanup(release)
+
+	// The local run: the coordinator's own dispatch, over the socket.
+	var outcome agent.DispatchTransportOutcome
+	streamErr := make(chan error, 1)
+	go func() {
+		var err error
+		outcome, err = factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+			Endpoint:  server.Endpoint,
+			Card:      server.Card,
+			Prompt:    "local work",
+			ContextID: "dispatch-session",
+		})
+		streamErr <- err
+	}()
+	<-runner.started
+
+	cert := clientCert(t, pki.ca, pki.caKey, "peer-host")
+	remote := pki.httpsClient(t, &cert)
+	task, rpcErr := sendOverTCP(t, remote, server.Card.SupportedInterfaces[1].URL, "", "")
+	require.Nil(t, rpcErr)
+	require.NotNil(t, task)
+	require.Equal(t, a2aspec.TaskStateRejected, task.Status.State)
+	require.NotNil(t, task.Status.Message)
+	require.Contains(t, partsText(task.Status.Message.Parts), "no running agent for context dispatch-session")
+	require.Zero(t, runner.steers.Load(), "no steer reaches the local run")
+	require.Zero(t, runner.cancels.Load(), "the local run is not canceled")
+
+	release()
+	require.NoError(t, <-streamErr)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Equal(t, "local done", outcome.Text)
+	require.Equal(t, 1, runner.ranCount)
+	require.Equal(t, "local work", runner.gotCall.Prompt)
 }
 
 // A client certificate's identity is its issuer and subject (#358), so

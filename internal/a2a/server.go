@@ -457,6 +457,7 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 		SessionID: p.SessionID,
 		Call:      p.Call,
 		Started:   time.Now(),
+		LocalOnly: true,
 	})
 	if p.Listed {
 		f.index.add(AgentDescriptor{
@@ -1077,6 +1078,13 @@ type ContextBinding struct {
 	SessionID string
 	Call      agent.SessionAgentCall
 	Started   time.Time
+	// LocalOnly keeps the binding off the TCP listener (#358): a call
+	// that arrived over TCP resolves it to nothing, exactly like an
+	// unknown context. Every binding today is a local dispatch or
+	// sub-agent run started in this process, so StartServer always sets
+	// it; agents meant to be called remotely arrive with the peer
+	// registry (#334).
+	LocalOnly bool
 }
 
 // ContextRegistry maps an A2A context ID onto the dispatch binding that
