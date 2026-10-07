@@ -19,8 +19,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/session"
 )
@@ -489,6 +491,106 @@ func TestStreamDispatchInputRequiredRoundTrip(t *testing.T) {
 		return msg.Role == a2aspec.MessageRoleUser && slices.Contains(msg.Extensions, AnswerExtensionURI)
 	})
 	require.True(t, answered, "the answer is a user message on the same task")
+}
+
+// startRequestingServer serves a dispatched agent whose tool requests
+// permission through its scoped permission service (#353).
+func startRequestingServer(t *testing.T, calls ...string) (*ServerFactory, *Server, *requestingRunner) {
+	t.Helper()
+	svc := permission.NewPermissionService(t.TempDir(), false, nil)
+	runner := newRequestingRunner(svc, calls...)
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID:  "dispatch-requests",
+		Runner:      runner,
+		SessionID:   "dispatch-session",
+		ContextID:   "dispatch-session",
+		Permissions: svc,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+	return factory, server, runner
+}
+
+// The permission round trip over the wire (#353): each request reaches
+// OnPermissionRequired with the tool's typed params, the decision goes
+// back on the same task, and the run's tool calls get those verdicts —
+// here allow, then deny, for two parallel calls parked in turn.
+func TestStreamDispatchPermissionRoundTrip(t *testing.T) {
+	factory, server, runner := startRequestingServer(t, "make test", "make lint")
+
+	var asked []agent.PermissionPrompt
+	var taskIDs []string
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "check everything",
+		ContextID: "dispatch-session",
+		OnTask:    func(taskID string) { taskIDs = append(taskIDs, taskID) },
+		OnPermissionRequired: func(_ context.Context, req agent.PermissionPrompt) (bool, error) {
+			asked = append(asked, req)
+			return len(asked) == 1, nil
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+
+	require.Len(t, asked, 2, "two requests, decided in turn")
+	verdicts := map[string]bool{}
+	for range 2 {
+		v := <-runner.verdicts
+		require.NoError(t, v.err)
+		verdicts[v.call] = v.granted
+	}
+	require.Equal(t, map[string]bool{asked[0].ToolCallID: true, asked[1].ToolCallID: false}, verdicts)
+	for _, req := range asked {
+		require.Equal(t, tools.BashToolName, req.ToolName)
+		params, ok := req.Params.(tools.BashPermissionsParams)
+		require.True(t, ok, "params decode as the tool's own type, got %T", req.Params)
+		require.Equal(t, req.ToolCallID, params.Command)
+	}
+	require.EqualValues(t, 1, runner.runs.Load(), "decisions resume the same run")
+	require.Len(t, taskIDs, 1, "every stream belongs to one task")
+}
+
+// Without a handler, a permission request is denied rather than left
+// waiting (#353).
+func TestStreamDispatchPermissionWithoutHandlerDenies(t *testing.T) {
+	factory, server, runner := startRequestingServer(t, "make test")
+
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "run the tests",
+		ContextID: "dispatch-session",
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	v := <-runner.verdicts
+	require.NoError(t, v.err)
+	require.False(t, v.granted)
+}
+
+// A permission request no decision is coming for — the handler failed,
+// as it does when a kill ends the parent's wait — cancels the parked task
+// with the error's text as the reason, and the tool call is not granted
+// (#353).
+func TestStreamDispatchUndecidedPermissionCancels(t *testing.T) {
+	factory, server, runner := startRequestingServer(t, "make test")
+
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "run the tests",
+		ContextID: "dispatch-session",
+		OnPermissionRequired: func(context.Context, agent.PermissionPrompt) (bool, error) {
+			return false, errors.New("wander kill: hard timeout")
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCanceled, outcome.Status)
+	require.Equal(t, "wander kill: hard timeout", outcome.Text)
+	require.False(t, (<-runner.verdicts).granted)
 }
 
 // startSteeringServer serves a run that holds its turn until released
@@ -1188,6 +1290,35 @@ func TestStreamDispatchResumesAfterDrop(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, status.Status)
 	require.Equal(t, "resumed to the end", status.Text)
+}
+
+// A stream cut before the run parks on a permission request (#353) ends
+// there all the same: the resume finds the task in input-required — the
+// replay or tasks/get carries the request — and the client decides it on
+// the same task instead of resubscribing until its attempts run out.
+func TestStreamDispatchResumesIntoPermissionPause(t *testing.T) {
+	factory, server, runner := startRequestingServer(t, "make test")
+	factory.httpClient = &http.Client{
+		Transport: &cuttingTransport{base: unixDialClient(factory).Transport},
+	}
+
+	var asked int
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "run the tests",
+		ContextID: "dispatch-session",
+		OnPermissionRequired: func(context.Context, agent.PermissionPrompt) (bool, error) {
+			asked++
+			return true, nil
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Equal(t, 1, asked, "the request is decided once")
+	v := <-runner.verdicts
+	require.NoError(t, v.err)
+	require.True(t, v.granted)
 }
 
 // A run that finishes before the first resume attempt — the stream cut

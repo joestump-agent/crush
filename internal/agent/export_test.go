@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/stretchr/testify/require"
 )
 
@@ -282,6 +283,18 @@ func (h *DispatchHarness) Dispatch(t *testing.T, prompt string) dispatch.Dispatc
 
 // ParentSessionID is the session the harness dispatches from.
 func (h *DispatchHarness) ParentSessionID() string { return h.parentID }
+
+// PromptingPermissions gives the parent a permission service that
+// prompts — no yolo, no allowlist — and returns it, so a test can watch
+// and decide the requests its dispatched agents raise (#353). Call it
+// before Dispatch: the dispatch's scoped service is built on the
+// parent's when the toolchain is.
+func (h *DispatchHarness) PromptingPermissions(t *testing.T) permission.Service {
+	t.Helper()
+	svc := permission.NewPermissionService(t.TempDir(), false, nil)
+	h.c.permissions = svc
+	return svc
+}
 
 // Steer sends text to the running dispatch as the parent's user would,
 // through the coordinator's DeliverAgentMessage (#351).

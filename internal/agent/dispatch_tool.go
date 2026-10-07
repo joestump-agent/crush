@@ -295,10 +295,9 @@ func (c *coordinator) registerLiveDispatch(id string, live *liveDispatch) {
 	c.liveDispatches[id] = live
 }
 
-// teardownLiveDispatch ends one dispatch: cancel the root (the bridge
-// bound to it exits with it), drop the live record, and close done so
-// waiters observe the teardown. Unknown IDs (a dispatch that never
-// registered, or a second teardown) are a no-op.
+// teardownLiveDispatch ends one dispatch: cancel the root, drop the live
+// record, and close done so waiters observe the teardown. Unknown IDs (a
+// dispatch that never registered, or a second teardown) are a no-op.
 func (c *coordinator) teardownLiveDispatch(id string) {
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
@@ -656,17 +655,16 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			reg.Register(entry)
 
 			// The dispatch outlives the turn that started it: its root
-			// context is detached from the tool call's, so the run and
-			// the permission bridge bound to the root (#371) survive the
-			// turn's end. runDispatch's teardown cancels it, and every
-			// setup-failure path below does too. Not derived from
+			// context is detached from the tool call's, so the run bound
+			// to the root (#371) survives the turn's end. runDispatch's
+			// teardown cancels it, and every setup-failure path below
+			// does too. Not derived from
 			// c.dispatchCtx: in server mode that is still the request
 			// context (#419).
 			rootCtx, rootCancel := context.WithCancel(context.WithoutCancel(ctx))
 
-			// The toolchain's permission bridge binds to the dispatch's
-			// root (#371): the bridge lives as long as the dispatch, not
-			// the tool call.
+			// The toolchain is built on the dispatch's root (#371), not
+			// the tool call's context.
 			toolchain, err := c.BuildDispatchToolchain(rootCtx, DispatchToolchainOptions{WorkingDir: entry.Path, Agent: agentCfg.ID})
 			if err != nil {
 				rootCancel()
@@ -796,7 +794,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 					Cost:             sess.Cost,
 				}, nil
 			}
-			stopServer, err := c.startDispatchServer(ctx, provider, reg, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current, usage, toolchain.Questions())
+			stopServer, err := c.startDispatchServer(ctx, provider, reg, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current, usage, toolchain.Questions(), toolchain.Permissions())
 			if err != nil {
 				rootCancel()
 				c.releaseDispatchSlot()
@@ -806,8 +804,8 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			run.stopServer = stopServer
 
 			// The dispatch runs on its root context, detached from the
-			// tool call's (#371): the permission bridge bound to the root
-			// lives as long as the dispatch, not the turn. The live record
+			// tool call's (#371): it lives as long as the dispatch, not
+			// the turn. The live record
 			// goes in before the run starts so teardown cancels the root
 			// and closes done exactly once per dispatch.
 			live := &liveDispatch{
@@ -984,14 +982,12 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		if run.stopServer != nil {
 			c.stopDispatchServer(run.reg, run.entry.ID, run.stopServer)
 		}
-		// The toolchain outlives the turn: Close stops the permission
-		// bridge and the scoped LSP clients once nothing runs in the
-		// workspace anymore.
+		// The toolchain outlives the turn: Close stops the scoped LSP
+		// clients once nothing runs in the workspace anymore.
 		run.toolchain.Close(ctx)
 		// The dispatch's root dies with the dispatch (#371): canceling
-		// it ends the bridge goroutine bound to it, and dropping the
-		// live record keeps the registry holding exactly the running
-		// dispatches.
+		// it ends everything bound to it, and dropping the live record
+		// keeps the registry holding exactly the running dispatches.
 		c.teardownLiveDispatch(run.entry.ID)
 		// The dispatch's concurrency slot (#390) is held from the tool
 		// call's reservation to here, when the dispatch has reached its

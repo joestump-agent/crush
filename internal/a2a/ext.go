@@ -204,6 +204,34 @@ var AnswerExt = Extension{
 	Schema:      new(jsonschema.Reflector).Reflect(agent.QuestionAnswer{}),
 }
 
+// PermissionExtensionURI is the URI of the permissions/v1 extension: a
+// dispatched agent's permission request, carried as a DataPart on the
+// input-required status message that parks its run (#353).
+const PermissionExtensionURI = extensionURIPrefix + "permissions/v1"
+
+// PermissionExt is the permissions/v1 extension's registry entry.
+var PermissionExt = Extension{
+	URI:         PermissionExtensionURI,
+	Description: "A dispatched agent's permission request as a DataPart on the input-required status message.",
+	Type:        reflect.TypeFor[agent.PermissionPrompt](),
+	Schema:      new(jsonschema.Reflector).Reflect(agent.PermissionPrompt{}),
+}
+
+// PermissionDecisionExtensionURI is the URI of the
+// permission-decisions/v1 extension: the verdict on a parked permission
+// request, carried as a DataPart on the follow-up message to the same
+// task (#353).
+const PermissionDecisionExtensionURI = extensionURIPrefix + "permission-decisions/v1"
+
+// PermissionDecisionExt is the permission-decisions/v1 extension's
+// registry entry.
+var PermissionDecisionExt = Extension{
+	URI:         PermissionDecisionExtensionURI,
+	Description: "The verdict on a parked permission request as a DataPart on the follow-up message to the same task.",
+	Type:        reflect.TypeFor[agent.PermissionDecision](),
+	Schema:      new(jsonschema.Reflector).Reflect(agent.PermissionDecision{}),
+}
+
 // UndeliveredSteersExtensionURI is the URI of the undelivered-steers/v1
 // extension: the steers a dispatched agent accepted but never consumed,
 // carried in the dispatch's terminal TaskStatusUpdateEvent metadata (#398).
@@ -238,6 +266,8 @@ func init() {
 	mustRegister(UsageExt)
 	mustRegister(QuestionExt)
 	mustRegister(AnswerExt)
+	mustRegister(PermissionExt)
+	mustRegister(PermissionDecisionExt)
 	mustRegister(UndeliveredSteersExt)
 	mustRegister(SteerRefusalExt)
 }

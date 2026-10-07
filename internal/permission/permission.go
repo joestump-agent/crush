@@ -109,8 +109,12 @@ type permissionService struct {
 	parent       Service
 	allowedTools []string
 
-	// used to make sure we only process one request at a time
-	requestMu       sync.Mutex
+	// requestSlot puts one request in front of the user at a time. It is
+	// a one-slot channel rather than a mutex so a caller can stop
+	// waiting for its turn when its context ends: a killed dispatch
+	// (#353) must not wait behind another open dialog, then publish a
+	// request nobody needs.
+	requestSlot     chan struct{}
 	activeRequest   *PermissionRequest
 	activeRequestMu sync.Mutex
 }
@@ -206,8 +210,17 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 		return true, nil
 	}
 
-	s.requestMu.Lock()
-	defer s.requestMu.Unlock()
+	select {
+	case s.requestSlot <- struct{}{}:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	defer func() { <-s.requestSlot }()
+	// The turn can arrive together with the caller's end: publish
+	// nothing for a request whose caller is gone.
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 
 	// tell the UI that a permission was requested
 	s.notificationBroker.Publish(pubsub.CreatedEvent, PermissionNotification{
@@ -302,6 +315,7 @@ func (s *permissionService) SkipRequests() bool {
 
 func NewPermissionService(workingDir string, skip bool, allowedTools []string) Service {
 	svc := &permissionService{
+		requestSlot:         make(chan struct{}, 1),
 		Broker:              pubsub.NewBroker[PermissionRequest](),
 		notificationBroker:  pubsub.NewBroker[PermissionNotification](),
 		workingDir:          workingDir,
@@ -338,6 +352,7 @@ func (s *scopedPermissionService) SetSkipRequests(skip bool) {
 // both directions. parent must be non-nil.
 func NewScopedPermissionService(parent Service, workingDir string, allowedTools []string) Service {
 	svc := &permissionService{
+		requestSlot:         make(chan struct{}, 1),
 		Broker:              pubsub.NewBroker[PermissionRequest](),
 		notificationBroker:  pubsub.NewBroker[PermissionNotification](),
 		workingDir:          workingDir,

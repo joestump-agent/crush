@@ -50,10 +50,12 @@ var ErrNoWorkingDir = errors.New("dispatch toolchain requires a workspace direct
 // parent's transport carries the question to its user.
 //
 // Phase 1 is in-process: the parent's session, history, and file-tracker
-// services are shared (they are keyed by session ID, not path), and the
-// scoped permission service bridges to the parent's so a dispatched
-// agent's permission requests surface in the same approval flow as the
-// main agent's.
+// services are shared (they are keyed by session ID, not path). The
+// scoped permission service follows the parent's live yolo state, and a
+// request that needs a person rides the A2A task the same way a question
+// does (#353): the served executor parks the run in input-required, and
+// the parent's transport puts the request through the parent's approval
+// flow.
 type DispatchToolchain struct {
 	workingDir  string
 	store       *config.ConfigStore
@@ -64,10 +66,6 @@ type DispatchToolchain struct {
 	// the one its question tool asks through. Nil when the parent was
 	// not interactive at build time, and the agent has no question tool.
 	questions question.Service
-
-	// cancel stops the permission bridge. Nil when the toolchain was
-	// built without a parent permission service to bridge to.
-	cancel context.CancelFunc
 }
 
 // WorkingDir returns the isolated workspace directory the toolchain is
@@ -115,16 +113,12 @@ func (t *DispatchToolchain) Tools() []fantasy.AgentTool {
 	return t.tools
 }
 
-// Close tears the toolchain down: it stops the permission bridge and
-// shuts down every LSP client the scoped manager started. It is safe to
-// call more than once and on a nil toolchain.
+// Close tears the toolchain down: it shuts down every LSP client the
+// scoped manager started. It is safe to call more than once and on a nil
+// toolchain.
 func (t *DispatchToolchain) Close(ctx context.Context) {
 	if t == nil {
 		return
-	}
-	if t.cancel != nil {
-		t.cancel()
-		t.cancel = nil
 	}
 	if t.lspManager != nil {
 		t.lspManager.StopAll(ctx)
@@ -156,10 +150,11 @@ type DispatchToolchainOptions struct {
 // is taken.
 //
 // #64's DispatchAgent tool consumes this: provision a clean workspace,
-// bootstrap the toolchain against its path, run. The caller's context is
-// the permission bridge's lifetime (#371): the tool passes the dispatch's
-// root, never the tool-call context.
-func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchToolchainOptions) (*DispatchToolchain, error) {
+// bootstrap the toolchain against its path, run. The tool passes the
+// dispatch's root context (#371), never the tool-call context; nothing in
+// the toolchain holds it since the permission bridge gave way to A2A
+// permission prompts (#353).
+func (c *coordinator) BuildDispatchToolchain(_ context.Context, opts DispatchToolchainOptions) (*DispatchToolchain, error) {
 	if opts.WorkingDir == "" {
 		return nil, ErrNoWorkingDir
 	}
@@ -213,17 +208,11 @@ func (c *coordinator) BuildDispatchToolchain(ctx context.Context, opts DispatchT
 		permissions = permission.NewPermissionService(dir, c.cfg.Overrides().SkipPermissionRequests, allowedTools)
 	}
 
-	var cancel context.CancelFunc
-	if c.permissions != nil {
-		cancel = bridgePermissions(ctx, c.permissions, permissions)
-	}
-
 	t := &DispatchToolchain{
 		workingDir:  dir,
 		store:       scoped,
 		lspManager:  lspManager,
 		permissions: permissions,
-		cancel:      cancel,
 	}
 	// A dispatched agent may ask the parent's user a question (#352), but
 	// only while someone can answer: a non-interactive parent's dispatch
@@ -394,48 +383,4 @@ func (c containedTool) SetProviderOptions(opts fantasy.ProviderOptions) {
 
 func (c containedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 	return c.inner.Run(tools.WithContainmentRoot(ctx, c.workspace), call)
-}
-
-// bridgePermissions forwards permission requests raised inside a dispatch
-// scope to the parent workspace's permission service, so dispatched-agent
-// tool calls surface in the same approval flow as the main agent's. Each
-// forwarded request resolves the scoped service's pending request with
-// the parent's verdict. The bridge's context is the dispatch's root, not
-// the parent turn's tool-call context: it lives as long as the dispatch
-// (#371), so requests raised after the turn ends still reach the parent's
-// subscribers. Requests still waiting when the bridge stops are denied by
-// the canceled context.
-func bridgePermissions(ctx context.Context, parent, scoped permission.Service) context.CancelFunc {
-	ctx, cancel := context.WithCancel(ctx)
-	// Subscribe before spawning the consumer: Broker delivery is lossy
-	// for events published before a subscriber registers, so subscribing
-	// inside the goroutine could strand a request that arrived first and
-	// leave its waiter blocked until the context is canceled.
-	events := scoped.Subscribe(ctx)
-	go func() {
-		for ev := range events {
-			req := ev.Payload
-			allowed, err := parent.Request(ctx, permission.CreatePermissionRequest{
-				SessionID:   req.SessionID,
-				ToolCallID:  req.ToolCallID,
-				ToolName:    req.ToolName,
-				Description: req.Description,
-				Action:      req.Action,
-				Params:      req.Params,
-				Path:        req.Path,
-			})
-			// A parent error (including the bridge's context being
-			// canceled while the parent waits on the UI) denies the
-			// scoped request so its waiter is never stranded.
-			if err != nil {
-				allowed = false
-			}
-			if allowed {
-				scoped.Grant(req)
-			} else {
-				scoped.Deny(req)
-			}
-		}
-	}()
-	return cancel
 }

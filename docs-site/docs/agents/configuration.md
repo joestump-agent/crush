@@ -132,28 +132,23 @@ default for dispatches or name a specific model.
 ## Permissions and yolo
 
 A dispatched agent's permission requests show up in your normal permission
-dialog, next to the main agent's.
+dialog, next to the main agent's. The request's path is the agent's worktree,
+and its description carries the agent's `@handle`, though the dialog shows the
+description only for some tools. Each request travels on the agent's A2A task
+([#353](https://github.com/joestump-agent/crush/issues/353)): its run pauses
+until you decide, other agents keep running, and requests from parallel tool
+calls come one at a time.
 
-- **Auto-approval** (`permissions.allowed_tools`) comes from the config the
-  worktree loads, not from the config your session already loaded. See
+- **Auto-approval** (`permissions.allowed_tools`) comes from your session's
+  config, never from the worktree's. See
   [below](#config-the-dispatched-agent-reads).
-- **Yolo** is copied from the `--yolo` flag Crush started with. If you started
-  with `--yolo`, turning it off with <kbd>ctrl+y</kbd> does not stop dispatched
-  agents from auto-approving ([#378](https://github.com/joestump-agent/crush/issues/378)). Turning yolo *on* mid-session approves
-  their requests only while the permission bridge below is still alive.
-- **Bash allow-lists**: `--allow-commands` and `--allow-all-commands` carry
-  over. `options.allowed_commands` is read from the worktree's config.
-
-:::warning[Known issue]
-The bridge that forwards a dispatched agent's permission requests to you shuts
-down when the **main agent's turn** ends. Any later request waits forever, and
-no dialog appears. That usually means the dispatched agent's first `edit`,
-`write` or `bash` call. Tracked in [#371](https://github.com/joestump-agent/crush/issues/371).
-
-**Workaround:** start Crush with `--yolo`, or auto-approve the tools the agent
-needs (`permissions allow edit multiedit write`, plus `bash` if you accept the
-risk) in your **global** config or a **committed** project config.
-:::
+- **Yolo** follows your live setting. Turning it on or off with
+  <kbd>ctrl+y</kbd> applies to the next request of every running dispatched
+  agent ([#378](https://github.com/joestump-agent/crush/issues/378)).
+- **Bash allow-lists**: `--allow-commands`, `--allow-all-commands` and
+  `options.allowed_commands` carry over from your session's config.
+- **Kills**: if the agent is killed while its request waits on you, the request
+  is denied and the agent's task ends canceled with the kill reason.
 
 ## Hooks
 

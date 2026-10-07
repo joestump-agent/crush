@@ -730,3 +730,44 @@ func TestScopedPermissionService_SkipAccessorsForwardToParent(t *testing.T) {
 	require.True(t, parent.SkipRequests())
 	require.True(t, scoped.SkipRequests())
 }
+
+// A request waiting for its turn behind another open request stops
+// waiting when its context ends, and publishes nothing (#353): a killed
+// dispatch must not hang behind the main agent's dialog, then show a
+// request for an agent that is already gone.
+func TestRequestStopsWaitingForItsTurnWhenCanceled(t *testing.T) {
+	t.Parallel()
+
+	svc := NewPermissionService(t.TempDir(), false, nil)
+	events := svc.Subscribe(t.Context())
+
+	firstDone := make(chan bool, 1)
+	go func() {
+		granted, _ := svc.Request(context.Background(), CreatePermissionRequest{SessionID: "s", ToolCallID: "first", ToolName: "bash", Action: "execute"})
+		firstDone <- granted
+	}()
+	first := <-events
+
+	ctx, cancel := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := svc.Request(ctx, CreatePermissionRequest{SessionID: "s", ToolCallID: "second", ToolName: "bash", Action: "execute"})
+		secondDone <- err
+	}()
+	cancel()
+
+	select {
+	case err := <-secondDone:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(10 * time.Second):
+		t.Fatal("a canceled request kept waiting behind the open one")
+	}
+
+	require.True(t, svc.Grant(first.Payload))
+	require.True(t, <-firstDone)
+	select {
+	case ev := <-events:
+		t.Fatalf("a canceled request was published: %+v", ev.Payload)
+	default:
+	}
+}

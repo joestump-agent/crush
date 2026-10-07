@@ -136,6 +136,11 @@ type ServerParams struct {
 	// ParentSessionID is the session the dispatch was created from
 	// (#399), carried on the index.
 	ParentSessionID string
+	// Permissions is the dispatched agent's scoped permission service
+	// (#353): the executor parks the run in input-required on each
+	// request that needs a person and resolves it with the decision on
+	// the same task. Optional; nil leaves requests to other subscribers.
+	Permissions PermissionSource
 	// TaskStore persists served tasks durably (#354) instead of the
 	// SDK's in-process default, so task state survives a restart.
 	// Optional; the production store arrives with #355. nil keeps
@@ -355,6 +360,9 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 		dispatchID := p.DispatchID
 		opts = append(opts, withOnTurn(func(taskID string) { f.index.setTask(dispatchID, taskID) }))
 	}
+	if p.Permissions != nil {
+		opts = append(opts, WithPermissions(p.Permissions))
+	}
 	opts = append(opts, withHooks(p.hooks))
 	// The call template rides the context binding (#350): the executor
 	// resolves runner, session, and shaping together, per turn.
@@ -523,6 +531,7 @@ func (f *ServerFactory) StartDispatchServer(ctx context.Context, p agent.Dispatc
 		Questions:         p.Questions,
 		Listed:            p.Listed,
 		ParentSessionID:   p.ParentSessionID,
+		Permissions:       p.Permissions,
 	})
 	if err != nil {
 		return "", nil, nil, err

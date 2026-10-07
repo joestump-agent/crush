@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/tools"
+	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/session"
 )
@@ -1627,7 +1629,7 @@ func TestExecuteAnswerWithoutPendingQuestionRejects(t *testing.T) {
 
 		evs := collect(t, exec.Execute(t.Context(), parkedTaskCtx(answer())))
 		require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateRejected}, states(t, evs))
-		require.Contains(t, statusMessageText(t, evs[0]), "no question is pending")
+		require.Contains(t, statusMessageText(t, evs[0]), "no question or permission request is pending")
 		require.False(t, runner.ran, "a rejected answer must not start a turn")
 		require.Empty(t, runner.enqueued(), "a rejected answer must not steer")
 	})
@@ -1642,7 +1644,7 @@ func TestExecuteAnswerWithoutPendingQuestionRejects(t *testing.T) {
 
 		evs := collect(t, exec.Execute(t.Context(), parkedTaskCtx(answer())))
 		require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateRejected}, states(t, evs))
-		require.Contains(t, statusMessageText(t, evs[0]), "no question is pending")
+		require.Contains(t, statusMessageText(t, evs[0]), "no question or permission request is pending")
 		require.EqualValues(t, 1, runner.runs.Load())
 		require.Empty(t, runner.enqueued())
 	})
@@ -1690,6 +1692,253 @@ func TestExecuteSteerWhileParkedStaysASteer(t *testing.T) {
 		a2aspec.TaskStateCompleted,
 	}, states(t, answered))
 	require.Contains(t, (<-runner.toolResp).Content, "User provided: postgres")
+}
+
+// requestingRunner is a dispatched agent whose turn requests permission
+// for its tool calls through the scoped permission service (#353), the
+// way bash does, then ends the turn naming each verdict.
+type requestingRunner struct {
+	fakeRunner
+
+	svc permission.Service
+	// calls are the tool calls the turn requests permission for, in
+	// parallel when there is more than one.
+	calls []string
+	// verdicts receives each call's (granted, err) once its request
+	// resolves.
+	verdicts chan permissionVerdict
+	runs     atomic.Int32
+}
+
+type permissionVerdict struct {
+	call    string
+	granted bool
+	err     error
+}
+
+func newRequestingRunner(svc permission.Service, calls ...string) *requestingRunner {
+	return &requestingRunner{
+		fakeRunner: fakeRunner{enqueueAccepted: true},
+		svc:        svc,
+		calls:      calls,
+		verdicts:   make(chan permissionVerdict, len(calls)),
+	}
+}
+
+func (r *requestingRunner) Run(ctx context.Context, _ agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	r.runs.Add(1)
+	var wg sync.WaitGroup
+	results := make([]string, len(r.calls))
+	for i, call := range r.calls {
+		wg.Go(func() {
+			granted, err := r.svc.Request(ctx, permission.CreatePermissionRequest{
+				SessionID:   "sess-1",
+				ToolCallID:  call,
+				ToolName:    tools.BashToolName,
+				Description: "Execute command: " + call,
+				Action:      "execute",
+				Params:      tools.BashPermissionsParams{Command: call},
+				Path:        "/work",
+			})
+			r.verdicts <- permissionVerdict{call: call, granted: granted, err: err}
+			results[i] = fmt.Sprintf("%s=%v", call, granted)
+		})
+	}
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return textResult(strings.Join(results, " ")), nil
+}
+
+// newRequestingExecutor binds a requesting runner and a real permission
+// service that prompts (no yolo, no allowlist) to the test context.
+func newRequestingExecutor(t *testing.T, calls ...string) (*requestingRunner, *Executor) {
+	svc := permission.NewPermissionService(t.TempDir(), false, nil)
+	runner := newRequestingRunner(svc, calls...)
+	return runner, newBoundExecutor(runner, WithPermissions(svc))
+}
+
+// parkedPermission asserts the execution ended in input-required on a
+// permission request and returns its typed payload: the status message
+// names the permissions/v1 extension, and the tool's params survive the
+// wire with their concrete type.
+func parkedPermission(t *testing.T, evs []a2aspec.Event) agent.PermissionPrompt {
+	t.Helper()
+	require.NotEmpty(t, evs)
+	last := statusUpdate(t, evs[len(evs)-1])
+	require.Equal(t, a2aspec.TaskStateInputRequired, last.Status.State)
+	require.NotNil(t, last.Status.Message)
+	require.Contains(t, last.Status.Message.Extensions, PermissionExtensionURI)
+	var payload *agent.PermissionPrompt
+	for _, part := range last.Status.Message.Parts {
+		data, ok := part.Content.(a2aspec.Data)
+		if !ok {
+			continue
+		}
+		decoded, err := DecodeValue(PermissionExt, data.Value)
+		require.NoError(t, err)
+		payload = decoded.(*agent.PermissionPrompt)
+	}
+	require.NotNil(t, payload, "the request rides a typed permissions/v1 DataPart")
+	require.Equal(t, tools.BashToolName, payload.ToolName)
+	params, ok := payload.Params.(tools.BashPermissionsParams)
+	require.True(t, ok, "params decode as the tool's own type, got %T", payload.Params)
+	require.Equal(t, payload.ToolCallID, params.Command)
+	return *payload
+}
+
+// decisionMessage is a decision message carrying the
+// permission-decisions/v1 DataPart.
+func decisionMessage(t *testing.T, allow bool) *a2aspec.Message {
+	t.Helper()
+	encoded, err := Encode(PermissionDecisionExt, agent.PermissionDecision{Allow: allow})
+	require.NoError(t, err)
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewDataPart(encoded))
+	msg.Extensions = []string{PermissionDecisionExtensionURI}
+	return msg
+}
+
+// TestExecutePermissionParksAndResumes is #353 at the executor: a tool's
+// permission request parks the run in input-required with a typed
+// payload while the tool call waits, and a decision on the parked task
+// grants or denies it and resumes the same run to its terminal state.
+// A message with no decodable decision denies.
+func TestExecutePermissionParksAndResumes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		answer  func(t *testing.T) *a2aspec.Message
+		granted bool
+	}{
+		{name: "allow", answer: func(t *testing.T) *a2aspec.Message { return decisionMessage(t, true) }, granted: true},
+		{name: "deny", answer: func(t *testing.T) *a2aspec.Message { return decisionMessage(t, false) }},
+		{name: "plain text denies", answer: func(*testing.T) *a2aspec.Message {
+			return a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("yes please"))
+		}},
+		{name: "an allow that does not name the extension denies", answer: func(t *testing.T) *a2aspec.Message {
+			msg := decisionMessage(t, true)
+			msg.Extensions = nil
+			return msg
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			runner, exec := newRequestingExecutor(t, "make test")
+			msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("run the tests"))
+			evs := collect(t, exec.Execute(t.Context(), newExecCtx(msg)))
+			require.Equal(t, []a2aspec.TaskState{
+				a2aspec.TaskStateSubmitted,
+				a2aspec.TaskStateWorking,
+				a2aspec.TaskStateInputRequired,
+			}, states(t, evs), "a permission request ends the execution in input-required")
+			parkedPermission(t, evs)
+			select {
+			case v := <-runner.verdicts:
+				t.Fatalf("the parked request resolved before any decision: %+v", v)
+			default:
+			}
+
+			evs = collect(t, exec.Execute(t.Context(), parkedTaskCtx(tt.answer(t))))
+			require.Equal(t, []a2aspec.TaskState{
+				a2aspec.TaskStateWorking,
+				a2aspec.TaskStateCompleted,
+			}, states(t, evs), "the decision resumes the run to its terminal state")
+			v := <-runner.verdicts
+			require.NoError(t, v.err)
+			require.Equal(t, tt.granted, v.granted)
+			require.Equal(t, fmt.Sprintf("make test=%v", tt.granted), statusMessageText(t, evs[1]))
+			require.EqualValues(t, 1, runner.runs.Load(), "the decision resumes the same run, never a new turn")
+		})
+	}
+}
+
+// Parallel tool calls park one request at a time (#353): each decision
+// resumes the run, which parks again on the next request until every
+// call has its verdict.
+func TestExecuteParallelPermissionRequestsParkInTurn(t *testing.T) {
+	t.Parallel()
+
+	runner, exec := newRequestingExecutor(t, "make test", "make lint")
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("check everything"))
+	evs := collect(t, exec.Execute(t.Context(), newExecCtx(msg)))
+	first := parkedPermission(t, evs)
+
+	evs = collect(t, exec.Execute(t.Context(), parkedTaskCtx(decisionMessage(t, true))))
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateInputRequired,
+	}, states(t, evs), "the second request parks the run again")
+	second := parkedPermission(t, evs)
+	require.NotEqual(t, first.ToolCallID, second.ToolCallID)
+	require.Equal(t, verdictFor(t, runner, first.ToolCallID), permissionVerdict{call: first.ToolCallID, granted: true})
+
+	evs = collect(t, exec.Execute(t.Context(), parkedTaskCtx(decisionMessage(t, false))))
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateCompleted,
+	}, states(t, evs))
+	require.Equal(t, verdictFor(t, runner, second.ToolCallID), permissionVerdict{call: second.ToolCallID, granted: false})
+	require.EqualValues(t, 1, runner.runs.Load())
+}
+
+// verdictFor reads the next verdict and checks it is the one for call.
+func verdictFor(t *testing.T, runner *requestingRunner, call string) permissionVerdict {
+	t.Helper()
+	v := <-runner.verdicts
+	require.NoError(t, v.err)
+	require.Equal(t, call, v.call)
+	return v
+}
+
+// denyRecorder is a PermissionSource that records which requests were
+// denied before passing the denial on.
+type denyRecorder struct {
+	PermissionSource
+
+	mu     sync.Mutex
+	denied []string
+}
+
+func (d *denyRecorder) Deny(req permission.PermissionRequest) bool {
+	d.mu.Lock()
+	d.denied = append(d.denied, req.ID)
+	d.mu.Unlock()
+	return d.PermissionSource.Deny(req)
+}
+
+func (d *denyRecorder) deniedIDs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.denied)
+}
+
+// Canceling a task parked on a permission request denies the request and
+// ends the task Canceled (#353): the parked request is denied by ID, the
+// tool call is never granted — it gets the denial or the canceled run's
+// context error, whichever lands first — and a late decision is Rejected.
+func TestExecuteCancelWhileParkedOnPermission(t *testing.T) {
+	t.Parallel()
+
+	svc := permission.NewPermissionService(t.TempDir(), false, nil)
+	runner := newRequestingRunner(svc, "make test")
+	recorder := &denyRecorder{PermissionSource: svc}
+	exec := newBoundExecutor(runner, WithPermissions(recorder))
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("run the tests"))
+	parked := parkedPermission(t, collect(t, exec.Execute(t.Context(), newExecCtx(msg))))
+
+	evs := collect(t, exec.Cancel(t.Context(), parkedTaskCtx(nil)))
+	require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateCanceled}, states(t, evs))
+	require.Equal(t, []string{parked.ID}, recorder.deniedIDs(), "the parked request is denied")
+
+	v := <-runner.verdicts
+	require.False(t, v.granted, "a canceled task's parked request must not be granted")
+
+	late := collect(t, exec.Execute(t.Context(), parkedTaskCtx(decisionMessage(t, true))))
+	require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateRejected}, states(t, late))
 }
 
 // unwindingRunner models a run still unwinding a tool call after its
