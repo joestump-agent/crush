@@ -80,7 +80,7 @@ the wire:
 | `description` | The dispatch's `role`, which may be empty. |
 | `version` | The Crush build version. |
 | `supportedInterfaces[0]` | The routed endpoint, `http://crush-a2a/agents/<dispatch id>`, JSON-RPC binding, protocol `1.0`. Always first. |
-| `supportedInterfaces[1]` | Only while the [TCP listener](#tcp-listener) runs: `https://<host:port>/agents/<dispatch id>`, same binding and protocol. |
+| `supportedInterfaces[1]` | Only while the [TCP listener](#tcp-listener) runs and has an address to advertise: `https://<host:port>/agents/<dispatch id>`, same binding and protocol. |
 | `capabilities` | `streaming: true` and the declared `extensions`: `todos/v1`, `usage/v1`, `questions/v1`, `answers/v1`, `permissions/v1`, `permission-decisions/v1`, `undelivered-steers/v1` and `steer-refusals/v1`, each with its JSON Schema in its params. No push notifications, no extended card. |
 | `defaultInputModes`, `defaultOutputModes` | `text/plain` both ways. |
 | `skills` | One entry per Crush skill the dispatch was given: every discovered skill when the dispatch named none. `id` and `name` are the skill name, and every entry carries the single tag `crush-skill`. |
