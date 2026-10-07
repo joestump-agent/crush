@@ -39,6 +39,14 @@ const subAgentTestProvider = "test-openai-compat"
 // returned so tests can read the host's own surfaces (card listing).
 func newSubAgentCoordinator(t *testing.T) (agent.Coordinator, session.Service, *a2a.ServerFactory) {
 	t.Helper()
+	factory := a2a.NewServerFactory(t.TempDir())
+	co, sessions := newSubAgentCoordinatorOn(t, factory)
+	return co, sessions, factory
+}
+
+// newSubAgentCoordinatorOn is newSubAgentCoordinator over a given host.
+func newSubAgentCoordinatorOn(t *testing.T, host agent.DispatchHost) (agent.Coordinator, session.Service) {
+	t.Helper()
 	conn, err := db.Connect(t.Context(), t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
@@ -46,11 +54,30 @@ func newSubAgentCoordinator(t *testing.T) (agent.Coordinator, session.Service, *
 	sessions := session.NewService(q, conn)
 	messages := message.NewService(q)
 
-	factory := a2a.NewServerFactory(t.TempDir())
 	co, err := agenttest.NewCoordinator(t.Context(), t.TempDir(), sessions, messages,
-		agenttest.WithDispatchHost(factory))
+		agenttest.WithDispatchHost(host))
 	require.NoError(t, err)
-	return co, sessions, factory
+	return co, sessions
+}
+
+// taskSeenHost is the real host, closing taskSeen once the client has
+// read the served task's ID off the stream: from then on a client cancel
+// can recover the run through tasks/cancel.
+type taskSeenHost struct {
+	*a2a.ServerFactory
+	taskSeen chan struct{}
+	once     sync.Once
+}
+
+func (h *taskSeenHost) StreamDispatch(ctx context.Context, p agent.DispatchTransportParams) (agent.DispatchTransportOutcome, error) {
+	onTask := p.OnTask
+	p.OnTask = func(id string) {
+		if onTask != nil {
+			onTask(id)
+		}
+		h.once.Do(func() { close(h.taskSeen) })
+	}
+	return h.ServerFactory.StreamDispatch(ctx, p)
 }
 
 // subAgentResult is the minimal successful AgentResult a mock returns.
@@ -148,7 +175,8 @@ func TestSubAgentOverA2AProviderError(t *testing.T) {
 func TestSubAgentOverA2ACancelRecoversThroughProtocol(t *testing.T) {
 	t.Parallel()
 
-	co, sessions, _ := newSubAgentCoordinator(t)
+	host := &taskSeenHost{ServerFactory: a2a.NewServerFactory(t.TempDir()), taskSeen: make(chan struct{})}
+	co, sessions := newSubAgentCoordinatorOn(t, host)
 	parent, err := sessions.Create(t.Context(), "parent")
 	require.NoError(t, err)
 
@@ -175,10 +203,14 @@ func TestSubAgentOverA2ACancelRecoversThroughProtocol(t *testing.T) {
 	}()
 
 	<-entered
-	// The served task and its working status were emitted before the
-	// run parked; give the stream a beat to deliver them so recovery
-	// knows the task id, then cut the client turn.
-	time.Sleep(500 * time.Millisecond)
+	// Cut the client turn only once the client has the task's ID, so
+	// recovery can name it: the server emitting it is not enough, as the
+	// stream may not have reached the client yet.
+	select {
+	case <-host.taskSeen:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the client never read the served task's ID")
+	}
 	cancel()
 
 	res := <-ch
