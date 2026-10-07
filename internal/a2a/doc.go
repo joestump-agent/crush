@@ -118,6 +118,7 @@
 //     subscription, so the error arrives as an in-stream error event
 //     rather than a plain JSON-RPC error body — which the TCK's
 //     streaming client reads as a successfully opened stream.
+//
 // Three of the TCK's findings were fixed rather than accepted, and their
 // upstream shapes are worth reporting to the a2a-go project (filing
 // there needs Joe's approval, so they are tracked here):
