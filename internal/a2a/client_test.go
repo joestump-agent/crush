@@ -779,6 +779,10 @@ func TestStreamDispatchResumesAfterDrop(t *testing.T) {
 		ContextID: "dispatch-session",
 	})
 	require.NoError(t, err)
+	if controlOutcome.Status != DispatchStatusCompleted {
+		t.Logf("control run outcome: status=%q text=%q diff_err=%q",
+			controlOutcome.Status, controlOutcome.Text, controlOutcome.DiffError)
+	}
 	require.Equal(t, DispatchStatusCompleted, controlOutcome.Status)
 	require.Equal(t, 3, controlOutcome.WorkingEvents,
 		"the uncut run counts the initial Working plus both todo snapshots")
