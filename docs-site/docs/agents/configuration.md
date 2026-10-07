@@ -32,6 +32,7 @@ worktree location is still hard-coded.
 | Skills a dispatch gets | `option skill-path`, `option disable-skill` | `options.skills_paths`, `options.disabled_skills` | Plus the per-call `skills` argument |
 | Auto-approved tools | `permissions allow …` | `permissions.allowed_tools` | Read from the config the worktree loads (see [below](#config-the-dispatched-agent-reads)) |
 | Yolo | `--yolo` at startup | — | Dispatched agents follow the startup flag. Turning yolo off with <kbd>ctrl+y</kbd> does not reach them ([#378](https://github.com/joestump-agent/crush/issues/378)) |
+| A2A TCP listener | `option a2a-listen`, `a2a-tls-cert`, `a2a-tls-key`, `a2a-client-ca` | `options.a2a.{listen,tls_cert,tls_key,client_ca}` | The process's A2A host, beside its unix socket. TLS only: plain TCP fails the load. See [TCP listener](./a2a-protocol.md#tcp-listener) ([#358](https://github.com/joestump-agent/crush/issues/358)) |
 
 ## Todo enforcement settings
 
@@ -183,15 +184,11 @@ on the base revision, a revision the main agent chooses, is read or executed
 | Diff in the result | Per-file stat plus the diff, cut at 250 lines |
 | Nudges per run | 2 |
 | Tool-loop detection | More than 5 identical tool calls and results in the last 10 steps |
-| A2A server | One host per process on a unix socket, `<data dir>/a2a/<pid>.sock` (socket `0600`, directory `0700`), JSON-RPC, bearer-authenticated with a per-process token ([#346](https://github.com/joestump-agent/crush/issues/346), [#357](https://github.com/joestump-agent/crush/issues/357)) |
+| A2A server | One host per process on a unix socket, `<data dir>/a2a/<pid>.sock` (socket `0600`, directory `0700`), JSON-RPC, bearer-authenticated with a per-process token ([#346](https://github.com/joestump-agent/crush/issues/346), [#357](https://github.com/joestump-agent/crush/issues/357)). A TLS-only TCP listener is opt-in; see the table above |
 | A2A client timeout | No total timeout; per-phase bounds only: 10 s dial, 10 s TLS handshake, 30 s response headers ([#344](https://github.com/joestump-agent/crush/issues/344)) |
 | A2A server shutdown | 5 seconds |
 | Cleanup when Crush exits | A sweep that force-removes every `crush-dispatch-*` worktree and branch, with a 30-second timeout. Whether it finishes depends on how Crush exits; see [troubleshooting](/agents/troubleshooting) |
 | Inspect keys | <kbd>ctrl+]</kbd> and <kbd>ctrl+[</kbd> |
-
-:::info[Planned]
-- A TCP listener with TLS becomes opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)).
-:::
 
 `apply_dispatch` and `dismiss_dispatch` record your decision about a
 workspace explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)). Exit and startup already keep decided and

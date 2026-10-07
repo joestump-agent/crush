@@ -95,6 +95,7 @@ with your shell's privileges, before the UI appears.
 | `option global-context-path …` | `options.global_context_paths[]` |
 | `option attribution-*` | `options.attribution.*` |
 | `option todo-*/dispatch-*` | `options.todo_enforcement.<key>` |
+| `option a2a-listen\|a2a-tls-cert\|a2a-tls-key\|a2a-client-ca` | `options.a2a.{listen,tls_cert,tls_key,client_ca}` |
 | `option ui <key> <value>` | `options.tui.<key>` |
 
 Note that the JSON names are not a mechanical transliteration of the builtin
@@ -113,7 +114,9 @@ builtin yet: `allowed_commands`, `allow_all_commands` (see
 :::info[Fork feature]
 These `crush.json` keys do not exist upstream: `options.allowed_commands`,
 `options.allow_all_commands`, `options.disable_a2ui`,
-`options.todo_enforcement` ([multi-agent](/agents/todo-enforcement)), the
+`options.todo_enforcement` ([multi-agent](/agents/todo-enforcement)),
+`options.a2a` (the A2A host's [TLS-only TCP listener](/agents/a2a-protocol#tcp-listener);
+`listen` without `tls_cert` and `tls_key` fails the load), the
 top-level `agents` block ([multi-agent](/agents/configuration)), the
 top-level `embeddings` block ([semantic search](/features/semantic-search)),
 and the per-server `channel_enabled` ([channels](/features/channels)). See

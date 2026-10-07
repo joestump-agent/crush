@@ -128,7 +128,7 @@ built by [Charm](https://charm.land) — bugs in them belong
 
 | Thing | Status |
 | --- | --- |
-| A2A as an external interface | Every dispatch is served over A2A on a loopback port, but only Crush's own in-process client talks to it. There is no authentication and the endpoint is not shown anywhere, so third-party A2A clients are not a supported interface yet. See [the A2A protocol page](/agents/a2a-protocol). |
+| A2A as an external interface | Every dispatch is served over A2A on the process's bearer-authenticated unix socket, and Crush's own in-process client is the main one talking to it. An opt-in, TLS-only [TCP listener](/agents/a2a-protocol#tcp-listener) (`options.a2a`) lets clients on other hosts reach it, but the UI does not show dispatch endpoints yet. See [the A2A protocol page](/agents/a2a-protocol). |
 
 ## Reporting bugs
 

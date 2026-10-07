@@ -188,6 +188,23 @@ lands in the config file. Every flag is in the
 | `dispatch-stall DUR\|off` | Kill a dispatched run whose todos stop updating for this long |
 | `dispatch-timeout DUR\|off` | Kill a dispatched run after this long, whatever its progress |
 
+## A2A TCP listener
+
+The `a2a-*` keys add an opt-in, TLS-only TCP listener to the process's
+[A2A host](/agents/a2a-protocol#tcp-listener), beside its unix socket. The
+JSON form keeps them under `options.a2a`.
+
+```bash
+option a2a-listen 127.0.0.1:7443
+option a2a-tls-cert certs/a2a.pem
+option a2a-tls-key certs/a2a-key.pem
+option a2a-client-ca certs/clients-ca.pem   # optional: require client certificates
+```
+
+Plain TCP is refused: `a2a-listen` without both `a2a-tls-cert` and
+`a2a-tls-key` fails the load. Relative paths resolve against the working
+directory.
+
 ## Security
 
 Both `crushrc` and `crush.json` are **trusted code**. `crushrc` runs in a full
