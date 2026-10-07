@@ -94,20 +94,59 @@ func WithExternalTransport(rt http.RoundTripper) ServerFactoryOption {
 
 // externalBaseTransport returns the transport one external agent's
 // requests go out on: the injected test transport, else a fresh one.
-func (f *ServerFactory) externalBaseTransport() http.RoundTripper {
-	if f.externalTransport != nil {
+// Plain http is allowed only for a loopback card, so for an http origin
+// the transport uses no proxy and dials only addresses the host resolves
+// to on loopback: a name such as localhost is checked where it resolves,
+// not where it reads.
+func (f *ServerFactory) externalBaseTransport(pinned origin) http.RoundTripper {
+	if f.externalTransport != nil && pinned.scheme != "http" {
 		return f.externalTransport
 	}
-	return &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   externalDialTimeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+	dialer := &net.Dialer{
+		Timeout:   externalDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	transport := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		DialContext:         dialer.DialContext,
 		TLSHandshakeTimeout: externalTLSHandshakeTimeout,
 		ForceAttemptHTTP2:   true,
 		MaxIdleConns:        4,
 		IdleConnTimeout:     90 * time.Second,
+	}
+	if pinned.scheme == "http" {
+		lookup := f.externalLookup
+		if lookup == nil {
+			lookup = net.DefaultResolver.LookupIPAddr
+		}
+		transport.Proxy = nil
+		transport.DialContext = loopbackOnlyDial(dialer, lookup)
+	}
+	return transport
+}
+
+// loopbackOnlyDial resolves the host itself and dials it only when every
+// address it resolves to is loopback (#434), so plain http — allowed for
+// a loopback card alone — never leaves the machine.
+func loopbackOnlyDial(dialer *net.Dialer, lookup func(ctx context.Context, host string) ([]net.IPAddr, error)) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := lookup(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("a2a: %s resolves to no address", host)
+		}
+		for _, ip := range ips {
+			if !ip.IP.IsLoopback() {
+				return nil, fmt.Errorf("a2a: refusing plain http to %s: it resolves to %s, not a loopback address", host, ip.IP)
+			}
+		}
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 	}
 }
 
@@ -125,7 +164,7 @@ func (f *ServerFactory) ResolveExternalAgent(ctx context.Context, p agent.Extern
 	}
 	source := cardURL.String()
 	pinned := originOf(cardURL)
-	base := f.externalBaseTransport()
+	base := f.externalBaseTransport(pinned)
 
 	card, err := fetchExternalCard(ctx, base, pinned, source)
 	if err != nil {

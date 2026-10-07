@@ -9,11 +9,13 @@ import (
 	"io"
 	"iter"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -809,4 +811,39 @@ func TestExternalFoldCapsArtifacts(t *testing.T) {
 	}
 	require.Len(t, fold.order, maxExternalArtifacts)
 	require.Len(t, fold.texts, maxExternalArtifacts)
+}
+
+// A plain-http card is allowed only on loopback, and a name is checked
+// where it resolves (#434): a localhost that resolves off the machine is
+// refused before anything is sent, and one that resolves to loopback is
+// reached.
+func TestExternalAgentPlainHTTPMustResolveToLoopback(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(externalTestCard("http://"+r.Host+"/a2a", false))
+	}))
+	t.Cleanup(srv.Close)
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	require.NoError(t, err)
+	cardURL := "http://localhost:" + port + externalCardPath
+
+	resolvesTo := func(ip string) *ServerFactory {
+		f := NewServerFactory(t.TempDir())
+		f.externalLookup = func(context.Context, string) ([]net.IPAddr, error) {
+			return []net.IPAddr{{IP: net.ParseIP(ip)}}, nil
+		}
+		return f
+	}
+
+	_, err = resolvesTo("203.0.113.9").ResolveExternalAgent(t.Context(), agent.ExternalAgentParams{CardURL: cardURL})
+	require.ErrorContains(t, err, "not a loopback address")
+	require.Zero(t, requests.Load(), "nothing is sent to a localhost that is not local")
+
+	ext, err := resolvesTo("127.0.0.1").ResolveExternalAgent(t.Context(), agent.ExternalAgentParams{CardURL: cardURL})
+	require.NoError(t, err)
+	ext.Close()
+	require.Equal(t, int32(1), requests.Load())
 }

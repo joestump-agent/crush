@@ -256,6 +256,11 @@ type ServerFactory struct {
 	// agent gets a transport of its own.
 	externalTransport http.RoundTripper
 
+	// externalLookup, when set, replaces the resolver the plain-http
+	// loopback check uses (#434) — the test seam that makes localhost
+	// resolve somewhere else.
+	externalLookup func(ctx context.Context, host string) ([]net.IPAddr, error)
+
 	mu         sync.Mutex
 	started    bool
 	closed     bool
