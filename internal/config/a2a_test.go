@@ -153,6 +153,33 @@ func TestA2AOptionsValidate(t *testing.T) {
 			opts:    &config.A2AOptions{Listen: "127.0.0.1:7443", TLSCert: cert, TLSKey: key, ClientCA: filepath.Join(dir, "nope.pem")},
 			wantErr: "options.a2a.client_ca",
 		},
+		{
+			name:    "relative certificate",
+			opts:    &config.A2AOptions{Listen: "127.0.0.1:7443", TLSCert: certRel, TLSKey: key},
+			wantErr: "options.a2a.tls_cert: \"" + certRel + "\" is a relative path",
+		},
+		{
+			name:    "relative key",
+			opts:    &config.A2AOptions{Listen: "127.0.0.1:7443", TLSCert: cert, TLSKey: keyRel},
+			wantErr: "options.a2a.tls_key: \"" + keyRel + "\" is a relative path",
+		},
+		{
+			name:    "relative client CA",
+			opts:    &config.A2AOptions{Listen: "127.0.0.1:7443", TLSCert: cert, TLSKey: key, ClientCA: certRel},
+			wantErr: "options.a2a.client_ca: \"" + certRel + "\" is a relative path",
+		},
+		{
+			name:    "relative path without listen",
+			opts:    &config.A2AOptions{TLSCert: certRel},
+			wantErr: "is a relative path",
+		},
+		{
+			// A ~/ path is accepted as a path: it fails here only
+			// because the file does not exist under the home directory.
+			name:    "home-relative path is not refused as relative",
+			opts:    &config.A2AOptions{Listen: "127.0.0.1:7443", TLSCert: "~/crush-a2a-test-missing.pem", TLSKey: "~/crush-a2a-test-missing-key.pem"},
+			wantErr: "options.a2a.tls_cert, options.a2a.tls_key",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -230,20 +257,22 @@ func loadA2AConfig(t *testing.T, workDir, name, content string) (*config.ConfigS
 func TestA2ACrushrcMatchesJSON(t *testing.T) {
 	isolateA2AConfig(t)
 	workDir := t.TempDir()
-	cert, key := a2aTestCert(t, workDir)
+	certDir := t.TempDir()
+	certRel, keyRel := a2aTestCert(t, certDir)
+	cert, key := filepath.Join(certDir, certRel), filepath.Join(certDir, keyRel)
 
 	rc, err := loadA2AConfig(t, workDir, "crushrc", `option a2a-listen 127.0.0.1:7443
-option a2a-tls-cert `+filepath.ToSlash(cert)+`
-option a2a-tls-key `+filepath.ToSlash(key)+`
-option a2a-client-ca `+filepath.ToSlash(cert))
+option a2a-tls-cert '`+cert+`'
+option a2a-tls-key '`+key+`'
+option a2a-client-ca '`+cert+`'`)
 	require.NoError(t, err)
 	require.NoError(t, os.Remove(filepath.Join(workDir, "crushrc")))
 
 	body, err := json.Marshal(map[string]any{"options": map[string]any{"a2a": map[string]any{
 		"listen":    "127.0.0.1:7443",
-		"tls_cert":  filepath.ToSlash(cert),
-		"tls_key":   filepath.ToSlash(key),
-		"client_ca": filepath.ToSlash(cert),
+		"tls_cert":  cert,
+		"tls_key":   key,
+		"client_ca": cert,
 	}}})
 	require.NoError(t, err)
 	js, err := loadA2AConfig(t, workDir, "crush.json", string(body))
@@ -251,12 +280,43 @@ option a2a-client-ca `+filepath.ToSlash(cert))
 
 	want := &config.A2AOptions{
 		Listen:   "127.0.0.1:7443",
-		TLSCert:  filepath.Join(workDir, cert),
-		TLSKey:   filepath.Join(workDir, key),
-		ClientCA: filepath.Join(workDir, cert),
+		TLSCert:  cert,
+		TLSKey:   key,
+		ClientCA: cert,
 	}
-	require.Equal(t, want, js.Config().Options.A2A, "relative paths resolve against the working directory")
+	require.Equal(t, want, js.Config().Options.A2A)
 	require.Equal(t, js.Config().Options.A2A, rc.Config().Options.A2A, "crushrc and crush.json load the same block")
+}
+
+// A relative TLS path fails the load (#358), from either config format,
+// even when the file exists under the working directory: in a global
+// config it would resolve against every project Crush runs in, and pick
+// up a cloned repository's certs/ directory.
+func TestA2ARelativeTLSPathRefusedAtLoad(t *testing.T) {
+	isolateA2AConfig(t)
+	workDir := t.TempDir()
+	cert, key := a2aTestCert(t, workDir)
+
+	_, err := loadA2AConfig(t, workDir, "crushrc", `option a2a-listen 127.0.0.1:7443
+option a2a-tls-cert `+filepath.ToSlash(cert)+`
+option a2a-tls-key `+filepath.ToSlash(key))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "options.a2a.tls_cert")
+	require.Contains(t, err.Error(), "is a relative path")
+	require.NoError(t, os.Remove(filepath.Join(workDir, "crushrc")))
+
+	body, err := json.Marshal(map[string]any{"options": map[string]any{"a2a": map[string]any{
+		"listen":   "127.0.0.1:7443",
+		"tls_cert": filepath.Join(workDir, cert),
+		"tls_key":  filepath.Join(workDir, key),
+		// The client CA is the relative one this time.
+		"client_ca": filepath.ToSlash(cert),
+	}}})
+	require.NoError(t, err)
+	_, err = loadA2AConfig(t, workDir, "crush.json", string(body))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "options.a2a.client_ca")
+	require.Contains(t, err.Error(), "is a relative path")
 }
 
 // A listen address without TLS material fails the load (#358), from

@@ -644,9 +644,9 @@ func (c *Config) setDefaults(workingDir, dataDir string) {
 		}
 	}
 	c.Options.DataDirectory = filepath.Clean(filepathext.SmartJoin(workingDir, c.Options.DataDirectory))
-	// The A2A listener's TLS files resolve the same way (#358): stored
-	// absolute, so the host loads what validation checked.
-	c.Options.A2A.resolvePaths(workingDir)
+	// The A2A listener's TLS files expand a leading ~ (#358). They are
+	// never joined to the working directory: load refuses a relative one.
+	c.Options.A2A.expandPaths()
 	if c.Providers == nil {
 		c.Providers = csync.NewMap[string, ProviderConfig]()
 	}
