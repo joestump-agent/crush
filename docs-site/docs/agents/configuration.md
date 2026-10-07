@@ -410,33 +410,45 @@ The fields:
 
 | Field | Meaning |
 | --- | --- |
-| `card` | Required. The card's URL. It must be `https`; plain `http` is allowed only for `localhost` and loopback addresses. A URL with no path, or `/`, fetches `/.well-known/agent-card.json`. Credentials in the URL are a load error. |
-| `auth` | Optional. `type` is `bearer`, the only type. `token` is required with it, and is usually a `$VAR` or `$(cmd)` reference. `--bearer` in `crushrc` accepts only a reference, never a literal token. |
+| `card` | Required. The card's URL. It must be `https`; plain `http` is allowed only for `localhost` and loopback addresses, and the name must resolve to loopback when Crush dials it. A URL with no path, or `/`, fetches `/.well-known/agent-card.json`. Credentials in the URL are not allowed. |
+| `auth` | Optional. `type` is `bearer`, the only type. `token` is required with it, and is usually a `$VAR` or `$(cmd)` reference. `--bearer` in `crushrc` accepts only a reference, never a literal token. A config layer that sets `card` drops the `auth` earlier layers gave the agent, so a project config that moves a card never inherits your global token; set `auth` again next to the new `card`. |
 | `workspace` | `none`, the default and the only value. An external agent never touches your disk. |
-| `transport.idle_timeout` | How long the agent's stream may stay silent before Crush cancels its task. Unset falls back to `options.todo_enforcement.inactivity_timeout`; `0` or `off` disables it. |
-| `kill.timeout` | The hard timeout for the whole run. Unset falls back to `options.todo_enforcement.hard_timeout`. It is the only `kill` field an external agent may set. |
+| `transport.idle_timeout` | How long the agent's stream may stay silent before Crush cancels its task. Unset falls back to `options.todo_enforcement.inactivity_timeout`, then to **5 minutes**, so an external run is bounded by default. `0` or `off` disables it. |
+| `kill.timeout` | The hard timeout for the whole run. Unset falls back to `options.todo_enforcement.hard_timeout`, which is off by default. It is the only `kill` field an external agent may set. |
 | `name`, `description`, `disabled`, `role` | As for any agent. `role` must be `dispatch`. |
 
 `model`, `prompt`, `tools`, `mcp`, `skills` and the other local fields are load
 errors on an external agent: the card defines it. The `dispatch_agent` call
 refuses `model`, `skills` and `branch` for the same reason.
 
+A definition with a missing or refused `card`, `auth` without a `token`, or a
+negative `idle_timeout` does not fail the whole config. It loads with a
+warning that names the problem, drops out of `dispatch_agent`'s agent list,
+and a call that names it anyway is refused with the same reason.
+
 What happens on each dispatch:
 
-1. **The token is resolved.** `auth.token` goes through the same `$VAR` and
-   `$(cmd)` resolver as the rest of your config, on every dispatch, so a
-   rotated token is picked up. A reference that resolves to nothing fails the
-   call.
+1. **The token is resolved.** Once the call has a concurrency slot,
+   `auth.token` goes through the same `$VAR` and `$(cmd)` resolver as the rest
+   of your config, on every dispatch, so a rotated token is picked up. The
+   resolution ends with the tool call. A reference that resolves to nothing,
+   or a command that fails, fails the call; the reason, including the
+   command's stderr, goes to the log and not to the model.
 2. **The card is fetched and checked.** The fetch carries no credentials, has
    10-second dial and 30-second total timeouts, caps the card at 1 MiB, and
    never follows a redirect to another origin. Crush then needs a JSON-RPC
-   interface on the card URL's own origin and, when `auth` is set, an HTTP
-   bearer security scheme. Anything else fails the call with an error that
-   names the card.
+   interface on the card URL's own origin, preferring one on protocol version
+   1.x, and, when `auth` is set, an HTTP bearer security scheme. Anything else
+   fails the call with an error that names the card and the HTTP status code
+   or kind of failure, never text the remote sent.
 3. **The prompt is sent.** It goes out as a new task, with no context ID of
-   Crush's own. No worktree, branch, toolchain or local agent is created. The
-   dispatch still gets a registry entry, a handle and a role, so its agent
-   block and `@handle` show up as usual.
+   Crush's own. A card that streams gets `SendStreamingMessage`, and its calls
+   wait at most 30 seconds for response headers. A card that declares
+   `streaming: false` gets a blocking `SendMessage` that answers only when the
+   task ends, so the idle timeout bounds the whole run: raise it for a slow
+   non-streaming agent. No worktree, branch, toolchain or local agent is
+   created. The dispatch still gets a registry entry, a handle and a role, so
+   its agent block and `@handle` show up as usual.
 4. **The result is delivered.** The terminal result carries `source`, the card
    URL. Its first line tells the main agent that the content came from an
    external agent and is untrusted.
@@ -450,23 +462,40 @@ output as data, and never lets it steer where your credentials go:
   the card URL's origin (scheme, host and port). Every request off that origin
   is refused before it is sent. That covers a card whose service URL points
   elsewhere, which is refused before any request carries the token, and a
-  redirect to another host.
-- **The token is never echoed.** It is not logged, persisted, or put in the
+  redirect to another host. The pin is by origin, not path: a card may name
+  any path on its own host as its service, so agents hosted under different
+  paths of one host can receive each other's tokens. Give each agent a host
+  of its own when that matters.
+- **The token is not echoed.** It is not logged, persisted, or put in the
   registry, the result, or an error. If the remote echoes it back, it is
-  scrubbed to `[REDACTED]`. Crush's own host token never rides an external
-  call.
-- **Output is untrusted text.** Findings and errors are stripped of control
-  characters, such as terminal escapes and bidirectional overrides, and capped
-  at 32 KiB. Artifacts are read as text and never applied to disk. There is no
-  diff, and the agent's self-reported usage is not added to your session's
-  cost.
+  scrubbed to `[REDACTED]`. The scrub is an exact match, run after invisible
+  characters are dropped and before any text is cut, and a prefix of four or
+  more bytes left at a cut is scrubbed too. A remote that sends the token
+  encoded, or a deliberate fragment of it, is not caught. Crush's own host
+  token never rides an external call.
+- **Output is untrusted text.** Findings, failure reasons, and stream errors
+  that carry the remote's words are labeled `UNTRUSTED:`. They are stripped
+  of control and invisible characters, such as terminal escapes, zero-width
+  spaces, bidirectional overrides and the Unicode tag block, and capped at
+  32 KiB. A response body is cut off at 16 MiB, one server-sent event at
+  4 MiB, and the output is collected from at most 64 artifacts. Artifacts are
+  read as text and never applied to disk. There is no diff, and the agent's
+  self-reported usage is not added to your session's cost. A task ID that is
+  not 256 or fewer printable characters ends the stream.
 - **No questions, no permissions.** If the agent asks for input or
   authentication, Crush does not forward the request. It cancels the remote
   task and fails the dispatch, saying why. Write the prompt so the agent does
   not need to ask.
-- **Kills are `tasks/cancel`.** Cancel, the hard timeout, the idle timeout and
-  Crush exiting each end the stream and send `tasks/cancel` with the reason.
-  The dispatch ends `killed` with that reason.
+- **Kills end the stream; `tasks/cancel` is best effort.** Cancel, the hard
+  timeout, the idle timeout and Crush exiting each end the stream, and the
+  dispatch ends `killed` with the reason. Once the remote has named its task,
+  Crush also sends `tasks/cancel` carrying the reason, bounded at 10 seconds,
+  and logs a failure. A kill that lands before the remote names a task cuts
+  the stream only: there is no task to cancel, and the remote may keep
+  working.
+- **After a crash.** A dispatch the dead process left running fails at the
+  next start. An external one has no workspace to preserve, so it fails as
+  external, without the card URL, which the durable record does not keep.
 
 Steering is not supported: a message to the agent's `@handle`, or
 `message_agent`, fails with "steering external agents is not supported yet".

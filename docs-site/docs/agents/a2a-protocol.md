@@ -724,14 +724,21 @@ differs from a served dispatch in these ways:
 - Every call after that carries `Authorization: Bearer <token>` when the
   definition sets `auth`, and goes only to that origin.
 - The prompt is a `SendStreamingMessage` with no `contextId` and no
-  activated extensions. Extension metadata on the stream is ignored.
+  activated extensions, and its response headers must arrive within 30
+  seconds. A card that declares `streaming: false` gets a blocking
+  `SendMessage` instead, bounded by the idle timeout. Extension metadata on
+  the stream is ignored.
 - A bare `Message` reply completes the dispatch. Artifacts are read as text,
   never as the `diff` and `dispatch-result` artifacts.
+- The first task ID must be 256 or fewer printable characters, or the stream
+  is refused.
 - `INPUT_REQUIRED` and `AUTH_REQUIRED` are answered with `CancelTask`, never
   forwarded to the user.
-- A kill, or a stream silent past `transport.idle_timeout`, ends the stream
-  and sends `CancelTask` carrying the reason under
-  `crush.dispatch.cancel_reason`.
+- A kill, or a stream silent past `transport.idle_timeout` (5 minutes unless
+  configured), ends the stream. Once the remote has named its task, Crush
+  sends a best-effort `CancelTask` carrying the reason under
+  `crush.dispatch.cancel_reason`; before that, there is no task to cancel.
+- Response bodies stop at 16 MiB and one server-sent event at 4 MiB.
 
 Configuration and the trust model are in
 [External agents](./configuration.md#external-agents).
