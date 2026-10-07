@@ -74,7 +74,25 @@ func newDispatchTestCoordinatorAt(t *testing.T, env fakeEnv, workingDir, dataDir
 	// survives, and teardown must close every lease, salvageable work
 	// included. Sweep is idempotent, so a test that swept or released
 	// explicitly is unaffected.
+	//
+	// Agent builds are joined first (#515). Every coordinator run — a
+	// dispatch's parent delivery turn among them — rebuilds the tool
+	// palette, and the task sub-agent built there renders its system
+	// prompt on a detached goroutine that runs git branch, git status
+	// and git log in the working directory. git status writes
+	// .git/index.lock and renames it over .git/index, so a render still
+	// running when t.TempDir()'s RemoveAll reaches .git leaves an entry
+	// behind and the removal fails with "unlinkat .git: directory not
+	// empty". Running after the reaper (LIFO), the wait sees every build
+	// a reaped run started; it fails the test rather than hang if one
+	// never finishes.
 	t.Cleanup(func() {
+		buildCtx, buildCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer buildCancel()
+		if err := c.waitAgentBuilds(buildCtx); err != nil {
+			t.Errorf("agent build outlived the test: %v", err)
+		}
+
 		c.dispatchMu.Lock()
 		provider := c.dispatchProvider
 		c.dispatchMu.Unlock()

@@ -16,7 +16,14 @@ import "sync"
 // outstanding — which Go 1.27's sync.WaitGroup treats as reuse and panics on,
 // crash-looping Crush in channel mode (joestump-agent/crush#298).
 //
+// The coordinator also keeps every unsettled latch it armed, so teardown can
+// wait for setup work no run ever waits on (coordinator.waitAgentBuilds).
+//
 // @joestump-agent 09/22/2026 - Added, replacing coordinator.readyWg.
+//
+// @joestump-agent 10/07/2026 - The coordinator tracks unsettled latches for
+// teardown (joestump-agent/crush#515): the system-prompt render runs git in
+// the working directory and outlived the dispatch tests' TempDir removal.
 type readiness struct {
 	done chan struct{}
 	once sync.Once
