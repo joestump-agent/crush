@@ -365,15 +365,20 @@ func TestDispatchedFileToolsContained(t *testing.T) {
 	outsideFile := filepath.Join(outsideDir, "parent_owned.go")
 	require.NoError(t, os.WriteFile(outsideFile, []byte("package main"), 0o644))
 
-	agentCfg := c.cfg.Config().Agents[config.AgentTask]
-	agentCfg.AllowedTools = []string{
+	// The worker definition is the dispatched palette (#432): every
+	// file tool under test must be on it.
+	workerCfg := c.cfg.Config().Agents[config.AgentWorker]
+	workerCfg.AllowedTools = []string{
 		tools.ViewToolName,
 		tools.GlobToolName,
 		tools.GrepToolName,
 		tools.LSToolName,
 		tools.DownloadToolName,
+		tools.WriteToolName,
+		tools.EditToolName,
+		tools.MultiEditToolName,
 	}
-	c.cfg.Config().Agents[config.AgentTask] = agentCfg
+	c.cfg.Config().Agents[config.AgentWorker] = workerCfg
 
 	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
 	require.NoError(t, err)
@@ -478,9 +483,9 @@ func TestDispatchedViewRefusesSymlinkEscape(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	agentCfg := c.cfg.Config().Agents[config.AgentTask]
-	agentCfg.AllowedTools = []string{tools.ViewToolName}
-	c.cfg.Config().Agents[config.AgentTask] = agentCfg
+	workerCfg := c.cfg.Config().Agents[config.AgentWorker]
+	workerCfg.AllowedTools = []string{tools.ViewToolName}
+	c.cfg.Config().Agents[config.AgentWorker] = workerCfg
 
 	tc, err := c.BuildDispatchToolchain(t.Context(), DispatchToolchainOptions{WorkingDir: workspace})
 	require.NoError(t, err)
