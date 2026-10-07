@@ -325,11 +325,13 @@ a question:
    ```
 
 2. **The decision.** The parent's coordinator requests it on the parent's
-   own permission service, with the dispatch's `@handle` in front of the
-   description. That service applies your live yolo setting and the grants
+   own permission service, for the dispatch's own session, with the
+   dispatch's `@handle` in front of the description. That service applies your live yolo setting and the grants
    you made for the session before it shows the dialog. The tool's params
    decode back to the tool's own type, so the dialog renders a dispatched
-   request like a local one. With no handler on the client, the request is
+   request like a local one; an MCP tool's raw input stays a string. The
+   dialog shows the request's path, the dispatch's worktree, while it
+   shows the description only for some tools. With no handler on the client, the request is
    denied.
 3. **The answer.** The client sends a user message with the parked task's
    `taskId`, whose data part is the declared `permission-decisions/v1`
@@ -337,11 +339,13 @@ a question:
    allow grants the request; a message with no decodable decision denies
    it. The same run resumes, and the tool call runs or returns a denial.
 
-Requests from parallel tool calls park one at a time, oldest first: after
-each decision the run resumes and parks again on the next one. A kill
+Requests from parallel tool calls park one at a time: the scoped
+service publishes the next request only once the parked one is decided,
+and the run resumes and parks again on it. A kill
 while a request is parked ends the wait the same way it does for a
-question, and a `CancelTask` on a task parked on a request denies it before
-the task ends `TASK_STATE_CANCELED`.
+question. A `CancelTask` on a task parked on a request ends the task
+`TASK_STATE_CANCELED`, and the parked tool call gets a denial or the
+canceled run's context error, whichever lands first; it never runs.
 
 ## Event stream
 

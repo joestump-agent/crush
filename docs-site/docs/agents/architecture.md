@@ -2,7 +2,7 @@
 id: architecture
 title: How multi-agent works today
 sidebar_label: Architecture
-description: The components behind dispatched agents as they exist on main — coordinator, workspace registry, the per-process A2A host and its socket client, injection queue, todo bridge, kill ladder, permission bridge — and one dispatch's lifecycle end to end.
+description: The components behind dispatched agents as they exist on main — coordinator, workspace registry, the per-process A2A host and its socket client, injection queue, todo bridge, kill ladder, permission prompts — and one dispatch's lifecycle end to end.
 ---
 
 # How multi-agent works today
@@ -69,7 +69,7 @@ protocol.
 | --- | --- | --- |
 | Coordinator | [`internal/agent/dispatch_tool.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch_tool.go) | Implements the `dispatch_agent` tool and owns each run's lifecycle. |
 | Workspace and dispatch registry | [`internal/dispatch/workspace.go`](https://github.com/joestump-agent/crush/blob/main/internal/dispatch/workspace.go) | Creates and diffs worktrees, and keeps the one in-memory registry that handles and discovery read. |
-| Dispatch toolchain | [`internal/agent/dispatch.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch.go) | Builds worktree-rooted tools, scoped config, LSP and permissions, plus the permission bridge. |
+| Dispatch toolchain | [`internal/agent/dispatch.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch.go) | Builds worktree-rooted tools, scoped config, LSP and permissions. |
 | A2A server and card | [`internal/a2a/server.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/server.go), [`agentcard.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/agentcard.go) | One JSON-RPC host per process on a `0600` unix socket; routes `/agents/<dispatch id>` per dispatch. |
 | Executor | [`internal/a2a/executor.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/executor.go) | Maps one `SessionAgent.Run` onto A2A task states and events. |
 | A2A client | [`internal/a2a/client.go`](https://github.com/joestump-agent/crush/blob/main/internal/a2a/client.go), [`internal/agent/dispatch_a2a.go`](https://github.com/joestump-agent/crush/blob/main/internal/agent/dispatch_a2a.go) | Sends the prompt and consumes the stream to a terminal state. |
@@ -199,8 +199,12 @@ the parked task. The wire details are on
 [A2A protocol](./a2a-protocol.md#questions).
 
 **Permissions.** Permission requests from the dispatched agent go to its
-scoped permission service. The bridge forwards each one to the parent's
-service, so it appears in the same approval prompt as the main agent's.
+scoped permission service. One that needs a person parks the run in
+`input-required` on the A2A task, and the parent's transport puts it
+through the parent's own service, so it appears in the same approval
+prompt as the main agent's
+([#353](https://github.com/joestump-agent/crush/issues/353)). See
+[Permission prompts](./a2a-protocol.md#permission-prompts).
 
 **Nudge ladder and wander kill.** The ladder counts tool calls without
 todo activity. It injects a nudge after `nudge_threshold` calls (default
@@ -210,12 +214,6 @@ unanswered, it fires the `ignored nudges` kill. The watchdog adds
 `hard timeout` and `stalled todos`, and loop detection supplies
 `tool loop`. A kill records its reason and calls `SessionAgent.Cancel`.
 Details are on [Todo enforcement](./todo-enforcement.md).
-
-:::warning[Known issue]
-The permission bridge is bound to the tool call's context, which ends with
-the parent's turn. After that, a dispatched agent's permission prompts
-block forever unless yolo is on ([#371](https://github.com/joestump-agent/crush/issues/371)).
-:::
 
 :::warning[Known issue]
 The ladder's kill is wired for every agent, not just dispatched ones. With
@@ -272,8 +270,7 @@ In `crush run` the process exits before results arrive
 
 When the run returns, the A2A server stops, with a 5-second graceful
 shutdown. Its endpoint and card are cleared from the registry. The
-toolchain then closes, which stops the permission bridge and the scoped
-LSP clients. The worktree and branch stay so they can be reviewed.
+toolchain then closes, which stops the scoped LSP clients. The worktree and branch stay so they can be reviewed.
 
 When Crush exits, `App.Shutdown` releases this instance's dispatch
 workspaces synchronously, bounded by a 30-second budget ([#367](https://github.com/joestump-agent/crush/issues/367)):

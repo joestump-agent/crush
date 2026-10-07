@@ -132,8 +132,9 @@ default for dispatches or name a specific model.
 ## Permissions and yolo
 
 A dispatched agent's permission requests show up in your normal permission
-dialog, next to the main agent's, with the agent's `@handle` in front of the
-description. Each request travels on the agent's A2A task
+dialog, next to the main agent's. The request's path is the agent's worktree,
+and its description carries the agent's `@handle`, though the dialog shows the
+description only for some tools. Each request travels on the agent's A2A task
 ([#353](https://github.com/joestump-agent/crush/issues/353)): its run pauses
 until you decide, other agents keep running, and requests from parallel tool
 calls come one at a time.
