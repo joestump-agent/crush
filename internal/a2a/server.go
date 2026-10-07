@@ -124,6 +124,11 @@ type ServerParams struct {
 	// status under the usage/v1 extension. Optional; nil emits no usage
 	// metadata.
 	Usage func(ctx context.Context) (agent.Usage, error)
+	// Questions is the dispatched agent's own question service (#352):
+	// the executor parks the run in input-required on each question and
+	// resolves it with the answer on the same task. Optional; nil means
+	// the agent cannot ask.
+	Questions QuestionSource
 	// TaskStore persists served tasks durably (#354) instead of the
 	// SDK's in-process default, so task state survives a restart.
 	// Optional; the production store arrives with #355. nil keeps
@@ -288,6 +293,9 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	if p.Usage != nil {
 		opts = append(opts, WithUsage(p.Usage))
 	}
+	if p.Questions != nil {
+		opts = append(opts, WithQuestions(p.Questions))
+	}
 	// The call template rides the context binding (#350): the executor
 	// resolves runner, session, and shaping together, per turn.
 	executor := NewExecutor(f.contexts, p.ContextID, opts...)
@@ -381,6 +389,7 @@ func (f *ServerFactory) StartDispatchServer(ctx context.Context, p agent.Dispatc
 		InactivityTimeout: p.InactivityTimeout,
 		CancelReason:      p.CancelReason,
 		Usage:             p.Usage,
+		Questions:         p.Questions,
 	})
 	if err != nil {
 		return "", nil, nil, err

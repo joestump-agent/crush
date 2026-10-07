@@ -42,8 +42,10 @@ a refactor of an unrelated package.
 
 Don't dispatch work that needs your uncommitted changes, because the agent never
 sees your working tree. Don't dispatch read-only searches either; the `agent`
-tool handles those. A dispatched agent can't ask you questions, so the request
-must stand on its own.
+tool handles those. A dispatched agent can ask you a question while your
+session is interactive — it appears in your question prompt labeled with its
+`@handle`, and the agent waits for your answer — but it can't ask anything in a
+non-interactive run, so make the request stand on its own.
 
 :::warning[Known issue]
 Dispatched agents don't get your context files (`AGENTS.md`, `CRUSH.md`,

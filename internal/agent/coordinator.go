@@ -284,6 +284,10 @@ type coordinator struct {
 	// nil means dispatches are refused at the tool — nothing runs
 	// unserved (#347).
 	dispatchHost DispatchHost
+	// dispatchQuestions is the one-slot semaphore dispatched agents'
+	// questions take turns on (#352): the question service holds one
+	// pending question at a time. Made on first use under dispatchMu.
+	dispatchQuestions chan struct{}
 
 	// semanticStore and semanticClient back the semantic_search and
 	// semantic_index tools. Both are nil unless an embedding provider is

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/session"
 )
 
@@ -412,6 +414,106 @@ func TestCancelDispatchEndsStream(t *testing.T) {
 	require.NoError(t, <-errCh)
 	require.Equal(t, DispatchStatusCanceled, outcome.Status)
 	require.Equal(t, "hard timeout", outcome.Text)
+}
+
+// startAskingServer serves a dispatched agent that asks one question
+// through its scoped question service (#352), on a fresh host.
+func startAskingServer(t *testing.T) (*ServerFactory, *Server, *askingRunner) {
+	t.Helper()
+	svc := question.NewService()
+	runner := newAskingRunner(svc)
+	factory := NewServerFactory(t.TempDir())
+	server, err := factory.StartServer(t.Context(), ServerParams{
+		DispatchID: "dispatch-asks",
+		Runner:     runner,
+		SessionID:  "dispatch-session",
+		ContextID:  "dispatch-session",
+		Questions:  svc,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = factory.Close(context.Background()) })
+	return factory, server, runner
+}
+
+// The input-required round trip over the wire (#352): the agent's
+// question reaches the client as input-required with the typed payload,
+// OnInputRequired answers it while the run stays parked, the answer goes
+// back as a typed message on the same task, and the terminal state
+// arrives on the second stream — from the same run, never a second turn.
+func TestStreamDispatchInputRequiredRoundTrip(t *testing.T) {
+	factory, server, runner := startAskingServer(t)
+
+	var asked []agent.QuestionRequest
+	var taskIDs []string
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "set up the schema",
+		ContextID: "dispatch-session",
+		OnTask:    func(taskID string) { taskIDs = append(taskIDs, taskID) },
+		OnInputRequired: func(_ context.Context, req agent.QuestionRequest) (agent.QuestionAnswer, error) {
+			asked = append(asked, req)
+			select {
+			case resp := <-runner.toolResp:
+				t.Errorf("the run must stay parked while the question is open, got %+v", resp)
+			default:
+			}
+			return agent.QuestionAnswer{Answers: []question.Answer{
+				{QuestionID: req.Questions[0].ID, FillInText: "use postgres"},
+			}}, nil
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Contains(t, outcome.Text, "User provided: use postgres")
+
+	require.Len(t, asked, 1, "one question, asked once")
+	require.Len(t, asked[0].Questions, 1)
+	require.Equal(t, question.TypeFreeText, asked[0].Questions[0].Type)
+	require.Equal(t, "Which database?", asked[0].Questions[0].Text)
+	require.Equal(t, "The schema differs per engine.", asked[0].Questions[0].Description)
+
+	require.False(t, (<-runner.toolResp).IsError)
+	require.EqualValues(t, 1, runner.runs.Load(), "the answer resumes the same run")
+	require.Len(t, taskIDs, 1, "both streams belong to one task")
+
+	// The answer went back on that task: its history holds the typed
+	// answers/v1 message after the prompt.
+	client, err := newDispatchClient(t.Context(), server.Card, factory.dispatchHTTPClient(), factory)
+	require.NoError(t, err)
+	authCtx := factory.dispatchAuthContext(t.Context(), server.Endpoint)
+	task, err := client.GetTask(authCtx, &a2aspec.GetTaskRequest{ID: a2aspec.TaskID(taskIDs[0])})
+	require.NoError(t, err)
+	require.Equal(t, a2aspec.TaskStateCompleted, task.Status.State)
+	answered := slices.ContainsFunc(task.History, func(msg *a2aspec.Message) bool {
+		return msg.Role == a2aspec.MessageRoleUser && slices.Contains(msg.Extensions, AnswerExtensionURI)
+	})
+	require.True(t, answered, "the answer is a user message on the same task")
+}
+
+// A question no answer is coming for (#352) — OnInputRequired failed,
+// as it does when a kill ends the parent's wait — cancels the parked
+// task with the error's text as the reason: the stream's outcome is
+// Canceled with it, and the parked tool call returns an error.
+func TestStreamDispatchUnansweredQuestionCancels(t *testing.T) {
+	factory, server, runner := startAskingServer(t)
+
+	outcome, err := factory.StreamDispatch(t.Context(), agent.DispatchTransportParams{
+		Endpoint:  server.Endpoint,
+		Card:      server.Card,
+		Prompt:    "set up the schema",
+		ContextID: "dispatch-session",
+		OnInputRequired: func(context.Context, agent.QuestionRequest) (agent.QuestionAnswer, error) {
+			return agent.QuestionAnswer{}, errors.New("wander kill: hard timeout")
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCanceled, outcome.Status)
+	require.Equal(t, "wander kill: hard timeout", outcome.Text)
+
+	resp := <-runner.toolResp
+	require.True(t, resp.IsError, "the parked tool call must return an error")
+	require.EqualValues(t, 1, runner.runs.Load())
 }
 
 // CancelDispatch without a resolvable card or task ID is an error, not

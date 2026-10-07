@@ -79,7 +79,7 @@ the wire:
 | `description` | The dispatch's `role`, which may be empty. |
 | `version` | The Crush build version. |
 | `supportedInterfaces[0]` | The routed endpoint, `http://crush-a2a/agents/<dispatch id>`, JSON-RPC binding, protocol `1.0`. Always exactly one. |
-| `capabilities` | `streaming: true` only. No push notifications, no extended card, no `extensions`. |
+| `capabilities` | `streaming: true` and the declared `extensions`: `todos/v1`, `usage/v1`, `questions/v1` and `answers/v1`, each with its JSON Schema in its params. No push notifications, no extended card. |
 | `defaultInputModes`, `defaultOutputModes` | `text/plain` both ways. |
 | `skills` | One entry per Crush skill the dispatch was given: every discovered skill when the dispatch named none. `id` and `name` are the skill name, and every entry carries the single tag `crush-skill`. |
 
@@ -106,15 +106,16 @@ unless `Content-Type` parses to `application/json`, and `400` unless the
 ## Methods
 
 The SDK's default request handler serves the whole A2A method set. Crush's
-client calls three of them: the dispatch itself, and — when a stream
-drops mid-run — the two resume methods.
+client calls four of them: `SendStreamingMessage` for the dispatch, its
+steers and its answers, `CancelTask` for kills, and — when a stream drops
+mid-run — the two resume methods.
 
 | Method | Crush calls it | What the server does |
 | --- | --- | --- |
-| `SendStreamingMessage` | Yes, once per dispatch | Runs the turn and streams the events below. |
+| `SendStreamingMessage` | Yes: the dispatch, steers, and one per answered question | Runs the turn, delivers the steer, or resumes the parked run, and streams the events below. |
 | `SendMessage` | No | Runs the turn and returns the final result in one response. |
 | `GetTask`, `ListTasks` | `GetTask` on resume | Answer from the per-server in-memory store. |
-| `CancelTask` | Yes — wander kills and user cancels | Calls the agent's `Cancel` and emits `TASK_STATE_CANCELED`, the request's reason as the status message. |
+| `CancelTask` | Yes — wander kills, user cancels, and questions no answer is coming for | Calls the agent's `Cancel` and emits `TASK_STATE_CANCELED`, the request's reason as the status message. |
 | `SubscribeToTask` | On resume | Re-attaches to a live task's stream. |
 | Push-notification config methods | No | Return "push notifications not supported". |
 | `GetExtendedAgentCard` | No | Returns "extended card not configured". |
@@ -172,6 +173,73 @@ The steer is its own task, terminal on the queue's verdict:
 The steer's reply streams on the dispatch's own surfaces — the parent's
 dispatch block, `@handle` inspection — never on the steer's task.
 
+### Questions
+
+A dispatched agent can ask the parent's user a question
+([#352](https://github.com/joestump-agent/crush/issues/352)). It gets the
+`question` tool when the parent session is interactive at dispatch time,
+and the tool asks through the dispatch's own question service, never the
+parent's:
+
+1. **The pause.** The agent's question parks the run: the agent stays
+   blocked inside its tool call, and the stream ends with
+   `TASK_STATE_INPUT_REQUIRED`. The status message carries the question
+   texts as a text part and the whole request as a data part — the
+   declared `questions/v1` extension, named in the message's
+   `extensions`:
+
+   ```json
+   {
+     "statusUpdate": {
+       "status": {
+         "state": "TASK_STATE_INPUT_REQUIRED",
+         "message": {
+           "role": "ROLE_AGENT",
+           "extensions": ["https://crush.charm.land/ext/questions/v1"],
+           "parts": [
+             { "text": "Which database?" },
+             { "data": { "id": "…", "session_id": "…", "tool_call_id": "…",
+               "questions": [
+                 { "id": "…", "type": "free_text", "question": "Which database?",
+                   "description": "The schema differs per engine." }
+               ] } }
+           ]
+         }
+       }
+     }
+   }
+   ```
+
+2. **The question.** The parent's coordinator shows it in your question
+   prompt, each question prefixed with the dispatch's `@handle`.
+   Dispatched questions take turns: one is on screen at a time. With no
+   interactive user — a non-interactive parent, or a transport with no
+   question handler — every question is answered at once with
+   `no interactive user; proceed with your best judgment`, and the agent
+   carries on. Dismissing the prompt answers
+   `the user declined to answer; proceed with your best judgment`.
+3. **The answer.** The client sends a user message with the parked
+   task's `taskId`, whose data part is the declared `answers/v1`
+   extension: `{"answers": [...]}`, one answer per question ID. A
+   message with no answers data counts its text as a free-text answer to
+   every question. The task goes back to `TASK_STATE_WORKING`, the same
+   run resumes — no new turn starts — and the new stream runs to the
+   terminal state or the next question.
+
+An answer and a steer are told apart explicitly. A message whose `taskId`
+names a task in `TASK_STATE_INPUT_REQUIRED` is an answer; with no
+question pending on that task it is `TASK_STATE_REJECTED` ("no question
+is pending on this task") and starts nothing. Every other message on the
+context is a turn or a steer, as above, so a steer sent while a question
+is open is still only a steer, and the question stays open.
+
+While a run is parked there is no execution, so neither the SDK's
+inactivity guard nor the executor's backstop runs, but `hard_timeout`
+and `stall_window` keep counting. A kill ends the wait on your answer:
+the client cancels the parked task with the kill reason, the parked tool
+call returns an error, and the task ends `TASK_STATE_CANCELED`. A
+`CancelTask` on a parked task does the same.
+
 ## Event stream
 
 Each SSE `data:` line is a JSON-RPC response whose `result` holds exactly
@@ -185,6 +253,10 @@ streams:
 | 3 | `statusUpdate` × 0..n | `TASK_STATE_WORKING` | One per todo-list change: the current todo as message text, and the typed progress under the declared `todos/v1` extension's metadata key. |
 | 4 | `artifactUpdate` × 1..n | — | The work product: the diff as chunked `text/x-diff` parts (artifact `diff`), then the typed outcome as a data part (artifact `dispatch-result`). |
 | 5 | `statusUpdate` | `TASK_STATE_COMPLETED` | The agent's final text as an agent message. |
+
+A question the agent asks ends a stream early, with
+`TASK_STATE_INPUT_REQUIRED` after row 3; the answer's stream starts at
+row 2 on the same task. See [Questions](#questions).
 
 ### Todo progress events
 
@@ -298,6 +370,8 @@ rides the result.
 | Run returns an error | `TASK_STATE_FAILED` with the error text. |
 | Agent was busy, or a cancel landed at start | `TASK_STATE_FAILED`, "agent session did not start a turn (busy or canceled)". The prompt is still queued on the session, and the running agent reads it. |
 | `CancelTask` | `TASK_STATE_CANCELED`, the request's reason as the status message. |
+| The agent asks a question | `TASK_STATE_INPUT_REQUIRED` with the question; not an end. The answer resumes the run on the same task. |
+| An answer on a task with no question pending | `TASK_STATE_REJECTED`, "no question is pending on this task". |
 
 ### How the client maps the outcome
 
@@ -323,7 +397,8 @@ server, so the client resumes instead of failing the dispatch
   partial diff can never double — and then the live events.
 - When the execution has already ended, `SubscribeToTask` answers
   "task not found" and the client calls `GetTask` instead: a terminal
-  state folds and lands; a non-terminal one retries.
+  state folds and lands, a task parked in `TASK_STATE_INPUT_REQUIRED`
+  hands its question on to be answered, and any other state retries.
 - A terminal state wins wherever it comes from, and the replayed
   snapshot never counts as progress, so a Working event is never
   counted twice.
@@ -364,9 +439,9 @@ A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/c
 
 ## Not implemented
 
-- **`input-required` and `auth-required`.** Dispatched agents have no
-  question tool, and permission prompts use an in-process bridge
-  ([#352](https://github.com/joestump-agent/crush/issues/352), [#353](https://github.com/joestump-agent/crush/issues/353)).
+- **`auth-required`.** Permission prompts use an in-process bridge
+  ([#353](https://github.com/joestump-agent/crush/issues/353)).
+  Questions use `input-required`; see [Questions](#questions).
 - **Durable task state.** A restart loses every task ([#354](https://github.com/joestump-agent/crush/issues/354)).
 
 ## Security model

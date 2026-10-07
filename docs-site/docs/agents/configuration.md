@@ -117,7 +117,8 @@ A dispatched agent gets the task agent's read-only tools plus five write tools.
 | Always added | `bash`, `edit`, `multiedit`, `write`, `todos` | Added after your deny list is applied, so `permissions deny` cannot remove them ([#376](https://github.com/joestump-agent/crush/issues/376)) |
 | Read-only set | `glob`, `grep`, `ls`, `view` | Your deny list can remove these |
 | LSP lookups | `lsp_definition`, `lsp_symbols`, `lsp_call_hierarchy` | Only when an LSP is configured or `auto-lsp` is not turned off |
-| Never included | `agent`, `agentic_fetch`, `dispatch_agent`, `message_agent`, `question`, MCP tools, `semantic_search`, `sourcegraph` | Each would reach outside the worktree or needs an interactive session. Only one level of delegation is allowed |
+| Interactive parents only | `question` | Its questions pause the run and appear in your question prompt labeled with the agent's `@handle`; your deny list can remove it ([#352](https://github.com/joestump-agent/crush/issues/352)) |
+| Never included | `agent`, `agentic_fetch`, `dispatch_agent`, `message_agent`, MCP tools, `semantic_search`, `sourcegraph` | Each would reach outside the worktree. Only one level of delegation is allowed |
 | Missing today | `job_output`, `job_kill`, `lsp_diagnostics`, `fetch`, `download`, `lsp_references`, `lsp_rename`, `lsp_replace_symbol` | `bash` moves commands that run longer than 60 s into the background, but the agent has no `job_output` to read them back ([#384](https://github.com/joestump-agent/crush/issues/384)) |
 
 Every path-based tool is rooted at the worktree. The agent's LSP servers start

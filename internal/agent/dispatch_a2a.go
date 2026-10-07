@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/skills"
 )
 
@@ -87,6 +88,11 @@ type DispatchServerParams struct {
 	// status under the usage/v1 extension. Nil-safe — a nil func simply
 	// emits no usage metadata.
 	Usage func(ctx context.Context) (Usage, error)
+	// Questions is the dispatched agent's own question service (#352),
+	// the one its question tool asks through: the served executor parks
+	// the run in input-required on each question and resolves it with
+	// the answer. Nil when the agent has no question tool.
+	Questions question.Service
 }
 
 // DispatchTransportParams is one dispatch's slice of the A2A client
@@ -108,6 +114,13 @@ type DispatchTransportParams struct {
 	// the run stays recoverable (tasks/resubscribe, tasks/get) and
 	// answerable after the fact. Called at most once. Nil-safe.
 	OnTask func(taskID string)
+	// OnInputRequired answers a question the served agent parked its run
+	// on (#352): the transport calls it when the task enters
+	// input-required, sends the answer on the same task, and keeps
+	// consuming until a terminal state. An error means no answer is
+	// coming; the transport cancels the parked task with the error's
+	// text as the reason. Nil answers with UnattendedQuestionAnswer.
+	OnInputRequired func(ctx context.Context, req QuestionRequest) (QuestionAnswer, error)
 }
 
 // GetDispatchTaskParams is one A2A task query (#349): the served
@@ -315,6 +328,41 @@ type Usage struct {
 	TraceID string `json:"traceId"`
 }
 
+// QuestionRequest is the statically typed payload of the questions/v1
+// extension (#352): a dispatched agent's question — the question.Request
+// fields — carried as a DataPart on the input-required status message
+// that parks the run, so the parent renders it without parsing prose.
+type QuestionRequest question.Request
+
+// QuestionAnswer is the statically typed payload of the answers/v1
+// extension (#352): the answers to a parked question, carried as a
+// DataPart on the follow-up message to the same task. Each answer names
+// the question it answers by ID.
+type QuestionAnswer struct {
+	Answers []question.Answer `json:"answers"`
+}
+
+// NoInteractiveUserAnswer is what a dispatched agent's question is
+// answered with when no one can answer it (#352): the parent is not
+// interactive, or the transport has no question handler.
+const NoInteractiveUserAnswer = "no interactive user; proceed with your best judgment"
+
+// UnattendedQuestionAnswer answers every question in req with
+// NoInteractiveUserAnswer as free text, so the dispatched agent carries
+// on instead of waiting for a user who is not there.
+func UnattendedQuestionAnswer(req QuestionRequest) QuestionAnswer {
+	return freeTextAnswer(req, NoInteractiveUserAnswer)
+}
+
+// freeTextAnswer answers every question in req with text.
+func freeTextAnswer(req QuestionRequest, text string) QuestionAnswer {
+	answers := make([]question.Answer, len(req.Questions))
+	for i, q := range req.Questions {
+		answers[i] = question.Answer{QuestionID: q.ID, FillInText: text}
+	}
+	return QuestionAnswer{Answers: answers}
+}
+
 // traceparentCtxKey is the context key the parent's dispatch turn stores
 // the W3C traceparent under; the A2A client's interceptor (in the a2a
 // package) reads it and sends the value as the traceparent request
@@ -508,6 +556,11 @@ func (c *coordinator) runDispatchOverTransport(ctx context.Context, run dispatch
 			run.reg.SetTaskID(run.entry.ID, taskID)
 			slog.Debug("Dispatch A2A task started", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "context_id", run.sessionID, "task_id", taskID, "trace_id", traceID)
 		},
+		// A question the served agent parked on (#352) reaches the
+		// parent's user, labeled with the dispatch's handle.
+		OnInputRequired: func(ctx context.Context, req QuestionRequest) (QuestionAnswer, error) {
+			return c.answerDispatchQuestion(ctx, run, entry.Handle, req)
+		},
 	})
 	if err != nil {
 		slog.Error("Dispatch A2A stream failed", "dispatch_id", run.entry.ID, "session_id", run.sessionID, "context_id", run.sessionID, "trace_id", traceID, "error", err)
@@ -578,8 +631,9 @@ func (c *coordinator) a2aHost() DispatchHost {
 // stamps its endpoint and card on the registry entry — the in-memory
 // discovery surface. A start failure is a dispatch failure (#347): the
 // caller tears the dispatch down and reports the tool error; nothing
-// ever runs unserved.
-func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string, usage func(ctx context.Context) (Usage, error)) (stop func(), err error) {
+// ever runs unserved. questions is the dispatched agent's own question
+// service (#352), nil when it has no question tool.
+func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatch.GitWorktreeProvider, reg *dispatch.AgentRegistry, entryID, sessionID, handle, role string, runner SessionAgent, loaded []*skills.Skill, call SessionAgentCall, inactivityTimeout time.Duration, cancelReason func() string, usage func(ctx context.Context) (Usage, error), questions question.Service) (stop func(), err error) {
 	starter := c.a2aHost()
 	if starter == nil {
 		return nil, errors.New("no A2A host is wired")
@@ -604,6 +658,7 @@ func (c *coordinator) startDispatchServer(ctx context.Context, provider *dispatc
 		InactivityTimeout: inactivityTimeout,
 		CancelReason:      cancelReason,
 		Usage:             usage,
+		Questions:         questions,
 	})
 	if err != nil {
 		return nil, err

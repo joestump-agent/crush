@@ -25,7 +25,10 @@ In one sentence: `dispatch_agent` provisions a git worktree, builds a
 scoped agent for it, serves that agent over A2A on the process's unix
 socket, and drives exactly one turn through an A2A client. A steer is an
 A2A message on the running context
-([#351](https://github.com/joestump-agent/crush/issues/351));
+([#351](https://github.com/joestump-agent/crush/issues/351)), and a
+dispatched agent's question pauses its task in `input-required` until the
+answer arrives on the same task
+([#352](https://github.com/joestump-agent/crush/issues/352));
 permissions, kill, progress to the UI and result delivery still happen
 in-process, outside the protocol.
 
@@ -100,10 +103,11 @@ model.
    registry entry.
 2. **Toolchain.** It reuses the parent's config viewed from the worktree
    path and builds the tools against it: the task agent's read-only set plus
-   `bash`, `edit`, `multiedit`, `write` and `todos`. Nothing the base
-   revision's config files declare is read or executed. It also builds a
-   scoped LSP manager and a scoped permission service bridged to the
-   parent's.
+   `bash`, `edit`, `multiedit`, `write` and `todos`, and `question` when
+   the parent is interactive. Nothing the base revision's config files
+   declare is read or executed. It also builds a scoped LSP manager, a
+   scoped permission service bridged to the parent's, and — for
+   `question` — the dispatch's own question service.
 3. **Agent.** It renders the system prompt from `dispatch.md.tpl` and
    builds a `SessionAgent` on the chosen model, with the todo
    enforcement ladder resolved from the worker definition's `todos` and
@@ -176,6 +180,18 @@ counts those events but does not re-publish them.
 next model step or run as the immediate follow-up turn. A finished or
 unknown agent refuses cleanly, because task sessions are never continuable.
 This is a Go call, not an A2A message.
+
+**Questions.** The dispatched agent's `question` tool asks through the
+dispatch's own question service. The executor watches it: a question
+parks the run — the agent stays blocked in the tool — and ends the
+stream with `input-required`, the question as a typed data part. The
+client hands it to the coordinator, which shows it in the parent's
+question prompt labeled with the `@handle`, or answers "no interactive
+user; proceed with your best judgment" when no one is there. The answer
+goes back as a message on the same task, and the same run carries on.
+`hard_timeout` keeps counting while a question waits, and a kill cancels
+the parked task. The wire details are on
+[A2A protocol](./a2a-protocol.md#questions).
 
 **Permissions.** Permission requests from the dispatched agent go to its
 scoped permission service. The bridge forwards each one to the parent's
@@ -283,6 +299,7 @@ around one call. The main changes:
 - no direct-run fallback;
 - `contextId` is the session and `taskId` the run;
 - steering is an A2A message;
+- a dispatched agent's question is an `input-required` pause;
 - kill is `tasks/cancel` with a reason;
 - a durable SQLite task store;
 - agents as data, with overridable built-ins.

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/question"
 	"github.com/stretchr/testify/require"
 )
 
@@ -112,4 +113,42 @@ func TestDecodeValueDynamic(t *testing.T) {
 		Total:     3,
 		Todos:     []agent.TodoItem{{Content: "read the code", Status: "in_progress", ActiveForm: "reading the code"}},
 	}, progress)
+}
+
+// The question and answer payloads of an input-required round trip
+// (#352) are declared extensions with typed payloads and schemas, and
+// both survive the JSON-shaped encoding a DataPart carries.
+func TestQuestionExtensionsRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	for _, uri := range []string{QuestionExtensionURI, AnswerExtensionURI} {
+		ext, ok := Lookup(uri)
+		require.True(t, ok, "%s is registered", uri)
+		require.NotNil(t, ext.Type)
+		require.NotNil(t, ext.Schema, "%s ships its JSON Schema", uri)
+	}
+
+	yes := true
+	req := agent.QuestionRequest{
+		ID: "batch-1",
+		Questions: []question.Question{{
+			ID:          "q-1",
+			Type:        question.TypeSingleChoice,
+			Text:        "Which database?",
+			Description: "The schema differs per engine.",
+			Choices:     []question.Choice{{ID: "pg", Label: "Postgres"}, {ID: "lite", Label: "SQLite"}},
+		}},
+	}
+	encoded, err := Encode(QuestionExt, req)
+	require.NoError(t, err)
+	decodedReq, err := DecodeValue(QuestionExt, encoded)
+	require.NoError(t, err)
+	require.Equal(t, &req, decodedReq)
+
+	answer := agent.QuestionAnswer{Answers: []question.Answer{{QuestionID: "q-1", SelectedIDs: []string{"pg"}, Yes: &yes}}}
+	encoded, err = Encode(AnswerExt, answer)
+	require.NoError(t, err)
+	decodedAnswer, err := DecodeValue(AnswerExt, encoded)
+	require.NoError(t, err)
+	require.Equal(t, &answer, decodedAnswer)
 }

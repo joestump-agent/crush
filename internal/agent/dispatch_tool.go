@@ -109,6 +109,9 @@ type dispatchAgentOptions struct {
 type dispatchKill struct {
 	mu     sync.Mutex
 	reason string
+	// done is closed by the first kill (#352), so a wait on the user —
+	// a parked question — ends with the run. Made on first use.
+	done chan struct{}
 }
 
 func (k *dispatchKill) kill(reason string) {
@@ -117,9 +120,32 @@ func (k *dispatchKill) kill(reason string) {
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if k.reason == "" {
+	// An empty reason records nothing, as before; the first real one
+	// wins and closes done exactly once.
+	if k.reason == "" && reason != "" {
 		k.reason = reason
+		close(k.doneLocked())
 	}
+}
+
+// killed returns a channel closed by the first kill; a nil kill's never
+// closes.
+func (k *dispatchKill) killed() <-chan struct{} {
+	if k == nil {
+		return nil
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.doneLocked()
+}
+
+// doneLocked returns the kill's done channel, making it on first use.
+// k.mu must be held.
+func (k *dispatchKill) doneLocked() chan struct{} {
+	if k.done == nil {
+		k.done = make(chan struct{})
+	}
+	return k.done
 }
 
 func (k *dispatchKill) current() string {
@@ -662,7 +688,7 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 					Cost:             sess.Cost,
 				}, nil
 			}
-			stopServer, err := c.startDispatchServer(ctx, provider, reg, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current, usage)
+			stopServer, err := c.startDispatchServer(ctx, provider, reg, entry.ID, taskSession.ID, assignedHandle, params.Role, dispatched.agent, resolvedSkills(toolchain.Config(), params.Skills), run.call(c), run.killSettings.InactivityTimeout, run.kill.current, usage, toolchain.Questions())
 			if err != nil {
 				rootCancel()
 				c.releaseDispatchSlot()

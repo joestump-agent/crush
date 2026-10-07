@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -22,6 +23,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/tools"
+	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/session"
 )
 
@@ -1382,4 +1385,274 @@ func TestExecuteDiffChunkedArtifact(t *testing.T) {
 	require.Equal(t, len(diff), decoded.DiffBytes)
 	require.Empty(t, decoded.DiffError)
 	require.Positive(t, decoded.FilesChanged)
+}
+
+// askingRunner is a dispatched agent whose turn asks a question through
+// its scoped question service with the real question tool (#352), then
+// ends the turn with the tool's response as its text — or with the run's
+// context error once the ask was canceled, the way the agent's turn
+// ends when its context dies.
+type askingRunner struct {
+	fakeRunner
+
+	svc question.Service
+	// toolResp receives the question tool's response once the ask ends.
+	toolResp chan fantasy.ToolResponse
+	// runs counts Run calls: a resumed run is the same call, never a
+	// second one.
+	runs atomic.Int32
+}
+
+func newAskingRunner(svc question.Service) *askingRunner {
+	return &askingRunner{
+		fakeRunner: fakeRunner{enqueueAccepted: true},
+		svc:        svc,
+		toolResp:   make(chan fantasy.ToolResponse, 1),
+	}
+}
+
+// askingRunnerInput is the question tool call the asking runner makes.
+const askingRunnerInput = `{"questions":[{"type":"free_text","question":"Which database?","description":"The schema differs per engine."}]}`
+
+func (r *askingRunner) Run(ctx context.Context, _ agent.SessionAgentCall) (*fantasy.AgentResult, error) {
+	r.runs.Add(1)
+	resp, err := tools.NewQuestionTool(r.svc).Run(ctx, fantasy.ToolCall{
+		ID:    "call-1",
+		Name:  tools.QuestionToolName,
+		Input: askingRunnerInput,
+	})
+	r.toolResp <- resp
+	if err != nil {
+		return nil, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return textResult(resp.Content), nil
+}
+
+// newAskingExecutor binds an asking runner and its scoped question
+// service to the test context, the way the dispatch host wires them.
+func newAskingExecutor() (*askingRunner, *Executor) {
+	svc := question.NewService()
+	runner := newAskingRunner(svc)
+	return runner, newBoundExecutor(runner, WithQuestions(svc))
+}
+
+// parkedTaskCtx is the executor context of a message naming the test
+// task while it is parked in input-required (#352).
+func parkedTaskCtx(msg *a2aspec.Message) *a2asrv.ExecutorContext {
+	execCtx := newExecCtx(msg)
+	execCtx.StoredTask = &a2aspec.Task{
+		ID:        "task-1",
+		ContextID: "ctx-1",
+		Status:    a2aspec.TaskStatus{State: a2aspec.TaskStateInputRequired},
+	}
+	return execCtx
+}
+
+// parkOnQuestion starts the dispatch's turn and returns the typed
+// question it parked on: the execution ends in input-required, and the
+// status message names the questions/v1 extension and carries the
+// question both as text and as a typed DataPart.
+func parkOnQuestion(t *testing.T, exec *Executor) agent.QuestionRequest {
+	t.Helper()
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("set up the schema"))
+	evs := collect(t, exec.Execute(t.Context(), newExecCtx(msg)))
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateInputRequired,
+	}, states(t, evs), "a question ends the execution in input-required")
+
+	parked := statusUpdate(t, evs[2])
+	require.NotNil(t, parked.Status.Message)
+	require.Contains(t, parked.Status.Message.Extensions, QuestionExtensionURI)
+	require.Equal(t, "Which database?", partsText(parked.Status.Message.Parts))
+	var payload *agent.QuestionRequest
+	for _, part := range parked.Status.Message.Parts {
+		data, ok := part.Content.(a2aspec.Data)
+		if !ok {
+			continue
+		}
+		decoded, err := DecodeValue(QuestionExt, data.Value)
+		require.NoError(t, err)
+		payload = decoded.(*agent.QuestionRequest)
+	}
+	require.NotNil(t, payload, "the question rides a typed questions/v1 DataPart")
+	require.Len(t, payload.Questions, 1)
+	require.Equal(t, question.TypeFreeText, payload.Questions[0].Type)
+	require.Equal(t, "Which database?", payload.Questions[0].Text)
+	require.NotEmpty(t, payload.Questions[0].ID)
+	return *payload
+}
+
+// typedAnswer is an answer message carrying the answers/v1 DataPart.
+func typedAnswer(t *testing.T, questionID, text string) *a2aspec.Message {
+	t.Helper()
+	encoded, err := Encode(AnswerExt, agent.QuestionAnswer{Answers: []question.Answer{
+		{QuestionID: questionID, FillInText: text},
+	}})
+	require.NoError(t, err)
+	msg := a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewDataPart(encoded))
+	msg.Extensions = []string{AnswerExtensionURI}
+	return msg
+}
+
+// TestExecuteQuestionParksAndResumes is the #352 contract at the
+// executor: the agent's question parks the run in input-required with a
+// typed payload while the tool call keeps waiting, and a message naming
+// the parked task resumes the same run — no second turn — which then
+// ends on the answer's execution. A typed answer and plain text (a
+// free-text answer) both resume it.
+func TestExecuteQuestionParksAndResumes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		answer func(t *testing.T, q agent.QuestionRequest) *a2aspec.Message
+	}{
+		{
+			name: "typed answer",
+			answer: func(t *testing.T, q agent.QuestionRequest) *a2aspec.Message {
+				return typedAnswer(t, q.Questions[0].ID, "postgres")
+			},
+		},
+		{
+			name: "plain text counts as free text",
+			answer: func(*testing.T, agent.QuestionRequest) *a2aspec.Message {
+				return a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("postgres"))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			runner, exec := newAskingExecutor()
+			q := parkOnQuestion(t, exec)
+			select {
+			case resp := <-runner.toolResp:
+				t.Fatalf("the parked question returned before any answer: %+v", resp)
+			default:
+			}
+
+			evs := collect(t, exec.Execute(t.Context(), parkedTaskCtx(tt.answer(t, q))))
+			require.Equal(t, []a2aspec.TaskState{
+				a2aspec.TaskStateWorking,
+				a2aspec.TaskStateCompleted,
+			}, states(t, evs), "the answer resumes the run to its terminal state")
+			require.Contains(t, statusMessageText(t, evs[1]), "User provided: postgres")
+
+			resp := <-runner.toolResp
+			require.False(t, resp.IsError)
+			require.EqualValues(t, 1, runner.runs.Load(), "the answer resumes the same run, never a new turn")
+		})
+	}
+}
+
+// Canceling a parked task ends it Canceled, and the run's parked question
+// tool call returns an error: the ask ends with the run's context (#352).
+// The canceled run's question is gone, so a late answer is Rejected.
+func TestExecuteCancelWhileParked(t *testing.T) {
+	t.Parallel()
+
+	runner, exec := newAskingExecutor()
+	parkOnQuestion(t, exec)
+
+	evs := collect(t, exec.Cancel(t.Context(), parkedTaskCtx(nil)))
+	require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateCanceled}, states(t, evs))
+	require.Equal(t, "sess-1", runner.canceledFor)
+
+	resp := <-runner.toolResp
+	require.True(t, resp.IsError, "the parked tool call must return an error")
+	require.Contains(t, resp.Content, context.Canceled.Error())
+
+	late := collect(t, exec.Execute(t.Context(), parkedTaskCtx(
+		a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("postgres")))))
+	require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateRejected}, states(t, late))
+}
+
+// An answer on a task with no pending question is Rejected (#352) and
+// starts nothing: neither a turn nor a steer. That holds for a task
+// whose run never asked and for one whose question was already
+// answered.
+func TestExecuteAnswerWithoutPendingQuestionRejects(t *testing.T) {
+	t.Parallel()
+
+	answer := func() *a2aspec.Message {
+		return a2aspec.NewMessage(a2aspec.MessageRoleUser, a2aspec.NewTextPart("postgres"))
+	}
+
+	t.Run("never asked", func(t *testing.T) {
+		t.Parallel()
+
+		runner := &fakeRunner{result: textResult("never"), enqueueAccepted: true}
+		exec := newBoundExecutor(runner, WithQuestions(question.NewService()))
+
+		evs := collect(t, exec.Execute(t.Context(), parkedTaskCtx(answer())))
+		require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateRejected}, states(t, evs))
+		require.Contains(t, statusMessageText(t, evs[0]), "no question is pending")
+		require.False(t, runner.ran, "a rejected answer must not start a turn")
+		require.Empty(t, runner.enqueued(), "a rejected answer must not steer")
+	})
+
+	t.Run("already answered", func(t *testing.T) {
+		t.Parallel()
+
+		runner, exec := newAskingExecutor()
+		parkOnQuestion(t, exec)
+		collect(t, exec.Execute(t.Context(), parkedTaskCtx(answer())))
+		<-runner.toolResp
+
+		evs := collect(t, exec.Execute(t.Context(), parkedTaskCtx(answer())))
+		require.Equal(t, []a2aspec.TaskState{a2aspec.TaskStateRejected}, states(t, evs))
+		require.Contains(t, statusMessageText(t, evs[0]), "no question is pending")
+		require.EqualValues(t, 1, runner.runs.Load())
+		require.Empty(t, runner.enqueued())
+	})
+}
+
+// Answers and steers stay apart while a question is parked (#351, #352):
+// a new message on the context that names no parked task is a steer —
+// enqueued, never an answer — and the question stays parked until a
+// message naming the task answers it.
+func TestExecuteSteerWhileParkedStaysASteer(t *testing.T) {
+	t.Parallel()
+
+	runner, exec := newAskingExecutor()
+	q := parkOnQuestion(t, exec)
+
+	steerCtx := newExecCtx(steerOnContext("also add an index", nil))
+	steerCtx.TaskID = "task-2"
+	var evs []a2aspec.Event
+	for ev, err := range exec.Execute(t.Context(), steerCtx) {
+		require.NoError(t, err)
+		evs = append(evs, ev)
+		if len(evs) != 2 {
+			continue
+		}
+		enqueued := runner.enqueued()
+		require.Len(t, enqueued, 1, "the message is enqueued as a steer")
+		require.True(t, enqueued[0].Steer)
+		require.Equal(t, "also add an index", enqueued[0].Prompt)
+		runner.consume(true)
+	}
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateSubmitted,
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateCompleted,
+	}, states(t, evs))
+	select {
+	case resp := <-runner.toolResp:
+		t.Fatalf("a steer answered the parked question: %+v", resp)
+	default:
+	}
+
+	answered := collect(t, exec.Execute(t.Context(), parkedTaskCtx(typedAnswer(t, q.Questions[0].ID, "postgres"))))
+	require.Equal(t, []a2aspec.TaskState{
+		a2aspec.TaskStateWorking,
+		a2aspec.TaskStateCompleted,
+	}, states(t, answered))
+	require.Contains(t, (<-runner.toolResp).Content, "User provided: postgres")
 }
