@@ -9,6 +9,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"sync"
 	"testing"
@@ -242,6 +243,38 @@ func (h *DispatchHarness) TerminalTransitions(dispatchID string) int {
 // one per delivered terminal result.
 func (h *DispatchHarness) ParentDeliveries() int {
 	return h.main.runCount()
+}
+
+// SubAgentParams is the exported alias of the sub-agent turn's
+// parameters, so the external test package can drive runSubAgentOverA2A
+// (#392) with the same shape the tools build.
+type SubAgentParams = subAgentParams
+
+// RunSubAgentOverA2A drives one sub-agent turn through the A2A runtime
+// on c — the production path the agentic_fetch tool uses (#392). The
+// coordinator must have a DispatchHost wired.
+func RunSubAgentOverA2A(c Coordinator, ctx context.Context, params SubAgentParams) (fantasy.ToolResponse, error) {
+	co, ok := c.(*coordinator)
+	if !ok {
+		return fantasy.ToolResponse{}, errors.New("coordinator is not *agent.coordinator")
+	}
+	return co.runSubAgentOverA2A(ctx, params)
+}
+
+// NewSubAgentMock builds a mock SessionAgent whose Run delegates to
+// runFunc, for driving sub-agent turns without a real model.
+func NewSubAgentMock(providerID string, maxTokens int64, runFunc func(context.Context, SessionAgentCall) (*fantasy.AgentResult, error)) SessionAgent {
+	return newMockAgent(providerID, maxTokens, runFunc)
+}
+
+// SubAgentMockCancellations returns the session IDs Cancel was called
+// with on a mock built by NewSubAgentMock.
+func SubAgentMockCancellations(a SessionAgent) []string {
+	m, ok := a.(*mockSessionAgent)
+	if !ok {
+		return nil
+	}
+	return m.cancellations()
 }
 
 // todoEnforcementConfigFrom inverts config.ResolveTodoEnforcement for

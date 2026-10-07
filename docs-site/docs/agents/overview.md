@@ -159,7 +159,7 @@ dispatched agents get `dispatch_agent` or `message_agent`. See
 [Architecture](/agents/architecture) and [A2A protocol](/agents/a2a-protocol).
 
 :::info[Planned]
-TCP plus TLS as an opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)), and later the other agents too ([#392](https://github.com/joestump-agent/crush/issues/392)).
+TCP plus TLS as an opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)). The runtime is spreading across the entry points one PR at a time ([#392](https://github.com/joestump-agent/crush/issues/392)): dispatched agents and the `agentic_fetch` sub-agent run on it today; the `agent` sub-agents, plan and task agents, cron, channels and the main coder follow.
 :::
 
 :::info[Partially shipped]

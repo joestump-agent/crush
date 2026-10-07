@@ -17,6 +17,18 @@ import (
 	"github.com/charmbracelet/crush/internal/session"
 )
 
+// CoordinatorOption mutates agent.CoordinatorOptions after the minimal
+// default wiring is applied, letting tests inject dependencies the
+// default leaves nil (e.g. a DispatchHost for A2A-runtime tests).
+type CoordinatorOption func(*agent.CoordinatorOptions)
+
+// WithDispatchHost wires the A2A host before the coordinator starts, so
+// runs that serve over the runtime find it and agent definitions are
+// published on it during construction.
+func WithDispatchHost(host agent.DispatchHost) CoordinatorOption {
+	return func(o *agent.CoordinatorOptions) { o.DispatchHost = host }
+}
+
 // NewCoordinator builds a real agent.Coordinator through the production
 // agent.NewCoordinator constructor so the RunAccepted / BeginAccepted /
 // run path (including UpdateModels) is the actual code under test.
@@ -30,12 +42,14 @@ import (
 //
 // The optional coordinator dependencies (history, filetracker, LSP,
 // notify, runComplete, skills) are nil: run guards the publisher fields
-// and the cancel-on-entry path never touches the others.
+// and the cancel-on-entry path never touches the others. Options passed
+// in opts are applied last and may set any of those fields.
 func NewCoordinator(
 	ctx context.Context,
 	workingDir string,
 	sessions session.Service,
 	messages message.Service,
+	opts ...CoordinatorOption,
 ) (agent.Coordinator, error) {
 	cfg, err := config.Init(workingDir, "", false)
 	if err != nil {
@@ -64,10 +78,14 @@ func NewCoordinator(
 	coderCfg.AllowedTools = nil
 	cfg.Config().Agents[config.AgentCoder] = coderCfg
 
-	return agent.NewCoordinator(ctx, agent.CoordinatorOptions{
+	copts := agent.CoordinatorOptions{
 		Config:      cfg,
 		Sessions:    sessions,
 		Messages:    messages,
 		Permissions: permission.NewPermissionService(workingDir, true, nil),
-	})
+	}
+	for _, opt := range opts {
+		opt(&copts)
+	}
+	return agent.NewCoordinator(ctx, copts)
 }
