@@ -681,11 +681,19 @@ func (f *ServerFactory) Close(ctx context.Context) error {
 	// Index streams (#421) never end on their own; end them first, or
 	// Shutdown waits on them until ctx runs out.
 	f.index.closeAll()
-	err := srv.Shutdown(ctx)
+	// The socket and the TCP listener (#358) shut down side by side, so
+	// one draining a slow request does not eat the other's time.
+	var (
+		wg     sync.WaitGroup
+		tcpErr error
+	)
 	if tcp != nil {
-		if terr := tcp.close(ctx); terr != nil && err == nil {
-			err = terr
-		}
+		wg.Go(func() { tcpErr = tcp.close(ctx) })
+	}
+	err := shutdownServer(ctx, srv)
+	wg.Wait()
+	if err == nil {
+		err = tcpErr
 	}
 	if cerr := listener.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) && err == nil {
 		err = cerr
@@ -695,6 +703,51 @@ func (f *ServerFactory) Close(ctx context.Context) error {
 	}
 	<-done
 	return err
+}
+
+// shutdownServer drains srv within ctx (#358). When ctx ends first, the
+// server is closed outright, so a request that never finishes cannot
+// keep a connection open past Close; the deadline error is returned.
+func shutdownServer(ctx context.Context, srv *http.Server) error {
+	err := srv.Shutdown(ctx)
+	if err != nil && ctx.Err() != nil {
+		_ = srv.Close()
+	}
+	return err
+}
+
+// closeSilentConnsOnShutdown closes, when srv shuts down, every
+// connection that has not sent a request yet (#358). net/http treats
+// such a connection as busy for its first five seconds, so a peer that
+// connects and sends nothing — or stalls mid-handshake — would hold
+// Shutdown for that long. It carries no request, so there is nothing to
+// drain. The server's ConnState tracks the connections, and its
+// shutdown hook runs once the listeners are closed.
+func closeSilentConnsOnShutdown(srv *http.Server) {
+	var (
+		mu    sync.Mutex
+		conns = make(map[net.Conn]struct{})
+	)
+	srv.ConnState = func(c net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		if state == http.StateNew {
+			conns[c] = struct{}{}
+			return
+		}
+		delete(conns, c)
+	}
+	srv.RegisterOnShutdown(func() {
+		mu.Lock()
+		silent := make([]net.Conn, 0, len(conns))
+		for c := range conns {
+			silent = append(silent, c)
+		}
+		mu.Unlock()
+		for _, c := range silent {
+			_ = c.Close()
+		}
+	})
 }
 
 // ensureHost lazily starts the process-wide listener: the socket lives
@@ -753,6 +806,7 @@ func (f *ServerFactory) ensureHost(ctx context.Context) error {
 		// the platform reports one, for the auth interceptor (#357).
 		ConnContext: withPeerCredentials,
 	}
+	closeSilentConnsOnShutdown(f.httpServer)
 	f.done = make(chan struct{})
 	f.started = true
 	close(f.startedCh)

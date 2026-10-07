@@ -178,6 +178,7 @@ func startTCPHost(ctx context.Context, f *ServerFactory, opts *config.A2AOptions
 		// the TUI.
 		ErrorLog: slog.NewLogLogger(t.logger.Handler(), slog.LevelInfo),
 	}
+	closeSilentConnsOnShutdown(t.server)
 	go func() {
 		defer close(t.done)
 		if err := t.server.Serve(t.listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -210,10 +211,11 @@ func (t *tcpHost) baseURL() string {
 }
 
 // close shuts the TCP listener down within ctx: it stops accepting,
-// drains in-flight requests, closes the listener and reaps the Serve
-// goroutine.
+// closes connections that never sent a request, drains in-flight
+// requests — closing the server outright if ctx ends first — closes the
+// listener and reaps the Serve goroutine.
 func (t *tcpHost) close(ctx context.Context) error {
-	err := t.server.Shutdown(ctx)
+	err := shutdownServer(ctx, t.server)
 	if cerr := t.listener.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) && err == nil {
 		err = cerr
 	}
