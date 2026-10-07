@@ -431,9 +431,10 @@ func TestHostLongDataDirFallsBack(t *testing.T) {
 // Two hosts in one process whose data dirs both overflow the socket
 // path limit share the fallback directory but never a socket (#346):
 // before the fallback name carried the data dir, the second bind
-// removed the first host's live socket and took over its traffic, so a
-// client reached the wrong host. Each host keeps its own socket and
-// serves its own dispatch.
+// removed the first host's live socket and took over its traffic,
+// which the bearer check (#357) then rejected with the wrong token.
+// Each host keeps its own socket, and each serves its own dispatch
+// with its own token.
 func TestHostFallbackSocketIsPerDataDir(t *testing.T) {
 	type host struct {
 		factory *ServerFactory
@@ -472,7 +473,7 @@ func TestHostFallbackSocketIsPerDataDir(t *testing.T) {
 	require.NoError(t, err, "the second host's bind must leave the first host's socket in place")
 
 	for i, h := range []host{first, second} {
-		resp, err := postJSONRPC(t, unixDialClient(h.factory), h.server.Endpoint, sendMessageBody(t, "dispatch-session", "run the task"))
+		resp, err := postJSONRPCAuthed(t, h.factory, unixDialClient(h.factory), h.server.Endpoint, sendMessageBody(t, "dispatch-session", "run the task"))
 		require.NoError(t, err)
 		var rpcResp struct {
 			Result struct {
@@ -482,7 +483,7 @@ func TestHostFallbackSocketIsPerDataDir(t *testing.T) {
 		}
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&rpcResp))
 		_ = resp.Body.Close()
-		require.Nil(t, rpcResp.Error, "host %d must serve its own dispatch on its own socket", i)
+		require.Nil(t, rpcResp.Error, "host %d must authenticate its own token on its own socket", i)
 		require.NotNil(t, rpcResp.Result.Task)
 		require.Equal(t, a2aspec.TaskStateCompleted, rpcResp.Result.Task.Status.State)
 		require.True(t, h.runner.ran, "host %d's own runner must serve its socket", i)
