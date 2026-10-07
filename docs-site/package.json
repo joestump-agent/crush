@@ -33,7 +33,8 @@
   },
   "overrides": {
     "proxy-addr": "^2.0.8",
-    "tinypool": "^2.1.2"
+    "tinypool": "^2.1.2",
+    "shell-quote": "^1.11.0"
   },
   "browserslist": {
     "production": [

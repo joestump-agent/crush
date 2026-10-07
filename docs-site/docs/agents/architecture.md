@@ -23,8 +23,10 @@ callout links the fix. The target design is on
 
 In one sentence: `dispatch_agent` provisions a git worktree, builds a
 scoped agent for it, serves that agent over A2A on the process's unix
-socket, and drives exactly one turn through an A2A client. Steering,
-permissions, kill, progress to the UI and result delivery all happen
+socket, and drives exactly one turn through an A2A client. A steer is an
+A2A message on the running context
+([#351](https://github.com/joestump-agent/crush/issues/351));
+permissions, kill, progress to the UI and result delivery still happen
 in-process, outside the protocol.
 
 ## The pieces

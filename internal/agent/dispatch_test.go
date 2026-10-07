@@ -197,6 +197,33 @@ func (f *runnerTransport) StreamDispatch(ctx context.Context, _ DispatchTranspor
 	return outcome, nil
 }
 
+// SteerDispatch delivers a steer the way the served executor does (#351):
+// it derives the steer call from the recorded dispatch call — same
+// shaping, prompt replaced, RunID empty, Steer set, hooks stripped — and
+// enqueues it through the runner's EnqueueWhenBusy. "working" means the
+// runner accepted the message; "rejected" means it refused, the way an
+// ended run does.
+func (f *runnerTransport) SteerDispatch(ctx context.Context, p DispatchSteerParams) (DispatchSteerOutcome, error) {
+	if p.ContextID == "" {
+		return DispatchSteerOutcome{}, errors.New("a2a: steer context id is empty")
+	}
+	if p.Text == "" {
+		return DispatchSteerOutcome{}, errors.New("a2a: steer text is empty")
+	}
+	params := f.lastServed()
+	call := params.Call
+	call.Prompt = p.Text
+	call.Attachments = p.Attachments
+	call.RunID = ""
+	call.Steer = true
+	call.Accepted = nil
+	call.OnComplete = nil
+	if !params.Runner.EnqueueWhenBusy(call) {
+		return DispatchSteerOutcome{Status: steerStatusRejected, Text: "agent is no longer running; task sessions are not continuable"}, nil
+	}
+	return DispatchSteerOutcome{Status: steerStatusWorking}, nil
+}
+
 // provisionDispatchEntry provisions a workspace through the
 // coordinator's git worktree provider and registers its entry, the same
 // two steps the dispatch tool performs. It returns the registered entry

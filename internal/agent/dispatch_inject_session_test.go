@@ -482,3 +482,171 @@ func TestFoldedSteerLeavesDispatchFindingsUnchanged(t *testing.T) {
 	require.Empty(t, e.Result.SteerReplies, "a folded steer is part of the work turn and records no reply")
 	require.Equal(t, 2, model.stepsCount(), "the folded steer must not start a follow-up turn")
 }
+
+// consumedRecorder collects the verdicts a queue fire site delivers
+// through a call's OnConsumed (#351), so a test can assert exactly-once
+// delivery after the run has settled.
+type consumedRecorder struct {
+	mu   sync.Mutex
+	seen []bool
+}
+
+func (r *consumedRecorder) record(ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = append(r.seen, ok)
+}
+
+func (r *consumedRecorder) verdicts() []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]bool(nil), r.seen...)
+}
+
+// TestOnConsumedTrueOnFold covers the fold fire site: a queued call
+// consumed by the active turn's next step reports consumed exactly once,
+// with true (#351).
+func TestOnConsumedTrueOnFold(t *testing.T) {
+	t.Parallel()
+
+	env := testEnv(t)
+	model := &twoStepEchoModel{}
+	echo, echoState := newGatedEchoTool()
+	sa := newInjectionSessionAgent(env, model, []fantasy.AgentTool{echo})
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, runErr := sa.Run(t.Context(), SessionAgentCall{SessionID: sess.ID, Prompt: "task", NonInteractive: true})
+		runDone <- runErr
+	}()
+	select {
+	case <-echoState.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run never reached the tool call")
+	}
+
+	var rec consumedRecorder
+	require.True(t, sa.EnqueueWhenBusy(SessionAgentCall{
+		SessionID: sess.ID,
+		Prompt:    "fold me in",
+		OnConsumed: func(ok bool) {
+			rec.record(ok)
+		},
+	}))
+
+	close(echoState.gate)
+	select {
+	case err := <-runDone:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not finish after the gate was released")
+	}
+
+	require.Equal(t, []bool{true}, rec.verdicts(),
+		"a folded call must report consumed exactly once, with true")
+	require.Equal(t, 0, sa.QueuedPrompts(sess.ID))
+}
+
+// TestOnConsumedFalseOnCancelDrop covers the drop fire sites: a queued
+// call removed from the queue by a Cancel — via clearQueueAndNotify or
+// the canceled drain, whichever wins the lock — reports consumed exactly
+// once, with false (#351).
+func TestOnConsumedFalseOnCancelDrop(t *testing.T) {
+	t.Parallel()
+
+	env := testEnv(t)
+	model := &twoStepEchoModel{}
+	echo, echoState := newGatedEchoTool()
+	sa := newInjectionSessionAgent(env, model, []fantasy.AgentTool{echo})
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, runErr := sa.Run(t.Context(), SessionAgentCall{SessionID: sess.ID, Prompt: "task", NonInteractive: true})
+		runDone <- runErr
+	}()
+	select {
+	case <-echoState.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run never reached the tool call")
+	}
+
+	var rec consumedRecorder
+	require.True(t, sa.EnqueueWhenBusy(SessionAgentCall{
+		SessionID: sess.ID,
+		Prompt:    "never delivered",
+		OnConsumed: func(ok bool) {
+			rec.record(ok)
+		},
+	}))
+
+	// The cancel covers both the active turn and the queued call: the
+	// queue is cleared and the call's waiter learns the drop.
+	sa.Cancel(sess.ID)
+	select {
+	case <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not finish after the cancel")
+	}
+
+	require.Equal(t, []bool{false}, rec.verdicts(),
+		"a queue-dropped call must report consumed exactly once, with false")
+	require.Equal(t, 0, sa.QueuedPrompts(sess.ID))
+}
+
+// TestOnConsumedTrueOnDequeuedTurn covers the handoff fire site: a
+// RunID-bearing queued call never folds (drainQueueForStep keeps it), so
+// when the active turn ends the run hands it off as its own turn —
+// reporting consumed exactly once, with true, before the recursive run
+// starts (#351).
+func TestOnConsumedTrueOnDequeuedTurn(t *testing.T) {
+	t.Parallel()
+
+	env := testEnv(t)
+	model := &twoStepEchoModel{}
+	echo, echoState := newGatedEchoTool()
+	sa := newInjectionSessionAgent(env, model, []fantasy.AgentTool{echo})
+
+	sess, err := env.sessions.Create(t.Context(), "session")
+	require.NoError(t, err)
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, runErr := sa.Run(t.Context(), SessionAgentCall{SessionID: sess.ID, Prompt: "task", NonInteractive: true})
+		runDone <- runErr
+	}()
+	select {
+	case <-echoState.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run never reached the tool call")
+	}
+
+	var rec consumedRecorder
+	require.True(t, sa.EnqueueWhenBusy(SessionAgentCall{
+		SessionID: sess.ID,
+		Prompt:    "run as my own turn",
+		RunID:     "run-1",
+		OnConsumed: func(ok bool) {
+			rec.record(ok)
+		},
+	}))
+
+	close(echoState.gate)
+	select {
+	case err := <-runDone:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("run (including the dequeued follow-up turn) did not finish")
+	}
+
+	require.Equal(t, []bool{true}, rec.verdicts(),
+		"a dequeued call must report consumed exactly once, with true, at the handoff")
+	require.Equal(t, 0, sa.QueuedPrompts(sess.ID))
+	require.Equal(t, 4, model.stepsCount(),
+		"the work turn and the RunID call's own turn each serve two steps")
+}

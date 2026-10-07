@@ -409,10 +409,18 @@ func (r dispatchRun) call(c *coordinator) SessionAgentCall {
 		NonInteractive:   true,
 		OnAuthRefresh:    c.makeAuthRefreshCallback(r.providerCfg),
 	}
-	// The work-turn observer (#397): every turn the run drives — the
-	// served turn and the direct turn alike — reports its finished text
-	// into the run's findings.
-	call.turnText = r.findings.setWork
+	// The per-turn observer (#397), routed by the turn's own call: the
+	// work turn reports into the findings; a steer turn — folded or the
+	// follow-up — records its reply in the steers' record instead of
+	// replacing the work's. The route rides the call template so the
+	// steering path (#351) needs no per-injection registration.
+	call.turnText = func(turned SessionAgentCall, text string) {
+		if turned.Steer {
+			r.findings.addSteerReply(text)
+			return
+		}
+		r.findings.setWork(text)
+	}
 	return call
 }
 
@@ -849,38 +857,16 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	watchStop := c.startDispatchKillWatch(ctx, run)
 	defer watchStop()
 
-	call := run.call(c)
-
-	// Make the running agent addressable for mid-run injection (#312)
-	// for exactly the run's lifetime: injected messages clone this call's
-	// shaping, and the target is dropped the moment the run returns so a
-	// finished dispatch refuses instead of running another turn.
-	if injectable, ok := run.agent.(injectableAgent); ok {
-		c.registerDispatchRun(run.sessionID, injectable, call, run.findings)
-		defer c.unregisterDispatchRun(run.sessionID)
-	}
-
 	// One execution path (#347): the served dispatch is driven through
 	// the A2A client, its SSE stream consumed to the terminal state.
-	// The injection target above is the same agent the server's executor
-	// runs — one object on both sides of the protocol boundary.
+	// Steering rides the same path (#351): the server's executor resolves
+	// the run's binding from the task's A2A context and enqueues the
+	// message on this very agent.
 	terminal, servedUsage := c.runDispatchOverTransport(ctx, run)
 	// The kill watch ends with the run, before terminal assembly fires
 	// the escalation hook against a finished dispatch.
 	watchStop()
 
-	// Drop the injection target before the terminal status is published
-	// below: relying on the deferred unregister alone left a window in
-	// which a terminal entry still resolved to a live target and accepted
-	// a message into a session whose run had ended. Not earlier: while
-	// the result is assembled (diff capture can be slow) the entry still
-	// reads running, and the registered target's refusal stays the
-	// informative "no longer running" rather than the unknown-session
-	// one. unregisterDispatchRun is idempotent; the deferred call above
-	// stays for the early-return paths. The transported path returns only
-	// once the served turn reached its terminal state, so the run has
-	// ended here on both paths.
-	c.unregisterDispatchRun(run.sessionID)
 	// Record the terminal payload before the terminal status so the
 	// terminal entry event carries it: the completed agent block (#65)
 	// renders its durable record from the registry.

@@ -147,8 +147,30 @@ one whose run has ended — task sessions are not continuable. The
 `taskId` identifies one run: each turn is a new task, and the terminal
 status echoes it as the run ID.
 
-The executor joins every text part of the message with newlines and
-ignores any other kind of part.
+The executor joins every text part of the message with newlines. Any
+other kind of part is carried as an attachment — a steer delivers it to
+the running agent through the same attachment pipeline a typed prompt
+takes; the dispatch's own single-part message has none.
+
+### Steering
+
+The first message on a context is the dispatch's own turn. Every later
+message on that context is a **steer**: the server hands it to the
+running agent through the same queue the in-process front doors use
+(`@handle`, `message_agent`) — it never starts a turn, and the persisted
+message is marked as a steer. `referenceTasks` may name the task being
+steered; they are advisory and never validated.
+
+The steer is its own task, terminal on the queue's verdict:
+
+| Outcome | State | Status message |
+| --- | --- | --- |
+| The running agent consumed the message — folded into its active turn or picked up as its follow-up turn | `TASK_STATE_COMPLETED` | `delivered` |
+| The queue dropped it without running (the run was canceled while the steer sat queued) | `TASK_STATE_FAILED` | `agent finished before the message was consumed` |
+| The run has ended — task sessions are not continuable | `TASK_STATE_REJECTED` | `agent is no longer running; task sessions are not continuable` |
+
+The steer's reply streams on the dispatch's own surfaces — the parent's
+dispatch block, `@handle` inspection — never on the steer's task.
 
 ## Event stream
 
@@ -342,9 +364,6 @@ A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/c
 
 ## Not implemented
 
-- **Follow-up messages.** A second message to a busy dispatch is queued and
-  run, but its task reports `TASK_STATE_FAILED`. Steering uses the
-  in-process injection queue instead ([#351](https://github.com/joestump-agent/crush/issues/351)).
 - **`input-required` and `auth-required`.** Dispatched agents have no
   question tool, and permission prompts use an in-process bridge
   ([#352](https://github.com/joestump-agent/crush/issues/352), [#353](https://github.com/joestump-agent/crush/issues/353)).
