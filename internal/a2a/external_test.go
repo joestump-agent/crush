@@ -38,8 +38,9 @@ const externalCardPath = "/.well-known/agent-card.json"
 
 // recordedRequest is one request an external test server saw.
 type recordedRequest struct {
-	path string
-	auth []string
+	path   string
+	auth   []string
+	method string
 }
 
 // externalScenario is what the fake executor does with one task.
@@ -50,6 +51,11 @@ type externalScenario func(ctx context.Context, execCtx *a2asrv.ExecutorContext,
 // the reason every cancel carried.
 type externalExecutor struct {
 	scenario externalScenario
+	// failCancel makes every cancel fail with an error that echoes the
+	// request's Authorization header back.
+	failCancel atomic.Bool
+	// executing, when set, is signaled each time an execution starts.
+	executing chan struct{}
 
 	mu            sync.Mutex
 	execAuth      [][]string
@@ -62,6 +68,9 @@ func (e *externalExecutor) Execute(ctx context.Context, execCtx *a2asrv.Executor
 	e.mu.Lock()
 	e.execAuth = append(e.execAuth, auth)
 	e.mu.Unlock()
+	if e.executing != nil {
+		e.executing <- struct{}{}
+	}
 	return func(yield func(a2aspec.Event, error) bool) {
 		e.scenario(ctx, execCtx, yield)
 	}
@@ -73,6 +82,11 @@ func (e *externalExecutor) Cancel(_ context.Context, execCtx *a2asrv.ExecutorCon
 	e.cancelReasons = append(e.cancelReasons, cancelReasonFromMetadata(execCtx.Metadata))
 	e.cancelAuth = append(e.cancelAuth, auth)
 	e.mu.Unlock()
+	if e.failCancel.Load() {
+		return func(yield func(a2aspec.Event, error) bool) {
+			yield(nil, fmt.Errorf("cannot cancel for %s", strings.Join(auth, "")))
+		}
+	}
 	return func(yield func(a2aspec.Event, error) bool) {
 		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled, nil), nil)
 	}
@@ -102,6 +116,19 @@ type externalServer struct {
 	requests []recordedRequest
 }
 
+// methods returns the JSON-RPC method of every call the server saw.
+func (es *externalServer) methods() []string {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	var out []string
+	for _, req := range es.requests {
+		if req.method != "" {
+			out = append(out, req.method)
+		}
+	}
+	return out
+}
+
 // newExternalServer starts one external agent. release is closed before
 // the server closes, so a scenario parked on it never holds Close up.
 func newExternalServer(t *testing.T, scenario externalScenario) (*externalServer, chan struct{}) {
@@ -127,8 +154,19 @@ func newExternalServer(t *testing.T, scenario externalScenario) (*externalServer
 		_ = json.NewEncoder(w).Encode(es.card(es.srv.URL))
 	})
 	es.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := recordedRequest{path: r.URL.Path, auth: r.Header.Values(bearerAuthorizationHeader)}
+		if r.Body != nil && r.Method == http.MethodPost {
+			body, _ := io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var call struct {
+				Method string `json:"method"`
+			}
+			if json.Unmarshal(body, &call) == nil {
+				rec.method = call.Method
+			}
+		}
 		es.mu.Lock()
-		es.requests = append(es.requests, recordedRequest{path: r.URL.Path, auth: r.Header.Values(bearerAuthorizationHeader)})
+		es.requests = append(es.requests, rec)
 		es.mu.Unlock()
 		mux.ServeHTTP(w, r)
 	}))
@@ -677,6 +715,9 @@ func TestExternalAgentNeverLogsToken(t *testing.T) {
 		}
 	})
 	ext := resolveTestAgent(t, es)
+	// Every cancel fails with the credential echoed back, so the code's
+	// own warning about it is what the logs are checked against.
+	es.exec.failCancel.Store(true)
 
 	for _, prompt := range []string{"ask", "park", "fail"} {
 		kill := newTestKill()
@@ -692,10 +733,12 @@ func TestExternalAgentNeverLogsToken(t *testing.T) {
 		Token:   agent.NewSecret(externalTestToken),
 	})
 	require.Error(t, err)
-	slog.Warn("Resolution refused", "error", err, "params", agent.ExternalAgentParams{CardURL: es.cardURL(), Token: agent.NewSecret(externalTestToken)})
+	requireNoToken(t, err.Error(), "the error")
 
 	logs := buf.String()
-	require.NotEmpty(t, logs, "the scenarios must have logged something for the check to mean anything")
+	require.Contains(t, logs, "External agent task cancel failed",
+		"the code under test must have logged the failed cancel for the check to mean anything")
+	require.Contains(t, logs, "[REDACTED]", "the echoed credential is logged scrubbed")
 	requireNoToken(t, logs, "the logs")
 }
 
@@ -867,4 +910,76 @@ func TestExternalAgentPrefersV1Interface(t *testing.T) {
 	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+}
+
+// The task-call client refuses a redirect off the card's origin: the
+// call fails, and the other origin never sees the request or the token.
+func TestExternalAgentCallRefusesCrossOriginRedirect(t *testing.T) {
+	t.Parallel()
+	elsewhere, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+	es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+	es.callHandler = func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.srv.URL+"/a2a", http.StatusTemporaryRedirect)
+	}
+	ext := resolveTestAgent(t, es)
+
+	_, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
+	require.ErrorContains(t, err, "cross-origin redirect")
+	require.Empty(t, elsewhere.recorded(), "the redirect target must never be contacted")
+}
+
+// A kill that lands before the stream names the task ends the run with
+// the kill's reason; with no task ID there is nothing to cancel remotely.
+func TestExternalAgentKillBeforeTaskID(t *testing.T) {
+	t.Parallel()
+	var release chan struct{}
+	es, release := newExternalServer(t, func(ctx context.Context, _ *a2asrv.ExecutorContext, _ func(a2aspec.Event, error) bool) {
+		parkUntil(ctx, release)
+	})
+	es.exec.executing = make(chan struct{}, 1)
+	ext := resolveTestAgent(t, es)
+	kill := newTestKill()
+	go func() {
+		<-es.exec.executing
+		kill.Kill(dispatch.ReasonCanceled)
+	}()
+
+	var named bool
+	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{
+		Prompt: "review",
+		OnTask: func(string) { named = true },
+		Kill:   kill,
+	})
+	require.NoError(t, err)
+	require.False(t, named, "the remote never named a task")
+	require.Equal(t, DispatchStatusCanceled, outcome.Status)
+	require.Equal(t, dispatch.ReasonCanceled, outcome.Text)
+	require.Empty(t, es.exec.canceled(), "no tasks/cancel without a task ID")
+}
+
+// A card that does not stream is driven with a blocking SendMessage,
+// and its answer folds like a stream's.
+func TestExternalAgentNonStreamingCard(t *testing.T) {
+	t.Parallel()
+	es, _ := newExternalServer(t, func(_ context.Context, execCtx *a2asrv.ExecutorContext, yield func(a2aspec.Event, error) bool) {
+		if !yield(a2aspec.NewSubmittedTask(execCtx, execCtx.Message), nil) {
+			return
+		}
+		done := a2aspec.NewMessageForTask(a2aspec.MessageRoleAgent, execCtx, a2aspec.NewTextPart("blocking review done"))
+		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted, done), nil)
+	})
+	es.card = func(base string) *a2aspec.AgentCard {
+		card := externalTestCard(base+"/a2a", true)
+		card.Capabilities.Streaming = false
+		return card
+	}
+	ext := resolveTestAgent(t, es)
+
+	var taskID string
+	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review", OnTask: func(id string) { taskID = id }})
+	require.NoError(t, err)
+	require.Equal(t, DispatchStatusCompleted, outcome.Status)
+	require.Equal(t, "blocking review done", outcome.Text)
+	require.NotEmpty(t, taskID)
+	require.Equal(t, []string{"SendMessage"}, es.methods(), "a non-streaming card gets a blocking SendMessage")
 }
