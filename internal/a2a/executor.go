@@ -131,6 +131,40 @@ type Executor struct {
 	// the dispatch's own turn — the first one — or is a steer.
 	turnMu      sync.Mutex
 	turnStarted bool
+	// runsMu guards runs: the in-flight run records by task ID (#352).
+	// A record outlives the execution that drains it, so the executor —
+	// not Execute's stack — owns it.
+	runsMu sync.Mutex
+	runs   map[string]*taskRun
+}
+
+// runOutcome is what a dispatched run's goroutine hands back: the
+// runner's result and error.
+type runOutcome struct {
+	result *fantasy.AgentResult
+	err    error
+}
+
+// taskRun is one dispatched run's record (#352): the run goroutine's
+// outcome channel, the run's own context and the subscriptions that live
+// on it. The run's context is detached from the execution that started
+// it and owned here, so whichever execution drains the record reads the
+// same run; every way a drain ends without the run's outcome — a cancel,
+// a stopped consumer, the inactivity backstop — cancels it.
+type taskRun struct {
+	taskID  string
+	binding ContextBinding
+	// cancel ends the run's context: the runner's turn and every
+	// subscription the record holds.
+	cancel context.CancelFunc
+	// done receives the run goroutine's single outcome.
+	done chan runOutcome
+	// todoCh is the run's todo subscription (#174); nil without a todo
+	// source.
+	todoCh <-chan dispatch.TodoSnapshot
+	// lastTodos is the last todo list emitted, so a snapshot that did
+	// not change the list stays silent.
+	lastTodos []session.Todo
 }
 
 // Option configures an [Executor].
@@ -393,31 +427,41 @@ func statusEvent(execCtx *a2asrv.ExecutorContext, state a2aspec.TaskState, msg *
 }
 
 // runWithTodos invokes the binding's runner while streaming the run's todo
-// progress (#174): the run executes on its own goroutine and the todo
-// subscription is drained inline on the iterator's goroutine, so Working
-// progress events and the terminal status share one yield path and can
-// never race. The turn runs against the resolved binding (#350) — its
-// session, its call template, its runner — and the task ID is stamped as
-// the call's RunID, so the run's terminal RunComplete event names the A2A
-// task that started it. The subscription is bounded by the run — created
-// after the initial Working status, dropped on run end, consumer stop,
-// and cancel — and a snapshot is only emitted when the todo list actually
-// changed, so usage-only session saves stay silent.
+// progress (#174): it starts the turn's run record and drains it. The
+// turn runs against the resolved binding (#350) — its session, its call
+// template, its runner — and the task ID is stamped as the call's RunID,
+// so the run's terminal RunComplete event names the A2A task that
+// started it.
 func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorContext, binding ContextBinding, prompt string, yield func(a2aspec.Event, error) bool) (*fantasy.AgentResult, error) {
-	var todoCh <-chan dispatch.TodoSnapshot
-	if e.todos != nil {
-		// The subscription ends with this call: run end, consumer stop,
-		// and cancel all return through the deferred cancel.
-		subCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		todoCh = e.todos.SubscribeSessionTodos(subCtx, binding.SessionID)
-	}
+	run := e.startRun(ctx, execCtx, binding, prompt)
+	return e.drainRun(ctx, execCtx, run, yield)
+}
 
-	type runOutcome struct {
-		result *fantasy.AgentResult
-		err    error
+// startRun starts the turn's run on its own goroutine and records it
+// under the task ID (#352). The run's context is detached from ctx — the
+// execution's — and owned by the record: the SDK cancels an execution's
+// context once its consumer has a final event, which must not reach a
+// run another execution may still drain. The todo subscription is
+// created on the run's context before the run starts, so it is bounded
+// by the record: dropped on run end, consumer stop, and cancel.
+func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext, binding ContextBinding, prompt string) *taskRun {
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	run := &taskRun{
+		taskID:  string(execCtx.TaskID),
+		binding: binding,
+		cancel:  cancel,
+		done:    make(chan runOutcome, 1),
 	}
-	done := make(chan runOutcome, 1)
+	if e.todos != nil {
+		run.todoCh = e.todos.SubscribeSessionTodos(runCtx, binding.SessionID)
+	}
+	e.runsMu.Lock()
+	if e.runs == nil {
+		e.runs = make(map[string]*taskRun)
+	}
+	e.runs[run.taskID] = run
+	e.runsMu.Unlock()
+
 	go func() {
 		// A panic in a tool or provider adapter must fail this task, not
 		// the whole process (#345): recover it, log it, and hand a run
@@ -427,8 +471,8 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 		// swallow it (#342).
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("Dispatched run panicked", "session_id", binding.SessionID, "trace_id", traceIDFromContext(ctx), "panic", r, "stack", string(debug.Stack()))
-				done <- runOutcome{err: fmt.Errorf("dispatched run panicked: %v", r)}
+				slog.Error("Dispatched run panicked", "session_id", binding.SessionID, "trace_id", traceIDFromContext(runCtx), "panic", r, "stack", string(debug.Stack()))
+				run.done <- runOutcome{err: fmt.Errorf("dispatched run panicked: %v", r)}
 			}
 		}()
 		call := binding.Call
@@ -436,10 +480,53 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 		call.Prompt = prompt
 		// The task is the run (#350): the RunComplete event echoes the
 		// A2A task ID back as RunID, so the task and the run correlate.
-		call.RunID = string(execCtx.TaskID)
-		result, err := binding.Runner.Run(ctx, call)
-		done <- runOutcome{result, err}
+		call.RunID = run.taskID
+		result, err := binding.Runner.Run(runCtx, call)
+		run.done <- runOutcome{result, err}
 	}()
+	return run
+}
+
+// drainRun drains the run record until the run ends or the drain cannot
+// go on, then releases the record: a drain that ends without the run's
+// outcome cancels the run with it.
+func (e *Executor) drainRun(ctx context.Context, execCtx *a2asrv.ExecutorContext, run *taskRun, yield func(a2aspec.Event, error) bool) (*fantasy.AgentResult, error) {
+	result, err := e.drain(ctx, execCtx, run, yield)
+	e.releaseRun(run)
+	return result, err
+}
+
+// releaseRun drops the record and cancels the run's context, ending its
+// subscriptions — and the run itself, when it is still going.
+func (e *Executor) releaseRun(run *taskRun) {
+	e.runsMu.Lock()
+	if e.runs[run.taskID] == run {
+		delete(e.runs, run.taskID)
+	}
+	e.runsMu.Unlock()
+	run.cancel()
+}
+
+// cancelRun cancels the run recorded under taskID, if any: the
+// executor's Cancel ends the run's own context, not only the runner's
+// session, so a run whose runner ignores the session cancel still stops.
+func (e *Executor) cancelRun(taskID string) {
+	e.runsMu.Lock()
+	run := e.runs[taskID]
+	e.runsMu.Unlock()
+	if run != nil {
+		run.cancel()
+	}
+}
+
+// drain streams the run's progress until it ends (#174): the run
+// executes on its own goroutine and the todo subscription is drained
+// inline on the iterator's goroutine, so Working progress events and the
+// terminal status share one yield path and can never race. A snapshot is
+// only emitted when the todo list actually changed, so usage-only
+// session saves stay silent.
+func (e *Executor) drain(ctx context.Context, execCtx *a2asrv.ExecutorContext, run *taskRun, yield func(a2aspec.Event, error) bool) (*fantasy.AgentResult, error) {
+	binding := run.binding
 
 	// The inactivity backstop (#360): a timer that every event the
 	// executor yields resets, so a run making visible progress never
@@ -464,7 +551,6 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 		}
 	}
 
-	var lastTodos []session.Todo
 	for {
 		// Check cancellation before selecting: a canceled context and a
 		// queued snapshot are both ready, and select would pick either,
@@ -476,10 +562,10 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 		select {
 		case <-ctx.Done():
 			// Canceled — the executor's Cancel emits the terminal Canceled
-			// status itself, and the runner is aborting on this same
-			// context; reporting anything here would race it.
+			// status itself, and the run is aborted with the record's
+			// release; reporting anything here would race it.
 			return nil, context.Canceled
-		case out := <-done:
+		case out := <-run.done:
 			return out.result, out.err
 		case <-inactC:
 			// The backstop fired: no event was yielded for the whole
@@ -492,19 +578,19 @@ func (e *Executor) runWithTodos(ctx context.Context, execCtx *a2asrv.ExecutorCon
 			// settle; a truly wedged run ignores it, and the outcome is
 			// discarded either way — the task fails with the reason.
 			select {
-			case <-done:
+			case <-run.done:
 			case <-time.After(inactivitySettleWindow):
 			}
 			return nil, fmt.Errorf("inactivity timeout: no progress for %s", e.inactivityTimeout)
-		case snap, ok := <-todoCh:
+		case snap, ok := <-run.todoCh:
 			if !ok {
-				todoCh = nil
+				run.todoCh = nil
 				continue
 			}
-			if len(snap.Todos) == 0 || slices.Equal(snap.Todos, lastTodos) {
+			if len(snap.Todos) == 0 || slices.Equal(snap.Todos, run.lastTodos) {
 				continue
 			}
-			lastTodos = slices.Clone(snap.Todos)
+			run.lastTodos = slices.Clone(snap.Todos)
 			if !yield(todoStatusUpdate(execCtx, snap), nil) {
 				return nil, errConsumerStopped
 			}
@@ -629,7 +715,8 @@ func traceIDFromContext(ctx context.Context) string {
 // and reports the task canceled. The task is marked as this executor's own
 // cancel before the runner aborts (#342), so the run's returning
 // context.Canceled takes the silent path and this Canceled status stays
-// the only terminal one. The reason travels the protocol (#348): the
+// the only terminal one. The runner's session and the task's run record
+// (#352) are both canceled. The reason travels the protocol (#348): the
 // cancel request's declared metadata carries it, and it lands on the
 // terminal Canceled status message so the caller — and any tasks/get
 // reader — sees why the run stopped. Without one, the in-process kill
@@ -647,6 +734,7 @@ func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) 
 		}
 		e.markOwnCancel(string(execCtx.TaskID))
 		binding.Runner.Cancel(binding.SessionID)
+		e.cancelRun(string(execCtx.TaskID))
 		text := cancelReasonFromMetadata(execCtx.Metadata)
 		if text == "" {
 			text = e.canceledStatusText()
