@@ -25,6 +25,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/a2aproject/a2a-go/v2/a2aext"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/eventqueue"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 	"github.com/a2aproject/a2a-go/v2/errordetails"
 
@@ -134,6 +135,8 @@ type ServerParams struct {
 	// Optional; the production store arrives with #355. nil keeps
 	// today's in-memory behavior.
 	TaskStore taskstore.Store
+	// hooks are the executor's test-only seams; zero in production.
+	hooks executorHooks
 }
 
 // Server is one dispatched agent's slice of the process-wide A2A host
@@ -296,6 +299,7 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	if p.Questions != nil {
 		opts = append(opts, WithQuestions(p.Questions))
 	}
+	opts = append(opts, withHooks(p.hooks))
 	// The call template rides the context binding (#350): the executor
 	// resolves runner, session, and shaping together, per turn.
 	executor := NewExecutor(f.contexts, p.ContextID, opts...)
@@ -330,7 +334,7 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 			return strings.EqualFold(key, traceparentHeader)
 		},
 	})))
-	handler := a2asrv.NewHandler(executor, handlerOpts...)
+	handler := cancelRaceHandler{a2asrv.NewHandler(executor, handlerOpts...)}
 	mux := http.NewServeMux()
 	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
 	mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
@@ -351,6 +355,41 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 		Started:   time.Now(),
 	})
 	return &Server{Endpoint: endpoint, Card: card, factory: f, id: p.DispatchID, contextID: p.ContextID}, nil
+}
+
+// cancelRaceHandler reports the SDK's two outcomes of one race the same
+// way (#352): a tasks/cancel that finds the task's execution still
+// registered is routed into that execution's event pipe (a2a-go v2.5.0
+// internal/taskexec/local_manager.go Cancel and
+// handleCancelWithConcurrentRun). When the execution has already
+// delivered its final event — a parked task's input-required — the
+// Canceled the executor writes there is never processed. If the pipe was
+// still open, the cancel resolves to the execution's own result and the
+// SDK answers TaskNotCancelable (promise.go convertToCancelationResult,
+// and the TODO at local_manager.go:391-396). If the execution had
+// already closed its pipe on its way out, the write fails with
+// eventqueue.ErrQueueClosed and the SDK answers an internal error. Both
+// mean the same thing — the cancel lost to the execution's exit and the
+// task still waits in its prior state — so the closed-pipe case is
+// reported as TaskNotCancelable too, and the client's single re-issue
+// (cancelTask) covers both. The two differ in one respect. A cancel that
+// waited for the execution's result answers only after the execution
+// was unregistered. A closed pipe proves only that the execution reached
+// its last step: cleanupExecution closes the pipe, then takes the
+// manager's lock to unregister. The re-issue arrives a full client round
+// trip later; one that still beats that lock fails the same way, and its
+// error stands.
+type cancelRaceHandler struct {
+	a2asrv.RequestHandler
+}
+
+// CancelTask implements [a2asrv.RequestHandler].
+func (h cancelRaceHandler) CancelTask(ctx context.Context, req *a2aspec.CancelTaskRequest) (*a2aspec.Task, error) {
+	task, err := h.RequestHandler.CancelTask(ctx, req)
+	if errors.Is(err, eventqueue.ErrQueueClosed) {
+		return nil, fmt.Errorf("%w: %w", a2aspec.ErrTaskNotCancelable, err)
+	}
+	return task, err
 }
 
 // ServerFactoryOption customizes the server factory built by

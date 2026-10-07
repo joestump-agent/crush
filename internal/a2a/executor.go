@@ -164,6 +164,29 @@ type Executor struct {
 	// not Execute's stack — owns it.
 	runsMu sync.Mutex
 	runs   map[string]*taskRun
+	// hooks are test-only seams; every field is nil in production.
+	hooks executorHooks
+}
+
+// executorHooks are seams that only tests set, to hold the SDK's
+// execution and cancelation goroutines at a chosen point and force an
+// interleaving deterministically. Every field is nil in production.
+type executorHooks struct {
+	// parked runs on the producer's goroutine after the input-required
+	// status was yielded and before the execution returns (#352). While
+	// it blocks, the SDK keeps the parking execution registered and its
+	// event pipe open, even though the consumer has already delivered
+	// input-required and canceled the producer's context.
+	parked func()
+	// canceled runs after Cancel yielded its Canceled status: the SDK has
+	// written it to the event pipe the cancel was routed to, or failed
+	// to.
+	canceled func()
+}
+
+// withHooks installs test-only seams (see [executorHooks]).
+func withHooks(h executorHooks) Option {
+	return func(e *Executor) { e.hooks = h }
 }
 
 // runOutcome is what a dispatched run's goroutine hands back: the
@@ -822,6 +845,9 @@ func (e *Executor) drain(ctx context.Context, execCtx *a2asrv.ExecutorContext, r
 			if !yield(inputRequiredStatus(execCtx, ev.Payload), nil) {
 				return nil, errConsumerStopped
 			}
+			if e.hooks.parked != nil {
+				e.hooks.parked()
+			}
 			return nil, errParked
 		}
 	}
@@ -970,7 +996,34 @@ func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) 
 			text = e.canceledStatusText()
 		}
 		yield(statusEvent(execCtx, a2aspec.TaskStateCanceled, agentMessage(execCtx, text)), nil)
+		if e.hooks.canceled != nil {
+			e.hooks.canceled()
+		}
 	}
+}
+
+var _ a2asrv.AgentExecutionCleaner = (*Executor)(nil)
+
+// Cleanup implements [a2asrv.AgentExecutionCleaner]: the SDK calls it
+// once an execution or a cancelation has resolved. A resolved
+// cancelation drops the own-cancel mark its Cancel set (#342). Execute's
+// own deferred forget covers a cancel that ended a drained run, and the
+// parked branch covers a parked one, but a cancel that found no run
+// record at all — the re-issued cancel of a parked task whose first
+// cancel already dropped the run (#352) — has neither, and no Execute
+// for that task will ever run again. Dropping the mark here is safe: the
+// SDK refuses to start an execution while a cancelation is registered,
+// and calls Cleanup before unregistering it — after any concurrent
+// execution's Execute has returned, since the cancel either waited for
+// that execution's result or found its event pipe already closed
+// (a2a-go v2.5.0 internal/taskexec/local_manager.go handleCancel and
+// handleCancelWithConcurrentRun). An execution (execCtx.Message is
+// non-nil) leaves its mark to Execute's own defer.
+func (e *Executor) Cleanup(_ context.Context, execCtx *a2asrv.ExecutorContext, _ a2aspec.SendMessageResult, _ error) {
+	if execCtx == nil || execCtx.Message != nil {
+		return
+	}
+	e.forgetCanceledTask(string(execCtx.TaskID))
 }
 
 // markOwnCancel records taskID as canceled by this executor's own Cancel.
