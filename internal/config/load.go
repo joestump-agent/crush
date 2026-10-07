@@ -1116,7 +1116,7 @@ func loadFromBytes(configs [][]byte) (*Config, error) {
 		return &Config{}, nil
 	}
 
-	data, err := jsons.Merge(configs)
+	data, err := jsons.Merge(bindAgentAuthToCard(configs))
 	if err != nil {
 		return nil, err
 	}
@@ -1125,6 +1125,41 @@ func loadFromBytes(configs [][]byte) (*Config, error) {
 		return nil, err
 	}
 	return &config, nil
+}
+
+// bindAgentAuthToCard ties an agent's auth to the config layer that set
+// its card (#434). The layers merge key by key, so a project config that
+// repoints agents.<id>.card would otherwise inherit the global
+// agents.<id>.auth and send that token to the project's origin. A layer
+// that sets a card therefore drops the auth every earlier layer gave the
+// agent, whole: only its own auth, if any, and later layers' apply. To
+// keep a credential, the layer that moves the card sets it again.
+// configs is ordered lowest precedence first and is not modified.
+func bindAgentAuthToCard(configs [][]byte) [][]byte {
+	out := slices.Clone(configs)
+	for i, layer := range out {
+		agents := gjson.GetBytes(layer, "agents")
+		if !agents.IsObject() {
+			continue
+		}
+		agents.ForEach(func(id, def gjson.Result) bool {
+			card := def.Get("card")
+			if !card.Exists() || card.Type == gjson.Null {
+				return true
+			}
+			path := "agents." + gjson.Escape(id.String()) + ".auth"
+			for j := range i {
+				if !gjson.GetBytes(out[j], path).Exists() {
+					continue
+				}
+				if stripped, err := sjson.DeleteBytes(out[j], path); err == nil {
+					out[j] = stripped
+				}
+			}
+			return true
+		})
+	}
+	return out
 }
 
 func hasAWSCredentials(env env.Env) bool {
