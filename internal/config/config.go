@@ -1128,8 +1128,8 @@ type Agent struct {
 	//
 	// Role classifies the agent: main, subagent, or dispatch.
 	Role string `json:"-"`
-	// Runtime selects the execution path: builtin or a2a. Only builtin
-	// is honored; a2a waits on #392 and #434.
+	// Runtime selects the execution path: builtin or a2a. A runtime a2a
+	// dispatch agent runs behind its external Agent Card (#434).
 	Runtime string `json:"-"`
 	// Prompt is builtin:<id> or file:<path> (#432).
 	Prompt string `json:"-"`
@@ -1140,16 +1140,16 @@ type Agent struct {
 	ModelRef *AgentModelRef `json:"-"`
 	// Skills lists skill names for the agent (#432).
 	Skills []string `json:"-"`
-	// Workspace selects dispatch isolation: worktree or none. Only
-	// worktree is honored: dispatches always run in a worktree.
+	// Workspace selects dispatch isolation: worktree or none. A builtin
+	// dispatch always runs in a worktree; a runtime a2a agent resolves
+	// to none (#434).
 	Workspace string `json:"-"`
-	// Card is the external Agent Card URL for runtime a2a agents. Not
-	// honored until #392 and #434.
+	// Card is the external Agent Card URL for runtime a2a agents (#434).
 	Card string `json:"-"`
-	// Auth configures bearer auth for runtime a2a agents. Not honored
-	// until #392 and #434.
+	// Auth configures bearer auth for runtime a2a agents (#434). Token
+	// is the unresolved reference; the dispatch resolves it per call.
 	Auth *AgentAuth `json:"-"`
-	// Transport tunes an a2a agent's connection. Not honored until #392.
+	// Transport tunes an a2a agent's connection (#434).
 	Transport *AgentTransport `json:"-"`
 }
 
@@ -1572,11 +1572,22 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 		PromptAppend:    orString(def.PromptAppend, ""),
 		ModelRef:        modelRef,
 		Skills:          def.Skills,
-		Workspace:       orString(def.Workspace, ""),
+		Workspace:       definitionWorkspace(def),
 		Card:            orString(def.Card, ""),
 		Auth:            def.Auth,
 		Transport:       def.Transport,
 	}
+}
+
+// definitionWorkspace resolves a definition's workspace: a runtime a2a
+// agent always runs with none (#434), whatever it set, since an
+// external agent never touches the local disk; any other definition
+// keeps its own value.
+func definitionWorkspace(def AgentDefinition) string {
+	if orString(def.Runtime, AgentRuntimeBuiltin) == AgentRuntimeA2A {
+		return AgentWorkspaceNone
+	}
+	return orString(def.Workspace, "")
 }
 
 // todoEnforcementFromDefinition maps a definition's todos and kill

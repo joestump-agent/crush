@@ -2,8 +2,11 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"slices"
@@ -30,8 +33,9 @@ const (
 	AgentRoleDispatch = "dispatch"
 )
 
-// Runtimes an agent definition can run on. Only builtin is honored
-// today; a2a entries are validated and carried for #432 and #392.
+// Runtimes an agent definition can run on. builtin runs in-process;
+// a2a dispatches to an external Agent Card (#434), and only dispatch
+// agents may use it until #392.
 const (
 	AgentRuntimeBuiltin = "builtin"
 	AgentRuntimeA2A     = "a2a"
@@ -122,7 +126,8 @@ type AgentDefinition struct {
 	// ContextPaths overrides the agent's context file paths.
 	ContextPaths []string `json:"context_paths,omitempty" jsonschema:"description=Context file paths for this agent"`
 	// Workspace selects dispatch isolation: worktree or none. Only
-	// meaningful on dispatch agents; carried for #432.
+	// meaningful on dispatch agents. A runtime a2a agent always runs with
+	// none (#434); a builtin dispatch agent always runs in a worktree.
 	Workspace *string `json:"workspace,omitempty" jsonschema:"description=Dispatch workspace isolation,enum=worktree,enum=none"`
 	// Todos configures the nudge ladder knobs.
 	Todos *AgentTodos `json:"todos,omitempty" jsonschema:"description=Todo enforcement knobs for this agent"`
@@ -139,8 +144,9 @@ type AgentDefinition struct {
 	// agents with a warning — kill is dispatch-only, the same rule the
 	// Kill block enforces as a load error.
 	TodoEnforcement *TodoEnforcementConfig `json:"todo_enforcement,omitempty" jsonschema:"description=Legacy alias for the todos and kill blocks, with the options.todo_enforcement shape; cannot be combined with either block"`
-	// Card, Auth, and Transport configure runtime a2a agents: the
+	// Card, Auth, and Transport configure runtime a2a agents (#434): the
 	// external Agent Card URL, the bearer token, and the idle timeout.
+	// Card is required on a runtime a2a agent.
 	Card      *string         `json:"card,omitempty" jsonschema:"description=External Agent Card URL for runtime a2a agents"`
 	Auth      *AgentAuth      `json:"auth,omitempty" jsonschema:"description=Bearer auth for runtime a2a agents"`
 	Transport *AgentTransport `json:"transport,omitempty" jsonschema:"description=Transport tuning for runtime a2a agents"`
@@ -193,14 +199,18 @@ type AgentKill struct {
 type AgentAuth struct {
 	// Type is the auth scheme; bearer is the only one today.
 	Type *string `json:"type,omitempty" jsonschema:"description=Auth scheme,enum=bearer"`
-	// Token is the bearer token, typically a $VAR reference.
+	// Token is the bearer token, typically a $VAR or $(cmd) reference.
+	// It is resolved at dispatch time, sent only to the card's origin,
+	// and never logged or persisted (#434). Required when auth is set.
 	Token *string `json:"token,omitempty" jsonschema:"description=Bearer token, usually a $VAR reference"`
 }
 
 // AgentTransport tunes an a2a agent's connection.
 type AgentTransport struct {
-	// IdleTimeout is how long a dispatched run may stay silent before
-	// the inactivity backstop ends it; 0 or off disables the backstop.
+	// IdleTimeout is how long an external agent's stream may stay silent
+	// before the dispatch cancels its task and ends killed (#434); 0 or
+	// off disables it, and unset falls back to
+	// options.todo_enforcement.inactivity_timeout.
 	IdleTimeout *Duration `json:"idle_timeout,omitempty" jsonschema:"description=How long a run may stay silent before it is ended; 0 or off disables"`
 }
 
@@ -735,7 +745,59 @@ func validateA2AFields(path string, def AgentDefinition) error {
 	if def.Auth != nil && def.Auth.Type != nil && *def.Auth.Type != "bearer" {
 		return fmt.Errorf("%s.auth.type: unknown auth type %q", path, *def.Auth.Type)
 	}
+	if def.Auth != nil && (def.Auth.Token == nil || strings.TrimSpace(*def.Auth.Token) == "") {
+		return fmt.Errorf("%s.auth.token: a bearer token is required when auth is set", path)
+	}
+	if def.Card == nil || strings.TrimSpace(*def.Card) == "" {
+		return fmt.Errorf("%s.card: a runtime a2a agent needs the URL of its Agent Card", path)
+	}
+	if _, err := ValidateAgentCardURL(*def.Card); err != nil {
+		return fmt.Errorf("%s.card: %w", path, err)
+	}
+	if def.Transport != nil && def.Transport.IdleTimeout != nil && *def.Transport.IdleTimeout < 0 {
+		return fmt.Errorf("%s.transport.idle_timeout: must not be negative (got %s)", path, durationForError(*def.Transport.IdleTimeout))
+	}
 	return nil
+}
+
+// ValidateAgentCardURL checks an external Agent Card URL (#434) and
+// returns it parsed. It must be absolute https, or plain http on a
+// loopback host, and carry no userinfo: a credential belongs in auth,
+// never in a URL that is echoed into results. Config validation and
+// the dispatch-time resolver share it, so a card that loaded is a card
+// the resolver accepts.
+func ValidateAgentCardURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		// The parse error repeats the URL, which may carry userinfo.
+		return nil, errors.New("not a valid URL")
+	}
+	if u.User != nil {
+		return nil, errors.New("must not carry credentials; set them in auth")
+	}
+	if !u.IsAbs() || u.Hostname() == "" {
+		return nil, errors.New("must be an absolute URL with a host")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+	case "http":
+		if !isLoopbackHost(u.Hostname()) {
+			return nil, errors.New("must use https; plain http is allowed only for loopback hosts")
+		}
+	default:
+		return nil, fmt.Errorf("must use https, not %q", u.Scheme)
+	}
+	return u, nil
+}
+
+// isLoopbackHost reports whether host names this machine: localhost or
+// a loopback IP literal.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // validateTools checks a tools block: every entry names a known tool,
@@ -873,19 +935,17 @@ var warnedDefinitionFields sync.Map
 // parses but does not honor yet, skipping values that merely restate
 // the built-in default so an untouched config starts up silent. #432
 // honored model, prompt, prompt_append, skills, context paths, tools,
-// MCP, and disabled; what remains waits on the a2a runtime (#392,
-// #434) and dispatch workspace selection.
+// MCP, and disabled; #434 honored the a2a runtime with its card, auth,
+// transport, and none workspace. What remains is workspace selection
+// for builtin dispatch agents, which always run in a worktree.
 func warnUnhonoredFields(id string, def AgentDefinition) {
 	builtin := builtinAgentDefinitions()[id]
+	isA2A := orString(def.Runtime, AgentRuntimeBuiltin) == AgentRuntimeA2A
 	fields := []struct {
 		name  string
 		isSet bool
 	}{
-		{"runtime", orString(def.Runtime, AgentRuntimeBuiltin) == AgentRuntimeA2A},
-		{"workspace", def.Workspace != nil && (builtin.Workspace == nil || *def.Workspace != *builtin.Workspace)},
-		{"card", def.Card != nil},
-		{"auth", def.Auth != nil},
-		{"transport", def.Transport != nil},
+		{"workspace", !isA2A && def.Workspace != nil && (builtin.Workspace == nil || *def.Workspace != *builtin.Workspace)},
 	}
 	for _, field := range fields {
 		if !field.isSet {
