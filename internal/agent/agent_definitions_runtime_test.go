@@ -187,7 +187,9 @@ func TestAgentDefinitionPromptAndContextPaths(t *testing.T) {
 
 	// A file: prompt renders as a template against the working dir.
 	plan := buildDefinedAgent(t, c, config.AgentPlan).(*sessionAgent).systemPrompt.Get()
-	require.Equal(t, "Custom plan prompt for "+env.workingDir+".", strings.TrimSpace(plan))
+	// The prompt data slash-normalizes WorkingDir (prompt.go), so the
+	// expected string must too or the test fails on Windows.
+	require.Equal(t, "Custom plan prompt for "+filepath.ToSlash(env.workingDir)+".", strings.TrimSpace(plan))
 }
 
 func TestAgentDefinitionDisabled(t *testing.T) {
