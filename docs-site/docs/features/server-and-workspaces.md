@@ -166,9 +166,10 @@ POST /v1/workspaces/{id}/a2a/agents/{dispatch id}
   dispatched agent: a steer, a cancel, or a task read. It streams the answer
   when the method streams.
 - **Credentials.** The server authenticates to the host with the host's own
-  token, which never leaves the server process. Every other check the host
-  makes still applies to the request as the client sent it, so an `Origin`
-  header is refused.
+  token, which never leaves the server process, so the host sees the server
+  as its caller. The host still checks the request's `Content-Type` and
+  version as the client sent them, and a request carrying an `Origin` header
+  is refused.
 
 The TUI follows this surface in place of the dispatch registry once the UI moves
 onto it (#421, step 3); until then, the list above still holds.

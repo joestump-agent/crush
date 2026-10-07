@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/a2a"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/config"
@@ -181,6 +182,10 @@ type Workspace struct {
 	Cfg    *config.ConfigStore
 	Env    []string
 	Skills *skills.Manager
+
+	// a2aHost, when set, is where A2AHost finds the workspace's agent
+	// host instead of its app (#421); tests set it.
+	a2aHost func() (*a2a.ServerFactory, <-chan struct{})
 
 	// resolvedPath is the path used as the dedup key in
 	// Backend.pathIndex. It is filepath.EvalSymlinks(filepath.Abs(Path))

@@ -30,12 +30,17 @@ func AgentPath(dispatchID string) string {
 
 // ServeProxied forwards r to path on this host (#421): the agent index
 // ([AgentsIndexPath]) or one dispatch's route (/agents/<dispatch id>).
-// The request keeps its method, body and headers — Origin, Content-Type
-// and A2A-Version included, so the host's own checks still judge what
-// the caller sent — while Host becomes the socket's label and the
-// caller's Authorization is replaced with the host's bearer token. A
-// host that is not up answers 503.
+// The request keeps its method, body, Content-Type and A2A-Version, so
+// the host's own checks judge them as the caller sent them. The proxy
+// stands in for the rest: Host becomes the socket's label, the caller's
+// Authorization is replaced with the host's bearer token, and the host
+// sees the server process as its peer. An Origin is refused here, before
+// hop-by-hop handling could drop it. A host that is not up answers 503.
 func (f *ServerFactory) ServeProxied(w http.ResponseWriter, r *http.Request, path string) {
+	if r.Header.Get("Origin") != "" {
+		http.Error(w, "a2a: cross-origin requests are not accepted", http.StatusForbidden)
+		return
+	}
 	if _, ok := f.AgentIndexConn(); !ok {
 		http.Error(w, "a2a: the workspace's agent host is not running", http.StatusServiceUnavailable)
 		return

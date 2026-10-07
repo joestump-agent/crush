@@ -398,7 +398,7 @@ func (f *ServerFactory) serveAgentsIndex(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if !acceptsEventStream(r) {
+	if !AcceptsEventStream(r) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(f.index.snapshot())
 		return
@@ -456,8 +456,9 @@ func (f *ServerFactory) serveAgentsIndex(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// acceptsEventStream reports whether the request asked for an SSE stream.
-func acceptsEventStream(r *http.Request) bool {
+// AcceptsEventStream reports whether any of r's Accept headers asks for
+// an SSE stream.
+func AcceptsEventStream(r *http.Request) bool {
 	return slices.ContainsFunc(r.Header.Values("Accept"), func(v string) bool {
 		return strings.Contains(v, "text/event-stream")
 	})

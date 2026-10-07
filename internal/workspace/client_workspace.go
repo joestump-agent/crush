@@ -1146,6 +1146,13 @@ func (w *ClientWorkspace) recoverWorkspace() error {
 	w.mu.Unlock()
 	slog.Info("Re-registered workspace after server-side loss",
 		"old_id", oldID, "new_id", created.ID)
+	if created.ID != oldID {
+		// The old workspace's agent host went with it (#421), so its
+		// agents still showing live are not running anywhere: end them
+		// now. The new host's agents arrive with its first snapshot,
+		// which can be a while — it starts with the first dispatch.
+		w.agentTasks.apply(a2a.AgentIndexEvent{}, true)
+	}
 
 	if created.Config != nil && created.Config.IsConfigured() {
 		if err := w.InitCoderAgent(w.subCtx); err != nil {

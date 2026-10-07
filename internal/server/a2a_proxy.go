@@ -2,7 +2,6 @@ package server
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/charmbracelet/crush/internal/a2a"
 )
@@ -12,8 +11,7 @@ import (
 // opens it before the first dispatch is held rather than refused; a
 // snapshot answers at once.
 func (c *controllerV1) handleGetWorkspaceA2AAgents(w http.ResponseWriter, r *http.Request) {
-	stream := strings.Contains(r.Header.Get("Accept"), "text/event-stream")
-	host, err := c.backend.A2AHost(r.Context(), r.PathValue("id"), stream)
+	host, err := c.backend.A2AHost(r.Context(), r.PathValue("id"), a2a.AcceptsEventStream(r))
 	if err != nil {
 		if r.Context().Err() != nil {
 			return

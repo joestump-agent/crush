@@ -2,6 +2,8 @@ package workspace
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -358,6 +360,28 @@ func TestAgentTaskWatcherStreamSnapshotEndsAgentsOfAGoneHost(t *testing.T) {
 	task, ok = w.bySession("c-live")
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusRunning, task.Status, "a host's copy replaces the inferred mark")
+}
+
+// A lookup's refresh reads the index outside the stream, so it can race
+// it: it adds what it read and never ends an agent it did not see (#421).
+func TestAgentTaskWatcherRefreshEndsNothing(t *testing.T) {
+	t.Parallel()
+	index := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("[]"))
+	}))
+	t.Cleanup(index.Close)
+	w := newAgentTaskWatcher(func() (a2a.AgentIndexConn, bool, <-chan struct{}) {
+		return a2a.AgentIndexConn{HTTP: index.Client(), BaseURL: index.URL}, true, nil
+	}, nil)
+	live := a2a.AgentDescriptor{ID: "d1", ContextID: "c-live", State: a2a.DispatchStatusWorking, Served: true, Revision: 3}
+	w.apply(a2a.AgentIndexEvent{Snapshot: []a2a.AgentDescriptor{live}}, true)
+
+	w.refresh(t.Context())
+
+	task, ok := w.bySession("c-live")
+	require.True(t, ok)
+	require.Equal(t, dispatch.StatusRunning, task.Status)
 }
 
 // A route that went down before its task ended shows as failed, not live

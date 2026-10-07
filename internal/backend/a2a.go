@@ -22,11 +22,11 @@ func (b *Backend) A2AHost(ctx context.Context, workspaceID string, wait bool) (*
 	if err != nil {
 		return nil, err
 	}
-	host, set := ws.A2AHost()
+	host, set := ws.agentHost()
 	if host == nil && wait {
 		select {
 		case <-set:
-			host, _ = ws.A2AHost()
+			host, _ = ws.agentHost()
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-ws.ctx.Done():
@@ -51,4 +51,13 @@ func (b *Backend) A2AHost(ctx context.Context, workspaceID string, wait bool) (*
 		return nil, ErrA2AHostNotRunning
 	}
 	return host, nil
+}
+
+// agentHost returns the workspace's A2A host and the channel closed once
+// it is set: the app's, unless a test supplied its own.
+func (ws *Workspace) agentHost() (*a2a.ServerFactory, <-chan struct{}) {
+	if ws.a2aHost != nil {
+		return ws.a2aHost()
+	}
+	return ws.A2AHost()
 }

@@ -154,9 +154,9 @@ In client/server mode the TUI runs in another process. It reaches the index,
 and each dispatch's route, through the server's proxy at
 `/v1/workspaces/{id}/a2a/agents`; see
 [Dispatched agents against a server](/features/server-and-workspaces#dispatched-agents-against-a-server).
-The server adds the host's token itself. The request keeps its `Origin`,
-`Content-Type` and version headers, so the checks above judge it as the
-client sent it.
+The server adds the host's token itself and refuses any request with an
+`Origin`. The request keeps its `Content-Type` and version headers, so the
+host judges those as the client sent them.
 
 ## Methods
 

@@ -1,6 +1,10 @@
 package backend
 
-import "context"
+import (
+	"context"
+
+	"github.com/charmbracelet/crush/internal/a2a"
+)
 
 // InsertWorkspaceForTest registers ws with b under its current ID and
 // path. It is intended for tests in other packages that need to drive
@@ -88,4 +92,12 @@ func WorkspaceLiveStreamCountForTest(ws *Workspace) int {
 		}
 	}
 	return n
+}
+
+// SetWorkspaceA2AHostForTest makes ws find its A2A host through source
+// instead of its app, for tests in other packages that drive the agent
+// proxy (#421) against a synthetic workspace. source returns the host,
+// nil until there is one, and a channel closed once it is set.
+func SetWorkspaceA2AHostForTest(ws *Workspace, source func() (*a2a.ServerFactory, <-chan struct{})) {
+	ws.a2aHost = source
 }

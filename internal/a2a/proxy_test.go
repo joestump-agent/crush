@@ -35,6 +35,7 @@ func proxyFront(t *testing.T, factory *ServerFactory) ProxyClient {
 // events arrive as they happen, a steer, and a cancel — with no token on
 // its side.
 func TestProxyServesTheIndexAndTheDispatch(t *testing.T) {
+	t.Parallel()
 	factory := NewServerFactory(t.TempDir())
 	runner := newPacedRunner("done")
 	runner.enqueueAccepted = true
@@ -90,6 +91,7 @@ func TestProxyServesTheIndexAndTheDispatch(t *testing.T) {
 // sent, and the host's other checks still judge the request as sent: an
 // Origin is refused (#421).
 func TestProxyAuthenticatesForTheCaller(t *testing.T) {
+	t.Parallel()
 	factory := NewServerFactory(t.TempDir())
 	_, err := factory.StartServer(t.Context(), ServerParams{
 		DispatchID: "dispatch-1", Runner: &fakeRunner{result: textResult("x")}, SessionID: "s", ContextID: "s", Listed: true,
@@ -108,11 +110,23 @@ func TestProxyAuthenticatesForTheCaller(t *testing.T) {
 		return resp.StatusCode
 	}
 	require.Equal(t, http.StatusOK, get(bearerAuthorizationHeader, "Bearer not-the-token"), "the caller's credential is replaced")
-	require.Equal(t, http.StatusForbidden, get("Origin", "https://evil.example"), "the host still refuses an Origin")
+	require.Equal(t, http.StatusForbidden, get("Origin", "https://evil.example"), "an Origin is refused")
+
+	// Naming Origin as hop-by-hop would have the proxy drop it before
+	// the host could see it: it is refused before then.
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxy.BaseURL+AgentsIndexPath, nil)
+	require.NoError(t, err)
+	req.Header.Set("Origin", "https://evil.example")
+	req.Header.Set("Connection", "Origin")
+	resp, err := proxy.HTTP.Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
 
 // Until the host is up there is nothing to proxy to: 503 (#421).
 func TestProxyRefusesBeforeTheHostStarts(t *testing.T) {
+	t.Parallel()
 	factory := NewServerFactory(t.TempDir())
 	proxy := proxyFront(t, factory)
 	_, err := proxy.IndexConn().ListAgents(t.Context())
@@ -122,6 +136,7 @@ func TestProxyRefusesBeforeTheHostStarts(t *testing.T) {
 // A proxied card keeps only a route on the host's own label, so a card
 // naming anywhere else cannot point the client off the proxy (#421).
 func TestProxiedCardStaysOnTheHost(t *testing.T) {
+	t.Parallel()
 	proxy := ProxyClient{BaseURL: "http://api.crush.localhost/v1/workspaces/w1/a2a"}
 	card := func(url string) *a2aspec.AgentCard {
 		return &a2aspec.AgentCard{SupportedInterfaces: []*a2aspec.AgentInterface{{

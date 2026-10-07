@@ -365,7 +365,7 @@ func (c *controllerV1) endpoints() []apigen.Endpoint {
 				"a snapshot answers 503 until it has.").
 			Tags("agent").
 			PathParam("id", "Workspace ID").
-			Fails(404, 502, 503).
+			Fails(403, 404, 409, 502, 503).
 			Handle(c.handleGetWorkspaceA2AAgents),
 
 		apigen.Post("/v1/workspaces/{id}/a2a/agents/{agent}").
@@ -377,7 +377,7 @@ func (c *controllerV1) endpoints() []apigen.Endpoint {
 			Tags("agent").
 			PathParam("id", "Workspace ID").
 			PathParam("agent", "Dispatch ID").
-			Fails(400, 403, 404, 415, 502, 503).
+			Fails(400, 403, 404, 409, 415, 502, 503).
 			Handle(c.handlePostWorkspaceA2AAgent),
 
 		apigen.Get("/v1/workspaces/{id}/agent/sessions/{sid}").
