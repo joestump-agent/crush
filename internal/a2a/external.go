@@ -601,7 +601,7 @@ func (a *externalAgent) Stream(ctx context.Context, p agent.ExternalDispatchPara
 	s := &dispatchStream{
 		params:   agent.DispatchTransportParams{OnTask: p.OnTask},
 		client:   a.client,
-		external: &externalFold{},
+		external: &externalFold{token: a.token},
 		onEvent:  watch.touch,
 	}
 	req := &a2aspec.SendMessageRequest{
@@ -707,6 +707,9 @@ func (a *externalAgent) cancelRemote(ctx context.Context, taskID a2aspec.TaskID,
 // updates say, under one byte budget. Nothing in it is ever read as a
 // diff or written anywhere.
 type externalFold struct {
+	// token is scrubbed from every artifact's text before the budget cut,
+	// so the cut cannot leave a prefix of it behind.
+	token agent.Secret
 	order []a2aspec.ArtifactID
 	texts map[a2aspec.ArtifactID]string
 	size  int
@@ -751,14 +754,16 @@ func (f *externalFold) artifact(art *a2aspec.Artifact, appendTo bool) {
 		}
 		f.order = append(f.order, art.ID)
 	}
-	text := b.String()
+	text := sanitizeRemote(b.String())
 	if appendTo {
 		text = current + text
 	}
-	// The budget is shared: past it, text is cut rather than buffered,
-	// and the final cap marks the truncation.
+	// Scrub before the budget cut, then cut: the budget is shared, past
+	// it text is cut rather than buffered, and the final cap marks the
+	// truncation.
+	text = redactToken(text, f.token)
 	if room := maxExternalTextBytes + 1 - (f.size - len(current)); len(text) > room {
-		text = truncateUTF8(text, max(room, 0))
+		text = cutText(text, max(room, 0), f.token)
 	}
 	f.size += len(text) - len(current)
 	f.texts[art.ID] = text
@@ -802,26 +807,78 @@ func (f *externalFold) text() string {
 	return strings.Join(parts, "\n\n")
 }
 
-// untrustedText prepares remote-controlled text for the parent: invalid
-// UTF-8 and control characters — terminal escapes, carriage returns,
-// bidirectional overrides — are dropped, the token is scrubbed in case
-// the remote echoed it back, and the result is capped.
+// untrustedText prepares remote-controlled text for the parent:
+// sanitizeRemote drops what a reader cannot see, the token is scrubbed in
+// case the remote echoed it back — after sanitizing, so a token split by
+// an invisible character is still caught, and before the cap, so a token
+// the cap would cut is still whole — and the result is capped, with a
+// token prefix the cut left dangling scrubbed too. The scrub is exact:
+// an encoded or partial echo the remote sends on purpose is not caught.
 func untrustedText(s string, token agent.Secret) string {
-	s = strings.ToValidUTF8(s, "�")
-	s = strings.Map(func(r rune) rune {
+	s = redactToken(sanitizeRemote(s), token)
+	if len(s) > maxExternalTextBytes {
+		s = cutText(s, maxExternalTextBytes, token) + externalTruncatedMarker
+	}
+	return s
+}
+
+// sanitizeRemote makes remote text valid UTF-8 and drops what a reader
+// cannot see but a model or terminal still acts on: control characters
+// other than newline and tab (terminal escapes, carriage returns), and
+// format characters — bidirectional overrides, zero-width spaces and
+// joiners, word joiners, byte-order marks, and the tag block — except
+// the zero-width joiner that emoji sequences need.
+func sanitizeRemote(s string) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	return strings.Map(func(r rune) rune {
 		switch {
-		case r == '\n' || r == '\t':
+		case r == '\n' || r == '\t' || r == zeroWidthJoiner:
 			return r
-		case unicode.IsControl(r), unicode.Is(unicode.Bidi_Control, r):
+		case unicode.IsControl(r), unicode.Is(unicode.Cf, r), unicode.Is(unicode.Bidi_Control, r):
+			return -1
+		case r >= 0xE0000 && r <= 0xE007F:
+			// The tag block: invisible, and able to spell text.
 			return -1
 		}
 		return r
 	}, s)
-	if !token.IsZero() {
-		s = strings.ReplaceAll(s, token.Reveal(), "[REDACTED]")
+}
+
+// zeroWidthJoiner is the one format character sanitizeRemote keeps.
+const zeroWidthJoiner = '\u200D'
+
+// redactedToken replaces a scrubbed credential.
+const redactedToken = "[REDACTED]"
+
+// minDanglingToken is the shortest token prefix cutText scrubs at a cut:
+// fewer bytes than this say nothing about the credential.
+const minDanglingToken = 4
+
+// redactToken replaces every whole occurrence of the token in s.
+func redactToken(s string, token agent.Secret) string {
+	if token.IsZero() {
+		return s
 	}
-	if len(s) > maxExternalTextBytes {
-		s = truncateUTF8(s, maxExternalTextBytes) + externalTruncatedMarker
+	return strings.ReplaceAll(s, token.Reveal(), redactedToken)
+}
+
+// cutText cuts s to at most n bytes without splitting a rune, then
+// scrubs a token prefix the cut left dangling at the end: whole tokens
+// are redacted before any cut, so a dangling prefix is the only part of
+// one a cut can expose.
+func cutText(s string, n int, token agent.Secret) string {
+	if len(s) <= n {
+		return s
+	}
+	s = truncateUTF8(s, n)
+	if token.IsZero() {
+		return s
+	}
+	t := token.Reveal()
+	for k := min(len(t)-1, len(s)); k >= minDanglingToken; k-- {
+		if strings.HasSuffix(s, t[:k]) {
+			return s[:len(s)-k] + redactedToken
+		}
 	}
 	return s
 }

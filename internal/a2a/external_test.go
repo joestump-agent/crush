@@ -1117,3 +1117,81 @@ func TestExternalAgentResponseHeaderTimeout(t *testing.T) {
 		require.Zero(t, es.srv.Client().Transport.(*http.Transport).ResponseHeaderTimeout, "the shared base is not modified")
 	}
 }
+
+// Remote text loses what a reader cannot see (#434): control and format
+// characters — zero-width spaces, word joiners, byte-order marks,
+// bidirectional overrides, the tag block — but keeps newlines, tabs and
+// the zero-width joiner emoji need. A token split by an invisible
+// character is caught once it is dropped.
+func TestUntrustedTextDropsInvisibles(t *testing.T) {
+	t.Parallel()
+	in := "a\u200bb\u2060c\ufeffd\U000E0041\U000E007Fe\u202ef\x1b[2Jg\rh\u200di\nj\tk"
+	require.Equal(t, "abcdef[2Jgh\u200di\nj\tk", untrustedText(in, agent.Secret{}))
+
+	token := agent.NewSecret(externalTestToken)
+	split := "leaked " + externalTestToken[:6] + "\u200b" + externalTestToken[6:] + " here"
+	got := untrustedText(split, token)
+	require.Equal(t, "leaked [REDACTED] here", got)
+}
+
+// A cut never leaves a prefix of the token behind (#434): whole tokens
+// are scrubbed before the cut, and a prefix the cut left dangling is
+// scrubbed at it. Shorter dangling prefixes say nothing and stay.
+func TestCutTextScrubsDanglingToken(t *testing.T) {
+	t.Parallel()
+	token := agent.NewSecret(externalTestToken)
+	require.Equal(t, "abc[REDACTED]", cutText("abc"+externalTestToken[:10]+"zz", 13, token))
+	require.Equal(t, "abc"+externalTestToken[:3], cutText("abc"+externalTestToken[:3]+"zzz", 6, token))
+	require.Equal(t, "short", cutText("short", 10, token), "no cut, nothing to scrub")
+}
+
+// The fold's budget cut cannot leave a token prefix in the findings: an
+// artifact whose token straddles the budget, whole or split across
+// appended chunks, reaches the parent with no part of it.
+func TestExternalAgentScrubsTokenAtTheCut(t *testing.T) {
+	t.Parallel()
+	filler := strings.Repeat("x", maxExternalTextBytes-5)
+	es, _ := newExternalServer(t, func(_ context.Context, execCtx *a2asrv.ExecutorContext, yield func(a2aspec.Event, error) bool) {
+		if !working(execCtx, yield) {
+			return
+		}
+		switch execCtx.Message.Parts[0].Text() {
+		case "whole":
+			if !yield(a2aspec.NewArtifactEvent(execCtx, a2aspec.NewTextPart(filler+externalTestToken)), nil) {
+				return
+			}
+		case "middle":
+			// The cut lands inside the first artifact, and a second one
+			// follows it, so the final cap cannot hide what the fold's cut
+			// left behind.
+			first := a2aspec.NewArtifactEvent(execCtx, a2aspec.NewTextPart("a"))
+			if !yield(first, nil) {
+				return
+			}
+			if !yield(a2aspec.NewArtifactEvent(execCtx, a2aspec.NewTextPart(strings.Repeat("y", 100))), nil) {
+				return
+			}
+			grow := a2aspec.NewArtifactUpdateEvent(execCtx, first.Artifact.ID, a2aspec.NewTextPart(strings.Repeat("x", maxExternalTextBytes-106)+externalTestToken))
+			if !yield(grow, nil) {
+				return
+			}
+		default:
+			first := a2aspec.NewArtifactEvent(execCtx, a2aspec.NewTextPart(filler+externalTestToken[:12]))
+			if !yield(first, nil) {
+				return
+			}
+			rest := a2aspec.NewArtifactUpdateEvent(execCtx, first.Artifact.ID, a2aspec.NewTextPart(externalTestToken[12:]+" tail"))
+			if !yield(rest, nil) {
+				return
+			}
+		}
+		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted, nil), nil)
+	})
+	ext := resolveTestAgent(t, es)
+	for _, prompt := range []string{"whole", "middle", "split"} {
+		outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: prompt})
+		require.NoError(t, err, prompt)
+		require.Equal(t, DispatchStatusCompleted, outcome.Status, prompt)
+		require.NotContains(t, outcome.Text, externalTestToken[:minDanglingToken], "%s: a token prefix survived the cut", prompt)
+	}
+}
