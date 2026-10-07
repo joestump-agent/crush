@@ -1774,6 +1774,12 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 	}
 	firstQueuedMessage := queuedMessages[0]
 	a.messageQueue.Set(sessionID, queuedMessages[1:])
+	// The dequeued call starts its own turn, exactly as at Run's
+	// handoff: tell its OnConsumed waiter the message was consumed
+	// (#351). A queued dispatch delivery stamps its durable record on
+	// this verdict (#355); without it, a delivery queued behind a
+	// summary would be re-delivered on every restart.
+	firstQueuedMessage.consume(true)
 	_, qErr := a.Run(ctx, firstQueuedMessage)
 	return qErr
 }
