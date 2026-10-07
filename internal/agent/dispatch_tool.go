@@ -322,11 +322,9 @@ func (c *coordinator) teardownLiveDispatch(id string) {
 // client stream, and one more shared bound; anything that outlives that
 // is logged with its dispatch ID and left to its run goroutine.
 func (c *coordinator) cancelDispatchesForShutdown() {
-	// Raise the flag before touching any dispatch: from here on a
-	// finishing dispatch records its terminal state but starts no
-	// parent delivery turn.
-	c.shuttingDown.Store(true)
-
+	// CancelAll raised the shutdown flag before canceling anything: a
+	// dispatch finishing from here on records its terminal state but
+	// starts no parent delivery turn.
 	type shutdownTarget struct {
 		id   string
 		live *liveDispatch
