@@ -301,6 +301,13 @@ type coordinator struct {
 	// questions take turns on (#352): the question service holds one
 	// pending question at a time. Made on first use under dispatchMu.
 	dispatchQuestions chan struct{}
+	// dispatchPersistWindow bounds how long a finished run waits for the
+	// parent turn to persist its dispatch_agent tool result (#410).
+	// NewCoordinator sets dispatchResultPersistWindow; a coordinator
+	// built as a struct literal (tests) leaves it zero and makes a single
+	// attempt, so a test that never writes the parent result does not sit
+	// out the window.
+	dispatchPersistWindow time.Duration
 
 	// dispatchRecords is the durable a2a_dispatches store (#355); nil
 	// until the app wires it, and nil means dispatches leave no restart
@@ -411,6 +418,8 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		dispatchSinks:   opts.DispatchSinks,
 		dispatchHost:    opts.DispatchHost,
 		dispatchRecords: opts.DispatchRecords,
+
+		dispatchPersistWindow: dispatchResultPersistWindow,
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]

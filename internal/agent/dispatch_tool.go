@@ -37,6 +37,7 @@ const dispatchRetryBackoff = 2 * time.Second
 // parent turn to persist the dispatch_agent tool result before stamping
 // the terminal result onto it (#410): the run is launched before the
 // tool returns, so a run that ends almost instantly can beat the write.
+// It is the production value of coordinator.dispatchPersistWindow.
 const dispatchResultPersistWindow = 5 * time.Second
 
 // dispatchResultPersistPoll paces that wait.
@@ -1080,7 +1081,7 @@ func (c *coordinator) persistDispatchTerminalResult(ctx context.Context, run dis
 	}
 	metadata := string(b)
 
-	deadline := time.Now().Add(dispatchResultPersistWindow)
+	deadline := time.Now().Add(c.dispatchPersistWindow)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -1119,7 +1120,7 @@ func (c *coordinator) persistDispatchTerminalResult(ctx context.Context, run dis
 			return
 		}
 		if !time.Now().Before(deadline) {
-			slog.Warn("Gave up waiting for the parent's dispatch tool result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "tool_call_id", toolCallID, "waited", dispatchResultPersistWindow)
+			slog.Warn("Gave up waiting for the parent's dispatch tool result", "parent_session", run.parentSessionID, "dispatch_id", run.entry.ID, "tool_call_id", toolCallID, "waited", c.dispatchPersistWindow)
 			return
 		}
 		select {

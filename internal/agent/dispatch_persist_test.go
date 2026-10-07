@@ -73,6 +73,9 @@ func TestRunDispatchStampsTerminalMetadataOnParentToolResult(t *testing.T) {
 		result: &fantasy.AgentResult{Response: fantasy.Response{Content: fantasy.ResponseContent{fantasy.TextContent{Text: "done"}}}},
 	}
 	c, env := newDispatchToolEnv(t, agent)
+	// The parent result is written after the tool returns, so the run
+	// can finish first: give it the production wait (#410).
+	c.dispatchPersistWindow = dispatchResultPersistWindow
 	parent, err := env.sessions.Create(t.Context(), "parent")
 	require.NoError(t, err)
 	tool := c.dispatchTool()
@@ -122,6 +125,9 @@ func decodeDispatchID(t *testing.T, handleJSON string) string {
 func TestRunDispatchTerminalMetadataWaitsForLateToolResult(t *testing.T) {
 	gated := newGatedDispatchAgent()
 	c, env := newInjectionEnv(t, gated)
+	// The parent result lands after the run ends: this test is the
+	// bounded wait itself, so it runs with the production window.
+	c.dispatchPersistWindow = dispatchResultPersistWindow
 	parent, err := env.sessions.Create(t.Context(), "parent")
 	require.NoError(t, err)
 	tool := c.dispatchTool()
