@@ -335,6 +335,56 @@ func (h *DispatchHarness) ParentDeliveries() int {
 	return h.main.runCount()
 }
 
+// ParentPrompts returns the prompts the parent's main agent ran with:
+// the delivered terminal messages, in order.
+func (h *DispatchHarness) ParentPrompts() []string {
+	runs := h.main.runsSnapshot()
+	prompts := make([]string, len(runs))
+	for i, run := range runs {
+		prompts[i] = run.Prompt
+	}
+	return prompts
+}
+
+// SetAgentDefinitions replaces the coordinator's agent definitions with
+// the JSON agents block, validated and resolved the way Load does, and
+// rebuilds the dispatch tool against them (#434).
+func (h *DispatchHarness) SetAgentDefinitions(t *testing.T, agents string) {
+	t.Helper()
+	var defs map[string]config.AgentDefinition
+	require.NoError(t, json.Unmarshal([]byte(agents), &defs))
+	h.c.cfg.Config().AgentDefinitions = defs
+	require.NoError(t, h.c.cfg.Config().ValidateAgents(h.c.cfg.WorkingDir()))
+	h.c.cfg.Config().SetupAgents()
+	h.tool = h.c.dispatchTool()
+}
+
+// DispatchTo starts one dispatch on the named agent definition through
+// the real dispatch_agent tool, with no branch, and returns its running
+// handle. callID keys the dispatch's task session.
+func (h *DispatchHarness) DispatchTo(t *testing.T, agentID, prompt, handle, callID string) dispatch.DispatchResult {
+	t.Helper()
+	input, err := json.Marshal(DispatchAgentParams{Prompt: prompt, Agent: agentID, Handle: handle})
+	require.NoError(t, err)
+	ctx := context.WithValue(context.Background(), tools.SessionIDContextKey, h.parentID)
+	ctx = context.WithValue(ctx, tools.MessageIDContextKey, "dispatch-parent-message")
+	ctx = context.WithValue(ctx, tools.ContentWidthContextKey, 80)
+	resp, err := h.tool.Run(ctx, fantasy.ToolCall{
+		ID:    callID,
+		Name:  DispatchAgentToolName,
+		Input: string(input),
+	})
+	require.NoError(t, err)
+	return decodeDispatchHandle(t, resp)
+}
+
+// DispatchBranchCount counts the dispatch branches in the harness's
+// repository: an external dispatch must leave it at zero.
+func (h *DispatchHarness) DispatchBranchCount(t *testing.T) int {
+	t.Helper()
+	return dispatchBranchCount(t, h.c.cfg.WorkingDir())
+}
+
 // SubAgentParams is the exported alias of the sub-agent turn's
 // parameters, so the external test package can drive runSubAgentOverA2A
 // (#392) with the same shape the tools build.

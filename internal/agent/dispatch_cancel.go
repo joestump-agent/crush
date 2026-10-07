@@ -91,7 +91,9 @@ func (c *coordinator) CancelDispatch(ctx context.Context, ref string) error {
 	// ends, and this call returns to the tool loop immediately.
 	live.kill.kill(dispatch.ReasonCanceled)
 	c.killDispatch(reg, entry.ID, dispatch.ReasonCanceled, func() {
-		live.agent.Cancel(live.sessionID)
+		if live.agent != nil {
+			live.agent.Cancel(live.sessionID)
+		}
 	})
 	slog.Debug("Dispatch canceled on demand", "dispatch_id", entry.ID, "session_id", live.sessionID)
 	return nil
@@ -112,6 +114,21 @@ func (c *coordinator) CancelDispatch(ctx context.Context, ref string) error {
 // because the kill site owns it — not necessarily the coordinator's
 // current one.
 func (c *coordinator) killDispatch(reg *dispatch.AgentRegistry, entryID, reason string, fallback func()) {
+	if entry, ok := reg.Get(entryID); ok && entry.Source != "" {
+		// An external dispatch (#434) is killed through its kill switch:
+		// its stream watches it, cuts itself, and sends the tasks/cancel
+		// carrying the reason to the remote's own origin. The process
+		// host's canceler cannot reach it, and there is no local agent
+		// to fall back on. Callers record the reason first; recording it
+		// here too keeps a caller that did not from losing the kill.
+		c.dispatchMu.Lock()
+		live := c.liveDispatches[entryID]
+		c.dispatchMu.Unlock()
+		if live != nil {
+			live.kill.kill(reason)
+		}
+		return
+	}
 	if fallback == nil {
 		fallback = func() { c.cancelDispatchRun(entryID) }
 	}
@@ -154,7 +171,9 @@ func (c *coordinator) cancelDispatchRun(entryID string) {
 	if live.cancel != nil {
 		live.cancel()
 	}
-	live.agent.Cancel(live.sessionID)
+	if live.agent != nil {
+		live.agent.Cancel(live.sessionID)
+	}
 }
 
 // cancelDispatchTool builds the CancelDispatch tool (#373): the model's

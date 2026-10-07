@@ -103,6 +103,16 @@ func (c *coordinator) DeliverAgentMessage(ctx context.Context, msg AgentMessage)
 		return fmt.Errorf("agent %s finished (%s); task sessions are never continuable — dispatch a new agent instead", msg.SessionID, entry.Status)
 	}
 
+	// An external agent (#434) is not steerable. #351's steer is a
+	// message on the dispatch's running context that crush's own
+	// executor folds into the running turn, with the reply streaming
+	// back on the dispatch's local session. A third-party agent has no
+	// such contract: the same message starts a second task there, whose
+	// reply nothing here reads. Refuse rather than pretend.
+	if entry.Source != "" {
+		return fmt.Errorf("%w; cancel the agent and dispatch it again with the new instructions", ErrSteerExternal)
+	}
+
 	steerer, ok := c.dispatchHost.(DispatchSteerer)
 	if !ok || steerer == nil {
 		return fmt.Errorf("no running agent for session %s; dispatch one first", msg.SessionID)

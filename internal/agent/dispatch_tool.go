@@ -168,6 +168,19 @@ func (k *dispatchKill) current() string {
 	return k.reason
 }
 
+// The exported trio makes the kill state the [RunKill] an external
+// agent's transport watches (#434).
+var _ RunKill = (*dispatchKill)(nil)
+
+// Kill implements [RunKill].
+func (k *dispatchKill) Kill(reason string) { k.kill(reason) }
+
+// Killed implements [RunKill].
+func (k *dispatchKill) Killed() <-chan struct{} { return k.killed() }
+
+// Reason implements [RunKill].
+func (k *dispatchKill) Reason() string { return k.current() }
+
 // dispatchedAgent is the agent one dispatch runs, plus the model and
 // provider config its Run call needs — the same call shaping runSubAgent
 // applies to a sub-agent's turn.
@@ -282,6 +295,11 @@ type dispatchRun struct {
 	// Nil where a run is driven without the record (tests that assemble
 	// only); the accessors are nil-safe.
 	findings *dispatchFindings
+	// external is the resolved external agent a runtime a2a dispatch
+	// runs on (#434), holding the card's pinned client and credential;
+	// nil for a dispatch served in-process. An external run has no
+	// agent, toolchain, provider, or server of its own.
+	external ExternalAgent
 }
 
 // registerLiveDispatch records a running dispatch (#371). The map is
@@ -350,7 +368,11 @@ func (c *coordinator) cancelDispatchesForShutdown() {
 		if target.live.kill != nil {
 			target.live.kill.kill(dispatch.ReasonShutdown)
 		}
-		target.live.agent.Cancel(target.live.sessionID)
+		// An external dispatch has no local agent (#434): the kill above
+		// is what ends its stream.
+		if target.live.agent != nil {
+			target.live.agent.Cancel(target.live.sessionID)
+		}
 	}
 
 	deadline := time.NewTimer(cancelWait)
@@ -497,12 +519,12 @@ func (t *dispatchAgentTool) SetProviderOptions(opts fantasy.ProviderOptions) {
 }
 
 // dispatchableAgentIDs returns the sorted ids of the resolved agents a
-// dispatch may run: role dispatch, not disabled, builtin runtime. a2a
-// agents join once #434 serves remote agents.
+// dispatch may run: role dispatch, not disabled, on the builtin runtime
+// or behind an external card (#434).
 func (c *coordinator) dispatchableAgentIDs() []string {
 	ids := make([]string, 0, 4)
 	for id, agentCfg := range c.cfg.Config().Agents {
-		if agentCfg.Role != config.AgentRoleDispatch || agentCfg.Disabled || agentCfg.Runtime != config.AgentRuntimeBuiltin {
+		if agentCfg.Role != config.AgentRoleDispatch || agentCfg.Disabled || !dispatchableRuntime(agentCfg.Runtime) {
 			continue
 		}
 		ids = append(ids, id)
@@ -511,10 +533,15 @@ func (c *coordinator) dispatchableAgentIDs() []string {
 	return ids
 }
 
+// dispatchableRuntime reports whether dispatch_agent can serve runtime.
+func dispatchableRuntime(runtime string) bool {
+	return runtime == config.AgentRuntimeBuiltin || runtime == config.AgentRuntimeA2A
+}
+
 // resolveDispatchAgent maps the tool call's agent parameter onto the
 // resolved agent definition it names (#433): an empty parameter selects
-// options.dispatch.default_agent, and an unknown, disabled, non-dispatch,
-// or non-builtin id is refused with the valid ids listed.
+// options.dispatch.default_agent, and an unknown, disabled, or
+// non-dispatch id is refused with the valid ids listed.
 func (c *coordinator) resolveDispatchAgent(id string) (config.Agent, string) {
 	if id == "" {
 		id = c.cfg.Config().Options.GetDispatchDefaultAgent()
@@ -534,8 +561,8 @@ func (c *coordinator) resolveDispatchAgent(id string) (config.Agent, string) {
 	if agentCfg.Role != config.AgentRoleDispatch {
 		return refuse("agent %q is a %q agent, not a dispatch agent", id, agentCfg.Role)
 	}
-	if agentCfg.Runtime != config.AgentRuntimeBuiltin {
-		return refuse("agent %q runs on the %q runtime, which dispatch_agent cannot serve yet", id, agentCfg.Runtime)
+	if !dispatchableRuntime(agentCfg.Runtime) {
+		return refuse("agent %q runs on the %q runtime, which dispatch_agent cannot serve", id, agentCfg.Runtime)
 	}
 	return agentCfg, ""
 }
@@ -569,6 +596,13 @@ func (c *coordinator) dispatchTool() fantasy.AgentTool {
 			agentCfg, refusal := c.resolveDispatchAgent(params.Agent)
 			if refusal != "" {
 				return fantasy.NewTextErrorResponse(refusal), nil
+			}
+
+			// A runtime a2a agent runs behind its external card (#434):
+			// no worktree, no toolchain, no local agent or server — its
+			// own path from here.
+			if agentCfg.Runtime == config.AgentRuntimeA2A {
+				return c.dispatchExternal(ctx, params, call, agentCfg)
 			}
 
 			modelType := config.SelectedModelType(params.Model)
@@ -985,6 +1019,10 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		// The toolchain outlives the turn: Close stops the scoped LSP
 		// clients once nothing runs in the workspace anymore.
 		run.toolchain.Close(ctx)
+		// An external run's client dies with it too (#434).
+		if run.external != nil {
+			run.external.Close()
+		}
 		// The dispatch's root dies with the dispatch (#371): canceling
 		// it ends everything bound to it, and dropping the live record
 		// keeps the registry holding exactly the running dispatches.
@@ -1004,8 +1042,17 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 	// the A2A client, its SSE stream consumed to the terminal state.
 	// Steering rides the same path (#351): the server's executor resolves
 	// the run's binding from the task's A2A context and enqueues the
-	// message on this very agent.
-	terminal, servedUsage := c.runDispatchOverTransport(ctx, run)
+	// message on this very agent. An external agent (#434) streams
+	// through the same client folding against its own card, and reports
+	// no usage the parent applies: what it says it cost is the remote's
+	// own account, and untrusted.
+	var terminal dispatch.DispatchResult
+	var servedUsage *Usage
+	if run.external != nil {
+		terminal = c.runExternalDispatch(ctx, run)
+	} else {
+		terminal, servedUsage = c.runDispatchOverTransport(ctx, run)
+	}
 	// The kill watch ends with the run, before terminal assembly fires
 	// the escalation hook against a finished dispatch.
 	watchStop()
@@ -1041,7 +1088,7 @@ func (c *coordinator) runDispatch(ctx context.Context, run dispatchRun) {
 		if err := c.sessions.AddSessionUsage(ctx, run.parentSessionID, servedUsage.PromptTokens, servedUsage.CompletionTokens, servedUsage.Cost); err != nil {
 			slog.Warn("Failed to add dispatched usage to parent session", "child_session", run.sessionID, "parent_session", run.parentSessionID, "error", err)
 		}
-	} else {
+	} else if run.external == nil {
 		slog.Warn("Served dispatch carried no usage; parent cost unchanged", "child_session", run.sessionID, "parent_session", run.parentSessionID)
 	}
 
@@ -1233,7 +1280,9 @@ func (c *coordinator) startDispatchKillWatch(ctx context.Context, run dispatchRu
 			if run.cancel != nil {
 				run.cancel()
 			}
-			run.agent.Cancel(run.sessionID)
+			if run.agent != nil {
+				run.agent.Cancel(run.sessionID)
+			}
 		})
 	}
 
@@ -1667,20 +1716,42 @@ func (c *coordinator) dispatchWorkspaceProvider() (*dispatch.GitWorktreeProvider
 			c.dispatchProvider, c.dispatchProviderErr = dispatch.NewGitWorktreeProvider(c.cfg.WorkingDir(), worktreesDir, c.dispatchReg)
 		}
 		if c.dispatchProvider != nil {
-			c.dispatchCollector = dispatch.NewTodoCollector(c.dispatchReg, c.sessions, c.dispatchSinks...)
-			ctx := c.dispatchCtx
-			if ctx == nil {
-				// Tests construct the coordinator struct directly; a nil
-				// context would panic the collector's subscription.
-				ctx = context.Background()
-			}
-			// Start subscribes synchronously before returning, so the
-			// session and entry events of the dispatch being provisioned
-			// right now are already observed.
-			c.dispatchCollector.Start(ctx)
+			c.startDispatchCollectorLocked()
 		}
 	}
 	return c.dispatchProvider, c.dispatchProviderErr
+}
+
+// startDispatchCollector starts the todo collector (#65) if no dispatch
+// has yet: an external dispatch (#434) needs it as much as a worktree
+// one, but never creates the git provider whose first creation used to
+// start it.
+func (c *coordinator) startDispatchCollector() {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	c.startDispatchCollectorLocked()
+}
+
+// startDispatchCollectorLocked starts the todo collector on first use.
+// c.dispatchMu must be held.
+func (c *coordinator) startDispatchCollectorLocked() {
+	if c.dispatchCollector != nil {
+		return
+	}
+	if c.dispatchReg == nil {
+		c.dispatchReg = dispatch.NewAgentRegistry()
+	}
+	c.dispatchCollector = dispatch.NewTodoCollector(c.dispatchReg, c.sessions, c.dispatchSinks...)
+	ctx := c.dispatchCtx
+	if ctx == nil {
+		// Tests construct the coordinator struct directly; a nil
+		// context would panic the collector's subscription.
+		ctx = context.Background()
+	}
+	// Start subscribes synchronously before returning, so the session
+	// and entry events of the dispatch being provisioned right now are
+	// already observed.
+	c.dispatchCollector.Start(ctx)
 }
 
 // ReconcileDispatchDeliveries re-delivers the terminal dispatch
