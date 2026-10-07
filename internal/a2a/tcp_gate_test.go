@@ -164,7 +164,7 @@ func TestTCPGateRejectsBeforeReadingBody(t *testing.T) {
 	} {
 		for _, version := range []string{"", "99.0"} {
 			body := newCountingBody(`{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":"`, 8<<20)
-			req := httptest.NewRequest(http.MethodPost, "https://"+addr+"/agents/dispatch-1", body)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://"+addr+"/agents/dispatch-1", body)
 			req.Header.Set("Content-Type", "application/json")
 			if authorization != "" {
 				req.Header.Set(bearerAuthorizationHeader, authorization)
@@ -268,7 +268,7 @@ func TestTCPRequestBodyCapped(t *testing.T) {
 	factory.tcp.maxBody = limit
 
 	body := newCountingBody(`{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m","role":"ROLE_USER","contextId":"dispatch-session","parts":[{"text":"`, 1<<20)
-	req := httptest.NewRequest(http.MethodPost, "https://"+factory.tcpAddr()+"/agents/dispatch-1", body)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://"+factory.tcpAddr()+"/agents/dispatch-1", body)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(bearerAuthorizationHeader, "Bearer "+factory.authToken())
 	req.TLS = &tls.ConnectionState{}
@@ -288,7 +288,7 @@ func TestVersionNotSupportedReadsBoundedBody(t *testing.T) {
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
 
 	body := newCountingBody(`{"jsonrpc":"2.0","id":7,"method":"SendMessage","params":"`, 4*versionProbeLimit)
-	req := httptest.NewRequest(http.MethodPost, "http://"+a2aURLHost+"/agents/dispatch-1", body)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+a2aURLHost+"/agents/dispatch-1", body)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(a2aspec.SvcParamVersion, "99.0")
 	rec := httptest.NewRecorder()
