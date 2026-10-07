@@ -840,3 +840,31 @@ func TestAuthorizeRemote(t *testing.T) {
 	require.ErrorIs(t, unverifiedCert.authorize(), a2aspec.ErrUnauthenticated,
 		"only a verified certificate authenticates")
 }
+
+// The agent index (#421) lists every dispatch the host serves, so it is
+// the socket's alone: over the TCP listener (#358), even with the host's
+// token, GET /agents finds no route, while the socket still answers it.
+func TestTCPListenerDoesNotServeTheAgentIndex(t *testing.T) {
+	t.Parallel()
+
+	pki := newTestPKI(t)
+	factory, _ := startTCPDispatch(t, pki.listenerOptions(), &fakeRunner{result: textResult("done")})
+	client := pki.httpsClient(t, nil)
+
+	for _, accept := range []string{"application/json", "text/event-stream"} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://"+factory.tcpAddr()+AgentsIndexPath, nil)
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", accept)
+		req.Header.Set(bearerAuthorizationHeader, "Bearer "+factory.authToken())
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		require.Equal(t, http.StatusNotFound, resp.StatusCode, "the index is not served over TCP (Accept: %s)", accept)
+	}
+
+	conn, ok := factory.AgentIndexConn()
+	require.True(t, ok)
+	_, err := conn.ListAgents(t.Context())
+	require.NoError(t, err, "the socket still serves the index")
+}

@@ -223,7 +223,9 @@ How the listener behaves:
   loopback.
 - **Same routes, same middleware.** An authenticated request reaches the
   same `/agents/<id>` routes the socket serves, with the same `Origin`,
-  `Content-Type` and version checks. TLS 1.2 is the minimum. A request body
+  `Content-Type` and version checks. The [agent index](#agent-index) is the
+  exception: it lists every dispatch the host serves, so only the socket
+  answers `GET /agents`. TLS 1.2 is the minimum. A request body
   is capped at 32 MiB, enough for a message carrying several full-size
   attachments. An idle keep-alive connection is closed after two minutes.
   Plain HTTP to the port fails at the TLS layer and never reaches a route.
