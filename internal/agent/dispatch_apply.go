@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"charm.land/fantasy"
@@ -67,6 +68,38 @@ func (p ApplyDispatchParams) addresses() (string, string) { return p.DispatchID,
 
 func (p DismissDispatchParams) addresses() (string, string) { return p.DispatchID, p.Handle }
 
+// The registry-sourced refs are pinned to the shapes git itself allows
+// before they reach a command line: a branch with no leading dash (git
+// would read it as an option), no ".." range, and a base that is nothing
+// but a hex object name. A provisioned workspace always satisfies both;
+// anything else refuses instead of running.
+var (
+	dispatchBranchPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9./_-]*$`)
+	dispatchSHAPattern    = regexp.MustCompile(`^[0-9a-fA-F]{4,64}$`)
+)
+
+// validateDispatchRef refuses a registry entry whose branch or base SHA
+// is not a plain refname or object name.
+func validateDispatchRef(entry dispatch.Entry) error {
+	if !dispatchBranchPattern.MatchString(entry.Branch) || strings.Contains(entry.Branch, "..") {
+		return fmt.Errorf("dispatch %s carries an unusable branch %q", entry.ID, entry.Branch)
+	}
+	if !dispatchSHAPattern.MatchString(entry.BaseSHA) {
+		return fmt.Errorf("dispatch %s carries an unusable base SHA %q", entry.ID, entry.BaseSHA)
+	}
+	return nil
+}
+
+// pathInside reports whether path sits within dir, so a path assembled
+// from subprocess output can only ever point back into the repository.
+func pathInside(dir, path string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // resolveFinishedDispatch resolves the dispatch an address pair names and
 // enforces the shared preconditions of apply and dismiss: exactly one
 // address, a known dispatch, and a finished one — a running dispatch
@@ -88,6 +121,9 @@ func (c *coordinator) resolveFinishedDispatch(id, handle string) (dispatch.Entry
 	}
 	if !entry.Status.IsTerminal() {
 		return dispatch.Entry{}, fmt.Errorf("dispatch %s is still running; cancel it first", entry.ID)
+	}
+	if err := validateDispatchRef(entry); err != nil {
+		return dispatch.Entry{}, err
 	}
 	return entry, nil
 }
@@ -154,6 +190,9 @@ func parentCheckoutBusy(ctx context.Context, repoRoot string) (string, bool) {
 		}
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(repoRoot, path)
+		}
+		if !pathInside(repoRoot, path) {
+			continue
 		}
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Sprintf("a merge, rebase, or cherry-pick is already in progress (%s); finish or abort it first", marker), true

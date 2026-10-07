@@ -271,6 +271,33 @@ func gitQuietPath(t *testing.T, repoRoot, marker string) (string, error) {
 	return path, nil
 }
 
+// Registry refs that git could misread as an option, a range, or a path
+// are refused before any command runs; a provisioned entry passes.
+func TestValidateDispatchRefRefusesUnsafeRefs(t *testing.T) {
+	ok := dispatch.Entry{ID: "d-ok", Branch: "crush/dispatch-1", BaseSHA: "0123456789abcdef"}
+	require.NoError(t, validateDispatchRef(ok))
+
+	for _, branch := range []string{"-oProxyCommand=evil", "a..b", " leading", "trailing ", "with space", ""} {
+		require.ErrorContains(t, validateDispatchRef(dispatch.Entry{ID: "d", Branch: branch, BaseSHA: "0123456789abcdef"}),
+			"unusable branch", "branch %q must be refused", branch)
+	}
+	for _, sha := range []string{"", "not-a-sha", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeff"} {
+		require.ErrorContains(t, validateDispatchRef(dispatch.Entry{ID: "d", Branch: "main", BaseSHA: sha}),
+			"unusable base", "base %q must be refused", sha)
+	}
+}
+
+// A git-path marker that resolves outside the repository root is never
+// statted: subprocess output cannot point the busy check at an
+// arbitrary file.
+func TestPathInsideConfinesToRoot(t *testing.T) {
+	root := t.TempDir()
+	require.True(t, pathInside(root, filepath.Join(root, ".git", "MERGE_HEAD")))
+	require.True(t, pathInside(root, root))
+	require.False(t, pathInside(root, filepath.Join(root, "..", "elsewhere")))
+	require.False(t, pathInside(root, "/etc/passwd"))
+}
+
 // A denied permission refuses both tools and changes nothing.
 func TestApplyAndDismissPermissionDenied(t *testing.T) {
 	sealGitConfig(t)
