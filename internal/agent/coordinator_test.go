@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sync"
 	"testing"
 
@@ -21,9 +22,13 @@ import (
 )
 
 // mockSessionAgent is a minimal mock for the SessionAgent interface.
+// cancellations is mutex-guarded: the A2A executor cancels the served
+// runner from its own goroutine, so tests read the record while a run
+// may still be in flight.
 type mockSessionAgent struct {
 	model     Model
 	runFunc   func(ctx context.Context, call SessionAgentCall) (*fantasy.AgentResult, error)
+	cancelMu  sync.Mutex
 	cancelled []string
 	readyErr  error
 }
@@ -42,7 +47,17 @@ func (m *mockSessionAgent) SetTools(tools []fantasy.AgentTool)  {}
 func (m *mockSessionAgent) SetSystemPrompt(systemPrompt string) {}
 func (m *mockSessionAgent) WaitReady() error                    { return m.readyErr }
 func (m *mockSessionAgent) Cancel(sessionID string) {
+	m.cancelMu.Lock()
+	defer m.cancelMu.Unlock()
 	m.cancelled = append(m.cancelled, sessionID)
+}
+
+// cancellations returns a snapshot of the session IDs Cancel was called
+// with.
+func (m *mockSessionAgent) cancellations() []string {
+	m.cancelMu.Lock()
+	defer m.cancelMu.Unlock()
+	return slices.Clone(m.cancelled)
 }
 func (m *mockSessionAgent) CancelAll()                                  {}
 func (m *mockSessionAgent) IsSessionBusy(sessionID string) bool         { return false }

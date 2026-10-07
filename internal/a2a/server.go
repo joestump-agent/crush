@@ -205,6 +205,11 @@ type ServerFactory struct {
 	httpServer *http.Server
 	done       chan struct{}
 	routes     map[string]*route
+
+	// definitions is the card listing (#392): every agent definition
+	// published on the host, keyed by its config id. Distinct from the
+	// route table, which also carries per-run served agents.
+	definitions map[string]*a2aspec.AgentCard
 }
 
 // route is one dispatch's slice of the host: its JSON-RPC handler and a
@@ -220,10 +225,11 @@ type route struct {
 // dataDir, where the host socket and its directory are created.
 func NewServerFactory(dataDir string, opts ...ServerFactoryOption) *ServerFactory {
 	f := &ServerFactory{
-		dataDir:  dataDir,
-		contexts: NewContextRegistry(),
-		routes:   make(map[string]*route),
-		creds:    a2aclient.NewInMemoryCredentialsStore(),
+		dataDir:     dataDir,
+		contexts:    NewContextRegistry(),
+		routes:      make(map[string]*route),
+		definitions: make(map[string]*a2aspec.AgentCard),
+		creds:       a2aclient.NewInMemoryCredentialsStore(),
 	}
 	for _, opt := range opts {
 		opt(f)
@@ -383,6 +389,83 @@ func (f *ServerFactory) StartDispatchServer(ctx context.Context, p agent.Dispatc
 		_ = server.Stop(context.Background())
 	}
 	return server.Endpoint, server.Card, stop, nil
+}
+
+// PublishAgentDefinition implements [agent.AgentCatalog] (#392): it
+// publishes one stable card per agent definition on the process host,
+// at /agents/<ID>. The route is a live protocol surface — a message on
+// it is rejected with the standard no-running-agent rejection until the
+// definition's entry point binds a run to it — so the card listing and
+// the served protocol can never disagree. Publishing an already-known
+// ID keeps the first card and is not an error.
+func (f *ServerFactory) PublishAgentDefinition(ctx context.Context, p agent.AgentDefinitionCard) error {
+	if p.ID == "" {
+		return errors.New("a2a: agent definition requires an id")
+	}
+	f.mu.Lock()
+	if _, ok := f.definitions[p.ID]; ok {
+		f.mu.Unlock()
+		return nil
+	}
+	f.mu.Unlock()
+
+	endpoint := "http://" + a2aURLHost + agentsPathPrefix + p.ID
+	card := BuildAgentCard(CardParams{
+		Agent:     config.Agent{ID: p.ID, Name: p.Name, Description: p.Description},
+		Endpoint:  endpoint,
+		Version:   version.Version,
+		Transport: a2aspec.TransportProtocolJSONRPC,
+	})
+
+	// The definition route carries no run: its executor resolves no
+	// context (nil registry), so every message is rejected without a
+	// runner until the definition's entry point serves a turn on it.
+	executor := NewExecutor(nil, "")
+	handler := a2asrv.NewHandler(executor)
+	mux := http.NewServeMux()
+	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
+	mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
+
+	if err := f.ensureHost(ctx); err != nil {
+		return err
+	}
+
+	// Claim the route and the card under one lock: a concurrent publish
+	// of the same definition loses cleanly — the first card wins and
+	// definition routes are never replaced — which is the documented
+	// no-op, not an error.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return errors.New("a2a: host is closed")
+	}
+	if _, ok := f.routes[p.ID]; ok {
+		return nil
+	}
+	if _, ok := f.definitions[p.ID]; ok {
+		return nil
+	}
+	routeCtx, cancel := context.WithCancel(context.Background())
+	f.routes[p.ID] = &route{handler: mux, ctx: routeCtx, cancel: cancel}
+	if f.definitions == nil {
+		f.definitions = make(map[string]*a2aspec.AgentCard)
+	}
+	f.definitions[p.ID] = card
+	return nil
+}
+
+// AgentCards lists every agent-definition card published on the host
+// (#392): the host's card listing. Per-run served agents (dispatches,
+// sub-agent turns) are instances, not definitions — they are not part
+// of the listing.
+func (f *ServerFactory) AgentCards() []*a2aspec.AgentCard {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cards := make([]*a2aspec.AgentCard, 0, len(f.definitions))
+	for _, card := range f.definitions {
+		cards = append(cards, card)
+	}
+	return cards
 }
 
 // Close shuts the process host down (idempotent): every remaining

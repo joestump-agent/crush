@@ -415,6 +415,28 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		c.agents[config.AgentPlan] = planAgent
 	}
 
+	// #392: every agent definition is published on the per-process A2A
+	// host as one stable card, whether or not its entry point routes
+	// its turns through the runtime yet — the definitions are the
+	// host's card listing, and the per-definition routes are live
+	// protocol surfaces that reject runs until an entry point serves a
+	// turn on them. Publishing is best-effort: a host that cannot
+	// listen fails the runs that need it, not the whole coordinator.
+	if catalog, ok := opts.DispatchHost.(AgentCatalog); ok {
+		for id, ag := range opts.Config.Config().Agents {
+			if ag.Disabled {
+				continue
+			}
+			if err := catalog.PublishAgentDefinition(ctx, AgentDefinitionCard{
+				ID:          id,
+				Name:        ag.Name,
+				Description: ag.Description,
+			}); err != nil {
+				slog.Error("Failed to publish agent definition card", "agent", id, "error", err)
+			}
+		}
+	}
+
 	cronScheduler := scheduler.NewScheduler(c.cronStore, c.fireScheduledTask)
 	go cronScheduler.Run(ctx)
 
@@ -2028,6 +2050,11 @@ type subAgentParams struct {
 	// SessionSetup is an optional callback invoked after session creation
 	// but before agent execution, for custom session configuration.
 	SessionSetup func(sessionID string)
+	// AgentName and AgentDescription describe the card of the agent
+	// served for the turn when it runs through the A2A runtime (#392);
+	// empty falls back to a generic sub-agent identity.
+	AgentName        string
+	AgentDescription string
 }
 
 // callTopK returns topK for use on fantasy.Call.TopK, suppressing it for
@@ -2041,10 +2068,23 @@ func callTopK(providerCfg config.ProviderConfig, topK *int64) *int64 {
 	return topK
 }
 
-// runSubAgent runs a sub-agent and handles session management and cost accumulation.
-// It creates a sub-session, runs the agent with the given prompt, and propagates
-// the cost to the parent session.
-func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (fantasy.ToolResponse, error) {
+// subAgentTurn is one prepared sub-agent invocation (#392): the session
+// it runs against and the call template its turn runs with, with the
+// model and provider shaping already resolved. SessionID, Prompt and
+// RunID are per execution path — set directly for the in-process
+// runner, by the A2A executor from the binding and the served task for
+// a turn that runs through the runtime.
+type subAgentTurn struct {
+	sessionID string
+	call      SessionAgentCall
+	provider  string
+}
+
+// prepareSubAgent does the session and call shaping every sub-agent
+// execution path shares (#392): wait for the agent's setup, create its
+// task session, run the caller's setup hook, and resolve the model and
+// provider options the turn runs with.
+func (c *coordinator) prepareSubAgent(ctx context.Context, params subAgentParams) (*subAgentTurn, error) {
 	// A sub-agent built by buildAgent is handed to its tool before its
 	// system prompt and tool list land, so wait for its own setup here.
 	// Previously the only wait was coordinator.run's, which covered whichever
@@ -2053,14 +2093,14 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 	// surfaced on an unrelated later run instead of on the call that needed
 	// it.
 	if err := params.Agent.WaitReady(); err != nil {
-		return fantasy.ToolResponse{}, fmt.Errorf("sub-agent setup failed: %w", err)
+		return nil, fmt.Errorf("sub-agent setup failed: %w", err)
 	}
 
 	// Create sub-session
 	agentToolSessionID := c.sessions.CreateAgentToolSessionID(params.AgentMessageID, params.ToolCallID)
 	session, err := c.sessions.CreateTaskSession(ctx, agentToolSessionID, params.SessionID, params.SessionTitle)
 	if err != nil {
-		return fantasy.ToolResponse{}, fmt.Errorf("create session: %w", err)
+		return nil, fmt.Errorf("create session: %w", err)
 	}
 
 	// Call session setup function if provided
@@ -2077,19 +2117,18 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 
 	providerCfg, ok := c.cfg.Config().Providers.Get(model.ModelCfg.Provider)
 	if !ok {
-		return fantasy.ToolResponse{}, errModelProviderNotConfigured
+		return nil, errModelProviderNotConfigured
 	}
 
-	// Run the agent
-	run := func() (*fantasy.AgentResult, error) {
-		return params.Agent.Run(ctx, SessionAgentCall{
-			SessionID: session.ID,
+	return &subAgentTurn{
+		sessionID: session.ID,
+		provider:  model.ModelCfg.Provider,
+		call: SessionAgentCall{
 			// Inherit the parent turn's UI width hint: the sub-agent's
 			// PrepareStep stamps call.ContentWidth over the tool-call
 			// context unconditionally, so leaving this zero would clobber
 			// the value the parent already carries.
 			ContentWidth:     tools.GetContentWidthFromContext(ctx),
-			Prompt:           params.Prompt,
 			MaxOutputTokens:  maxTokens,
 			ProviderOptions:  getProviderOptions(model, providerCfg),
 			Temperature:      model.ModelCfg.Temperature,
@@ -2099,37 +2138,229 @@ func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (f
 			PresencePenalty:  model.ModelCfg.PresencePenalty,
 			NonInteractive:   true,
 			OnAuthRefresh:    c.makeAuthRefreshCallback(providerCfg),
-		})
+		},
+	}, nil
+}
+
+// runSubAgent runs a sub-agent in-process and handles session management
+// and cost accumulation. It creates a sub-session, runs the agent with the
+// given prompt, and propagates the cost to the parent session.
+//
+// This is the transitional direct path (#392): the agent-tool entry point
+// still runs here; every entry point that has switched serves its turn on
+// the A2A host instead (runSubAgentOverA2A), and this path is deleted
+// once the last one moves.
+func (c *coordinator) runSubAgent(ctx context.Context, params subAgentParams) (fantasy.ToolResponse, error) {
+	turn, err := c.prepareSubAgent(ctx, params)
+	if err != nil {
+		return fantasy.ToolResponse{}, err
 	}
-	result, err := run()
+	call := turn.call
+	call.SessionID = turn.sessionID
+	call.Prompt = params.Prompt
+	result, err := params.Agent.Run(ctx, call)
+	return c.finishSubAgent(ctx, turn, params.SessionID, subAgentOutput(result), err)
+}
+
+// finishSubAgent maps a finished sub-agent turn onto the tool response
+// its tool call expects (#392): a provider failure becomes an error
+// response carrying the reason, the child session's cost is propagated
+// to the parent on a best-effort basis, and empty output is its own
+// error response. Shared by every execution path, so the visible
+// contract cannot drift between them.
+func (c *coordinator) finishSubAgent(ctx context.Context, turn *subAgentTurn, parentSessionID, output string, runErr error) (fantasy.ToolResponse, error) {
 	// Notify only if still unauthorized after retry. AWS SSO is handled
 	// transparently inside OnAuthRefresh, so it needs no post-run notice.
-	if err != nil && isUnauthorized(err) && c.notify != nil && model.ModelCfg.Provider == hyper.Name {
+	if runErr != nil && isUnauthorized(runErr) && c.notify != nil && turn.provider == hyper.Name {
 		c.notify.Publish(pubsub.CreatedEvent, notify.Notification{
 			Type:       notify.TypeReAuthenticate,
-			ProviderID: model.ModelCfg.Provider,
+			ProviderID: turn.provider,
 		})
 	}
-	if err != nil {
-		return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to generate response: %s", err)), nil
+	if runErr != nil {
+		return fantasy.NewTextErrorResponse(fmt.Sprintf("Failed to generate response: %s", runErr)), nil
 	}
 
 	// Update parent session cost on a best-effort basis. A failure here must
 	// not discard the sub-agent output that was already produced.
-	if err := c.updateParentSessionCost(ctx, session.ID, params.SessionID); err != nil {
+	if err := c.updateParentSessionCost(ctx, turn.sessionID, parentSessionID); err != nil {
 		slog.Warn(
 			"Failed to update parent session cost",
-			"child_session", session.ID,
-			"parent_session", params.SessionID,
+			"child_session", turn.sessionID,
+			"parent_session", parentSessionID,
 			"error", err,
 		)
 	}
 
-	output := subAgentOutput(result)
 	if output == "" {
 		return fantasy.NewTextErrorResponse("Sub-agent completed but produced no text output."), nil
 	}
 	return fantasy.NewTextResponse(output), nil
+}
+
+// runSubAgentOverA2A runs a sub-agent turn through the A2A runtime
+// (#392): the agent is served on the process host for the turn's
+// lifetime — one card, one context (the sub-agent's task session, per
+// #350), one task — and the coordinator drives it with the A2A client,
+// consuming the stream to its terminal state. There is no direct-run
+// fallback: a coordinator with no host fails the turn. Transcripts stay
+// in the session store; only execution moves to the runtime.
+func (c *coordinator) runSubAgentOverA2A(ctx context.Context, params subAgentParams) (fantasy.ToolResponse, error) {
+	turn, err := c.prepareSubAgent(ctx, params)
+	if err != nil {
+		return fantasy.ToolResponse{}, err
+	}
+
+	host := c.a2aHost()
+	if host == nil {
+		return c.finishSubAgent(ctx, turn, params.SessionID, "", errors.New("sub-agent unavailable: no A2A host is wired"))
+	}
+
+	// Serve the turn: the agent answers at its own route for exactly the
+	// turn's lifetime, its context bound to the task session. Diff, todos
+	// and usage stay unset — a sub-agent turn produces text, not a
+	// workspace artifact, and carries no workspace toolchain.
+	endpoint, card, stop, err := host.StartDispatchServer(ctx, DispatchServerParams{
+		DispatchID:  subAgentRouteID(turn.sessionID),
+		SessionID:   turn.sessionID,
+		Runner:      params.Agent,
+		Name:        params.AgentName,
+		Description: params.AgentDescription,
+		Call:        turn.call,
+	})
+	if err != nil {
+		return c.finishSubAgent(ctx, turn, params.SessionID, "", fmt.Errorf("serve sub-agent: %w", err))
+	}
+	defer stop()
+
+	if TraceparentFromContext(ctx) == "" {
+		if tp, terr := NewTraceparent(); terr == nil {
+			ctx = WithTraceparent(ctx, tp)
+		}
+	}
+	traceID := TraceIDFromTraceparent(TraceparentFromContext(ctx))
+	slog.Debug("Sub-agent A2A turn starting", "session_id", turn.sessionID, "parent_session_id", params.SessionID, "context_id", turn.sessionID, "trace_id", traceID)
+
+	// The context is the task session (#350): the served executor resolves
+	// it to this turn's runner and session, and each turn is a fresh task.
+	var taskID string
+	outcome, err := host.StreamDispatch(ctx, DispatchTransportParams{
+		Endpoint:  endpoint,
+		Card:      card,
+		Prompt:    params.Prompt,
+		ContextID: turn.sessionID,
+		OnTask: func(id string) {
+			taskID = id
+			slog.Debug("Sub-agent A2A task started", "session_id", turn.sessionID, "task_id", id, "trace_id", traceID)
+		},
+	})
+	if err != nil {
+		outcome = c.recoverSubAgentOutcome(ctx, host, params, turn.sessionID, endpoint, card, taskID, err)
+	}
+	output, runErr := subAgentOutcomeFromTransport(outcome)
+	return c.finishSubAgent(ctx, turn, params.SessionID, output, runErr)
+}
+
+// recoverSubAgentOutcome ends a sub-agent turn whose stream broke before
+// a terminal state (#392). The served run is orphaned — the executor
+// runs its turn on a detached context — so the parent's cancel must
+// reach it through tasks/cancel (#348's protocol path), never by going
+// out of scope. The canceled-or-failed task is then read back so the
+// caller maps the run's real terminal state; if even that fails, the
+// stream error stands as a failure.
+func (c *coordinator) recoverSubAgentOutcome(ctx context.Context, host DispatchHost, params subAgentParams, runSessionID string, endpoint string, card any, taskID string, streamErr error) DispatchTransportOutcome {
+	slog.Warn("Sub-agent A2A stream failed; recovering the served run", "session_id", runSessionID, "parent_session_id", params.SessionID, "task_id", taskID, "error", streamErr)
+
+	if taskID != "" {
+		recoverCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if canceler, ok := host.(DispatchCanceler); ok {
+			if cerr := canceler.CancelDispatch(recoverCtx, DispatchCancelParams{
+				Endpoint: endpoint,
+				Card:     card,
+				TaskID:   taskID,
+				Reason:   "parent turn canceled",
+			}); cerr != nil {
+				// The protocol cancel is best-effort here; the direct
+				// cancel covers a host that cannot deliver it. The run
+				// lives on its task session, so the cancel names that.
+				slog.Warn("Sub-agent tasks/cancel failed; canceling the runner directly", "session_id", runSessionID, "task_id", taskID, "error", cerr)
+				params.Agent.Cancel(runSessionID)
+			}
+			if st, gerr := waitSubAgentTerminal(recoverCtx, host, endpoint, card, taskID); gerr == nil {
+				return DispatchTransportOutcome{Status: st.Status, Text: st.Text}
+			}
+		} else {
+			// No canceler on the seam (a bare test fake): the direct
+			// cancel is the only way the run ends.
+			params.Agent.Cancel(runSessionID)
+		}
+	} else {
+		// The stream died before any task was named: the direct cancel
+		// is a no-op if the run never started, and reaches it if it did.
+		params.Agent.Cancel(runSessionID)
+	}
+	return DispatchTransportOutcome{Status: transportStatusFailed, Text: streamErr.Error()}
+}
+
+// waitSubAgentTerminal polls tasks/get until the task leaves working
+// state or the context ends (#392): tasks/cancel is asynchronous — the
+// SDK resolves it when the run actually ends — so the terminal state
+// lands a beat after the cancel is accepted.
+func waitSubAgentTerminal(ctx context.Context, host DispatchHost, endpoint string, card any, taskID string) (DispatchTaskStatus, error) {
+	getter, ok := host.(interface {
+		GetDispatchTask(ctx context.Context, params GetDispatchTaskParams) (DispatchTaskStatus, error)
+	})
+	if !ok {
+		return DispatchTaskStatus{}, errors.New("host does not expose tasks/get")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, err := getter.GetDispatchTask(ctx, GetDispatchTaskParams{Endpoint: endpoint, Card: card, TaskID: taskID})
+		if err == nil && st.Status != "" && st.Status != "working" {
+			return st, nil
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return st, errors.New("timed out waiting for the sub-agent task to end")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// subAgentOutcomeFromTransport maps a served sub-agent turn's terminal
+// outcome onto the (output, error) the shared finish expects (#392):
+// completed carries the terminal status message as the turn's output;
+// every other terminal state is a run error whose text is the served
+// side's reason.
+func subAgentOutcomeFromTransport(outcome DispatchTransportOutcome) (string, error) {
+	switch outcome.Status {
+	case transportStatusCompleted:
+		return outcome.Text, nil
+	case transportStatusCanceled:
+		if outcome.Text == "" {
+			return "", errors.New("sub-agent run was canceled")
+		}
+		return "", fmt.Errorf("sub-agent run was canceled: %s", outcome.Text)
+	case transportStatusFailed:
+		if outcome.Text == "" {
+			return "", errors.New("sub-agent run failed")
+		}
+		return "", errors.New(outcome.Text)
+	case "":
+		return "", errors.New("sub-agent run ended without a terminal state")
+	default:
+		if outcome.Text == "" {
+			return "", fmt.Errorf("sub-agent run ended with status %q", outcome.Status)
+		}
+		return "", fmt.Errorf("%s: %s", outcome.Status, outcome.Text)
+	}
+}
+
+// subAgentRouteID is the route a sub-agent turn is served under
+// (#392): unique per turn's task session, namespaced away from dispatch
+// entry ids.
+func subAgentRouteID(sessionID string) string {
+	return "agent-" + sessionID
 }
 
 func subAgentOutput(result *fantasy.AgentResult) string {
