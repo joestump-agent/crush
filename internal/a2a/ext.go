@@ -1,7 +1,7 @@
 // Extension registry for declared, statically typed TaskStatusUpdateEvent
-// metadata (#359): each A2A extension names a metadata key (its URI), a
-// description, and the concrete Go type and JSON Schema of the value it
-// carries.
+// metadata (#359) and message DataParts (#352): each A2A extension names a
+// key (its URI), a description, and the concrete Go type and JSON Schema
+// of the value it carries.
 //
 // The server encodes extension values with [Encode] — a JSON round trip that
 // keeps the value JSON-shaped, which the SDK's task store requires — and the
@@ -178,11 +178,39 @@ var UsageExt = Extension{
 	Schema:      new(jsonschema.Reflector).Reflect(agent.Usage{}),
 }
 
+// QuestionExtensionURI is the URI of the questions/v1 extension: a
+// dispatched agent's question, carried as a DataPart on the input-required
+// status message that parks its run (#352).
+const QuestionExtensionURI = extensionURIPrefix + "questions/v1"
+
+// QuestionExt is the questions/v1 extension's registry entry.
+var QuestionExt = Extension{
+	URI:         QuestionExtensionURI,
+	Description: "A dispatched agent's question as a DataPart on the input-required status message.",
+	Type:        reflect.TypeFor[agent.QuestionRequest](),
+	Schema:      new(jsonschema.Reflector).Reflect(agent.QuestionRequest{}),
+}
+
+// AnswerExtensionURI is the URI of the answers/v1 extension: the answers
+// to a parked question, carried as a DataPart on the follow-up message to
+// the same task (#352).
+const AnswerExtensionURI = extensionURIPrefix + "answers/v1"
+
+// AnswerExt is the answers/v1 extension's registry entry.
+var AnswerExt = Extension{
+	URI:         AnswerExtensionURI,
+	Description: "Answers to a parked question as a DataPart on the follow-up message to the same task.",
+	Type:        reflect.TypeFor[agent.QuestionAnswer](),
+	Schema:      new(jsonschema.Reflector).Reflect(agent.QuestionAnswer{}),
+}
+
 // The statically known extensions, registered at init so every card, stream,
 // and decode sees them.
 func init() {
 	mustRegister(TodoExt)
 	mustRegister(UsageExt)
+	mustRegister(QuestionExt)
+	mustRegister(AnswerExt)
 }
 
 // cardExtensions derives the agent card's advertised extension list from the

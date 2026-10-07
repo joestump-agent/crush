@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/skills"
 )
 
@@ -290,6 +291,20 @@ type Usage struct {
 	// TraceID is the trace-id segment of the W3C traceparent the parent
 	// sent with the dispatch call. Empty when the call carried none.
 	TraceID string `json:"traceId"`
+}
+
+// QuestionRequest is the statically typed payload of the questions/v1
+// extension (#352): a dispatched agent's question — the question.Request
+// fields — carried as a DataPart on the input-required status message
+// that parks the run, so the parent renders it without parsing prose.
+type QuestionRequest question.Request
+
+// QuestionAnswer is the statically typed payload of the answers/v1
+// extension (#352): the answers to a parked question, carried as a
+// DataPart on the follow-up message to the same task. Each answer names
+// the question it answers by ID.
+type QuestionAnswer struct {
+	Answers []question.Answer `json:"answers"`
 }
 
 // traceparentCtxKey is the context key the parent's dispatch turn stores

@@ -22,6 +22,8 @@ import (
 	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/pubsub"
+	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/session"
 )
 
@@ -60,6 +62,19 @@ type TodoSource interface {
 // Compile-time proof that the collector is a TodoSource.
 var _ TodoSource = (*dispatch.TodoCollector)(nil)
 
+// QuestionSource is the dispatched agent's own question service (#352):
+// the question tool in its toolchain asks through it, the executor
+// watches its requests while draining the run and parks the run in
+// input-required on one, and an answer on the parked task resolves it.
+// A nil source disables questions; the run lifecycle is unchanged.
+type QuestionSource interface {
+	Subscribe(ctx context.Context) <-chan pubsub.Event[question.Request]
+	Answer(answers []question.Answer) bool
+}
+
+// Compile-time proof that a question service is a QuestionSource.
+var _ QuestionSource = question.Service(nil)
+
 // Executor adapts a Crush [agent.SessionAgent] to the [a2asrv.AgentExecutor]
 // interface: it runs one dispatched agent turn, maps the run lifecycle onto
 // A2A task states (submitted -> working -> completed/failed), and emits the git
@@ -87,6 +102,16 @@ var _ TodoSource = (*dispatch.TodoCollector)(nil)
 // on the dispatch's own surfaces, never on the steer task. The first
 // message on a context starts the dispatch's own turn; anything after
 // that is steering.
+//
+// A dispatched agent can ask the parent's user a question (#352): when
+// its question tool asks, the executor ends the execution with an
+// input-required status whose message carries the question as a typed
+// DataPart, while the run stays blocked in the tool. A message whose
+// taskId names that parked task is the answer — not a steer — and
+// resumes the same run on the same task. The two are told apart
+// explicitly: a message naming a task in input-required is an answer
+// (Rejected when no question is pending on it), and any other message on
+// the context goes down the turn-or-steer path above.
 type Executor struct {
 	// contexts resolves the A2A context ID onto the dispatch binding the
 	// turn runs against (#350). The host owns the registry; the binding
@@ -98,6 +123,9 @@ type Executor struct {
 	contextID string
 	diff      DiffFunc
 	todos     TodoSource
+	// questions is the dispatched agent's question service (#352); nil
+	// means the agent cannot ask and runs never park.
+	questions QuestionSource
 	// inactivityTimeout is the A2A-level backstop (#360): a run that
 	// yields no events for this long while in flight is canceled by
 	// the executor and failed with the reason. Zero (the default)
@@ -163,8 +191,15 @@ type taskRun struct {
 	// source.
 	todoCh <-chan dispatch.TodoSnapshot
 	// lastTodos is the last todo list emitted, so a snapshot that did
-	// not change the list stays silent.
+	// not change the list stays silent — across a park and resume too.
 	lastTodos []session.Todo
+	// questionCh is the run's question subscription (#352); nil without
+	// a question source.
+	questionCh <-chan pubsub.Event[question.Request]
+	// pending is the question the run is parked on (#352): non-nil
+	// exactly while the task is in input-required and no execution is
+	// draining the record. Guarded by the executor's runsMu.
+	pending *question.Request
 }
 
 // Option configures an [Executor].
@@ -183,6 +218,14 @@ func WithDiff(fn DiffFunc) Option {
 // without it, runs emit only the initial Working status.
 func WithTodos(source TodoSource) Option {
 	return func(e *Executor) { e.todos = source }
+}
+
+// WithQuestions sets the dispatched agent's question service (#352): a
+// request on it parks the run in input-required, and an answer on the
+// parked task resumes it. Without it, the agent has no way to ask and
+// runs never park.
+func WithQuestions(source QuestionSource) Option {
+	return func(e *Executor) { e.questions = source }
 }
 
 // WithInactivityTimeout sets the A2A-level backstop (#360): while the
@@ -236,7 +279,9 @@ var _ a2asrv.AgentExecutor = (*Executor)(nil)
 // status carrying the agent's text output. A run error maps to a Failed
 // status with the error surfaced; per the AgentExecutor contract,
 // failures after work has begun are reported as events, not as a
-// returned error.
+// returned error. A question the agent asks ends the execution in
+// input-required instead, and a message naming that parked task resumes
+// the same run (#352).
 func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
 		// The backstop's terminal is the task's last word: drop the
@@ -277,6 +322,15 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 			"task_id", string(execCtx.TaskID),
 			"trace_id", traceID)
 
+		// A message naming a task parked in input-required is the answer
+		// to its question (#352), never a turn or a steer: it resumes the
+		// parked run on the same task. Checked before the empty-prompt
+		// rule — a typed answer carries a DataPart and no text.
+		if awaitsAnswer(execCtx) {
+			e.executeAnswer(ctx, execCtx, binding, traceID, yield)
+			return
+		}
+
 		// A message that referenced no existing task starts a new one:
 		// announce it submitted before transitioning to working.
 		if execCtx.StoredTask == nil {
@@ -309,90 +363,221 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		}
 
 		result, err := e.runWithTodos(ctx, execCtx, binding, prompt, yield)
-		switch {
-		case errors.Is(err, errConsumerStopped):
-			// The consumer stopped consuming mid-run: nothing further can
-			// be delivered, and the run's own outcome is dropped with it.
-			return
-		case errors.Is(err, context.Canceled):
-			// A canceled run is either this executor's own Cancel — which
-			// emits the terminal Canceled status itself, and a second one
-			// here would race it — or the SDK canceling the producer's
-			// context, in which case the consumer is gone with the stream.
-			// The same silence holds for a task the inactivity backstop
-			// already failed (#360): its reason-bearing Failed is the
-			// task's last word. Any other cancel is out of band (#342):
-			// the wander ladder or the watchdog killed the agent behind
-			// the SDK's back, nothing else will emit a terminal state, and
-			// this stream is the consumer's only way out — so yield
-			// exactly one Canceled carrying the kill reason.
-			if e.ownCancel(string(execCtx.TaskID)) ||
-				e.endedByExecutorHas(string(execCtx.TaskID)) || ctx.Err() != nil {
-				return
-			}
-			ev := statusEvent(execCtx, a2aspec.TaskStateCanceled,
-				agentMessage(execCtx, e.canceledStatusText()))
-			e.attachUsage(ctx, ev, binding.SessionID, traceID)
-			yield(ev, nil)
-			return
-		case err != nil:
-			ev := statusEvent(execCtx, a2aspec.TaskStateFailed,
-				agentMessage(execCtx, err.Error()))
-			e.attachUsage(ctx, ev, binding.SessionID, traceID)
-			yield(ev, nil)
-			return
-		case result == nil:
-			// Run returns (nil, nil) without doing any work when the
-			// session is busy (the prompt was silently queued behind the
-			// active turn) or a cancel landed during dispatch. No turn ran
-			// on behalf of this task, so completing it would misreport;
-			// fail it and let the caller retry against an idle session.
-			ev := statusEvent(execCtx, a2aspec.TaskStateFailed,
-				agentMessage(execCtx, "agent session did not start a turn (busy or canceled)"))
-			e.attachUsage(ctx, ev, binding.SessionID, traceID)
-			yield(ev, nil)
+		e.finish(ctx, execCtx, binding, traceID, result, err, yield)
+	}
+}
+
+// finish turns a drained run's outcome into the task's last events: the
+// diff and dispatch-result artifacts and Completed for a finished turn,
+// Failed or Canceled for a run that broke or was killed, and nothing at
+// all when the run parked on a question (#352) — the input-required
+// status already ended the execution — or the consumer is gone.
+func (e *Executor) finish(ctx context.Context, execCtx *a2asrv.ExecutorContext, binding ContextBinding, traceID string, result *fantasy.AgentResult, err error, yield func(a2aspec.Event, error) bool) {
+	switch {
+	case errors.Is(err, errParked):
+		// The run waits on its question; the answer's execution
+		// drains it from here.
+		return
+	case errors.Is(err, errConsumerStopped):
+		// The consumer stopped consuming mid-run: nothing further can
+		// be delivered, and the run's own outcome is dropped with it.
+		return
+	case errors.Is(err, context.Canceled):
+		// A canceled run is either this executor's own Cancel — which
+		// emits the terminal Canceled status itself, and a second one
+		// here would race it — or the SDK canceling the producer's
+		// context, in which case the consumer is gone with the stream.
+		// The same silence holds for a task the inactivity backstop
+		// already failed (#360): its reason-bearing Failed is the
+		// task's last word. Any other cancel is out of band (#342):
+		// the wander ladder or the watchdog killed the agent behind
+		// the SDK's back, nothing else will emit a terminal state, and
+		// this stream is the consumer's only way out — so yield
+		// exactly one Canceled carrying the kill reason.
+		if e.ownCancel(string(execCtx.TaskID)) ||
+			e.endedByExecutorHas(string(execCtx.TaskID)) || ctx.Err() != nil {
 			return
 		}
-
-		if e.diff != nil {
-			diff, derr := e.diff(ctx)
-			if derr == nil && diff != "" {
-				// The diff streams as chunked text/x-diff parts of one
-				// named artifact (#361): no single SSE data line carries
-				// more than a 256 KiB piece, so a huge diff cannot trip
-				// the SDK's 10 MB line cap.
-				chunks := chunkDiff(diff)
-				for i := range chunks {
-					if !yield(diffArtifact(execCtx, chunks, i), nil) {
-						return
-					}
-				}
-			}
-			// The typed outcome rides alongside — and stands in for the
-			// diff when capture failed — so the error crosses the wire
-			// and the run still completes (#361).
-			outcome := DispatchOutcome{DiffBytes: len(diff)}
-			if derr != nil {
-				outcome.DiffError = derr.Error()
-			} else {
-				outcome.FilesChanged = countDiffFiles(diff)
-			}
-			if !yield(resultArtifact(execCtx, outcome), nil) {
-				return
-			}
-		}
-
-		ev := statusEvent(execCtx, a2aspec.TaskStateCompleted,
-			agentMessage(execCtx, result.Response.Content.Text()))
+		ev := statusEvent(execCtx, a2aspec.TaskStateCanceled,
+			agentMessage(execCtx, e.canceledStatusText()))
 		e.attachUsage(ctx, ev, binding.SessionID, traceID)
 		yield(ev, nil)
+		return
+	case err != nil:
+		ev := statusEvent(execCtx, a2aspec.TaskStateFailed,
+			agentMessage(execCtx, err.Error()))
+		e.attachUsage(ctx, ev, binding.SessionID, traceID)
+		yield(ev, nil)
+		return
+	case result == nil:
+		// Run returns (nil, nil) without doing any work when the
+		// session is busy (the prompt was silently queued behind the
+		// active turn) or a cancel landed during dispatch. No turn ran
+		// on behalf of this task, so completing it would misreport;
+		// fail it and let the caller retry against an idle session.
+		ev := statusEvent(execCtx, a2aspec.TaskStateFailed,
+			agentMessage(execCtx, "agent session did not start a turn (busy or canceled)"))
+		e.attachUsage(ctx, ev, binding.SessionID, traceID)
+		yield(ev, nil)
+		return
 	}
+
+	if e.diff != nil {
+		diff, derr := e.diff(ctx)
+		if derr == nil && diff != "" {
+			// The diff streams as chunked text/x-diff parts of one
+			// named artifact (#361): no single SSE data line carries
+			// more than a 256 KiB piece, so a huge diff cannot trip
+			// the SDK's 10 MB line cap.
+			chunks := chunkDiff(diff)
+			for i := range chunks {
+				if !yield(diffArtifact(execCtx, chunks, i), nil) {
+					return
+				}
+			}
+		}
+		// The typed outcome rides alongside — and stands in for the
+		// diff when capture failed — so the error crosses the wire
+		// and the run still completes (#361).
+		outcome := DispatchOutcome{DiffBytes: len(diff)}
+		if derr != nil {
+			outcome.DiffError = derr.Error()
+		} else {
+			outcome.FilesChanged = countDiffFiles(diff)
+		}
+		if !yield(resultArtifact(execCtx, outcome), nil) {
+			return
+		}
+	}
+
+	ev := statusEvent(execCtx, a2aspec.TaskStateCompleted,
+		agentMessage(execCtx, result.Response.Content.Text()))
+	e.attachUsage(ctx, ev, binding.SessionID, traceID)
+	yield(ev, nil)
 }
 
 // errConsumerStopped reports that the event consumer stopped consuming
 // mid-run: no further events can be delivered and the run's outcome is
 // dropped with the stream.
 var errConsumerStopped = errors.New("a2a: event consumer stopped")
+
+// errParked reports that the drain ended on a question (#352): the run
+// is parked in input-required, its record kept for the answer's
+// execution, and the execution that drained it is over.
+var errParked = errors.New("a2a: run parked on a question")
+
+// awaitsAnswer reports whether the message names a task parked in
+// input-required (#352): such a message answers the task's question.
+func awaitsAnswer(execCtx *a2asrv.ExecutorContext) bool {
+	return execCtx.StoredTask != nil && execCtx.StoredTask.Status.State == a2aspec.TaskStateInputRequired
+}
+
+// executeAnswer resumes a run parked on a question (#352): the message's
+// answers resolve the agent's pending question — a typed answers/v1
+// DataPart, or the message text as a free-text answer — the task goes
+// back to Working, and the same run record drains on to a terminal state
+// or the next question. A task with no question pending is Rejected:
+// nothing is waiting for an answer, and no turn or steer is started.
+func (e *Executor) executeAnswer(ctx context.Context, execCtx *a2asrv.ExecutorContext, binding ContextBinding, traceID string, yield func(a2aspec.Event, error) bool) {
+	run, req, ok := e.unpark(string(execCtx.TaskID))
+	if !ok {
+		yield(statusEvent(execCtx, a2aspec.TaskStateRejected,
+			agentMessage(execCtx, "no question is pending on this task")), nil)
+		return
+	}
+	if !e.questions.Answer(questionAnswers(execCtx.Message, req)) {
+		// The question was withdrawn before the answer arrived — the
+		// agent's ask ended with its context — and the run moved on; the
+		// drain below reports wherever it went.
+		slog.Debug("A2A answer arrived after the question was withdrawn",
+			"context_id", execCtx.ContextID,
+			"task_id", string(execCtx.TaskID),
+			"trace_id", traceID)
+	}
+	if !yield(statusEvent(execCtx, a2aspec.TaskStateWorking, nil), nil) {
+		e.releaseRun(run)
+		return
+	}
+	result, err := e.drainRun(ctx, execCtx, run, yield)
+	e.finish(ctx, execCtx, binding, traceID, result, err, yield)
+}
+
+// park records the question the run is waiting on (#352).
+func (e *Executor) park(run *taskRun, req question.Request) {
+	e.runsMu.Lock()
+	defer e.runsMu.Unlock()
+	run.pending = &req
+}
+
+// unpark takes the question the task's run is parked on (#352), handing
+// the record to the answer's execution. ok is false when no record is
+// parked under taskID: none ever asked, it was answered already, or a
+// cancel took it.
+func (e *Executor) unpark(taskID string) (*taskRun, question.Request, bool) {
+	e.runsMu.Lock()
+	defer e.runsMu.Unlock()
+	run := e.runs[taskID]
+	if run == nil || run.pending == nil {
+		return nil, question.Request{}, false
+	}
+	req := *run.pending
+	run.pending = nil
+	return run, req, true
+}
+
+// inputRequiredStatus parks the task on the agent's question (#352): an
+// input-required status whose message carries the question text for a
+// reader and the typed questions/v1 payload as a DataPart, with the
+// extension named on the message.
+func inputRequiredStatus(execCtx *a2asrv.ExecutorContext, req question.Request) *a2aspec.TaskStatusUpdateEvent {
+	texts := make([]string, 0, len(req.Questions))
+	for _, q := range req.Questions {
+		texts = append(texts, q.Text)
+	}
+	parts := []*a2aspec.Part{a2aspec.NewTextPart(strings.Join(texts, "\n"))}
+	if encoded, err := Encode(QuestionExt, agent.QuestionRequest(req)); err != nil {
+		// The text still carries the question; only the typed payload is
+		// lost, and the client falls back to a free-text question.
+		slog.Warn("A2A question failed to encode; input-required carries text only", "err", err)
+	} else {
+		parts = append(parts, a2aspec.NewDataPart(encoded))
+	}
+	msg := a2aspec.NewMessageForTask(a2aspec.MessageRoleAgent, execCtx, parts...)
+	msg.Extensions = []string{QuestionExtensionURI}
+	return statusEvent(execCtx, a2aspec.TaskStateInputRequired, msg)
+}
+
+// questionAnswers maps an answer message onto the pending question's
+// answers (#352): a typed answers/v1 DataPart carrying answers wins;
+// otherwise the message text answers every question as free text, and a
+// message with neither skips them.
+func questionAnswers(msg *a2aspec.Message, req question.Request) []question.Answer {
+	if msg != nil {
+		for _, part := range msg.Parts {
+			if part == nil {
+				continue
+			}
+			data, ok := part.Content.(a2aspec.Data)
+			if !ok {
+				continue
+			}
+			decoded, err := DecodeValue(AnswerExt, data.Value)
+			if err != nil {
+				slog.Warn("A2A answer DataPart failed to decode; falling back to the message text", "err", err)
+				continue
+			}
+			if answer, ok := decoded.(*agent.QuestionAnswer); ok && len(answer.Answers) > 0 {
+				return answer.Answers
+			}
+		}
+	}
+	text := messageText(msg)
+	answers := make([]question.Answer, len(req.Questions))
+	for i, q := range req.Questions {
+		answers[i] = question.Answer{QuestionID: q.ID, FillInText: text}
+	}
+	return answers
+}
 
 // resolve maps the request's A2A context onto the dispatch binding that
 // owns it (#350). Only this route's own, still-bound context resolves:
@@ -455,6 +640,11 @@ func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext
 	if e.todos != nil {
 		run.todoCh = e.todos.SubscribeSessionTodos(runCtx, binding.SessionID)
 	}
+	if e.questions != nil {
+		// Subscribed before the run starts, so a question the agent asks
+		// right away is never published to nobody.
+		run.questionCh = e.questions.Subscribe(runCtx)
+	}
 	e.runsMu.Lock()
 	if e.runs == nil {
 		e.runs = make(map[string]*taskRun)
@@ -489,10 +679,13 @@ func (e *Executor) startRun(ctx context.Context, execCtx *a2asrv.ExecutorContext
 
 // drainRun drains the run record until the run ends or the drain cannot
 // go on, then releases the record: a drain that ends without the run's
-// outcome cancels the run with it.
+// outcome cancels the run with it. A run parked on a question (#352) is
+// the exception — its record stays for the answer's execution.
 func (e *Executor) drainRun(ctx context.Context, execCtx *a2asrv.ExecutorContext, run *taskRun, yield func(a2aspec.Event, error) bool) (*fantasy.AgentResult, error) {
 	result, err := e.drain(ctx, execCtx, run, yield)
-	e.releaseRun(run)
+	if !errors.Is(err, errParked) {
+		e.releaseRun(run)
+	}
 	return result, err
 }
 
@@ -510,13 +703,22 @@ func (e *Executor) releaseRun(run *taskRun) {
 // cancelRun cancels the run recorded under taskID, if any: the
 // executor's Cancel ends the run's own context, not only the runner's
 // session, so a run whose runner ignores the session cancel still stops.
-func (e *Executor) cancelRun(taskID string) {
+// A run parked on a question (#352) has no execution draining it, so
+// its record is dropped here; parked reports that case. The question's
+// ask ends with the run's context, and the tool call returns an error.
+func (e *Executor) cancelRun(taskID string) (parked bool) {
 	e.runsMu.Lock()
 	run := e.runs[taskID]
+	if run != nil && run.pending != nil {
+		parked = true
+		run.pending = nil
+		delete(e.runs, taskID)
+	}
 	e.runsMu.Unlock()
 	if run != nil {
 		run.cancel()
 	}
+	return parked
 }
 
 // drain streams the run's progress until it ends (#174): the run
@@ -524,7 +726,8 @@ func (e *Executor) cancelRun(taskID string) {
 // inline on the iterator's goroutine, so Working progress events and the
 // terminal status share one yield path and can never race. A snapshot is
 // only emitted when the todo list actually changed, so usage-only
-// session saves stay silent.
+// session saves stay silent. A question the agent asks (#352) ends the
+// drain with errParked after the input-required status.
 func (e *Executor) drain(ctx context.Context, execCtx *a2asrv.ExecutorContext, run *taskRun, yield func(a2aspec.Event, error) bool) (*fantasy.AgentResult, error) {
 	binding := run.binding
 
@@ -597,6 +800,29 @@ func (e *Executor) drain(ctx context.Context, execCtx *a2asrv.ExecutorContext, r
 			if inactReset != nil {
 				inactReset()
 			}
+		case ev, ok := <-run.questionCh:
+			if !ok {
+				run.questionCh = nil
+				continue
+			}
+			// A run that already ended does not park on a question its
+			// ask has since withdrawn: its outcome is the task's.
+			select {
+			case out := <-run.done:
+				return out.result, out.err
+			default:
+			}
+			// The agent asked (#352): park the run on the question and
+			// end this execution with input-required. The run stays
+			// blocked in its question tool, on the record's context, and
+			// the answer's execution drains it from here. The SDK's
+			// inactivity guard is per execution and this backstop is per
+			// drain, so a parked run waits on a human without either.
+			e.park(run, ev.Payload)
+			if !yield(inputRequiredStatus(execCtx, ev.Payload), nil) {
+				return nil, errConsumerStopped
+			}
+			return nil, errParked
 		}
 	}
 }
@@ -728,13 +954,17 @@ func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) 
 	return func(yield func(a2aspec.Event, error) bool) {
 		binding, ok := e.resolve(execCtx.ContextID)
 		if !ok {
-			yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCanceled,
+			yield(statusEvent(execCtx, a2aspec.TaskStateCanceled,
 				agentMessage(execCtx, noAgentForContextText(execCtx.ContextID))), nil)
 			return
 		}
 		e.markOwnCancel(string(execCtx.TaskID))
 		binding.Runner.Cancel(binding.SessionID)
-		e.cancelRun(string(execCtx.TaskID))
+		if e.cancelRun(string(execCtx.TaskID)) {
+			// A parked run has no drain to consult the own-cancel mark,
+			// and the canceled task takes no further message.
+			e.forgetCanceledTask(string(execCtx.TaskID))
+		}
 		text := cancelReasonFromMetadata(execCtx.Metadata)
 		if text == "" {
 			text = e.canceledStatusText()
