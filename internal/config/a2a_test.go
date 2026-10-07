@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -156,17 +157,17 @@ func TestA2AOptionsValidate(t *testing.T) {
 		{
 			name:    "relative certificate",
 			opts:    &config.A2AOptions{Listen: "127.0.0.1:7443", TLSCert: certRel, TLSKey: key},
-			wantErr: "options.a2a.tls_cert: \"" + certRel + "\" is a relative path",
+			wantErr: "options.a2a.tls_cert: " + strconv.Quote(certRel) + " is a relative path",
 		},
 		{
 			name:    "relative key",
 			opts:    &config.A2AOptions{Listen: "127.0.0.1:7443", TLSCert: cert, TLSKey: keyRel},
-			wantErr: "options.a2a.tls_key: \"" + keyRel + "\" is a relative path",
+			wantErr: "options.a2a.tls_key: " + strconv.Quote(keyRel) + " is a relative path",
 		},
 		{
 			name:    "relative client CA",
 			opts:    &config.A2AOptions{Listen: "127.0.0.1:7443", TLSCert: cert, TLSKey: key, ClientCA: certRel},
-			wantErr: "options.a2a.client_ca: \"" + certRel + "\" is a relative path",
+			wantErr: "options.a2a.client_ca: " + strconv.Quote(certRel) + " is a relative path",
 		},
 		{
 			name:    "relative path without listen",
