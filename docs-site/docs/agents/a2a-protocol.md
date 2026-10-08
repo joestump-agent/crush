@@ -233,10 +233,12 @@ How the listener behaves:
   configured, or with the port the kernel picked for `:0`) or a DNS or IP
   name in the server certificate's subject alternative names, at any port.
   Anything else is a `400`.
-- **Identity.** A certificate holder is identified by the certificate's
-  issuer and subject, and its tasks are stored under that identity.
-  Holders of certificates with the same issuer and subject share their
-  tasks; anyone else's are invisible to them.
+- **Identity.** A certificate holder is identified by the fingerprint of
+  the `client_ca` certificate that verified it plus the certificate's
+  subject, and its tasks are stored under that identity. Holders of
+  certificates with the same subject from the same CA share their tasks;
+  anyone else's are invisible to them, even from a CA that reuses another
+  CA's name.
 - **Cards.** While the listener runs, every card lists its HTTPS interface
   second, after the socket one: `https://<host:port>/agents/<id>`. The host is
   the configured one. With a wildcard listen address it is the server

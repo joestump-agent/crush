@@ -261,7 +261,7 @@ func (t *tcpHost) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // header carrying the host's bearer token, compared in constant time.
 // The route's call interceptor checks again after the body is decoded.
 func (t *tcpHost) authenticated(r *http.Request) bool {
-	if t.verifiedCert(r) != nil {
+	if t.verifiedChain(r) != nil {
 		return true
 	}
 	return authDecision{
@@ -272,11 +272,11 @@ func (t *tcpHost) authenticated(r *http.Request) bool {
 
 // verifiedCert returns the client certificate the handshake verified
 // against client_ca, or nil without mutual TLS or a verified chain.
-func (t *tcpHost) verifiedCert(r *http.Request) *x509.Certificate {
+func (t *tcpHost) verifiedChain(r *http.Request) []*x509.Certificate {
 	if !t.mutualTLS || r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.VerifiedChains[0]) == 0 {
 		return nil
 	}
-	return r.TLS.VerifiedChains[0][0]
+	return r.TLS.VerifiedChains[0]
 }
 
 // hostAllowed implements [hostListener] (#358): a Host is accepted when
@@ -301,25 +301,29 @@ func (t *tcpHost) hostAllowed(host string) bool {
 // carries the client certificate the handshake verified, if any.
 func (t *tcpHost) serveContext(routeCtx context.Context, r *http.Request) context.Context {
 	var peer remotePeer
-	if cert := t.verifiedCert(r); cert != nil {
+	if chain := t.verifiedChain(r); chain != nil {
 		peer.certVerified = true
-		peer.certIdentity = certIdentity(cert)
+		peer.certIdentity = certIdentity(chain)
 	}
 	return context.WithValue(routeCtx, remotePeerContextKey{}, peer)
 }
 
-// certIdentity names a verified client certificate "<issuer>/<subject>"
-// by its distinguished names (#358). A client_ca bundle can hold several
-// CAs, and two of them can issue the same subject: keyed by the subject
-// alone, their holders would share one task namespace. An empty subject
-// falls back to the certificate's SHA-256 fingerprint.
-func certIdentity(cert *x509.Certificate) string {
-	subject := cert.Subject.String()
+// certIdentity names a verified client certificate "ca-sha256:<ca>/
+// <subject>" (#358): ca is the SHA-256 fingerprint of the client_ca
+// certificate its chain verified against, the last in the chain. A
+// client_ca bundle can hold several CAs, and two of them can issue the
+// same subject under the same issuer name: keyed by names alone, their
+// holders would share one task namespace. An empty subject falls back
+// to the certificate's own SHA-256 fingerprint.
+func certIdentity(chain []*x509.Certificate) string {
+	leaf, anchor := chain[0], chain[len(chain)-1]
+	ca := sha256.Sum256(anchor.Raw)
+	subject := leaf.Subject.String()
 	if subject == "" {
-		sum := sha256.Sum256(cert.Raw)
+		sum := sha256.Sum256(leaf.Raw)
 		subject = "sha256:" + hex.EncodeToString(sum[:])
 	}
-	return cert.Issuer.String() + "/" + subject
+	return "ca-sha256:" + hex.EncodeToString(ca[:]) + "/" + subject
 }
 
 // advertisedAddr is the host:port the cards list for the TCP listener:

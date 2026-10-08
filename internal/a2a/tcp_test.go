@@ -6,9 +6,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -544,24 +546,35 @@ func TestTCPListenerCannotReachLocalContexts(t *testing.T) {
 	require.Equal(t, "local work", runner.gotCall.Prompt)
 }
 
-// A client certificate's identity is its issuer and subject (#358), so
-// two CAs issuing the same subject name two identities, and a
-// certificate without a subject is named by its fingerprint.
+// A client certificate's identity is the fingerprint of the CA that
+// verified it plus its subject (#358): two CAs issuing the same subject
+// name two identities, even when the CAs share a name, and a certificate
+// without a subject is named by its own fingerprint.
 func TestCertIdentity(t *testing.T) {
 	t.Parallel()
 
+	fingerprint := func(cert *x509.Certificate) string {
+		sum := sha256.Sum256(cert.Raw)
+		return "ca-sha256:" + hex.EncodeToString(sum[:])
+	}
 	pki := newTestPKI(t)
 	otherCA, otherKey := newTestCA(t, "second CA")
+	sameNameCA, sameNameKey := newTestCA(t, pki.ca.Subject.CommonName)
 	first := clientCert(t, pki.ca, pki.caKey, "peer-host")
 	second := clientCert(t, otherCA, otherKey, "peer-host")
+	impostor := clientCert(t, sameNameCA, sameNameKey, "peer-host")
 
-	require.Equal(t, "CN=crush test CA/CN=peer-host", certIdentity(first.Leaf))
-	require.Equal(t, "CN=second CA/CN=peer-host", certIdentity(second.Leaf))
+	require.Equal(t, fingerprint(pki.ca)+"/CN=peer-host", certIdentity([]*x509.Certificate{first.Leaf, pki.ca}))
+	require.Equal(t, fingerprint(otherCA)+"/CN=peer-host", certIdentity([]*x509.Certificate{second.Leaf, otherCA}))
+	require.NotEqual(t,
+		certIdentity([]*x509.Certificate{first.Leaf, pki.ca}),
+		certIdentity([]*x509.Certificate{impostor.Leaf, sameNameCA}),
+		"a CA reusing another's name is still another identity")
 
 	der, _ := pki.issue(t, &x509.Certificate{ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
 	bare, err := x509.ParseCertificate(der)
 	require.NoError(t, err)
-	require.Regexp(t, `^CN=crush test CA/sha256:[0-9a-f]{64}$`, certIdentity(bare))
+	require.Regexp(t, `^ca-sha256:[0-9a-f]{64}/sha256:[0-9a-f]{64}$`, certIdentity([]*x509.Certificate{bare, pki.ca}))
 }
 
 // Two CAs in one client_ca bundle that issue the same subject do not
