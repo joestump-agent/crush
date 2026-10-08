@@ -1207,8 +1207,8 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// user's disabled tools, applied last so a definition can never
 	// widen user policy. A disabled task agent takes the `agent` tool
 	// off the main agents' palettes — there is no sub-agent to run —
-	// and with no enabled dispatch agent the dispatch and message
-	// tools have nothing to act on.
+	// and with no enabled dispatch agent the dispatch, message, cancel,
+	// apply, and dismiss tools have nothing to act on.
 	allowedTools := effectiveToolNames(agent.AllowedTools, c.cfg.Config().Options.DisabledTools)
 	if taskCfg, ok := c.cfg.Config().Agents[config.AgentTask]; ok && taskCfg.Disabled {
 		allowedTools = slices.DeleteFunc(allowedTools, func(name string) bool {
@@ -1217,7 +1217,8 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	}
 	if !hasEnabledDispatchAgent(c.cfg.Config()) {
 		allowedTools = slices.DeleteFunc(allowedTools, func(name string) bool {
-			return name == DispatchAgentToolName || name == MessageAgentToolName || name == CancelDispatchToolName
+			return name == DispatchAgentToolName || name == MessageAgentToolName || name == CancelDispatchToolName ||
+				name == ApplyDispatchToolName || name == DismissDispatchToolName
 		})
 	}
 
@@ -1265,6 +1266,18 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// apply, and a tool with nothing running behind it is dead weight.
 	if !isSubAgent && interactive && slices.Contains(allowedTools, CancelDispatchToolName) {
 		allTools = append(allTools, c.cancelDispatchTool())
+	}
+
+	// Apply and dismiss (#368) are the model-facing front door for the
+	// review decision a finished dispatch's terminal message asks for.
+	// They ride the same gate as cancel: main agents only, interactive
+	// only — a non-interactive run exits with the parent's turn, so
+	// nothing is left to apply or dismiss.
+	if !isSubAgent && interactive && slices.Contains(allowedTools, ApplyDispatchToolName) {
+		allTools = append(allTools, c.applyDispatchTool())
+	}
+	if !isSubAgent && interactive && slices.Contains(allowedTools, DismissDispatchToolName) {
+		allTools = append(allTools, c.dismissDispatchTool())
 	}
 
 	// Get the model name for the agent: an explicit pin (#432) names it,

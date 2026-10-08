@@ -191,10 +191,11 @@ on the base revision, a revision the main agent chooses, is read or executed
 
 :::info[Planned]
 - A TCP listener with TLS becomes opt-in ([#358](https://github.com/joestump-agent/crush/issues/358)).
-- `apply_dispatch` and `dismiss_dispatch` will record your decision about a
-  workspace explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)). Exit and startup already keep decided and
-  work-producing workspaces and remove only the rest ([#367](https://github.com/joestump-agent/crush/issues/367)).
 :::
+
+`apply_dispatch` and `dismiss_dispatch` record your decision about a
+workspace explicitly ([#368](https://github.com/joestump-agent/crush/issues/368)). Exit and startup already keep decided and
+work-producing workspaces and remove only the rest ([#367](https://github.com/joestump-agent/crush/issues/367)).
 
 ## Turning dispatch off
 
@@ -345,7 +346,8 @@ How the runtime applies each field:
   - A disabled `task` removes the `agent` tool.
   - A disabled `plan` cannot be switched to.
   - With no enabled dispatch agent, the main agent loses `dispatch_agent`,
-    `message_agent` and `cancel_dispatch`.
+    `message_agent`, `cancel_dispatch`, `apply_dispatch` and
+    `dismiss_dispatch`.
   - `coder` cannot be disabled.
 
 The same configuration in `crushrc`:

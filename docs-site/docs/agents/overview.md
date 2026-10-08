@@ -141,10 +141,12 @@ branch, disposition, owner liveness, pending changes) and `crush dispatch
 prune` removes decided ones, or every dead owner's with `--all-dead`;
 `--dry-run` previews without deleting ([#369](https://github.com/joestump-agent/crush/issues/369)).
 
-:::info[Planned]
-You'll record your decision about a workspace explicitly with
-`apply_dispatch` and `dismiss_dispatch` ([#368](https://github.com/joestump-agent/crush/issues/368)).
-:::
+You record your decision with the `apply_dispatch` and `dismiss_dispatch`
+tools ([#368](https://github.com/joestump-agent/crush/issues/368)): apply brings the work into your checkout —
+merge, squash, or cherry-pick, uncommitted changes included — and removes the
+workspace; dismiss discards the work and removes it. Both refuse while the
+dispatch is still running (cancel it first) and ask your permission before
+they change anything.
 
 ## Under the hood: A2A
 

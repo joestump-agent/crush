@@ -843,7 +843,7 @@ func TestConfig_setupAgentsWithDisabledTools(t *testing.T) {
 	coderAgent, ok := cfg.Agents[AgentCoder]
 	require.True(t, ok)
 
-	assert.ElementsMatch(t, []string{"agent", "bash", "crush_info", "crush_logs", "CronCreate", "CronList", "CronDelete", "job_output", "job_kill", "dispatch_agent", "message_agent", "cancel_dispatch", "multiedit", "lsp_diagnostics", "lsp_references", "lsp_restart", "lsp_symbols", "lsp_definition", "lsp_call_hierarchy", "lsp_rename", "lsp_replace_symbol", "fetch", "agentic_fetch", "glob", "ls", "question", "semantic_search", "semantic_index", "sourcegraph", "todos", "view", "write", "list_mcp_resources", "read_mcp_resource", "list_mcp_prompts", "call_mcp_prompt"}, coderAgent.AllowedTools)
+	assert.ElementsMatch(t, []string{"agent", "bash", "crush_info", "crush_logs", "CronCreate", "CronList", "CronDelete", "job_output", "job_kill", "dispatch_agent", "message_agent", "cancel_dispatch", "apply_dispatch", "dismiss_dispatch", "multiedit", "lsp_diagnostics", "lsp_references", "lsp_restart", "lsp_symbols", "lsp_definition", "lsp_call_hierarchy", "lsp_rename", "lsp_replace_symbol", "fetch", "agentic_fetch", "glob", "ls", "question", "semantic_search", "semantic_index", "sourcegraph", "todos", "view", "write", "list_mcp_resources", "read_mcp_resource", "list_mcp_prompts", "call_mcp_prompt"}, coderAgent.AllowedTools)
 
 	taskAgent, ok := cfg.Agents[AgentTask]
 	require.True(t, ok)
@@ -875,7 +875,7 @@ func TestConfig_setupAgentsWithEveryReadOnlyToolDisabled(t *testing.T) {
 	cfg.SetupAgents()
 	coderAgent, ok := cfg.Agents[AgentCoder]
 	require.True(t, ok)
-	assert.ElementsMatch(t, []string{"bash", "crush_info", "crush_logs", "CronCreate", "CronList", "CronDelete", "job_output", "job_kill", "download", "dispatch_agent", "message_agent", "cancel_dispatch", "edit", "multiedit", "lsp_diagnostics", "lsp_references", "lsp_restart", "lsp_rename", "lsp_replace_symbol", "fetch", "agentic_fetch", "question", "semantic_index", "todos", "write", "list_mcp_resources", "read_mcp_resource", "list_mcp_prompts", "call_mcp_prompt"}, coderAgent.AllowedTools)
+	assert.ElementsMatch(t, []string{"bash", "crush_info", "crush_logs", "CronCreate", "CronList", "CronDelete", "job_output", "job_kill", "download", "dispatch_agent", "message_agent", "cancel_dispatch", "apply_dispatch", "dismiss_dispatch", "edit", "multiedit", "lsp_diagnostics", "lsp_references", "lsp_restart", "lsp_rename", "lsp_replace_symbol", "fetch", "agentic_fetch", "question", "semantic_index", "todos", "write", "list_mcp_resources", "read_mcp_resource", "list_mcp_prompts", "call_mcp_prompt"}, coderAgent.AllowedTools)
 
 	taskAgent, ok := cfg.Agents[AgentTask]
 	require.True(t, ok)
