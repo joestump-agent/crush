@@ -135,7 +135,14 @@ func TestExternalDispatchE2E(t *testing.T) {
 				require.NotContains(t, entry.Result.Error, "push to main", "the remote's question is not relayed")
 				remote.mu.Lock()
 				defer remote.mu.Unlock()
-				require.Len(t, remote.cancels, 1, "the parked task is canceled")
+				// The cancel can land while the execution that parked the task is still
+				// registered; the first cancel is then routed into that execution and the
+				// client re-issues it (#352), so the remote may see the cancel twice,
+				// depending on timing. What matters is that it arrives with the refusal.
+				require.NotEmpty(t, remote.cancels, "the parked task is canceled")
+				for _, reason := range remote.cancels {
+					require.Contains(t, reason, "crush does not forward", "the cancel carries the refusal, not the question")
+				}
 			},
 		},
 	}
