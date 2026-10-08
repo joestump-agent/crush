@@ -61,6 +61,11 @@ const a2aSocketDirName = "a2a"
 // requests to a dispatch's JSON-RPC handler.
 const agentsPathPrefix = "/agents/"
 
+// versionProbeLimit bounds how much of a request body the
+// unsupported-version answer reads to echo the request id (#358): far
+// more than any envelope's id needs, far less than a body worth buffering.
+const versionProbeLimit = 64 << 10
+
 // traceparentHeader is the W3C Trace Context header the dispatch client
 // sends and the server propagator lifts into the request context (#364).
 const traceparentHeader = "traceparent"
@@ -261,6 +266,14 @@ type ServerFactory struct {
 	// resolve somewhere else.
 	externalLookup func(ctx context.Context, host string) ([]net.IPAddr, error)
 
+	// tcpOpts configures the optional TLS-only TCP listener (#358),
+	// started with the socket; nil keeps the host on its socket alone.
+	tcpOpts *config.A2AOptions
+
+	// logger, when set, replaces slog.Default for the TCP listener's
+	// lines (#358) — the test seam for its audit log.
+	logger *slog.Logger
+
 	mu         sync.Mutex
 	started    bool
 	closed     bool
@@ -269,6 +282,10 @@ type ServerFactory struct {
 	httpServer *http.Server
 	done       chan struct{}
 	routes     map[string]*route
+
+	// tcp is the running TCP listener (#358); nil when none is
+	// configured or it failed to start.
+	tcp *tcpHost
 
 	// definitions is the card listing (#392): every agent definition
 	// published on the host, keyed by its config id. Distinct from the
@@ -339,13 +356,23 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 		cardVersion = version.Version
 	}
 
+	// The host starts before the card is built: the card lists the TCP
+	// listener's HTTPS interface only when it is running, at the port
+	// it actually bound (#358).
+	if err := f.ensureHost(ctx); err != nil {
+		return nil, err
+	}
+
 	endpoint := "http://" + a2aURLHost + agentsPathPrefix + p.DispatchID
+	tlsEndpoint, mutualTLS := f.tcpEndpoint(p.DispatchID)
 	card := BuildAgentCard(CardParams{
-		Agent:     config.Agent{Name: p.Name, Description: p.Description},
-		Skills:    p.Skills,
-		Endpoint:  endpoint,
-		Version:   cardVersion,
-		Transport: a2aspec.TransportProtocolJSONRPC,
+		Agent:       config.Agent{Name: p.Name, Description: p.Description},
+		Skills:      p.Skills,
+		Endpoint:    endpoint,
+		TLSEndpoint: tlsEndpoint,
+		MutualTLS:   mutualTLS,
+		Version:     cardVersion,
+		Transport:   a2aspec.TransportProtocolJSONRPC,
 	})
 
 	var opts []Option
@@ -392,7 +419,8 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	handlerOpts = append(handlerOpts, a2asrv.WithCapabilityChecks(&card.Capabilities))
 	// The auth interceptor (#357): every served call carries the host's
 	// bearer token and arrives from the host's own user, or it is
-	// rejected before the executor runs.
+	// rejected before the executor runs. A call over the TCP listener
+	// (#358) carries a verified client certificate or the token instead.
 	handlerOpts = append(handlerOpts, a2asrv.WithCallInterceptors(&hostAuthenticator{factory: f}))
 	if p.InactivityTimeout > 0 {
 		handlerOpts = append(handlerOpts, a2asrv.WithAgentInactivityTimeout(p.InactivityTimeout+time.Minute))
@@ -429,9 +457,6 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
 	mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
 
-	if err := f.ensureHost(ctx); err != nil {
-		return nil, err
-	}
 	if err := f.register(p.DispatchID, mux); err != nil {
 		return nil, err
 	}
@@ -443,6 +468,7 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 		SessionID: p.SessionID,
 		Call:      p.Call,
 		Started:   time.Now(),
+		LocalOnly: true,
 	})
 	if p.Listed {
 		f.index.add(AgentDescriptor{
@@ -571,26 +597,33 @@ func (f *ServerFactory) PublishAgentDefinition(ctx context.Context, p agent.Agen
 	}
 	f.mu.Unlock()
 
+	// The host starts before the card is built, so the card can list the
+	// TCP listener's HTTPS interface when it runs (#358).
+	if err := f.ensureHost(ctx); err != nil {
+		return err
+	}
+
 	endpoint := "http://" + a2aURLHost + agentsPathPrefix + p.ID
+	tlsEndpoint, mutualTLS := f.tcpEndpoint(p.ID)
 	card := BuildAgentCard(CardParams{
-		Agent:     config.Agent{ID: p.ID, Name: p.Name, Description: p.Description},
-		Endpoint:  endpoint,
-		Version:   version.Version,
-		Transport: a2aspec.TransportProtocolJSONRPC,
+		Agent:       config.Agent{ID: p.ID, Name: p.Name, Description: p.Description},
+		Endpoint:    endpoint,
+		TLSEndpoint: tlsEndpoint,
+		MutualTLS:   mutualTLS,
+		Version:     version.Version,
+		Transport:   a2aspec.TransportProtocolJSONRPC,
 	})
 
 	// The definition route carries no run: its executor resolves no
 	// context (nil registry), so every message is rejected without a
-	// runner until the definition's entry point serves a turn on it.
+	// runner until the definition's entry point serves a turn on it. On
+	// the socket it needs no credentials; a call over the TCP listener
+	// must still authenticate before it is rejected (#358).
 	executor := NewExecutor(nil, "")
-	handler := a2asrv.NewHandler(executor)
+	handler := a2asrv.NewHandler(executor, a2asrv.WithCallInterceptors(&hostAuthenticator{factory: f, remoteOnly: true}))
 	mux := http.NewServeMux()
 	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
 	mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
-
-	if err := f.ensureHost(ctx); err != nil {
-		return err
-	}
 
 	// Claim the route and the card under one lock: a concurrent publish
 	// of the same definition loses cleanly — the first card wins and
@@ -632,8 +665,9 @@ func (f *ServerFactory) AgentCards() []*a2aspec.AgentCard {
 
 // Close shuts the process host down (idempotent): every remaining
 // route's context is canceled, in-flight requests drain within the
-// caller's context, the listener is closed and the socket file is
-// removed. App shutdown owns the call.
+// caller's context, both listeners — the socket and, when one runs, the
+// TCP listener (#358) — are closed and the socket file is removed. App
+// shutdown owns the call.
 func (f *ServerFactory) Close(ctx context.Context) error {
 	f.mu.Lock()
 	if f.closed {
@@ -652,13 +686,26 @@ func (f *ServerFactory) Close(ctx context.Context) error {
 	// Every remaining binding dies with the host (#350): no dispatch is
 	// running anymore, so no context resolves to anything.
 	f.contexts.clear()
-	srv, listener, path, done := f.httpServer, f.listener, f.sockPath, f.done
+	srv, listener, path, done, tcp := f.httpServer, f.listener, f.sockPath, f.done, f.tcp
 	f.mu.Unlock()
 
 	// Index streams (#421) never end on their own; end them first, or
 	// Shutdown waits on them until ctx runs out.
 	f.index.closeAll()
-	err := srv.Shutdown(ctx)
+	// The socket and the TCP listener (#358) shut down side by side, so
+	// one draining a slow request does not eat the other's time.
+	var (
+		wg     sync.WaitGroup
+		tcpErr error
+	)
+	if tcp != nil {
+		wg.Go(func() { tcpErr = tcp.close(ctx) })
+	}
+	err := shutdownServer(ctx, srv)
+	wg.Wait()
+	if err == nil {
+		err = tcpErr
+	}
 	if cerr := listener.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) && err == nil {
 		err = cerr
 	}
@@ -667,6 +714,51 @@ func (f *ServerFactory) Close(ctx context.Context) error {
 	}
 	<-done
 	return err
+}
+
+// shutdownServer drains srv within ctx (#358). When ctx ends first, the
+// server is closed outright, so a request that never finishes cannot
+// keep a connection open past Close; the deadline error is returned.
+func shutdownServer(ctx context.Context, srv *http.Server) error {
+	err := srv.Shutdown(ctx)
+	if err != nil && ctx.Err() != nil {
+		_ = srv.Close()
+	}
+	return err
+}
+
+// closeSilentConnsOnShutdown closes, when srv shuts down, every
+// connection that has not sent a request yet (#358). net/http treats
+// such a connection as busy for its first five seconds, so a peer that
+// connects and sends nothing — or stalls mid-handshake — would hold
+// Shutdown for that long. It carries no request, so there is nothing to
+// drain. The server's ConnState tracks the connections, and its
+// shutdown hook runs once the listeners are closed.
+func closeSilentConnsOnShutdown(srv *http.Server) {
+	var (
+		mu    sync.Mutex
+		conns = make(map[net.Conn]struct{})
+	)
+	srv.ConnState = func(c net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		if state == http.StateNew {
+			conns[c] = struct{}{}
+			return
+		}
+		delete(conns, c)
+	}
+	srv.RegisterOnShutdown(func() {
+		mu.Lock()
+		silent := make([]net.Conn, 0, len(conns))
+		for c := range conns {
+			silent = append(silent, c)
+		}
+		mu.Unlock()
+		for _, c := range silent {
+			_ = c.Close()
+		}
+	})
 }
 
 // ensureHost lazily starts the process-wide listener: the socket lives
@@ -725,6 +817,7 @@ func (f *ServerFactory) ensureHost(ctx context.Context) error {
 		// the platform reports one, for the auth interceptor (#357).
 		ConnContext: withPeerCredentials,
 	}
+	closeSilentConnsOnShutdown(f.httpServer)
 	f.done = make(chan struct{})
 	f.started = true
 	close(f.startedCh)
@@ -736,6 +829,20 @@ func (f *ServerFactory) ensureHost(ctx context.Context) error {
 			slog.Error("A2A host server died early", "error", err)
 		}
 	}()
+
+	// The optional TCP listener (#358) starts with the socket. Dispatch
+	// never depends on it — the coordinator always dials the socket —
+	// so a listener that cannot start (a port already taken, files gone
+	// since load) is logged and the host keeps serving the socket alone;
+	// the cards then list no HTTPS interface.
+	if f.tcpOpts != nil {
+		tcp, err := startTCPHost(ctx, f, f.tcpOpts)
+		if err != nil {
+			slog.Error("A2A TCP listener not started; serving the unix socket only", "listen", f.tcpOpts.Listen, "error", err)
+		} else {
+			f.tcp = tcp
+		}
+	}
 	return nil
 }
 
@@ -807,23 +914,34 @@ func shortHash(s string, n int) string {
 	return hex.EncodeToString(sum[:n])
 }
 
-// serveHTTP is the host's single root handler (#346): middleware first,
-// rejecting cross-origin, non-JSON, wrong-host and unsupported-protocol-version
-// requests before any dispatch work runs, then the route table maps
-// /agents/<dispatch id> onto that dispatch's JSON-RPC handler. The middleware
-// exists because a browser page can CSRF a text/plain POST at any loopback
-// port, DNS-rebind its Host, and fold text into a running agent's turn;
-// requests that pass it still have to authenticate (#357): the route's call
-// interceptor demands the host's bearer token — and the socket peer's own uid
-// where the platform reports it — before the executor runs. The route context
-// is injected so a Stop or Close cancels the in-flight streams it owns.
+// serveHTTP is the unix socket's root handler (#346): the shared
+// middleware and route table, answering only to the crush-a2a Host label.
 func (f *ServerFactory) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// The agent index (#421) is a GET with no JSON body, so it takes its
-	// own copy of the checks below rather than the content-type gate.
+	// own copy of serveRequest's checks rather than the content-type gate.
+	// It is the socket's alone: the TCP listener (#358) serves dispatch
+	// routes to remote callers, never the host's list of every dispatch.
 	if r.URL.Path == AgentsIndexPath {
 		f.serveAgentsIndex(w, r)
 		return
 	}
+	f.serveRequest(w, r, socketListener{})
+}
+
+// serveRequest is the host's request path, shared by the unix socket and
+// the TCP listener (#346, #358): middleware first, rejecting cross-origin,
+// non-JSON, wrong-host and unsupported-protocol-version requests before any
+// dispatch work runs, then the route table maps /agents/<dispatch id> onto
+// that dispatch's JSON-RPC handler. The middleware exists because a browser
+// page can CSRF a text/plain POST at any loopback port, DNS-rebind its Host,
+// and fold text into a running agent's turn; requests that pass it still
+// have to authenticate (#357): the route's call interceptor demands the
+// host's bearer token — and the socket peer's own uid where the platform
+// reports it, or on TCP a verified client certificate in the token's place
+// — before the executor runs. The listener decides which Host it answers to
+// and what the interceptor learns about the caller. The route context is
+// injected so a Stop or Close cancels the in-flight streams it owns.
+func (f *ServerFactory) serveRequest(w http.ResponseWriter, r *http.Request, l hostListener) {
 	if r.Header.Get("Origin") != "" {
 		http.Error(w, "a2a: cross-origin requests are not accepted", http.StatusForbidden)
 		return
@@ -832,7 +950,7 @@ func (f *ServerFactory) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "a2a: only application/json requests are accepted", http.StatusUnsupportedMediaType)
 		return
 	}
-	if r.Host != a2aURLHost {
+	if !l.hostAllowed(r.Host) {
 		http.Error(w, "a2a: unexpected Host", http.StatusBadRequest)
 		return
 	}
@@ -852,30 +970,29 @@ func (f *ServerFactory) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The route context replaces the request's connection context, so
-	// the socket peer's uid the ConnContext hook read (#357) is copied
-	// across the swap before it serves.
-	serveCtx := rt.ctx
-	if uid, ok := peerUIDFromContext(r.Context()); ok {
-		serveCtx = context.WithValue(serveCtx, peerUIDContextKey{}, uid)
-	}
-	rt.handler.ServeHTTP(w, r.WithContext(serveCtx))
+	// what the listener knows about the caller — the socket peer's uid
+	// the ConnContext hook read (#357), or the TCP caller and its client
+	// certificate (#358) — is carried across the swap before it serves.
+	rt.handler.ServeHTTP(w, r.WithContext(l.serveContext(rt.ctx, r)))
 }
 
 // writeVersionNotSupported answers a request carrying an A2A-Version the
 // host does not serve with the spec's VersionNotSupportedError envelope
 // (-32009), before the SDK handler runs: the answer is a plain JSON-RPC
 // error even when the request asked for a stream, so a client cannot miss
-// the rejection inside SSE framing.
+// the rejection inside SSE framing. Only the first versionProbeLimit
+// bytes are read for the request id (#358): a larger body answers with
+// a null id rather than being buffered whole.
 func writeVersionNotSupported(w http.ResponseWriter, r *http.Request) {
 	id := json.RawMessage("null")
-	if body, err := io.ReadAll(r.Body); err == nil {
+	if body, err := io.ReadAll(io.LimitReader(r.Body, versionProbeLimit)); err == nil {
 		var req struct {
 			ID json.RawMessage `json:"id"`
 		}
 		if json.Unmarshal(body, &req) == nil && len(req.ID) > 0 {
 			id = req.ID
 		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
 	}
 	info := errordetails.NewErrorInfo(
 		a2aspec.ErrorReason(a2aspec.ErrVersionNotSupported),
@@ -945,6 +1062,39 @@ func (f *ServerFactory) socketPath() string {
 	return f.sockPath
 }
 
+// tcpEndpoint returns the HTTPS URL the TCP listener serves id at, and
+// whether it requires client certificates (#358). The URL is empty when
+// no TCP listener runs, or when it has no address a client could dial,
+// so the card lists only the socket interface.
+func (f *ServerFactory) tcpEndpoint(id string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.tcp == nil || f.tcp.baseURL() == "" {
+		return "", false
+	}
+	return f.tcp.baseURL() + agentsPathPrefix + id, f.tcp.mutualTLS
+}
+
+// log returns the logger the TCP listener writes to: the injected one,
+// or slog.Default.
+func (f *ServerFactory) log() *slog.Logger {
+	if f.logger != nil {
+		return f.logger
+	}
+	return slog.Default()
+}
+
+// tcpAddr returns the address the TCP listener bound (#358); empty when
+// none runs.
+func (f *ServerFactory) tcpAddr() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.tcp == nil {
+		return ""
+	}
+	return f.tcp.bound
+}
+
 // authToken returns the host's bearer token (#357); empty before the
 // first StartServer binds the socket.
 func (f *ServerFactory) authToken() string {
@@ -994,6 +1144,13 @@ type ContextBinding struct {
 	SessionID string
 	Call      agent.SessionAgentCall
 	Started   time.Time
+	// LocalOnly keeps the binding off the TCP listener (#358): a call
+	// that arrived over TCP resolves it to nothing, exactly like an
+	// unknown context. Every binding today is a local dispatch or
+	// sub-agent run started in this process, so StartServer always sets
+	// it; agents meant to be called remotely arrive with the peer
+	// registry (#334).
+	LocalOnly bool
 }
 
 // ContextRegistry maps an A2A context ID onto the dispatch binding that

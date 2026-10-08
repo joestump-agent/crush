@@ -38,6 +38,18 @@ type CardParams struct {
 	// unix-socket host in Phase 1, #346). Required for a resolvable card.
 	Endpoint string
 
+	// TLSEndpoint is the agent's URL on the host's optional TCP listener
+	// (#358), https://<host:port>/agents/<id>. When set, the card lists
+	// it as a second interface after Endpoint, so a client that picks
+	// the first interface it supports keeps dialing the socket. Empty
+	// (no TCP listener) lists Endpoint alone.
+	TLSEndpoint string
+
+	// MutualTLS declares the TCP listener's client-certificate scheme
+	// (#358) as an alternative to the bearer token. Only meaningful with
+	// TLSEndpoint.
+	MutualTLS bool
+
 	// Transport is the protocol binding served at Endpoint. Defaults to
 	// JSON-RPC over HTTP — the Phase 1 transport — when empty.
 	Transport a2aspec.TransportProtocol
@@ -58,14 +70,19 @@ func BuildAgentCard(p CardParams) *a2aspec.AgentCard {
 		transport = a2aspec.TransportProtocolJSONRPC
 	}
 
+	// NewAgentInterface stamps the SDK's protocol version. The socket
+	// interface stays first: the SDK client tries interfaces in card
+	// order, and the in-process dispatch client dials the socket.
+	interfaces := []*a2aspec.AgentInterface{a2aspec.NewAgentInterface(p.Endpoint, transport)}
+	if p.TLSEndpoint != "" {
+		interfaces = append(interfaces, a2aspec.NewAgentInterface(p.TLSEndpoint, transport))
+	}
+
 	return &a2aspec.AgentCard{
-		Name:        cardName(p.Agent),
-		Description: p.Agent.Description,
-		Version:     p.Version,
-		SupportedInterfaces: []*a2aspec.AgentInterface{
-			// NewAgentInterface stamps the SDK's protocol version.
-			a2aspec.NewAgentInterface(p.Endpoint, transport),
-		},
+		Name:                cardName(p.Agent),
+		Description:         p.Agent.Description,
+		Version:             p.Version,
+		SupportedInterfaces: interfaces,
 		Capabilities: a2aspec.AgentCapabilities{
 			// Dispatched agents stream todo/progress updates over SSE.
 			Streaming: true,
@@ -73,22 +90,44 @@ func BuildAgentCard(p CardParams) *a2aspec.AgentCard {
 			// TaskStatusUpdateEvents carry, with their schemas.
 			Extensions: cardExtensions(),
 		},
-		DefaultInputModes:  defaultInputModes,
-		DefaultOutputModes: defaultOutputModes,
-		Skills:             agentSkills(p.Skills),
-		// Authentication (#357): the host's per-process bearer token,
-		// required of every call. Scopes are empty — the token either
-		// matches or the call is rejected.
-		SecuritySchemes: a2aspec.NamedSecuritySchemes{
-			bearerSchemeName: a2aspec.HTTPAuthSecurityScheme{
-				Scheme:      "bearer",
-				Description: "Per-process bearer token minted by the serving Crush process.",
-			},
-		},
-		SecurityRequirements: a2aspec.SecurityRequirementsOptions{
-			{bearerSchemeName: {}},
+		DefaultInputModes:    defaultInputModes,
+		DefaultOutputModes:   defaultOutputModes,
+		Skills:               agentSkills(p.Skills),
+		SecuritySchemes:      securitySchemes(p),
+		SecurityRequirements: securityRequirements(p),
+	}
+}
+
+// securitySchemes declares how served calls authenticate (#357): the
+// host's per-process bearer token, plus — when the TCP listener requires
+// client certificates (#358) — mutual TLS.
+func securitySchemes(p CardParams) a2aspec.NamedSecuritySchemes {
+	schemes := a2aspec.NamedSecuritySchemes{
+		bearerSchemeName: a2aspec.HTTPAuthSecurityScheme{
+			Scheme:      "bearer",
+			Description: "Per-process bearer token minted by the serving Crush process.",
 		},
 	}
+	if p.TLSEndpoint != "" && p.MutualTLS {
+		schemes[mtlsSchemeName] = a2aspec.MutualTLSSecurityScheme{
+			Description: "Client certificate verified against the TCP listener's client CA.",
+		}
+	}
+	return schemes
+}
+
+// securityRequirements lists the alternatives a call may satisfy:
+// the bearer token always, and a verified client certificate on the
+// TCP listener when it requires one (#358). Scopes are empty — the
+// credential either matches or the call is rejected.
+func securityRequirements(p CardParams) a2aspec.SecurityRequirementsOptions {
+	reqs := a2aspec.SecurityRequirementsOptions{
+		{bearerSchemeName: {}},
+	}
+	if p.TLSEndpoint != "" && p.MutualTLS {
+		reqs = append(reqs, a2aspec.SecurityRequirements{mtlsSchemeName: {}})
+	}
+	return reqs
 }
 
 // cardName resolves a human-readable card name from the agent config, falling

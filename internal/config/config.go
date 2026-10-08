@@ -497,6 +497,8 @@ type Options struct {
 	TodoEnforcement *TodoEnforcementConfig `json:"todo_enforcement,omitempty" jsonschema:"description=Proactive todo enforcement: inject a nudge when an agent works without a todo list, and optionally reject mutating tools until one exists"`
 	// Dispatch carries the dispatch_agent tool's limits (#390).
 	Dispatch *DispatchOptions `json:"dispatch,omitempty" jsonschema:"description=Dispatched agent options"`
+	// A2A carries the A2A host's optional TCP listener (#358).
+	A2A *A2AOptions `json:"a2a,omitempty" jsonschema:"description=A2A host options: an optional TLS-only TCP listener beside the per-process unix socket"`
 }
 
 // DefaultDispatchMaxConcurrent bounds how many dispatched agents run at
