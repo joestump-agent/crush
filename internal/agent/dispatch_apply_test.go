@@ -152,6 +152,26 @@ func TestApplyAndDismissRefuseUnknownAndRunning(t *testing.T) {
 	waitTerminalDispatch(t, c, handle.DispatchID, dispatch.StatusCompleted)
 }
 
+// An external dispatch (#434) ran remotely and wrote nothing here: both
+// tools refuse it plainly instead of failing on its empty branch.
+func TestApplyAndDismissRefuseExternalDispatch(t *testing.T) {
+	c, _ := newInjectionEnv(t, newGatedDispatchAgent())
+	c.dispatchRegistry().Register(dispatch.Entry{
+		ID:     "external-1",
+		Handle: "remote",
+		Status: dispatch.StatusCompleted,
+		Source: "https://agents.example/card.json",
+	})
+
+	resp := runTool(t, c.applyDispatchTool(), ApplyDispatchToolName, ApplyDispatchParams{Handle: "remote"})
+	require.True(t, resp.IsError, "expected a tool error, got: %s", resp.Content)
+	require.Contains(t, resp.Content, "ran on an external agent")
+
+	resp = runTool(t, c.dismissDispatchTool(), DismissDispatchToolName, DismissDispatchParams{DispatchID: "external-1"})
+	require.True(t, resp.IsError, "expected a tool error, got: %s", resp.Content)
+	require.Contains(t, resp.Content, "ran on an external agent")
+}
+
 // Every apply mode brings both the committed and the uncommitted
 // workspace work into the parent checkout: merge lands a merge commit,
 // squash stages without committing, cherry-pick replays the commits

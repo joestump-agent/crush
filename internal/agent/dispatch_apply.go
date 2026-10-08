@@ -122,6 +122,11 @@ func (c *coordinator) resolveFinishedDispatch(id, handle string) (dispatch.Entry
 	if !entry.Status.IsTerminal() {
 		return dispatch.Entry{}, fmt.Errorf("dispatch %s is still running; cancel it first", entry.ID)
 	}
+	// An external agent ran remotely (#434): it wrote nothing here, so
+	// there is no workspace or branch to bring in or throw away.
+	if entry.Source != "" {
+		return dispatch.Entry{}, fmt.Errorf("dispatch %s ran on an external agent: nothing was written to disk, so there is no workspace or branch to apply or dismiss", entry.ID)
+	}
 	if err := validateDispatchRef(entry); err != nil {
 		return dispatch.Entry{}, err
 	}
