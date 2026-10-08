@@ -34,6 +34,7 @@ import (
 //	option auto-lsp false
 //	option request-timeout 300
 //	option request-timeout 0
+//	option a2a-listen 127.0.0.1:7443
 //
 // Boolean shortcuts: for boolean fields, omitting the value sets it to true.
 func handleOption(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -133,6 +134,20 @@ func handleOption(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		// agents (#433): a bad default is a load error, not a shell
 		// config error.
 		childMap(o, "dispatch")["default_agent"] = val
+		slog.Info("Option set in shell config", "key", key, "value", val)
+		return nil
+	}
+
+	// The a2a-* keys write into the nested options.a2a block (#358),
+	// the same nested-section pattern as dispatch-default-agent.
+	if jsonKey, ok := a2aOptions[key]; ok {
+		if val == "" {
+			return usage(stderr, fmt.Sprintf("option: %s requires a value", key))
+		}
+		// The address and the files are validated at load, against the
+		// working directory (#358): a bad value is a load error, not a
+		// shell config error, exactly as it is for crush.json.
+		childMap(o, "a2a")[jsonKey] = val
 		slog.Info("Option set in shell config", "key", key, "value", val)
 		return nil
 	}
@@ -253,6 +268,17 @@ var optionSpecs = map[string]optionSpec{
 	"global-context-path": {jsonKey: "global_context_paths", kind: optList},
 	"skill-path":          {jsonKey: "skills_paths", kind: optList},
 	"disable-skill":       {jsonKey: "disabled_skills", kind: optList},
+}
+
+// a2aOptions maps the a2a-* keys to their field under options.a2a
+// (#358): the A2A host's optional TLS-only TCP listener. Like the
+// dispatch-* keys they write a nested block, so they are handled as a
+// special case in handleOption rather than listed in optionSpecs.
+var a2aOptions = map[string]string{
+	"a2a-listen":    "listen",
+	"a2a-tls-cert":  "tls_cert",
+	"a2a-tls-key":   "tls_key",
+	"a2a-client-ca": "client_ca",
 }
 
 // optionUI implements "option ui <key> <value>" for TUI-specific settings

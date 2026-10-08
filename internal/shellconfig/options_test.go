@@ -471,3 +471,49 @@ func TestOption_DispatchDefaultAgentInvalid(t *testing.T) {
 		require.Contains(t, err.Error(), "dispatch-default-agent", "script: %s", script)
 	}
 }
+
+// The a2a-* keys (#358) land under options.a2a with the JSON key names,
+// so a crushrc and a crush.json describe the same listener.
+func TestOption_A2A(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	script := `option a2a-listen 127.0.0.1:7443
+option a2a-tls-cert certs/a2a.pem
+option a2a-tls-key certs/a2a-key.pem
+option a2a-client-ca certs/ca.pem`
+	path := filepath.Join(dir, "crushrc")
+
+	jsonBytes, err := LoadShellConfig(t.Context(), path, []byte(script))
+	require.NoError(t, err)
+
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(jsonBytes, &result))
+
+	opts := result["options"].(map[string]any)
+	require.Equal(t, map[string]any{
+		"listen":    "127.0.0.1:7443",
+		"tls_cert":  "certs/a2a.pem",
+		"tls_key":   "certs/a2a-key.pem",
+		"client_ca": "certs/ca.pem",
+	}, opts["a2a"])
+}
+
+// Every a2a-* key needs a value; the plain-TCP refusal itself is a load
+// error, checked against the merged config, not here.
+func TestOption_A2ARequiresValue(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "crushrc")
+
+	for _, key := range []string{"a2a-listen", "a2a-tls-cert", "a2a-tls-key", "a2a-client-ca"} {
+		_, err := LoadShellConfig(t.Context(), path, []byte("option "+key))
+		require.Error(t, err, "key: %s", key)
+		require.Contains(t, err.Error(), key+" requires a value")
+	}
+
+	_, err := LoadShellConfig(t.Context(), path, []byte("option a2a-bogus x"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown key")
+}

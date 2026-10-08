@@ -405,7 +405,7 @@ func (e *Executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		// — an unknown context, another dispatch's, or one whose run has
 		// ended and taken its binding with it — is rejected without the
 		// runner ever being called: task sessions are not continuable.
-		binding, ok := e.resolve(execCtx.ContextID)
+		binding, ok := e.resolve(ctx, execCtx.ContextID)
 		if !ok {
 			if execCtx.StoredTask == nil {
 				if !yield(a2aspec.NewSubmittedTask(execCtx, execCtx.Message), nil) {
@@ -796,11 +796,22 @@ func questionAnswers(msg *a2aspec.Message, req question.Request) []question.Answ
 // owns it (#350). Only this route's own, still-bound context resolves:
 // an unknown context, another dispatch's, or one whose binding was
 // removed when its run ended all reject with the same terminal message.
-func (e *Executor) resolve(contextID string) (ContextBinding, bool) {
+// A local-only binding does not resolve for a call that arrived over the
+// TCP listener (#358), so a remote caller that learns a local run's
+// context ID cannot message, steer, answer or cancel it; it gets the
+// same rejection as an unknown context.
+func (e *Executor) resolve(ctx context.Context, contextID string) (ContextBinding, bool) {
 	if contextID != e.contextID || e.contexts == nil {
 		return ContextBinding{}, false
 	}
-	return e.contexts.Lookup(contextID)
+	binding, ok := e.contexts.Lookup(contextID)
+	if !ok {
+		return ContextBinding{}, false
+	}
+	if _, remote := remotePeerFromContext(ctx); remote && binding.LocalOnly {
+		return ContextBinding{}, false
+	}
+	return binding, true
 }
 
 // noAgentForContextText is the rejection message for a task whose
@@ -1263,7 +1274,7 @@ func traceIDFromContext(ctx context.Context) string {
 // touches no runner.
 func (e *Executor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2aspec.Event, error] {
 	return func(yield func(a2aspec.Event, error) bool) {
-		binding, ok := e.resolve(execCtx.ContextID)
+		binding, ok := e.resolve(ctx, execCtx.ContextID)
 		if !ok {
 			yield(statusEvent(execCtx, a2aspec.TaskStateCanceled,
 				agentMessage(execCtx, noAgentForContextText(execCtx.ContextID))), nil)

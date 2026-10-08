@@ -517,6 +517,31 @@ option dispatch-stall 5m
 option dispatch-timeout 1h
 ```
 
+### A2A listener keys
+
+These keys configure the A2A host's optional TCP listener, which lives under
+`options.a2a` in the JSON form. It serves TLS only: `a2a-listen` without both
+`a2a-tls-cert` and `a2a-tls-key` fails the load with
+`a2a.listen requires tls_cert and tls_key; plain TCP is not supported`.
+Each `PATH` must be absolute or start with `~/`; a relative path fails the
+load. Without `a2a-client-ca` only this process's own bearer token is
+accepted, so no remote client can authenticate. See
+[TCP listener](/agents/a2a-protocol#tcp-listener) for how it serves and
+authenticates.
+
+| Key | JSON | Effect |
+| --- | --- | --- |
+| `a2a-listen HOST:PORT` | `options.a2a.listen` | Listen on TCP at this address |
+| `a2a-tls-cert PATH` | `options.a2a.tls_cert` | PEM server certificate |
+| `a2a-tls-key PATH` | `options.a2a.tls_key` | PEM private key for the certificate |
+| `a2a-client-ca PATH` | `options.a2a.client_ca` | PEM CA certificates; require client certificates signed by them (mutual TLS) |
+
+```bash
+option a2a-listen 127.0.0.1:7443
+option a2a-tls-cert ~/.config/crush/certs/a2a.pem
+option a2a-tls-key ~/.config/crush/certs/a2a-key.pem
+```
+
 ### `option reset`
 
 Clears every value previously added to a list option. Values added *after* the
