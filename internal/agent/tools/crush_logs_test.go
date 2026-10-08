@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -13,11 +14,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// newLogFilePath returns a crush.log path in a fresh temporary directory.
+// At cleanup, before TempDir removes the directory, it deletes the file
+// and fails the test if it cannot. Windows refuses to delete a file while
+// any handle to it is open, so a handle the fixture or the tool left open
+// fails here on the first attempt. TempDir's own cleanup retries for two
+// seconds and only fails if no GC finalizes the leaked file in that
+// window, which made such a leak an intermittent CI failure.
+//
+// @joestump-agent 10/07/2026 - Added after TestCrushLogs_EmptyFile's
+// discarded os.Create handle failed TempDir cleanup on windows-latest.
+func newLogFilePath(t *testing.T) string {
+	t.Helper()
+	logFile := filepath.Join(t.TempDir(), "crush.log")
+	t.Cleanup(func() {
+		err := os.Remove(logFile)
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		require.NoError(t, err, "crush.log is still open at cleanup")
+	})
+	return logFile
+}
+
 // createTestLogFile creates a temporary log file with the given entries.
 func createTestLogFile(t *testing.T, entries []map[string]any) string {
 	t.Helper()
-	tempDir := t.TempDir()
-	logFile := filepath.Join(tempDir, "crush.log")
+	logFile := newLogFilePath(t)
 
 	file, err := os.Create(logFile)
 	require.NoError(t, err)
@@ -129,10 +152,8 @@ func TestCrushLogs_MissingFile(t *testing.T) {
 
 func TestCrushLogs_EmptyFile(t *testing.T) {
 	t.Parallel()
-	tempDir := t.TempDir()
-	logFile := filepath.Join(tempDir, "crush.log")
-	_, err := os.Create(logFile)
-	require.NoError(t, err)
+	logFile := newLogFilePath(t)
+	require.NoError(t, os.WriteFile(logFile, nil, 0o644))
 
 	result := runCrushLogs(logFile, CrushLogsParams{Lines: 50})
 	require.Contains(t, result, "Log file is empty")
@@ -140,8 +161,7 @@ func TestCrushLogs_EmptyFile(t *testing.T) {
 
 func TestCrushLogs_MalformedLines(t *testing.T) {
 	t.Parallel()
-	tempDir := t.TempDir()
-	logFile := filepath.Join(tempDir, "crush.log")
+	logFile := newLogFilePath(t)
 
 	file, err := os.Create(logFile)
 	require.NoError(t, err)
@@ -300,8 +320,7 @@ func TestCrushLogs_ReservedFields(t *testing.T) {
 
 func TestCrushLogs_OversizedLines(t *testing.T) {
 	t.Parallel()
-	tempDir := t.TempDir()
-	logFile := filepath.Join(tempDir, "crush.log")
+	logFile := newLogFilePath(t)
 
 	file, err := os.Create(logFile)
 	require.NoError(t, err)
@@ -342,8 +361,7 @@ func TestCrushLogs_OversizedLines(t *testing.T) {
 
 func TestCrushLogs_PartialTrailingLine(t *testing.T) {
 	t.Parallel()
-	tempDir := t.TempDir()
-	logFile := filepath.Join(tempDir, "crush.log")
+	logFile := newLogFilePath(t)
 
 	file, err := os.Create(logFile)
 	require.NoError(t, err)
