@@ -126,6 +126,12 @@ type Entry struct {
 	// Agent is the id of the agent definition the dispatch runs (#433):
 	// worker by default, or the agent the tool call named.
 	Agent string
+	// Source is the external Agent Card URL a runtime a2a dispatch runs
+	// against (#434); empty for a dispatch served in-process. A dispatch
+	// with a source has no workspace, no local agent, and no A2A server
+	// of its own: Endpoint and AgentCard stay empty, so nothing that
+	// talks to a served dispatch can reach the external one.
+	Source string
 	// Status is the workspace's lifecycle state.
 	Status Status
 	// Endpoint is the A2A server endpoint serving the dispatched agent

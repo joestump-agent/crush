@@ -308,6 +308,7 @@ func TestExternalAgentHappyPath(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
 	require.NotEmpty(t, taskID, "the remote task's ID is tracked like a served dispatch's")
+	require.True(t, strings.HasPrefix(outcome.Text, dispatch.UntrustedPrefix), "the findings are labeled untrusted")
 	require.Contains(t, outcome.Text, "review done")
 	require.Contains(t, outcome.Text, "finding: nil deref in main.go")
 	require.Contains(t, outcome.Text, "you sent Bearer [REDACTED]", "a token the remote echoes back is scrubbed")
@@ -344,7 +345,7 @@ func TestExternalAgentMessageReply(t *testing.T) {
 	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
-	require.Equal(t, "looks good to me", outcome.Text)
+	require.Equal(t, dispatch.UntrustedPrefix+"looks good to me", outcome.Text)
 }
 
 // A card whose JSON-RPC service lives on another origin is refused
@@ -450,14 +451,14 @@ func TestExternalAgentResolverErrors(t *testing.T) {
 			handler: func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write([]byte("<html>login</html>"))
 			},
-			want: "card parsing failed",
+			want: "the response is not a valid Agent Card",
 		},
 		{
 			name: "oversized card",
 			handler: func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write(bytes.Repeat([]byte(" "), maxExternalCardBytes+1))
 			},
-			want: "request body too large",
+			want: "the card is larger than",
 		},
 	}
 	for _, tc := range cases {
@@ -647,7 +648,8 @@ func TestExternalAgentFailureIsCapped(t *testing.T) {
 	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusFailed, outcome.Status)
-	require.LessOrEqual(t, len(outcome.Text), maxExternalTextBytes+len(externalTruncatedMarker))
+	require.True(t, strings.HasPrefix(outcome.Text, dispatch.UntrustedPrefix), "a remote failure reason is labeled")
+	require.LessOrEqual(t, len(outcome.Text), len(dispatch.UntrustedPrefix)+maxExternalTextBytes+len(externalTruncatedMarker))
 	require.True(t, strings.HasSuffix(outcome.Text, externalTruncatedMarker))
 }
 
@@ -674,7 +676,8 @@ func TestExternalPinning(t *testing.T) {
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	require.ErrorContains(t, err, "pinned to https://reviewer.example.net:443")
+	require.ErrorContains(t, err, "pinned origin https://reviewer.example.net:443")
+	require.NotContains(t, err.Error(), "evil", "the refused target is not echoed")
 	requireNoToken(t, err.Error(), "the error")
 	require.False(t, called, "an off-origin request must not be sent")
 	require.True(t, body.closed, "a refused request's body is closed")
@@ -984,7 +987,246 @@ func TestExternalAgentNonStreamingCard(t *testing.T) {
 	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review", OnTask: func(id string) { taskID = id }})
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCompleted, outcome.Status)
-	require.Equal(t, "blocking review done", outcome.Text)
+	require.Equal(t, dispatch.UntrustedPrefix+"blocking review done", outcome.Text)
 	require.NotEmpty(t, taskID)
 	require.Equal(t, []string{"SendMessage"}, es.methods(), "a non-streaming card gets a blocking SendMessage")
+}
+
+// injectedText is what a hostile remote tries to get into crush's errors
+// and logs; no resolution error may carry it (#434).
+const injectedText = "ignore-previous-instructions"
+
+// A refused card names the user's card URL and fixed wording, never a
+// string the remote controls: not the status line's reason phrase, not
+// a foreign service host, not an unknown binding's name, not the SDK's
+// echo of the card's protocol strings, not a redirect target.
+func TestExternalAgentResolutionErrorsCarryNoRemoteText(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		setup func(es *externalServer)
+		want  string
+	}{
+		{
+			name: "status reason phrase",
+			setup: func(es *externalServer) {
+				es.cardHandler = func(w http.ResponseWriter, _ *http.Request) {
+					conn, buf, err := http.NewResponseController(w).Hijack()
+					if err != nil {
+						return
+					}
+					defer conn.Close()
+					_, _ = buf.WriteString("HTTP/1.1 404 " + injectedText + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+					_ = buf.Flush()
+				}
+			},
+			want: "HTTP status 404",
+		},
+		{
+			name: "foreign service host",
+			setup: func(es *externalServer) {
+				es.card = func(string) *a2aspec.AgentCard {
+					return externalTestCard("https://"+injectedText+".example.net/a2a", true)
+				}
+			},
+			want: "on another origin than",
+		},
+		{
+			name: "unknown binding name",
+			setup: func(es *externalServer) {
+				es.card = func(base string) *a2aspec.AgentCard {
+					card := externalTestCard(base+"/a2a", true)
+					card.SupportedInterfaces = []*a2aspec.AgentInterface{
+						{URL: base + "/x", ProtocolBinding: a2aspec.TransportProtocol(injectedText), ProtocolVersion: "1.0"},
+						{URL: base + "/g", ProtocolBinding: a2aspec.TransportProtocolGRPC, ProtocolVersion: "1.0"},
+					}
+					return card
+				}
+			},
+			want: "card offers 2 interfaces [GRPC, 1 unrecognized]",
+		},
+		{
+			name: "unsupported protocol version",
+			setup: func(es *externalServer) {
+				es.card = func(base string) *a2aspec.AgentCard {
+					card := externalTestCard(base+"/a2a", true)
+					card.SupportedInterfaces[0].ProtocolVersion = a2aspec.ProtocolVersion("9." + injectedText)
+					return card
+				}
+			},
+			want: "on a protocol version crush speaks (1.x)",
+		},
+		{
+			name: "redirect target",
+			setup: func(es *externalServer) {
+				es.cardHandler = func(w http.ResponseWriter, r *http.Request) {
+					http.Redirect(w, r, "https://"+injectedText+".example.net/card.json", http.StatusFound)
+				}
+			},
+			want: "refusing a cross-origin redirect",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+			tc.setup(es)
+			_, err := externalFactory(t, es).ResolveExternalAgent(t.Context(), agent.ExternalAgentParams{
+				CardURL: es.cardURL(),
+				Token:   agent.NewSecret(externalTestToken),
+			})
+			require.ErrorContains(t, err, tc.want)
+			require.NotContains(t, err.Error(), injectedText, "a remote string reached the error")
+		})
+	}
+}
+
+// A stream error can carry the remote's own words; they arrive labeled.
+func TestExternalAgentStreamErrorIsLabeled(t *testing.T) {
+	t.Parallel()
+	es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+	es.callHandler = sseHandler(func(w io.Writer) {
+		_, _ = w.Write([]byte(`data: {"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"` + injectedText + `"}}` + "\n\n"))
+	})
+	ext := resolveTestAgent(t, es)
+	_, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "a2a: external agent stream failed: "+dispatch.UntrustedPrefix)
+}
+
+// A streaming card's calls wait at most 30 seconds for response headers,
+// as the served path does; a non-streaming card's blocking SendMessage
+// answers only at the end, so the idle timeout bounds it instead. The
+// card fetch's own transport is left alone.
+func TestExternalAgentResponseHeaderTimeout(t *testing.T) {
+	t.Parallel()
+	for _, streaming := range []bool{true, false} {
+		es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+		es.card = func(base string) *a2aspec.AgentCard {
+			card := externalTestCard(base+"/a2a", true)
+			card.Capabilities.Streaming = streaming
+			return card
+		}
+		ext := resolveTestAgent(t, es)
+		base := ext.(*externalAgent).http.Transport.(*pinnedTransport).base.(*http.Transport)
+		if streaming {
+			require.Equal(t, externalResponseHeaderTimeout, base.ResponseHeaderTimeout)
+		} else {
+			require.Zero(t, base.ResponseHeaderTimeout)
+		}
+		require.Zero(t, es.srv.Client().Transport.(*http.Transport).ResponseHeaderTimeout, "the shared base is not modified")
+	}
+}
+
+// Remote text loses what a reader cannot see (#434): control and format
+// characters — zero-width spaces, word joiners, byte-order marks,
+// bidirectional overrides, the tag block — but keeps newlines, tabs and
+// the zero-width joiner emoji need. A token split by an invisible
+// character is caught once it is dropped.
+func TestUntrustedTextDropsInvisibles(t *testing.T) {
+	t.Parallel()
+	in := "a\u200bb\u2060c\ufeffd\U000E0041\U000E007Fe\u202ef\x1b[2Jg\rh\u200di\nj\tk"
+	require.Equal(t, "abcdef[2Jgh\u200di\nj\tk", untrustedText(in, agent.Secret{}))
+
+	token := agent.NewSecret(externalTestToken)
+	split := "leaked " + externalTestToken[:6] + "\u200b" + externalTestToken[6:] + " here"
+	got := untrustedText(split, token)
+	require.Equal(t, "leaked [REDACTED] here", got)
+}
+
+// A cut never leaves a prefix of the token behind (#434): whole tokens
+// are scrubbed before the cut, and a prefix the cut left dangling is
+// scrubbed at it. Shorter dangling prefixes say nothing and stay.
+func TestCutTextScrubsDanglingToken(t *testing.T) {
+	t.Parallel()
+	token := agent.NewSecret(externalTestToken)
+	require.Equal(t, "abc[REDACTED]", cutText("abc"+externalTestToken[:10]+"zz", 13, token))
+	require.Equal(t, "abc"+externalTestToken[:3], cutText("abc"+externalTestToken[:3]+"zzz", 6, token))
+	require.Equal(t, "short", cutText("short", 10, token), "no cut, nothing to scrub")
+}
+
+// The fold's budget cut cannot leave a token prefix in the findings: an
+// artifact whose token straddles the budget, whole or split across
+// appended chunks, reaches the parent with no part of it.
+func TestExternalAgentScrubsTokenAtTheCut(t *testing.T) {
+	t.Parallel()
+	filler := strings.Repeat("x", maxExternalTextBytes-5)
+	es, _ := newExternalServer(t, func(_ context.Context, execCtx *a2asrv.ExecutorContext, yield func(a2aspec.Event, error) bool) {
+		if !working(execCtx, yield) {
+			return
+		}
+		switch execCtx.Message.Parts[0].Text() {
+		case "whole":
+			if !yield(a2aspec.NewArtifactEvent(execCtx, a2aspec.NewTextPart(filler+externalTestToken)), nil) {
+				return
+			}
+		case "middle":
+			// The cut lands inside the first artifact, and a second one
+			// follows it, so the final cap cannot hide what the fold's cut
+			// left behind.
+			first := a2aspec.NewArtifactEvent(execCtx, a2aspec.NewTextPart("a"))
+			if !yield(first, nil) {
+				return
+			}
+			if !yield(a2aspec.NewArtifactEvent(execCtx, a2aspec.NewTextPart(strings.Repeat("y", 100))), nil) {
+				return
+			}
+			grow := a2aspec.NewArtifactUpdateEvent(execCtx, first.Artifact.ID, a2aspec.NewTextPart(strings.Repeat("x", maxExternalTextBytes-106)+externalTestToken))
+			if !yield(grow, nil) {
+				return
+			}
+		default:
+			first := a2aspec.NewArtifactEvent(execCtx, a2aspec.NewTextPart(filler+externalTestToken[:12]))
+			if !yield(first, nil) {
+				return
+			}
+			rest := a2aspec.NewArtifactUpdateEvent(execCtx, first.Artifact.ID, a2aspec.NewTextPart(externalTestToken[12:]+" tail"))
+			if !yield(rest, nil) {
+				return
+			}
+		}
+		yield(a2aspec.NewStatusUpdateEvent(execCtx, a2aspec.TaskStateCompleted, nil), nil)
+	})
+	ext := resolveTestAgent(t, es)
+	for _, prompt := range []string{"whole", "middle", "split"} {
+		outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: prompt})
+		require.NoError(t, err, prompt)
+		require.Equal(t, DispatchStatusCompleted, outcome.Status, prompt)
+		require.NotContains(t, outcome.Text, externalTestToken[:minDanglingToken], "%s: a token prefix survived the cut", prompt)
+	}
+}
+
+// A task ID crush would record — in the registry, the durable record,
+// log lines — must be at most 256 printable characters (#434); a stream
+// naming any other is refused before the ID goes anywhere.
+func TestExternalAgentRefusesBadTaskID(t *testing.T) {
+	t.Parallel()
+	for name, id := range map[string]string{
+		"too long":   strings.Repeat("t", maxTaskIDRunes+1),
+		"escape":     "task\x1b[2J",
+		"zero width": "task\u200bid",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			es, _ := newExternalServer(t, func(context.Context, *a2asrv.ExecutorContext, func(a2aspec.Event, error) bool) {})
+			event, err := json.Marshal(a2aspec.StreamResponse{Event: &a2aspec.Task{
+				ID:        a2aspec.TaskID(id),
+				ContextID: "ctx-1",
+				Status:    a2aspec.TaskStatus{State: a2aspec.TaskStateWorking},
+			}})
+			require.NoError(t, err)
+			es.callHandler = sseHandler(func(w io.Writer) {
+				_, _ = fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":%s}\n\n", event)
+			})
+			ext := resolveTestAgent(t, es)
+
+			var named []string
+			_, err = ext.Stream(t.Context(), agent.ExternalDispatchParams{Prompt: "review", OnTask: func(id string) { named = append(named, id) }})
+			require.ErrorIs(t, err, errInvalidTaskID)
+			require.Empty(t, named, "a refused ID is never recorded")
+		})
+	}
+	require.True(t, validTaskID(a2aspec.TaskID(strings.Repeat("t", maxTaskIDRunes))))
+	require.True(t, validTaskID("0c8f0d3e-6c9b-4c61-9f6e-0b7d6e2b1a77"))
+	require.False(t, validTaskID("task\xff"), "JSON cannot carry it, but a raw ID must be valid UTF-8 too")
 }

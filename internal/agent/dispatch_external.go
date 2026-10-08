@@ -3,8 +3,17 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
+
+	"charm.land/fantasy"
+	"github.com/charmbracelet/crush/internal/agent/tools"
+	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/dispatch"
+	"github.com/google/uuid"
 )
 
 // External agents (#434): a runtime a2a agent definition replaces the
@@ -123,4 +132,285 @@ type RunKill interface {
 	Killed() <-chan struct{}
 	// Reason returns the recorded kill reason, empty until a kill.
 	Reason() string
+}
+
+// ErrSteerExternal refuses a steer addressed to an external agent
+// (#434): see DeliverAgentMessage for why.
+var ErrSteerExternal = errors.New("steering external agents is not supported yet")
+
+// dispatchExternal starts one dispatch on a runtime a2a agent (#434).
+// It shares the built-in dispatch's front half — the tool's agent
+// resolution, the concurrency cap, the registry entry with its handle
+// and role, the task session, the durable record — and skips the rest:
+// the none workspace provider stands in for the worktree, and there is
+// no toolchain, no local agent, and no A2A server. The card is resolved
+// here, while the tool call is open, so an unreachable card, a refused
+// one, or a token that does not resolve is the tool's error.
+func (c *coordinator) dispatchExternal(ctx context.Context, params DispatchAgentParams, call fantasy.ToolCall, agentCfg config.Agent) (fantasy.ToolResponse, error) {
+	// Local knobs mean nothing to a remote agent: refuse them rather
+	// than silently dropping them, like a pinned model (#433).
+	var local []string
+	if params.Model != "" {
+		local = append(local, "model")
+	}
+	if len(params.Skills) > 0 {
+		local = append(local, "skills")
+	}
+	if params.Branch != "" {
+		local = append(local, "branch")
+	}
+	if len(local) > 0 {
+		return fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"agent %q is an external A2A agent; omit %s, which only apply to agents that run locally",
+			agentCfg.ID, strings.Join(local, ", "))), nil
+	}
+
+	sessionID := tools.GetSessionFromContext(ctx)
+	if sessionID == "" {
+		return fantasy.ToolResponse{}, errors.New("session id missing from context")
+	}
+	agentMessageID := tools.GetMessageFromContext(ctx)
+	if agentMessageID == "" {
+		return fantasy.ToolResponse{}, errors.New("agent message id missing from context")
+	}
+
+	resolver, ok := c.a2aHost().(ExternalAgentResolver)
+	if !ok || resolver == nil {
+		return fantasy.NewTextErrorResponse("dispatch unavailable: the A2A host cannot reach external agents"), nil
+	}
+
+	// The cap first, like a built-in dispatch (#390): a call refused at
+	// capacity must not have run the token's command.
+	reserved, running := c.reserveDispatchSlot()
+	if !reserved {
+		limit := c.cfg.Config().Options.GetDispatchMaxConcurrent()
+		return fantasy.NewTextErrorResponse(fmt.Sprintf(
+			"dispatch at capacity: %d agents are already running (dispatch.max_concurrent=%d); wait for one to finish or cancel one",
+			running, limit)), nil
+	}
+	token, err := c.resolveExternalToken(ctx, agentCfg)
+	if err != nil {
+		c.releaseDispatchSlot()
+		return fantasy.NewTextErrorResponse(err.Error()), nil
+	}
+
+	ext, err := resolver.ResolveExternalAgent(ctx, ExternalAgentParams{CardURL: agentCfg.Card, Token: token})
+	if err != nil {
+		c.releaseDispatchSlot()
+		slog.Warn("External agent card refused", "agent", agentCfg.ID, "card", agentCfg.Card, "error", err)
+		return fantasy.NewTextErrorResponse(fmt.Sprintf("dispatch to external agent %q failed: %s", agentCfg.ID, err)), nil
+	}
+
+	// The collector renders the agent block (#65); an external dispatch
+	// never creates the git provider that would otherwise start it.
+	c.startDispatchCollector()
+	reg := c.dispatchRegistry()
+
+	// The none workspace (#391): no directory, branch, or base, so the
+	// entry carries none and nothing is ever created on disk.
+	var provider dispatch.WorkspaceProvider = dispatch.NoneProvider{}
+	id := uuid.NewString()
+	placement, err := provider.Provision(ctx, id, dispatch.ProvisionOptions{})
+	if err != nil {
+		c.releaseDispatchSlot()
+		ext.Close()
+		return fantasy.NewTextErrorResponse(fmt.Sprintf("provision dispatch workspace: %s", err)), nil
+	}
+	entry := dispatch.Entry{
+		ID:      id,
+		Path:    placement.Path,
+		Branch:  placement.Branch,
+		Base:    placement.Base,
+		BaseSHA: placement.BaseSHA,
+		Agent:   agentCfg.ID,
+		Source:  ext.Source(),
+		Status:  dispatch.StatusProvisioned,
+	}
+	reg.Register(entry)
+
+	// Detached from the tool call, like a built-in dispatch's root
+	// (#371): the run outlives the turn that started it.
+	rootCtx, rootCancel := context.WithCancel(context.WithoutCancel(ctx))
+	fail := func(msg string) (fantasy.ToolResponse, error) {
+		rootCancel()
+		c.releaseDispatchSlot()
+		ext.Close()
+		reg.Remove(entry.ID)
+		return fantasy.NewTextErrorResponse(msg), nil
+	}
+
+	taskSessionID := c.sessions.CreateAgentToolSessionID(agentMessageID, call.ID)
+	taskSession, err := c.sessions.CreateTaskSession(ctx, taskSessionID, sessionID, "External Agent")
+	if err != nil {
+		return fail(fmt.Sprintf("create session: %s", err))
+	}
+	reg.SetSession(entry.ID, taskSession.ID)
+	reg.SetParentSessionID(entry.ID, sessionID)
+	reg.SetStatus(entry.ID, dispatch.StatusRunning)
+	assignedHandle, ok := reg.AssignHandle(entry.ID, params.Handle, params.Role)
+	if !ok {
+		return fail("assign dispatch handle: registry entry vanished")
+	}
+
+	kill := &dispatchKill{}
+	run := dispatchRun{
+		reg:             reg,
+		entry:           entry,
+		prompt:          params.Prompt,
+		sessionID:       taskSession.ID,
+		parentSessionID: sessionID,
+		contentWidth:    tools.GetContentWidthFromContext(ctx),
+		kill:            kill,
+		killSettings:    c.externalKillSettings(agentCfg),
+		cancel:          rootCancel,
+		findings:        &dispatchFindings{},
+		holdsSlot:       true,
+		external:        ext,
+	}
+	c.registerLiveDispatch(entry.ID, &liveDispatch{
+		cancel:    rootCancel,
+		sessionID: taskSession.ID,
+		kill:      kill,
+		done:      make(chan struct{}),
+	})
+
+	handle := dispatch.DispatchResult{
+		DispatchID: entry.ID,
+		Handle:     assignedHandle,
+		Agent:      entry.Agent,
+		SessionID:  taskSession.ID,
+		Source:     ext.Source(),
+		Status:     dispatch.StatusRunning,
+	}
+	if c.dispatchRecords != nil {
+		if err := c.dispatchRecords.RecordStarted(handle, sessionID); err != nil {
+			slog.Warn("Failed to record dispatch start", "dispatch_id", entry.ID, "error", err)
+		}
+	}
+	slog.Debug("External dispatch started", "dispatch_id", entry.ID, "agent", agentCfg.ID, "source", ext.Source())
+	c.startDispatchRun(func() { c.runDispatch(rootCtx, run) })
+	return fantasy.NewTextResponse(handle.Render()), nil
+}
+
+// resolveExternalToken resolves a runtime a2a definition's auth.token at
+// dispatch time (#434), through the config's variable resolver: the
+// same $VAR and $(cmd) expansion every other config credential gets,
+// rerun per dispatch so a rotated token is picked up, and bounded by the
+// tool call's context. The value lives only in the returned Secret. A
+// failure's details — a command's stderr among them — go to the log
+// only: the error names the agent and nothing the command printed.
+func (c *coordinator) resolveExternalToken(ctx context.Context, agentCfg config.Agent) (Secret, error) {
+	if agentCfg.Auth == nil || agentCfg.Auth.Token == nil {
+		return Secret{}, nil
+	}
+	resolver := c.cfg.Resolver()
+	if resolver == nil {
+		return Secret{}, fmt.Errorf("agent %q: no variable resolver to resolve auth.token", agentCfg.ID)
+	}
+	var value string
+	var err error
+	if withCtx, ok := resolver.(config.ContextVariableResolver); ok {
+		value, err = withCtx.ResolveValueContext(ctx, *agentCfg.Auth.Token)
+	} else {
+		value, err = resolver.ResolveValue(*agentCfg.Auth.Token)
+	}
+	if err != nil {
+		slog.Warn("External agent token did not resolve", "agent", agentCfg.ID, "error", err)
+		return Secret{}, fmt.Errorf("agent %q: auth.token did not resolve; the log has the reason", agentCfg.ID)
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return Secret{}, fmt.Errorf("agent %q: auth.token resolved to an empty value; set the variable or command it names", agentCfg.ID)
+	}
+	return NewSecret(value), nil
+}
+
+// defaultExternalIdleTimeout bounds an external run when nothing else
+// does (#434): a remote that stays silent this long has its task
+// canceled. transport.idle_timeout "off" is the only way to drop it.
+const defaultExternalIdleTimeout = 5 * time.Minute
+
+// externalKillSettings resolves the thresholds an external dispatch runs
+// with (#434). Two apply: the hard timeout — the definition's
+// kill.timeout over options.todo_enforcement.hard_timeout — and the idle
+// timeout, carried as InactivityTimeout: transport.idle_timeout, else
+// options.todo_enforcement.inactivity_timeout, else
+// defaultExternalIdleTimeout, so an external run is never unbounded by
+// default. The nudge ladder and the todos stall window watch a local
+// session the remote never writes to, so they stay off.
+func (c *coordinator) externalKillSettings(agentCfg config.Agent) config.TodoEnforcementSettings {
+	resolved := c.dispatchEnforcement(agentCfg)
+	settings := config.TodoEnforcementSettings{
+		HardTimeout:       resolved.HardTimeout,
+		InactivityTimeout: resolved.InactivityTimeout,
+	}
+	switch {
+	case agentCfg.Transport != nil && agentCfg.Transport.IdleTimeout != nil:
+		settings.InactivityTimeout = max(time.Duration(*agentCfg.Transport.IdleTimeout), 0)
+	case settings.InactivityTimeout <= 0:
+		settings.InactivityTimeout = defaultExternalIdleTimeout
+	}
+	return settings
+}
+
+// runExternalDispatch drives one external dispatch (#434): the prompt
+// goes to the remote as a new task, the stream is folded by the same
+// client machinery a served dispatch uses — the task ID stamped on the
+// registry and the durable record, resubscribe on a dropped stream —
+// and the outcome assembles into the terminal result. The run's kill
+// switch rides along: the hard timeout, a user cancel, and shutdown all
+// end the stream through it, and the idle timeout trips it.
+func (c *coordinator) runExternalDispatch(ctx context.Context, run dispatchRun) dispatch.DispatchResult {
+	outcome, err := run.external.Stream(ctx, ExternalDispatchParams{
+		Prompt: run.prompt,
+		OnTask: func(taskID string) {
+			c.recordDispatchTask(run, taskID)
+			slog.Debug("External dispatch task started", "dispatch_id", run.entry.ID, "source", run.external.Source(), "task_id", taskID)
+		},
+		IdleTimeout: run.killSettings.InactivityTimeout,
+		Kill:        run.kill,
+	})
+	if err != nil {
+		slog.Warn("External dispatch stream failed", "dispatch_id", run.entry.ID, "source", run.external.Source(), "error", err)
+		outcome = DispatchTransportOutcome{Status: transportStatusFailed, Text: err.Error()}
+	}
+	natural := dispatchNaturalOutcomeFromTransport(outcome)
+	// Kill reasons come from this process's own witness, the run's kill
+	// state. A remote's Canceled text is its own account, not a kill.
+	natural.killReason = ""
+	return assembleExternalDispatchResult(run, natural)
+}
+
+// assembleExternalDispatchResult maps an external run's outcome onto its
+// terminal DispatchResult (#434). It carries the card URL as the source
+// and nothing workspace-shaped: no branch, path, or diff. A kill that
+// ended the run wins; a run that finished before the kill landed keeps
+// its natural outcome, as for a built-in dispatch.
+func assembleExternalDispatchResult(run dispatchRun, natural dispatchNaturalOutcome) dispatch.DispatchResult {
+	terminal := dispatch.DispatchResult{
+		DispatchID: run.entry.ID,
+		Agent:      run.entry.Agent,
+		SessionID:  run.sessionID,
+		Source:     run.external.Source(),
+	}
+	if entry, ok := run.reg.Get(run.entry.ID); ok {
+		terminal.Handle = entry.Handle
+	}
+	if reason := run.kill.current(); reason != "" && natural.runErr != nil {
+		terminal.Status = dispatch.StatusKilled
+		terminal.KilledReason = reason
+		return terminal
+	}
+	switch {
+	case natural.runErr != nil:
+		terminal.Status = dispatch.StatusFailed
+		terminal.Error = natural.runErr.Error()
+	case !natural.completed:
+		terminal.Status = dispatch.StatusFailed
+		terminal.Error = "the external agent never started a task"
+	default:
+		terminal.Status = dispatch.StatusCompleted
+		terminal.KeyFindings = natural.findings
+	}
+	return terminal
 }

@@ -123,6 +123,13 @@ func ReconcileOrphanedTasks(ctx context.Context, database *sql.DB, currentHostID
 			Status:        dispatch.StatusFailed,
 			Error:         fmt.Sprintf("%s; workspace preserved at %s", reconcileRestartMessage, row.WorkspacePath),
 		}
+		if row.Branch == "" && row.WorkspacePath == "" {
+			// An external dispatch (#434) records neither: nothing is
+			// preserved on disk, and the row does not keep the card URL,
+			// so the result is marked external without naming it.
+			result.Source = dispatch.SourceExternalUnknown
+			result.Error = reconcileRestartMessage + "; the external agent's run was abandoned with the process, and nothing was written to disk"
+		}
 		data, err := json.Marshal(result)
 		if err != nil {
 			slog.Warn("A2A reconcile skipped an orphaned dispatch that failed to encode", "dispatch_id", row.DispatchID, "error", err)

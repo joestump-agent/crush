@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
@@ -237,6 +239,11 @@ func (s *dispatchStream) consume(ctx context.Context, events iter.Seq2[a2aspec.E
 		// carries it from the first event onward.
 		if s.taskID == "" {
 			if id := ev.TaskInfo().TaskID; id != "" {
+				// The ID lands in the registry, the durable record and
+				// log lines, and comes back in every later call (#434).
+				if !validTaskID(id) {
+					return errInvalidTaskID
+				}
 				s.taskID = id
 				if s.params.OnTask != nil {
 					s.params.OnTask(string(id))
@@ -297,6 +304,27 @@ func (s *dispatchStream) foldSnapshot(task *a2aspec.Task) {
 		return
 	}
 	foldTaskSnapshot(&s.outcome, task)
+}
+
+// maxTaskIDRunes caps the task ID a stream may name (#434).
+const maxTaskIDRunes = 256
+
+// errInvalidTaskID refuses a stream whose task ID crush will not record.
+var errInvalidTaskID = fmt.Errorf("a2a: refusing the stream: the remote named a task ID that is not %d or fewer printable characters", maxTaskIDRunes)
+
+// validTaskID reports whether id is at most maxTaskIDRunes printable
+// characters: no control or format characters, nothing invisible.
+func validTaskID(id a2aspec.TaskID) bool {
+	s := string(id)
+	if !utf8.ValidString(s) || utf8.RuneCountInString(s) > maxTaskIDRunes {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // noteQuestion tracks whether the task is parked, and on what (#352,

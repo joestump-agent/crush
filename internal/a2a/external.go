@@ -23,6 +23,7 @@ package a2a
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +33,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -54,6 +56,12 @@ const (
 	// and body included. Task calls have none: a stream lives as long as
 	// the run, bounded by the idle timeout and kill.timeout instead.
 	externalCardTimeout = 30 * time.Second
+	// externalResponseHeaderTimeout bounds the wait for a streaming
+	// call's response headers, as the served path's client does: a
+	// streaming agent answers at once and talks on the stream. A
+	// non-streaming card's blocking SendMessage answers only when the
+	// task ends, so it is left to the idle timeout instead.
+	externalResponseHeaderTimeout = 30 * time.Second
 	// externalCancelTimeout bounds the best-effort tasks/cancel sent when
 	// a stream ends without a terminal state.
 	externalCancelTimeout = 10 * time.Second
@@ -125,6 +133,22 @@ func (f *ServerFactory) externalBaseTransport(pinned origin) http.RoundTripper {
 	return transport
 }
 
+// errNotLoopback refuses a plain-http dial that would leave the machine.
+var errNotLoopback = errors.New("a2a: refusing plain http to a host that is not a loopback address")
+
+// withResponseHeaderTimeout returns base with its response-header
+// timeout set, cloned so the card fetch's transport is left alone. A
+// base that is not an *http.Transport is returned as is.
+func withResponseHeaderTimeout(base http.RoundTripper, timeout time.Duration) http.RoundTripper {
+	t, ok := base.(*http.Transport)
+	if !ok {
+		return base
+	}
+	clone := t.Clone()
+	clone.ResponseHeaderTimeout = timeout
+	return clone
+}
+
 // loopbackOnlyDial resolves the host itself and dials it only when every
 // address it resolves to is loopback (#434), so plain http — allowed for
 // a loopback card alone — never leaves the machine.
@@ -139,11 +163,11 @@ func loopbackOnlyDial(dialer *net.Dialer, lookup func(ctx context.Context, host 
 			return nil, err
 		}
 		if len(ips) == 0 {
-			return nil, fmt.Errorf("a2a: %s resolves to no address", host)
+			return nil, fmt.Errorf("%w: %s resolves to no address", errNotLoopback, host)
 		}
 		for _, ip := range ips {
 			if !ip.IP.IsLoopback() {
-				return nil, fmt.Errorf("a2a: refusing plain http to %s: it resolves to %s, not a loopback address", host, ip.IP)
+				return nil, fmt.Errorf("%w: %s resolves to %s", errNotLoopback, host, ip.IP)
 			}
 		}
 		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
@@ -178,9 +202,13 @@ func (f *ServerFactory) ResolveExternalAgent(ctx context.Context, p agent.Extern
 		return nil, fmt.Errorf("a2a: agent card %s declares no HTTP bearer security scheme; refusing to send the configured bearer token", source)
 	}
 
+	callBase := base
+	if card.Capabilities.Streaming {
+		callBase = withResponseHeaderTimeout(base, externalResponseHeaderTimeout)
+	}
 	httpClient := &http.Client{
 		Transport: &pinnedTransport{
-			base:          base,
+			base:          callBase,
 			origin:        pinned,
 			maxBody:       maxExternalBodyBytes,
 			maxEventBytes: maxExternalEventBytes,
@@ -196,7 +224,9 @@ func (f *ServerFactory) ResolveExternalAgent(ctx context.Context, p agent.Extern
 		a2aclient.WithCallInterceptors(&externalAuthInterceptor{origin: pinned, token: p.Token}),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("a2a: agent card %s offers no supported transport: %s", source, untrustedText(err.Error(), p.Token))
+		// The SDK's error lists the card's own protocol strings: keep them
+		// out, the version rule is what the user needs.
+		return nil, fmt.Errorf("a2a: agent card %s offers no JSON-RPC interface on a protocol version crush speaks (%s.x)", source, protocolMajor(a2aspec.Version))
 	}
 	return &externalAgent{
 		client:   client,
@@ -209,18 +239,85 @@ func (f *ServerFactory) ResolveExternalAgent(ctx context.Context, p agent.Extern
 
 // fetchExternalCard resolves the card with the SDK's resolver over an
 // uncredentialed, origin-pinned client: a total timeout, a capped body,
-// and no redirect off the card's origin.
+// and no redirect off the card's origin. A failure is described without
+// a word the remote controls (cardFetchFailure).
 func fetchExternalCard(ctx context.Context, base http.RoundTripper, pinned origin, source string) (*a2aspec.AgentCard, error) {
 	client := &http.Client{
 		Transport:     &pinnedTransport{base: base, origin: pinned, maxBody: maxExternalCardBytes},
 		CheckRedirect: pinnedRedirects(pinned),
 		Timeout:       externalCardTimeout,
 	}
-	card, err := agentcard.NewResolver(client).Resolve(ctx, source)
+	resolver := &agentcard.Resolver{
+		Client: client,
+		CardParser: func(body []byte) (*a2aspec.AgentCard, error) {
+			card, err := agentcard.DefaultCardParser(body)
+			if err != nil {
+				// The parse error can quote the card: scheme names, keys.
+				return nil, errInvalidCard
+			}
+			return card, nil
+		},
+	}
+	card, err := resolver.Resolve(ctx, source)
 	if err != nil {
-		return nil, fmt.Errorf("a2a: resolve agent card %s: %s", source, untrustedText(err.Error(), agent.Secret{}))
+		return nil, fmt.Errorf("a2a: resolve agent card %s: %s", source, cardFetchFailure(err))
 	}
 	return card, nil
+}
+
+// errInvalidCard stands in for a card body that does not parse.
+var errInvalidCard = errors.New("the response is not a valid Agent Card")
+
+// cardFetchFailure describes a failed card fetch without echoing
+// anything the remote controls (#434): the HTTP status code but not its
+// reason phrase, a size or redirect refusal but not the redirect target,
+// and the kind of network failure but not a certificate's names. The
+// card URL itself is the user's, and the caller names it.
+func cardFetchFailure(err error) string {
+	var status *agentcard.ErrStatusNotOK
+	var tooLarge *http.MaxBytesError
+	var dnsErr *net.DNSError
+	var certErr *tls.CertificateVerificationError
+	var netErr net.Error
+	switch {
+	case errors.As(err, &status):
+		return fmt.Sprintf("HTTP status %d", status.StatusCode)
+	case errors.As(err, &tooLarge):
+		return fmt.Sprintf("the card is larger than %d bytes", maxExternalCardBytes)
+	case errors.Is(err, errInvalidCard):
+		return errInvalidCard.Error()
+	case errors.Is(err, errCrossOriginRedirect), errors.Is(err, errTooManyRedirects), errors.Is(err, errNotLoopback):
+		return unwrapSentinel(err)
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return "timed out"
+	case errors.As(err, &dnsErr):
+		return "the host name did not resolve"
+	case errors.As(err, &certErr):
+		return "TLS certificate verification failed"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection refused"
+	default:
+		return "the request failed"
+	}
+}
+
+// unwrapSentinel returns the message of the first of the redirect and
+// loopback sentinels err wraps — fixed text, nothing from the remote.
+func unwrapSentinel(err error) string {
+	for _, sentinel := range []error{errCrossOriginRedirect, errTooManyRedirects, errNotLoopback} {
+		if errors.Is(err, sentinel) {
+			return sentinel.Error()
+		}
+	}
+	return "the request failed"
+}
+
+// knownBindings are the protocol bindings an error may name; any other
+// binding a card lists is counted, never quoted.
+var knownBindings = map[string]bool{
+	string(a2aspec.TransportProtocolJSONRPC):  true,
+	string(a2aspec.TransportProtocolGRPC):     true,
+	string(a2aspec.TransportProtocolHTTPJSON): true,
 }
 
 // selectExternalInterface picks a JSON-RPC interface on the card URL's
@@ -231,12 +328,17 @@ func fetchExternalCard(ctx context.Context, base http.RoundTripper, pinned origi
 func selectExternalInterface(card *a2aspec.AgentCard, pinned origin, source string) (*a2aspec.AgentInterface, error) {
 	var offered []string
 	var candidates []*a2aspec.AgentInterface
-	foreign := ""
+	unknown := 0
+	foreign := false
 	for _, iface := range card.SupportedInterfaces {
 		if iface == nil {
 			continue
 		}
-		offered = append(offered, string(iface.ProtocolBinding))
+		if name := strings.ToUpper(string(iface.ProtocolBinding)); knownBindings[name] {
+			offered = append(offered, name)
+		} else {
+			unknown++
+		}
 		if !strings.EqualFold(string(iface.ProtocolBinding), string(a2aspec.TransportProtocolJSONRPC)) {
 			continue
 		}
@@ -244,10 +346,8 @@ func selectExternalInterface(card *a2aspec.AgentCard, pinned origin, source stri
 		if err != nil || !u.IsAbs() || u.Hostname() == "" {
 			continue
 		}
-		if at := originOf(u); at != pinned {
-			if foreign == "" {
-				foreign = at.String()
-			}
+		if originOf(u) != pinned {
+			foreign = true
 			continue
 		}
 		selected := *iface
@@ -262,11 +362,14 @@ func selectExternalInterface(card *a2aspec.AgentCard, pinned origin, source stri
 	if len(candidates) > 0 {
 		return candidates[0], nil
 	}
-	if foreign != "" {
-		return nil, fmt.Errorf("a2a: agent card %s names its JSON-RPC service on another origin (%s); refusing it so a tampered card cannot redirect requests or credentials", source, untrustedText(foreign, agent.Secret{}))
+	if foreign {
+		return nil, fmt.Errorf("a2a: agent card %s names its JSON-RPC service on another origin than %s; refusing it so a tampered card cannot redirect requests or credentials", source, pinned)
 	}
-	return nil, fmt.Errorf("a2a: agent card %s offers no supported transport: want %s on %s, card offers [%s]",
-		source, a2aspec.TransportProtocolJSONRPC, pinned, untrustedText(strings.Join(offered, ", "), agent.Secret{}))
+	if unknown > 0 {
+		offered = append(offered, fmt.Sprintf("%d unrecognized", unknown))
+	}
+	return nil, fmt.Errorf("a2a: agent card %s offers no supported transport: want %s on %s, card offers %d interfaces [%s]",
+		source, a2aspec.TransportProtocolJSONRPC, pinned, len(card.SupportedInterfaces), strings.Join(offered, ", "))
 }
 
 // protocolMajor returns a protocol version's major component: "1" for
@@ -326,11 +429,11 @@ type pinnedTransport struct {
 }
 
 func (t *pinnedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if at := originOf(req.URL); at != t.origin {
+	if originOf(req.URL) != t.origin {
 		if req.Body != nil {
 			_ = req.Body.Close()
 		}
-		return nil, fmt.Errorf("a2a: refusing a request to %s: this external agent is pinned to %s", at, t.origin)
+		return nil, fmt.Errorf("a2a: refusing a request off this external agent's pinned origin %s", t.origin)
 	}
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
@@ -401,15 +504,21 @@ func (t *pinnedTransport) CloseIdleConnections() {
 	}
 }
 
+// Redirect refusals, worded without the remote's redirect target.
+var (
+	errCrossOriginRedirect = errors.New("refusing a cross-origin redirect")
+	errTooManyRedirects    = fmt.Errorf("stopped after %d redirects", maxExternalRedirects)
+)
+
 // pinnedRedirects is the redirect policy for external requests: follow
 // a few redirects within the pinned origin, never one off it.
 func pinnedRedirects(pinned origin) func(req *http.Request, via []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
 		if len(via) >= maxExternalRedirects {
-			return fmt.Errorf("stopped after %d redirects", maxExternalRedirects)
+			return errTooManyRedirects
 		}
-		if at := originOf(req.URL); at != pinned {
-			return fmt.Errorf("refusing a cross-origin redirect to %s", at)
+		if originOf(req.URL) != pinned {
+			return errCrossOriginRedirect
 		}
 		return nil
 	}
@@ -492,7 +601,7 @@ func (a *externalAgent) Stream(ctx context.Context, p agent.ExternalDispatchPara
 	s := &dispatchStream{
 		params:   agent.DispatchTransportParams{OnTask: p.OnTask},
 		client:   a.client,
-		external: &externalFold{},
+		external: &externalFold{token: a.token},
 		onEvent:  watch.touch,
 	}
 	req := &a2aspec.SendMessageRequest{
@@ -519,11 +628,17 @@ func (a *externalAgent) Stream(ctx context.Context, p agent.ExternalDispatchPara
 			Text:          refusal,
 			WorkingEvents: s.outcome.WorkingEvents,
 		}, nil
+	case errors.Is(err, errInvalidTaskID):
+		// Refused before the ID was recorded: nothing to cancel by it,
+		// and the error is crush's own words.
+		return agent.DispatchTransportOutcome{}, err
 	case err != nil:
 		// The stream is gone and resume could not bring it back: the
 		// remote task would run on unsupervised, its result unread.
 		a.cancelRemote(ctx, s.taskID, "crush lost the stream")
-		return agent.DispatchTransportOutcome{}, errors.New(untrustedText(err.Error(), a.token))
+		// The error can carry the remote's own words (a JSON-RPC error
+		// message): labeled, sanitized, and scrubbed.
+		return agent.DispatchTransportOutcome{}, fmt.Errorf("a2a: external agent stream failed: %s", untrustedLabeled(err.Error(), a.token))
 	default:
 		a.cancelRemote(ctx, s.taskID, "the stream ended without a terminal state")
 		return agent.DispatchTransportOutcome{}, errors.New("a2a: external agent stream ended without a terminal state")
@@ -554,9 +669,20 @@ func (a *externalAgent) finish(s *dispatchStream) agent.DispatchTransportOutcome
 	}
 	return agent.DispatchTransportOutcome{
 		Status:        s.outcome.Status,
-		Text:          untrustedText(text, a.token),
+		Text:          untrustedLabeled(text, a.token),
 		WorkingEvents: s.outcome.WorkingEvents,
 	}
+}
+
+// untrustedLabeled is untrustedText with dispatch.UntrustedPrefix in
+// front, for remote text that lands where it could pass for crush's
+// own; empty text stays empty.
+func untrustedLabeled(s string, token agent.Secret) string {
+	s = untrustedText(s, token)
+	if s == "" {
+		return ""
+	}
+	return dispatch.UntrustedPrefix + s
 }
 
 // cancelRemote sends a best-effort tasks/cancel carrying reason (#348)
@@ -576,7 +702,7 @@ func (a *externalAgent) cancelRemote(ctx context.Context, taskID a2aspec.TaskID,
 		},
 	})
 	if err != nil {
-		slog.Warn("External agent task cancel failed", "endpoint", a.endpoint, "task_id", taskID, "error", untrustedText(err.Error(), a.token))
+		slog.Warn("External agent task cancel failed", "source", a.source, "task_id", taskID, "error", untrustedLabeled(err.Error(), a.token))
 	}
 }
 
@@ -585,6 +711,9 @@ func (a *externalAgent) cancelRemote(ctx context.Context, taskID a2aspec.TaskID,
 // updates say, under one byte budget. Nothing in it is ever read as a
 // diff or written anywhere.
 type externalFold struct {
+	// token is scrubbed from every artifact's text before the budget cut,
+	// so the cut cannot leave a prefix of it behind.
+	token agent.Secret
 	order []a2aspec.ArtifactID
 	texts map[a2aspec.ArtifactID]string
 	size  int
@@ -629,14 +758,16 @@ func (f *externalFold) artifact(art *a2aspec.Artifact, appendTo bool) {
 		}
 		f.order = append(f.order, art.ID)
 	}
-	text := b.String()
+	text := sanitizeRemote(b.String())
 	if appendTo {
 		text = current + text
 	}
-	// The budget is shared: past it, text is cut rather than buffered,
-	// and the final cap marks the truncation.
+	// Scrub before the budget cut, then cut: the budget is shared, past
+	// it text is cut rather than buffered, and the final cap marks the
+	// truncation.
+	text = redactToken(text, f.token)
 	if room := maxExternalTextBytes + 1 - (f.size - len(current)); len(text) > room {
-		text = truncateUTF8(text, max(room, 0))
+		text = cutText(text, max(room, 0), f.token)
 	}
 	f.size += len(text) - len(current)
 	f.texts[art.ID] = text
@@ -680,26 +811,78 @@ func (f *externalFold) text() string {
 	return strings.Join(parts, "\n\n")
 }
 
-// untrustedText prepares remote-controlled text for the parent: invalid
-// UTF-8 and control characters — terminal escapes, carriage returns,
-// bidirectional overrides — are dropped, the token is scrubbed in case
-// the remote echoed it back, and the result is capped.
+// untrustedText prepares remote-controlled text for the parent:
+// sanitizeRemote drops what a reader cannot see, the token is scrubbed in
+// case the remote echoed it back — after sanitizing, so a token split by
+// an invisible character is still caught, and before the cap, so a token
+// the cap would cut is still whole — and the result is capped, with a
+// token prefix the cut left dangling scrubbed too. The scrub is exact:
+// an encoded or partial echo the remote sends on purpose is not caught.
 func untrustedText(s string, token agent.Secret) string {
-	s = strings.ToValidUTF8(s, "�")
-	s = strings.Map(func(r rune) rune {
+	s = redactToken(sanitizeRemote(s), token)
+	if len(s) > maxExternalTextBytes {
+		s = cutText(s, maxExternalTextBytes, token) + externalTruncatedMarker
+	}
+	return s
+}
+
+// sanitizeRemote makes remote text valid UTF-8 and drops what a reader
+// cannot see but a model or terminal still acts on: control characters
+// other than newline and tab (terminal escapes, carriage returns), and
+// format characters — bidirectional overrides, zero-width spaces and
+// joiners, word joiners, byte-order marks, and the tag block — except
+// the zero-width joiner that emoji sequences need.
+func sanitizeRemote(s string) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	return strings.Map(func(r rune) rune {
 		switch {
-		case r == '\n' || r == '\t':
+		case r == '\n' || r == '\t' || r == zeroWidthJoiner:
 			return r
-		case unicode.IsControl(r), unicode.Is(unicode.Bidi_Control, r):
+		case unicode.IsControl(r), unicode.Is(unicode.Cf, r), unicode.Is(unicode.Bidi_Control, r):
+			return -1
+		case r >= 0xE0000 && r <= 0xE007F:
+			// The tag block: invisible, and able to spell text.
 			return -1
 		}
 		return r
 	}, s)
-	if !token.IsZero() {
-		s = strings.ReplaceAll(s, token.Reveal(), "[REDACTED]")
+}
+
+// zeroWidthJoiner is the one format character sanitizeRemote keeps.
+const zeroWidthJoiner = '\u200D'
+
+// redactedToken replaces a scrubbed credential.
+const redactedToken = "[REDACTED]"
+
+// minDanglingToken is the shortest token prefix cutText scrubs at a cut:
+// fewer bytes than this say nothing about the credential.
+const minDanglingToken = 4
+
+// redactToken replaces every whole occurrence of the token in s.
+func redactToken(s string, token agent.Secret) string {
+	if token.IsZero() {
+		return s
 	}
-	if len(s) > maxExternalTextBytes {
-		s = truncateUTF8(s, maxExternalTextBytes) + externalTruncatedMarker
+	return strings.ReplaceAll(s, token.Reveal(), redactedToken)
+}
+
+// cutText cuts s to at most n bytes without splitting a rune, then
+// scrubs a token prefix the cut left dangling at the end: whole tokens
+// are redacted before any cut, so a dangling prefix is the only part of
+// one a cut can expose.
+func cutText(s string, n int, token agent.Secret) string {
+	if len(s) <= n {
+		return s
+	}
+	s = truncateUTF8(s, n)
+	if token.IsZero() {
+		return s
+	}
+	t := token.Reveal()
+	for k := min(len(t)-1, len(s)); k >= minDanglingToken; k-- {
+		if strings.HasSuffix(s, t[:k]) {
+			return s[:len(s)-k] + redactedToken
+		}
 	}
 	return s
 }

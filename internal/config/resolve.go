@@ -17,11 +17,26 @@ type VariableResolver interface {
 	ResolveValue(value string) (string, error)
 }
 
+// ContextVariableResolver is a VariableResolver that can resolve on the
+// caller's context, so a $(command) ends with the work that asked for it
+// (#434) instead of running on to resolveTimeout. Both built-in
+// resolvers implement it; callers assert to it and fall back to
+// ResolveValue.
+type ContextVariableResolver interface {
+	VariableResolver
+	ResolveValueContext(ctx context.Context, value string) (string, error)
+}
+
 // identityResolver is a no-op resolver that returns values unchanged.
 // Used in client mode where variable resolution is handled server-side.
 type identityResolver struct{}
 
 func (identityResolver) ResolveValue(value string) (string, error) {
+	return value, nil
+}
+
+// ResolveValueContext implements [ContextVariableResolver].
+func (identityResolver) ResolveValueContext(_ context.Context, value string) (string, error) {
 	return value, nil
 }
 
@@ -86,6 +101,12 @@ func NewShellVariableResolver(e env.Env, opts ...ShellResolverOption) VariableRe
 // strict mode is available via shell.NoUnset for callers that want the
 // old nounset-on behaviour back.
 func (r *shellVariableResolver) ResolveValue(value string) (string, error) {
+	return r.ResolveValueContext(context.Background(), value)
+}
+
+// ResolveValueContext implements [ContextVariableResolver]: ResolveValue
+// bounded by ctx as well as resolveTimeout.
+func (r *shellVariableResolver) ResolveValueContext(ctx context.Context, value string) (string, error) {
 	// Preserve the historical backward-compat contract: a lone "$" is a
 	// malformed config value, not a legal literal. The underlying shell
 	// parser would accept it as a literal; we reject it here so existing
@@ -94,7 +115,7 @@ func (r *shellVariableResolver) ResolveValue(value string) (string, error) {
 		return "", fmt.Errorf("invalid value format: %s", value)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
+	ctx, cancel := context.WithTimeout(ctx, resolveTimeout)
 	defer cancel()
 
 	out, err := r.expand(ctx, value, r.env.Env())

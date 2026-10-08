@@ -3,6 +3,7 @@ package a2a
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
@@ -146,4 +147,41 @@ func TestReconcileOrphanedTasks(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, report.FailedTasks)
 	require.Zero(t, report.FailedDispatches)
+}
+
+// An orphaned external dispatch (#434) has no branch or workspace to
+// preserve: reconcile fails it as external, says nothing was written to
+// disk, and never points at an empty workspace path.
+func TestReconcileOrphanedExternalDispatch(t *testing.T) {
+	database, err := db.Connect(t.Context(), t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(db.ResetPool)
+	q := db.New(database)
+
+	seedDispatch(t, q, db.UpsertA2ADispatchParams{
+		DispatchID:      "dispatch-external",
+		SessionID:       "agent$$external",
+		ParentSessionID: "parent-1",
+		Status:          "running",
+		HostID:          "dead-host|1|a",
+	})
+
+	report, err := ReconcileOrphanedTasks(t.Context(), database, "live-host|2|b", &ReconcileOptions{
+		Alive: aliveHosts("live-host|2|b"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, report.FailedDispatches)
+
+	drow, err := q.GetA2ADispatch(context.Background(), "dispatch-external")
+	require.NoError(t, err)
+	var result dispatch.DispatchResult
+	require.NoError(t, json.Unmarshal([]byte(drow.ResultJson), &result))
+	require.Equal(t, dispatch.StatusFailed, result.Status)
+	require.Equal(t, dispatch.SourceExternalUnknown, result.Source)
+	require.Empty(t, result.WorkspacePath)
+	require.NotContains(t, result.Error, "workspace preserved")
+	require.Contains(t, result.Error, "external agent")
+
+	msg := result.TerminalMessage()
+	require.True(t, strings.HasPrefix(msg, dispatch.ExternalResultNotice+" the result below came from an external agent, not from crush."), msg)
 }
