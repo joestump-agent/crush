@@ -537,8 +537,13 @@ func TestExternalAgentIdleTimeoutCancels(t *testing.T) {
 	kill := newTestKill()
 
 	outcome, err := ext.Stream(t.Context(), agent.ExternalDispatchParams{
-		Prompt:      "review",
-		IdleTimeout: 100 * time.Millisecond,
+		Prompt: "review",
+		// Generous against connection setup: the idle timer runs from
+		// the stream's start, so a tight value can fire before the
+		// first event lands and the task ID is known, and then no
+		// cancel could be sent. The stream goes silent only after the
+		// parked working event, so the timer still fires here.
+		IdleTimeout: 2 * time.Second,
 		Kill:        kill,
 	})
 	require.NoError(t, err)
