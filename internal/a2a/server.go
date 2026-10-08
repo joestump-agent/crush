@@ -255,6 +255,17 @@ type ServerFactory struct {
 	// defaults.
 	httpClient *http.Client
 
+	// externalTransport, when set, is the base transport external agent
+	// calls dial through under the origin pin (#434) — the test seam
+	// for TLS test servers. Production leaves it nil, and each external
+	// agent gets a transport of its own.
+	externalTransport http.RoundTripper
+
+	// externalLookup, when set, replaces the resolver the plain-http
+	// loopback check uses (#434) — the test seam that makes localhost
+	// resolve somewhere else.
+	externalLookup func(ctx context.Context, host string) ([]net.IPAddr, error)
+
 	// tcpOpts configures the optional TLS-only TCP listener (#358),
 	// started with the socket; nil keeps the host on its socket alone.
 	tcpOpts *config.A2AOptions

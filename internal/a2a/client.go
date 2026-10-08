@@ -199,6 +199,17 @@ type dispatchStream struct {
 	// whose typed payload did not decode parks as a non-nil prompt with
 	// no tool name, and is denied.
 	permission *agent.PermissionPrompt
+	// external, set on an external agent's stream (#434), folds the
+	// untrusted remote's output: artifacts are collected as text rather
+	// than read as crush's diff and result artifacts, a direct message
+	// reply ends the exchange, and auth-required parks the task like
+	// input-required so the caller can refuse it. Nil on a served
+	// dispatch, whose folding is unchanged.
+	external *externalFold
+	// onEvent, when set, observes every event the stream folds, the
+	// initial stream's and a resubscription's alike (#434): the
+	// external idle watch resets on it.
+	onEvent func()
 }
 
 // consume folds one stream's events into the dispatch's state. A stream
@@ -232,29 +243,81 @@ func (s *dispatchStream) consume(ctx context.Context, events iter.Seq2[a2aspec.E
 				}
 			}
 		}
-		switch e := ev.(type) {
-		case *a2aspec.TaskStatusUpdateEvent:
-			applyStatusUpdate(&s.outcome, e)
-			s.decoder.apply(&s.outcome, e)
-			s.noteQuestion(e.Status)
-		case *a2aspec.TaskArtifactUpdateEvent:
-			applyArtifactUpdate(&s.outcome, e)
-		case *a2aspec.Task:
-			foldTaskSnapshot(&s.outcome, e)
-			s.noteQuestion(e.Status)
+		s.fold(ev, true)
+		// An external agent's stream ends at its first terminal state or
+		// pause (#434): a crush host closes the stream there itself, but
+		// an untrusted remote may hold it open — after auth-required, or
+		// on purpose — and the run must not hang on it.
+		if s.external != nil && s.ended() {
+			return nil
 		}
 	}
 	return nil
+}
+
+// fold folds one event into the dispatch's state. decode is true on the
+// initial stream, whose status updates also carry the declared extension
+// metadata (#359); a resubscription's replay folds without it.
+func (s *dispatchStream) fold(ev a2aspec.Event, decode bool) {
+	if s.onEvent != nil {
+		s.onEvent()
+	}
+	switch e := ev.(type) {
+	case *a2aspec.TaskStatusUpdateEvent:
+		applyStatusUpdate(&s.outcome, e)
+		if decode {
+			s.decoder.apply(&s.outcome, e)
+		}
+		s.noteQuestion(e.Status)
+	case *a2aspec.TaskArtifactUpdateEvent:
+		if s.external != nil {
+			s.external.artifactUpdate(e)
+			return
+		}
+		applyArtifactUpdate(&s.outcome, e)
+	case *a2aspec.Task:
+		s.foldSnapshot(e)
+		s.noteQuestion(e.Status)
+	case *a2aspec.Message:
+		// A served crush dispatch always answers with a task; an
+		// external agent may reply with a bare message, which ends the
+		// exchange (#434).
+		if s.external != nil {
+			s.external.reply(&s.outcome, e)
+		}
+	}
+}
+
+// foldSnapshot folds a task snapshot — a stream's opener, a
+// resubscription's replay, or a tasks/get answer — through the stream's
+// own artifact rules.
+func (s *dispatchStream) foldSnapshot(task *a2aspec.Task) {
+	if s.external != nil {
+		s.external.snapshot(&s.outcome, task)
+		return
+	}
+	foldTaskSnapshot(&s.outcome, task)
 }
 
 // noteQuestion tracks whether the task is parked, and on what (#352,
 // #353): an input-required status naming the permissions/v1 extension
 // parks it on a permission request, any other input-required status on
 // the question it carries, and any later non-terminal status means the
-// run moved on.
+// run moved on. An external agent's stream (#434) also parks on
+// auth-required, and decodes neither: the caller refuses the pause
+// whatever it asked, and a remote agent never reaches the local
+// permission prompt.
 func (s *dispatchStream) noteQuestion(status a2aspec.TaskStatus) {
 	s.question, s.permission = nil, nil
-	if s.outcome.Status != "" || status.State != a2aspec.TaskStateInputRequired {
+	if s.outcome.Status != "" {
+		return
+	}
+	if s.external != nil && (status.State == a2aspec.TaskStateInputRequired || status.State == a2aspec.TaskStateAuthRequired) {
+		s.external.pausedOn = status.State
+		s.question = &agent.QuestionRequest{}
+		return
+	}
+	if status.State != a2aspec.TaskStateInputRequired {
 		return
 	}
 	if status.Message != nil && slices.Contains(status.Message.Extensions, PermissionExtensionURI) {
@@ -505,7 +568,7 @@ func (s *dispatchStream) resume(ctx context.Context) error {
 			lastErr = gerr
 			continue
 		}
-		foldTaskSnapshot(&s.outcome, task)
+		s.foldSnapshot(task)
 		s.noteQuestion(task.Status)
 		if s.ended() {
 			return nil
@@ -536,28 +599,17 @@ func (s *dispatchStream) consumeResubscription(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("a2a: resubscribe task %s: %w", s.taskID, err)
 		}
-		s.foldEvent(ev)
+		s.fold(ev, false)
+		if s.external != nil && s.ended() {
+			// Same rule as the initial stream: an external remote
+			// cannot hold the run open past its end (#434).
+			break
+		}
 	}
 	if !s.ended() {
 		return fmt.Errorf("a2a: resubscribed stream for task %s ended without a terminal state", s.taskID)
 	}
 	return nil
-}
-
-// foldEvent folds one replay event into the dispatch's state. Both the
-// initial stream and a resubscription's replay carry the same event
-// vocabulary.
-func (s *dispatchStream) foldEvent(ev a2aspec.Event) {
-	switch e := ev.(type) {
-	case *a2aspec.TaskStatusUpdateEvent:
-		applyStatusUpdate(&s.outcome, e)
-		s.noteQuestion(e.Status)
-	case *a2aspec.TaskArtifactUpdateEvent:
-		applyArtifactUpdate(&s.outcome, e)
-	case *a2aspec.Task:
-		foldTaskSnapshot(&s.outcome, e)
-		s.noteQuestion(e.Status)
-	}
 }
 
 // metadataDecoder decodes declared A2A extension metadata off one stream's
@@ -594,6 +646,11 @@ func (d *metadataDecoder) activatedURIs() []string {
 // The last decoded value wins per key, mirroring the server's latest-snapshot
 // emission order. TodoProgress is the only typed payload consumed today.
 func (d *metadataDecoder) apply(outcome *agent.DispatchTransportOutcome, ev *a2aspec.TaskStatusUpdateEvent) {
+	if d == nil {
+		// An external agent's stream decodes nothing (#434): its
+		// metadata is untrusted and no consumer reads it yet (#359).
+		return
+	}
 	meta := ev.Meta()
 	if len(meta) == 0 {
 		return

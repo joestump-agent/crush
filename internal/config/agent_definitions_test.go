@@ -317,6 +317,114 @@ func TestAgentDefinitions_A2AAgentLoads(t *testing.T) {
 	require.Len(t, cfg.Agents, 5, "the a2a entry adds to the built-ins")
 }
 
+// TestAgentDefinitions_A2AAgentDefaults checks what a minimal runtime a2a
+// definition resolves to (#434): no workspace set still means none, an
+// http card is accepted on a loopback host, and no auth means no
+// credential at all.
+func TestAgentDefinitions_A2AAgentDefaults(t *testing.T) {
+	store := loadAgentsJSON(t, `{
+		"local": {"role": "dispatch", "runtime": "a2a", "card": "http://127.0.0.1:8080/.well-known/agent-card.json"},
+		"named": {"role": "dispatch", "runtime": "a2a", "card": "http://localhost:9000"}
+	}`)
+	cfg := store.Config()
+
+	local := cfg.Agents["local"]
+	require.Equal(t, config.AgentRuntimeA2A, local.Runtime)
+	require.Equal(t, config.AgentWorkspaceNone, local.Workspace, "an a2a agent never runs in a worktree")
+	require.Nil(t, local.Auth)
+	require.Equal(t, config.AgentWorkspaceNone, cfg.Agents["named"].Workspace)
+	require.Equal(t, config.AgentWorkspaceWorktree, cfg.Agents[config.AgentWorker].Workspace, "the builtin worker keeps its worktree")
+}
+
+// TestAgentDefinitions_UnusableExternalAgentLoads checks that one bad
+// external definition fails closed per agent rather than failing the
+// whole load (#434): the config loads, the other agents are untouched,
+// and the bad agent carries the reason dispatch refuses it with.
+func TestAgentDefinitions_UnusableExternalAgentLoads(t *testing.T) {
+	cases := []struct {
+		name string
+		def  string
+		want string
+	}{
+		{
+			name: "no card",
+			def:  `{"role": "dispatch", "runtime": "a2a"}`,
+			want: `agents.reviewer.card: a runtime a2a agent needs the URL of its Agent Card`,
+		},
+		{
+			name: "http card off loopback",
+			def:  `{"role": "dispatch", "runtime": "a2a", "card": "http://example.com/agent.json"}`,
+			want: `agents.reviewer.card: must use https; plain http is allowed only for loopback hosts`,
+		},
+		{
+			name: "file card",
+			def:  `{"role": "dispatch", "runtime": "a2a", "card": "file:///etc/agent.json"}`,
+			want: `agents.reviewer.card: must be an absolute URL with a host`,
+		},
+		{
+			name: "card carrying credentials",
+			def:  `{"role": "dispatch", "runtime": "a2a", "card": "https://user:secret@example.com/agent.json"}`,
+			want: `agents.reviewer.card: must not carry credentials; set them in auth`,
+		},
+		{
+			name: "auth with no token",
+			def:  `{"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "auth": {"type": "bearer"}}`,
+			want: `agents.reviewer.auth.token: a bearer token is required when auth is set`,
+		},
+		{
+			name: "negative idle timeout",
+			def:  `{"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "transport": {"idle_timeout": "-1m"}}`,
+			want: `agents.reviewer.transport.idle_timeout: must not be negative (got -60)`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := loadAgentsJSON(t, `{"reviewer": `+tc.def+`}`)
+			cfg := store.Config()
+			reviewer, ok := cfg.Agents["reviewer"]
+			require.True(t, ok, "the bad external agent still resolves")
+			require.Equal(t, tc.want, reviewer.Unusable)
+			require.NotContains(t, reviewer.Unusable, "secret", "the reason never echoes the card URL")
+			require.Empty(t, cfg.Agents[config.AgentWorker].Unusable, "the other agents are untouched")
+		})
+	}
+
+	good := loadAgentsJSON(t, `{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "auth": {"token": "$T"}}}`)
+	require.Empty(t, good.Config().Agents["reviewer"].Unusable)
+}
+
+// TestValidateAgentCardURL pins the card URL rule the loader and the
+// dispatch-time resolver share (#434).
+func TestValidateAgentCardURL(t *testing.T) {
+	t.Parallel()
+	ok := []string{
+		"https://reviewer.example.net/.well-known/agent-card.json",
+		"https://reviewer.example.net",
+		"http://localhost:8080/card.json",
+		"http://127.0.0.1/card.json",
+		"http://[::1]:9000/card.json",
+	}
+	for _, raw := range ok {
+		_, err := config.ValidateAgentCardURL(raw)
+		require.NoError(t, err, raw)
+	}
+	bad := map[string]string{
+		"http://reviewer.example.net/card.json":   "plain http is allowed only for loopback hosts",
+		"http://10.0.0.1/card.json":               "plain http is allowed only for loopback hosts",
+		"ftp://reviewer.example.net/card.json":    `must use https, not "ftp"`,
+		"file:///tmp/card.json":                   "must be an absolute URL with a host",
+		"/relative/card.json":                     "must be an absolute URL with a host",
+		"https://token@reviewer.example.net/":     "must not carry credentials",
+		"https://u:p@reviewer.example.net/":       "must not carry credentials",
+		"https://reviewer.example.net:bad/x.json": "not a valid URL",
+	}
+	for raw, want := range bad {
+		_, err := config.ValidateAgentCardURL(raw)
+		require.ErrorContains(t, err, want, raw)
+		require.NotContains(t, err.Error(), "@", "the error must not echo userinfo")
+	}
+}
+
 // TestAgentDefinitions_MCPAllow checks the mcp.allow spellings: a
 // server:tool entry resolves to one tool of one server, other agents
 // keep their defaults.
