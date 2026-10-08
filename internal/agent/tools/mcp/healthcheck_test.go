@@ -2,10 +2,12 @@ package mcp
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 )
 
@@ -93,6 +95,14 @@ func TestChannelHealthCheck_RenewsDeadChannelSession(t *testing.T) {
 // a loop still inside a renewal raced the newSession restore and called the
 // liveSession stub after the test had completed, panicking the test binary
 // ("Fail in goroutine after ... has completed") and turning main red.
+//
+// @joestump-agent 10/08/2026 - The join did not actually run first. The stub
+// called liveSession on the loop goroutine, which registered the renewed
+// server's close after the join, so LIFO teardown closed that server while
+// the loop was still ticking. The loop saw the session die and renewed again;
+// that renewal's own cleanup, appended mid-teardown, was popped next and
+// closed its server before initialize ("client is closing: EOF"). The stub
+// now leaves t alone and the test goroutine owns the servers it starts.
 func TestChannelHealthCheckLoop_TickerRenewsDeadSession(t *testing.T) {
 	const name = "test-health-loop"
 	t.Cleanup(cleanupSession(name))
@@ -101,27 +111,58 @@ func TestChannelHealthCheckLoop_TickerRenewsDeadSession(t *testing.T) {
 
 	seedDeadSession(t, name, true)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	// The stub runs on the loop goroutine, so it must not touch t (see
+	// connectLiveSession). The servers it starts are closed here instead, and
+	// this cleanup is registered before the join below so it runs after it:
+	// closing a server under a running loop is what started the failure.
+	var (
+		serversMu sync.Mutex
+		servers   []*mcp.ServerSession
+	)
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		default:
+			t.Error("the loop must be joined before the servers it renews against are closed")
+		}
+		serversMu.Lock()
+		defer serversMu.Unlock()
+		for _, s := range servers {
+			_ = s.Close()
+		}
+	})
+
+	connectErr := make(chan error, 1)
 	origNewSession := newSession
 	newSession = func(context.Context, *config.ConfigStore, string, config.MCPConfig, config.VariableResolver, bool) (*ClientSession, error) {
-		sess, _ := liveSession(t, "send_message")
+		sess, _, server, err := connectLiveSession("send_message")
+		if err != nil {
+			select {
+			case connectErr <- err:
+			default:
+			}
+			return nil, err
+		}
+		serversMu.Lock()
+		servers = append(servers, server)
+		serversMu.Unlock()
 		sess.channel = true
 		return sess, nil
 	}
 	t.Cleanup(func() { newSession = origNewSession })
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	events := SubscribeEvents(ctx)
 	go func() {
 		defer close(done)
 		runChannelHealthCheck(ctx, cfg, 10*time.Millisecond)
 	}()
-	// Stop and join the loop before anything else is torn down. This cleanup
-	// is registered after the newSession restore, so it runs first: a loop
-	// goroutine still inside a renewal when the test body returns races that
-	// restore and can call back into t after the test has completed, which
-	// panics the whole test binary ("Fail in goroutine after ... has
-	// completed"). Joining here is what keeps the stub's liveSession call
-	// inside the test's lifetime.
+	// Stop and join the loop before anything else is torn down. Registered
+	// last, and nothing on the loop goroutine registers cleanups of its own,
+	// so it runs first: the newSession restore and the server closes above
+	// both happen with the loop stopped.
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -131,18 +172,25 @@ func TestChannelHealthCheckLoop_TickerRenewsDeadSession(t *testing.T) {
 		}
 	})
 
-	deadline := time.Now().Add(5 * time.Second)
+	// Wait for the renewal to publish StateConnected, which renewClient does
+	// only after registering the new session, instead of pinging the registry
+	// while the loop is replacing what is in it.
+	timeout := time.After(5 * time.Second)
 	for {
-		sess, ok := sessions.Get(name)
-		if ok {
-			if err := pingSession(context.Background(), sess, time.Second); err == nil {
-				return
+		select {
+		case e := <-events:
+			if e.Payload.Type != EventStateChanged || e.Payload.Name != name || e.Payload.State != StateConnected {
+				continue
 			}
-		}
-		if time.Now().After(deadline) {
+			sess, ok := sessions.Get(name)
+			require.True(t, ok, "a renewed session must be registered when StateConnected is published")
+			require.NoError(t, pingSession(context.Background(), sess, time.Second))
+			return
+		case err := <-connectErr:
+			t.Fatalf("a renewal failed to connect: %v", err)
+		case <-timeout:
 			t.Fatal("health check loop never renewed the dead channel session")
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -169,12 +217,12 @@ func TestChannelHealthCheckLoop_StopsOnContextCancel(t *testing.T) {
 // TestChannelHealthCheckLoop_LeavesNoGoroutineBehind pins that a test which
 // starts the loop joins it before tearing down.
 //
-// The loop is driven through a stub that calls liveSession, and liveSession
-// asserts on t. A loop left running past the test body races the stub's
-// restoration and can call t after the test has completed, which panics the
-// whole test binary with "Fail in goroutine after ... has completed" rather
-// than failing one test. This is the flake that turned main red; the assertion
-// below fails if the join is dropped.
+// A loop left running past the test body keeps calling the newSession stub
+// while teardown restores it and closes the servers the stub started. When
+// that stub still asserted on t, this panicked the whole test binary with
+// "Fail in goroutine after ... has completed" rather than failing one test.
+// This is the flake that turned main red; the assertion below fails if the
+// join is dropped.
 //
 // @joestump-agent 10/01/2026 - Added after the unjoined loop in
 // TestChannelHealthCheckLoop_TickerRenewsDeadSession panicked CI on main.

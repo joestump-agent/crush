@@ -24,6 +24,19 @@ import (
 func liveSession(t *testing.T, toolName string) (*ClientSession, context.Context) {
 	t.Helper()
 
+	sess, ctx, serverSession, err := connectLiveSession(toolName)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = serverSession.Close() })
+	return sess, ctx
+}
+
+// connectLiveSession is liveSession without the *testing.T: it returns errors
+// instead of failing the test and hands the server half back for the caller
+// to close. Stubs that run on a goroutine other than the test's own must use
+// this. require there calls FailNow off the test goroutine, and a t.Cleanup
+// registered while the test is already tearing down runs next, LIFO, so it
+// can close the server before its client has finished connecting.
+func connectLiveSession(toolName string) (*ClientSession, context.Context, *mcp.ServerSession, error) {
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	server := mcp.NewServer(&mcp.Implementation{Name: "srv"}, nil)
 	mcp.AddTool(
@@ -34,15 +47,20 @@ func liveSession(t *testing.T, toolName string) (*ClientSession, context.Context
 		},
 	)
 	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = serverSession.Close() })
+	if err != nil {
+		return nil, nil, nil, err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	client := mcp.NewClient(&mcp.Implementation{Name: "crush-test"}, nil)
 	clientSession, err := client.Connect(ctx, clientTransport, nil)
-	require.NoError(t, err)
+	if err != nil {
+		cancel()
+		_ = serverSession.Close()
+		return nil, nil, nil, err
+	}
 
-	return &ClientSession{ClientSession: clientSession, cancel: cancel}, ctx
+	return &ClientSession{ClientSession: clientSession, cancel: cancel}, ctx, serverSession, nil
 }
 
 // liveSessionWithCapabilities is like liveSession but the server also exposes a
