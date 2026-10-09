@@ -166,7 +166,6 @@ type DispatchHarness struct {
 
 	mu       sync.Mutex
 	terminal map[string]int
-	last     map[string]dispatch.Status
 }
 
 // NewDispatchHarness builds the harness: a git-rooted coordinator, the
@@ -204,7 +203,7 @@ func NewDispatchHarness(t *testing.T, model fantasy.LanguageModel, settings conf
 	// the production path.
 	c.cfg.Config().Options.TodoEnforcement = todoEnforcementConfigFrom(settings)
 
-	h := &DispatchHarness{c: c, terminal: make(map[string]int), last: make(map[string]dispatch.Status)}
+	h := &DispatchHarness{c: c, terminal: make(map[string]int)}
 
 	c.dispatchAgentBuilder = func(ctx context.Context, opts dispatchAgentOptions) (*dispatchedAgent, error) {
 		// The toolchain ships its own todos tool and the helper appends
@@ -247,13 +246,12 @@ func NewDispatchHarness(t *testing.T, model fantasy.LanguageModel, settings conf
 					return
 				}
 				// The registry republishes the entry on every mutation,
-				// terminal states included; count only the crossings from
-				// a non-terminal status into a terminal one.
+				// terminal states included; count every terminal-status
+				// event so a double terminal write shows up (#568).
 				h.mu.Lock()
-				if ev.Payload.Status.IsTerminal() && !h.last[ev.Payload.ID].IsTerminal() {
+				if ev.Payload.Status.IsTerminal() {
 					h.terminal[ev.Payload.ID]++
 				}
-				h.last[ev.Payload.ID] = ev.Payload.Status
 				h.mu.Unlock()
 			}
 		}

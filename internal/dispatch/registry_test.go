@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -228,4 +229,47 @@ func TestByHandlePrefersLiveEntry(t *testing.T) {
 	got, ok = reg.ByHandle("tester")
 	require.True(t, ok)
 	require.Equal(t, c.ID, got.ID, "the live entry answers over finished ones")
+}
+
+// A terminal status is final (#568): once the entry is terminal,
+// SetStatus refuses and publishes nothing, so a late write (a probe's
+// Completed→Killed) cannot rewrite the record or stream a second
+// terminal event.
+func TestRegistryTerminalStatusIsFinal(t *testing.T) {
+	reg := NewAgentRegistry()
+	e := registeredEntry(reg, "d-1")
+
+	events := reg.Subscribe(t.Context())
+	var mu sync.Mutex
+	terminals := 0
+	go func() {
+		for ev := range events {
+			if ev.Payload.Status.IsTerminal() {
+				mu.Lock()
+				terminals++
+				mu.Unlock()
+			}
+		}
+	}()
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return terminals
+	}
+
+	require.True(t, reg.SetStatus(e.ID, StatusRunning))
+	require.True(t, reg.SetStatus(e.ID, StatusCompleted))
+	require.Eventually(t, func() bool { return count() == 1 }, time.Second, time.Millisecond,
+		"the first terminal write streams one terminal event")
+
+	for _, other := range []Status{StatusKilled, StatusFailed, StatusRunning, StatusCompleted} {
+		require.False(t, reg.SetStatus(e.ID, other), "a terminal entry refuses %s", other)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, 1, count(), "a refused write publishes nothing")
+
+	got, ok := reg.Get(e.ID)
+	require.True(t, ok)
+	require.Equal(t, StatusCompleted, got.Status, "the first terminal status stands")
 }
