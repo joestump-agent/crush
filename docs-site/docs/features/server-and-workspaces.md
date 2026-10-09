@@ -134,8 +134,7 @@ event stream.
 :::
 
 A client talking to a server — `crush --host …`, or `CRUSH_CLIENT_SERVER=1` —
-follows dispatched agents the way the in-process TUI does
-([#421](https://github.com/joestump-agent/crush/issues/421)). The agent block
+follows dispatched agents the way the in-process TUI does. The agent block
 updates live, the `@` completions list running agents, a leading `@handle`
 steers the agent, a mid-sentence `@handle` attaches its card, and
 <kbd>ctrl+x</kbd> cancels it. It does all of this over A2A through the server,
