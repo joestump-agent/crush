@@ -49,7 +49,14 @@ func newSubAgentCoordinatorOn(t *testing.T, host agent.DispatchHost) (agent.Coor
 	t.Helper()
 	conn, err := db.Connect(t.Context(), t.TempDir())
 	require.NoError(t, err)
-	t.Cleanup(func() { conn.Close() })
+	t.Cleanup(func() {
+		require.NoError(t, conn.Close())
+		// Close closes only idle connections; one a turn left checked
+		// out keeps crush.db open, and Windows then fails TempDir's
+		// cleanup.
+		require.Zero(t, conn.Stats().OpenConnections,
+			"a DB connection was still checked out when the test closed the database")
+	})
 	q := db.New(conn)
 	sessions := session.NewService(q, conn)
 	messages := message.NewService(q)

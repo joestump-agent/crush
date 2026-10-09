@@ -213,6 +213,7 @@ func newCancelTestAgentWithRunComplete(t *testing.T) (*sessionAgent, fakeEnv, *p
 		Messages:    env.messages,
 		RunComplete: broker,
 	}).(*sessionAgent)
+	env.joinTitles(sa)
 	return sa, env, broker
 }
 

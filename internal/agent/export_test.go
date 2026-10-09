@@ -181,6 +181,9 @@ func NewDispatchHarness(t *testing.T, model fantasy.LanguageModel, settings conf
 	env := testEnv(t)
 	initGitRepo(t, env.workingDir)
 	c := newDispatchTestCoordinator(t, env)
+	// A delivery turn stays a detached run: join it before the env's
+	// cleanup closes the database and deletes the directory (#422).
+	reapDispatchRuns(t, c)
 
 	// The delivery run resolves the main agent's models from the config
 	// store; register the offline test provider the fake main agent
