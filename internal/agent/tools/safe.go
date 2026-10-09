@@ -40,6 +40,14 @@ type safeCommand struct {
 	// It is false for commands that mutate when handed an operand, such
 	// as `git branch <name>` (creates) or `git remote add` (writes).
 	allowOperands bool
+	// operandsWithFlags lists flags that turn operands into read-only
+	// patterns: `git branch --list 'feat/*'` and `git tag -l 'v1.*'`
+	// filter the listing, while the same operand without the flag
+	// creates a branch or tag. When set, operands are accepted only if
+	// one of these flags is present anywhere in the arguments; the flag
+	// must also be in allowFlags, which keeps the rest of the entry's
+	// policy in force.
+	operandsWithFlags []string
 }
 
 // gitCodeExecFlags are flags that make an otherwise read-only git
@@ -149,7 +157,8 @@ var safeCommands = []safeCommand{
 			"-v", "-vv", "--verbose", "--show-current",
 			"--format", "--sort",
 		},
-		allowOperands: false,
+		allowOperands:     false,
+		operandsWithFlags: []string{"-l", "--list"},
 	},
 	{
 		argv:          []string{"git", "tag"},
@@ -159,7 +168,8 @@ var safeCommands = []safeCommand{
 			"--merged", "--no-merged", "--points-at",
 			"--format", "--sort",
 		},
-		allowOperands: false,
+		allowOperands:     false,
+		operandsWithFlags: []string{"-l", "--list"},
 	},
 	// The filter flags above take a commit-ish operand. Requiring one of
 	// them to be present is what keeps `git branch <name>` (creates) and
@@ -513,6 +523,21 @@ func (sc safeCommand) matches(argv []string) bool {
 		return false
 	}
 	rest := argv[len(sc.argv):]
+	// Operands become read-only patterns only in the presence of one of
+	// operandsWithFlags, which may come after the operand (`git tag v1
+	// --list` lists too), so settle that before walking the arguments.
+	allowOperands := sc.allowOperands
+	if !allowOperands && len(sc.operandsWithFlags) > 0 {
+		for _, arg := range rest {
+			if arg == "--" {
+				break
+			}
+			if isFlag(arg) && slices.Contains(sc.operandsWithFlags, flagName(arg)) {
+				allowOperands = true
+				break
+			}
+		}
+	}
 	operandsOnly := false
 	sawFlag := false
 	for _, arg := range rest {
@@ -533,7 +558,7 @@ func (sc safeCommand) matches(argv []string) bool {
 			sawFlag = true
 			continue
 		}
-		if !sc.allowOperands {
+		if !allowOperands {
 			return false
 		}
 	}

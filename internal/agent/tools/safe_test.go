@@ -141,6 +141,13 @@ func TestIsSafeReadOnly_Allowed(t *testing.T) {
 		{"git branch --merged", "git branch --merged main"},
 		{"git tag --points-at", "git tag --points-at HEAD"},
 		{"git tag --contains", "git tag --contains abc123"},
+		// A pattern operand is read-only when the listing flag is present,
+		// wherever it sits.
+		{"git branch --list with pattern", "git branch --list 'feat/*'"},
+		{"git branch -l with pattern", "git branch -l feat/x"},
+		{"git branch -a --list with pattern", "git branch -a --list 'origin/*'"},
+		{"git tag -l with pattern", "git tag -l 'v1.*'"},
+		{"git tag --list after the pattern", "git tag v1.0.0 --list"},
 		// -n keeps `git remote show` off the network; without it the
 		// subcommand queries the remote, so it is denied below.
 		{"git remote show with -n", "git remote show -n origin"},
@@ -222,8 +229,15 @@ func TestIsSafeReadOnly_Denied(t *testing.T) {
 		// Mutating git forms that used to slip through on the "-" rule.
 		{"git branch delete", "git branch -D main"},
 		{"git branch create via operand", "git branch newbranch"},
+		// Flags that are not the listing flag do not unlock operands:
+		// `git branch -v name` and `git branch -a name` still create.
+		{"git branch create with verbose flag", "git branch -v newbranch"},
+		{"git branch create with all flag", "git branch -a newbranch"},
+		{"git branch list with a denied flag", "git branch --list -D main"},
 		{"git tag delete", "git tag -d v1.0.0"},
 		{"git tag create via operand", "git tag v9.9.9"},
+		{"git tag create with -n", "git tag -n v9.9.9"},
+		{"git tag list with a message flag", "git tag -l v9.9.9 -m msg"},
 		{"git remote add", "git remote add evil https://evil.example/x.git"},
 		{"git remote set-url", "git remote set-url origin https://evil.example/x.git"},
 		{"git remote remove", "git remote remove origin"},
