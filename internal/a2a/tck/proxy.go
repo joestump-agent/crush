@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
 	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
@@ -89,12 +90,17 @@ func NewProxy(ctx context.Context, factory *a2a.ServerFactory, server *a2a.Serve
 			// The host routes exactly /agents/<dispatch id>
 			// (#346); A2A clients post JSON-RPC at the card's base
 			// URL, so every proxied call is pinned to the dispatch's
-			// route path.
-			pr.Out.URL.Path = endpoint.Path
-			pr.Out.URL.RawPath = ""
+			// route path. A route's own card path (#580) passes
+			// through as the caller spelled it, so a hand probe reads
+			// what the host serves there — for any route, the
+			// definition published beside the dispatch included.
+			if !isRouteCardPath(pr.In.URL.Path) {
+				pr.Out.URL.Path = endpoint.Path
+				pr.Out.URL.RawPath = ""
+			}
 			// The host rejects requests whose Host is not its
 			// internal routing label (#346), and requires JSON
-			// content even on the header-less well-known GET.
+			// content on every JSON-RPC call.
 			pr.Out.Host = endpoint.Host
 			if pr.Out.Header.Get("Content-Type") == "" {
 				pr.Out.Header.Set("Content-Type", "application/json")
@@ -225,6 +231,18 @@ func (p *Proxy) BaseURL() string {
 // Close stops the listener and drains the server.
 func (p *Proxy) Close() error {
 	return p.server.Close()
+}
+
+// isRouteCardPath reports a route's well-known card path on the host
+// (#580): /agents/<id>/.well-known/agent-card.json, one path segment for
+// the id.
+func isRouteCardPath(path string) bool {
+	rest, ok := strings.CutPrefix(path, a2a.AgentPath(""))
+	if !ok {
+		return false
+	}
+	id, ok := strings.CutSuffix(rest, wellKnownCardPath)
+	return ok && id != "" && !strings.Contains(id, "/")
 }
 
 // rewriteCard copies the served card with every interface URL pointed

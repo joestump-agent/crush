@@ -28,12 +28,19 @@ import (
 	"syscall"
 
 	"github.com/charmbracelet/crush/internal/a2a"
+	"github.com/charmbracelet/crush/internal/agent"
 )
 
 // dispatchID is the registry id the harness's scripted dispatch serves
 // under; the TCK never sees it, but the card's endpoint path carries
 // it.
 const dispatchID = "tck"
+
+// definitionID is the agent definition the harness publishes beside the
+// dispatch (#580), so the per-route card path has a definition to probe
+// by hand: GET /agents/coder/.well-known/agent-card.json. The TCK never
+// touches it.
+const definitionID = "coder"
 
 // sessionID is the ephemeral session the scripted runs answer within.
 const sessionID = "tck-session"
@@ -74,16 +81,34 @@ func main() {
 	if err != nil {
 		log.Fatalf("start host: %v", err)
 	}
+	if err := publishDefinition(ctx, factory); err != nil {
+		log.Fatalf("publish definition: %v", err)
+	}
 
 	proxy, err := NewProxy(ctx, factory, server, sessionID, *port)
 	if err != nil {
 		log.Fatalf("start proxy: %v", err)
 	}
-	slog.Info("TCK harness ready", "card", proxy.BaseURL()+"/.well-known/agent-card.json", "sut_host", proxy.BaseURL())
+	slog.Info("TCK harness ready",
+		"card", proxy.BaseURL()+wellKnownCardPath,
+		"sut_host", proxy.BaseURL(),
+		"definition_card", proxy.BaseURL()+a2a.AgentPath(definitionID)+wellKnownCardPath,
+		"socket", factory.SocketPath())
 
 	<-ctx.Done()
 	_ = proxy.Close()
 	_ = factory.Close(context.Background())
 	_ = server.Stop(context.Background())
 	fmt.Println("a2a-tck harness stopped")
+}
+
+// publishDefinition publishes the harness's one agent definition on the
+// host (#580): a stable card at /agents/coder, served the way the
+// production host serves every definition.
+func publishDefinition(ctx context.Context, factory *a2a.ServerFactory) error {
+	return factory.PublishAgentDefinition(ctx, agent.AgentDefinitionCard{
+		ID:          definitionID,
+		Name:        "Coder",
+		Description: "An agent that helps with executing coding tasks.",
+	})
 }

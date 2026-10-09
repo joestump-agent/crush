@@ -34,7 +34,7 @@ it.
 | Binding | JSON-RPC 2.0 over HTTP; streaming responses are Server-Sent Events |
 | Listener | One host per process on a unix socket: `<data dir>/a2a/<pid>.sock`, socket mode `0600` in a `0700` directory. Optionally also TLS on TCP; see [TCP listener](#tcp-listener) |
 | Lifetime | From just after provisioning until the run returns; 5-second graceful shutdown |
-| Discovery | In memory: endpoint and card are stamped on the dispatch registry entry |
+| Discovery | In memory: endpoint and card are stamped on the dispatch registry entry. Every route also serves its card at `GET /agents/<id>/.well-known/agent-card.json`; see [Fetching a card](#fetching-a-card) |
 | Task store | The SDK's in-memory store, one per server |
 | Authentication | The host's per-process bearer token; on the TCP listener, a verified client certificate when `client_ca` is set |
 
@@ -45,8 +45,11 @@ calls `SendStreamingMessage` `message/stream`, and `CancelTask`
 ## Agent Card
 
 The coordinator builds the card from the dispatch and stamps it on the
-registry entry; discovery is in-memory and the card is not served over
-the wire:
+registry entry, and the host builds one per enabled agent definition.
+Every route serves its card at `GET /agents/<id>/.well-known/agent-card.json`
+([#580](https://github.com/joestump-agent/crush/issues/580)); see
+[Fetching a card](#fetching-a-card). The coordinator itself never fetches
+one — it reads the same object from the registry entry. A dispatch's card:
 
 ```json
 {
@@ -76,20 +79,67 @@ the wire:
 
 | Field | Source |
 | --- | --- |
-| `name` | The dispatch's assigned `@handle`, without the `@`. |
-| `description` | The dispatch's `role`, which may be empty. |
+| `name` | The dispatch's assigned `@handle`, without the `@`. A definition card carries the definition's `name` (`Coder`, `Worker`, …). |
+| `description` | The dispatch's `role`, which may be empty. A definition card carries the definition's `description`. |
 | `version` | The Crush build version. |
 | `supportedInterfaces[0]` | The routed endpoint, `http://crush-a2a/agents/<dispatch id>`, JSON-RPC binding, protocol `1.0`. Always first. |
 | `supportedInterfaces[1]` | Only while the [TCP listener](#tcp-listener) runs and has an address to advertise: `https://<host:port>/agents/<dispatch id>`, same binding and protocol. |
 | `capabilities` | `streaming: true` and the declared `extensions`: `todos/v1`, `usage/v1`, `questions/v1`, `answers/v1`, `permissions/v1`, `permission-decisions/v1`, `undelivered-steers/v1` and `steer-refusals/v1`, each with its JSON Schema in its params. No push notifications, no extended card. |
 | `defaultInputModes`, `defaultOutputModes` | `text/plain` both ways. |
-| `skills` | One entry per Crush skill the dispatch was given: every discovered skill when the dispatch named none. `id` and `name` are the skill name, and every entry carries the single tag `crush-skill`. |
+| `skills` | One entry per Crush skill the dispatch was given: every discovered skill when the dispatch named none. `id` and `name` are the skill name, and every entry carries the single tag `crush-skill`. Empty on a definition card. |
 
 The card declares the `crush-bearer` security scheme (see
 [Security model](#security-model)) and, when the TCP listener requires
 client certificates, a `crush-mtls` scheme as the alternative. It declares
-no `provider`. The coordinator never fetches the card over HTTP. It reads
-the same object from the registry entry.
+no `provider`.
+
+### Fetching a card
+
+Each route — a running dispatch's, or an agent definition's — serves its
+card at the A2A well-known path under the route:
+
+```bash
+# On the socket: a bare GET, as any A2A client sends it. No token, no
+# Content-Type; the Host must be the crush-a2a label.
+curl --unix-socket "$DATA_DIR/a2a/$PID.sock" \
+  http://crush-a2a/agents/coder/.well-known/agent-card.json
+
+# Over the TCP listener: the gate authenticates first, with the client
+# certificate (shown) or the host's bearer token.
+curl --cacert ca.pem --cert bob.pem --key bob-key.pem \
+  https://alice.example.internal:7443/agents/coder/.well-known/agent-card.json
+```
+
+What comes back depends on the listener the request arrived on:
+
+- **On the socket**, the card as built: the object the registry entry and
+  the [agent index](#agent-index) carry, with the socket interface first
+  and the HTTPS interface second while the TCP listener runs.
+- **Over TCP**, a copy with one interface: the route at the origin the
+  caller dialed, `https://<Host>/agents/<id>`. The socket label is dropped,
+  because no remote client can dial it and an SDK client takes the first
+  interface it supports. The caller's own origin stands in for the
+  advertised address, so a card read through another certificate name —
+  or from a listener with no address to advertise — still names a URL its
+  reader can reach; Crush's own [external-agent](#external-agents)
+  resolver refuses a card whose JSON-RPC service is on another origin than
+  the card's. Everything else on the card is unchanged.
+
+The card is discovery metadata, which the A2A spec has clients fetch with a
+bare, uncredentialed `GET`, so the card path checks no credential of its
+own. On the socket, the `0600` socket is the reach restriction — as it
+already is for a definition route's JSON-RPC, which the socket serves
+without a token. Over TCP, the listener's gate still demands a verified
+client certificate or the bearer token before the route is looked up, so a
+bare GET there is `401`, like every other uncredentialed request. A
+listener without `client_ca` can therefore serve no remote card fetch: the
+token never leaves the process.
+
+The card path answers `GET` alone — anything else is `405` with
+`Allow: GET` — and only for a route that exists: an unknown id is `404`, as
+is every other sub-path of a route. The `Origin`, `Host` and `A2A-Version`
+checks below apply to a card GET too; only the `Content-Type` gate is
+skipped, since a GET carries no body.
 
 ## Endpoints
 
@@ -100,13 +150,14 @@ dialer maps it onto the unix socket.
 | Request | Path | Behaviour |
 | --- | --- | --- |
 | `POST` | `/agents/<dispatch id>` | JSON-RPC 2.0. `SendStreamingMessage` and `SubscribeToTask` answer as an SSE stream; every other method answers with one JSON response. |
+| `GET` | `/agents/<id>/.well-known/agent-card.json` | The route's Agent Card, for a dispatch or a definition route: see [Fetching a card](#fetching-a-card). Any other method is `405` with `Allow: GET`. |
 | `GET` | `/agents` | The agent index: see [below](#agent-index). |
-| anything else | any | `404`. The well-known card path is not served; discovery is in-memory. |
+| anything else | any | `404`: an unknown id, and every other sub-path of a route. The host has no card of its own at `/.well-known/agent-card.json`. |
 
 Middleware in front of the route table rejects a request before any
 dispatch work runs: `403` when an `Origin` header is present, `415`
-unless `Content-Type` parses to `application/json`, and `400` unless the
-`Host` is `crush-a2a`.
+unless `Content-Type` parses to `application/json` — a card `GET` excepted,
+since it carries no body — and `400` unless the `Host` is `crush-a2a`.
 
 ### Agent index
 
@@ -245,7 +296,12 @@ How the listener behaves:
   certificate's first DNS name that is not itself a wildcard, else its first
   IP address. With neither, the cards list no HTTPS interface and Crush logs
   a warning. With `client_ca` the card also declares the `crush-mtls`
-  scheme. Crush's own dispatch client keeps dialing the socket.
+  scheme. Crush's own dispatch client keeps dialing the socket. An
+  authenticated caller can fetch any route's card at
+  `/agents/<id>/.well-known/agent-card.json`; the copy it gets lists one
+  interface, the route at the origin the caller dialed, so a client that
+  takes the first interface it supports lands on this listener. See
+  [Fetching a card](#fetching-a-card).
 - **Lifetime.** The listener starts with the host and shuts down with it,
   alongside the socket. Connections that have not sent a request are closed
   at once, and a request still running at the shutdown deadline is cut. If
@@ -705,6 +761,12 @@ restriction is the socket, layered under the credential:
   `Host` other than the internal `crush-a2a` label on the socket, or one
   the TCP listener does not answer to (`400`), so a web page cannot fold a
   prompt into a running dispatch.
+- **The card.** A route's Agent Card is discovery metadata, which A2A
+  clients fetch with a bare `GET`. On the socket it is served without the
+  token — the `0600` socket is the reach restriction, as for a definition
+  route's JSON-RPC. Over TCP the gate still demands a client certificate or
+  the token first. The `Origin` and `Host` checks apply to it as to every
+  request. See [Fetching a card](#fetching-a-card).
 
 A same-user process can no longer steer a dispatch: without the token,
 which only the host process holds, every call is rejected.
