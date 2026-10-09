@@ -171,11 +171,14 @@ func TestDispatchE2EOverServerFactory(t *testing.T) {
 			elapsed := time.Since(start)
 
 			// Every scenario records exactly one terminal status
-			// transition on its registry entry and exactly one parent
-			// delivery, whatever the outcome.
-			require.Eventually(t, func() bool {
-				return h.TerminalTransitions(handle.DispatchID) == 1
-			}, 10*time.Second, 25*time.Millisecond, "exactly one terminal status transition expected")
+			// event on its registry entry and exactly one parent
+			// delivery, whatever the outcome. A terminal status is
+			// final (#568), so after a short settle for the event
+			// to reach the counter the count is a plain equality,
+			// not an Eventually: a double terminal write would hold
+			// it at two or more.
+			time.Sleep(100 * time.Millisecond)
+			require.Equal(t, 1, h.TerminalTransitions(handle.DispatchID), "exactly one terminal status transition expected")
 			require.Eventually(t, func() bool {
 				return h.ParentDeliveries() == 1
 			}, 10*time.Second, 25*time.Millisecond, "exactly one parent delivery expected")
