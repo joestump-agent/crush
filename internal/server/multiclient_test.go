@@ -146,7 +146,7 @@ func TestSanitizedWorkspaceRequestCopiesEveryField(t *testing.T) {
 			f.SetBool(true)
 		case reflect.Slice:
 			f.Set(reflect.MakeSlice(f.Type(), 1, 1))
-		case reflect.Ptr:
+		case reflect.Pointer:
 			f.Set(reflect.New(f.Type().Elem()))
 		default:
 			t.Fatalf("field %s has kind %s; teach this test to fill it", v.Type().Field(i).Name, f.Kind())
