@@ -582,7 +582,20 @@ func TestExternalAgentKillCancels(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DispatchStatusCanceled, outcome.Status)
 	require.Equal(t, dispatch.ReasonHardTimeout, outcome.Text)
-	require.Equal(t, []string{dispatch.ReasonHardTimeout}, es.exec.canceled())
+	requireCanceledWith(t, es, dispatch.ReasonHardTimeout)
+}
+
+// requireCanceledWith asserts the remote task was canceled with reason.
+// cancelTask re-issues tasks/cancel when the first attempt races the
+// task's state (#352), so the remote may record the same cancel twice;
+// the contract is at least one cancel, every one carrying the reason.
+func requireCanceledWith(t *testing.T, es *externalServer, reason string) {
+	t.Helper()
+	canceled := es.exec.canceled()
+	require.NotEmpty(t, canceled, "the remote task must be canceled")
+	for _, got := range canceled {
+		require.Contains(t, got, reason)
+	}
 }
 
 // A kill recorded before the stream even starts ends it at once.
@@ -626,15 +639,7 @@ func TestExternalAgentRefusesInputRequired(t *testing.T) {
 			require.Equal(t, DispatchStatusFailed, outcome.Status)
 			require.Contains(t, outcome.Text, "crush does not forward an external agent's input, permission, or auth requests")
 			require.NotContains(t, outcome.Text, "rm -rf", "the remote's question is not relayed")
-			// A cancel that lost the race against the delivery of the
-			// pause (client.go cancelTask) is re-issued once, so the
-			// executor can see the same refusal twice: every cancel
-			// must carry it, and the task must be canceled.
-			canceled := es.exec.canceled()
-			require.NotEmpty(t, canceled, "the paused task is canceled")
-			for _, reason := range canceled {
-				require.Contains(t, reason, "crush does not forward")
-			}
+			requireCanceledWith(t, es, "crush does not forward")
 		})
 	}
 }

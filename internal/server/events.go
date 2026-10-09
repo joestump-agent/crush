@@ -40,8 +40,8 @@ func wrapEvent(ev any) *pubsub.Payload {
 	case pubsub.Event[mcp.Event]:
 		pt := mcpEventTypeToProto(e.Payload.Type)
 		if pt == "" {
-			// Unsupported MCP event type — has no proto representation.
-			// Drop it instead of fabricating a state_changed event.
+			// Unsupported MCP event type. Drop it instead of fabricating
+			// a state_changed event.
 			slog.Debug("Dropping unsupported MCP event type for SSE", "type", e.Payload.Type)
 			return nil
 		}
@@ -53,6 +53,8 @@ func wrapEvent(ev any) *pubsub.Payload {
 				State:          proto.MCPState(e.Payload.State),
 				Error:          e.Payload.Error,
 				ToolCount:      e.Payload.Counts.Tools,
+				PromptCount:    e.Payload.Counts.Prompts,
+				ResourceCount:  e.Payload.Counts.Resources,
 				ChannelMessage: e.Payload.ChannelMessage,
 			},
 		})
@@ -195,8 +197,8 @@ func mcpEventTypeToProto(t mcp.EventType) proto.MCPEventType {
 	case mcp.EventChannelMessage:
 		return proto.MCPEventChannelMessage
 	default:
-		// Unsupported type. Return empty so callers can drop it
-		// rather than coercing to state_changed.
+		// Unsupported type. Return empty so callers can drop it rather
+		// than coercing to state_changed.
 		return ""
 	}
 }

@@ -11,6 +11,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -115,27 +116,26 @@ func (m *Attachments) Render(width int) string {
 // styles in place.
 func (m *Attachments) Renderer() *Renderer { return m.renderer }
 
-func NewRenderer(normalStyle, deletingStyle, imageStyle, textStyle, skillStyle, promptStyle, removeStyle lipgloss.Style) *Renderer {
-	return &Renderer{
-		normalStyle:   normalStyle,
-		textStyle:     textStyle,
-		imageStyle:    imageStyle,
-		skillStyle:    skillStyle,
-		promptStyle:   promptStyle,
-		removeStyle:   removeStyle,
-		deletingStyle: deletingStyle,
-	}
+// SetStyles updates the chip renderer's styles in place.
+func (m *Attachments) SetStyles(s styles.AttachmentStyles) { m.renderer.SetStyles(s) }
+
+func NewRenderer(s styles.AttachmentStyles) *Renderer {
+	r := &Renderer{}
+	r.SetStyles(s)
+	return r
 }
 
-// SetStyles updates the renderer styles in place.
-func (r *Renderer) SetStyles(normalStyle, deletingStyle, imageStyle, textStyle, skillStyle, promptStyle, removeStyle lipgloss.Style) {
-	r.normalStyle = normalStyle
-	r.textStyle = textStyle
-	r.imageStyle = imageStyle
-	r.skillStyle = skillStyle
-	r.promptStyle = promptStyle
-	r.removeStyle = removeStyle
-	r.deletingStyle = deletingStyle
+// SetStyles updates the renderer styles in place. The theme's attachment
+// styles are copied into per-kind fields so the chip builders read them
+// without a struct hop.
+func (r *Renderer) SetStyles(s styles.AttachmentStyles) {
+	r.normalStyle = s.Normal
+	r.textStyle = s.Text
+	r.imageStyle = s.Image
+	r.skillStyle = s.Skill
+	r.promptStyle = s.Prompt
+	r.removeStyle = s.Remove
+	r.deletingStyle = s.Deleting
 }
 
 type Renderer struct {

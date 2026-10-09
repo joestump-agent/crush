@@ -6,6 +6,8 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
+	"github.com/charmbracelet/crush/internal/db"
+	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,12 +24,20 @@ func TestFilterToolsForChannel(t *testing.T) {
 	plainTool := &fakeTool{name: "plain"}
 	states := map[string]mcp.ClientInfo{"signal": {Channel: true}}
 
+	// A local turn (no channel) keeps all tools, including channel server
+	// tools — a TUI user can still ask the agent to send via Signal.
 	local := filterToolsForChannel([]fantasy.AgentTool{channelTool, plainTool}, "", states)
-	require.Len(t, local, 1)
-	require.Equal(t, "plain", local[0].Info().Name)
+	require.Len(t, local, 2)
 
+	// A channel-originated turn only sees the originating channel's tools
+	// plus non-channel tools.
 	matching := filterToolsForChannel([]fantasy.AgentTool{channelTool, plainTool}, "signal", states)
 	require.Len(t, matching, 2)
+
+	// A different channel's turn does not see signal's tools.
+	other := filterToolsForChannel([]fantasy.AgentTool{channelTool, plainTool}, "switchboard", states)
+	require.Len(t, other, 1)
+	require.Equal(t, "plain", other[0].Info().Name)
 }
 
 type channelTestTool struct {
@@ -52,3 +62,46 @@ func (*channelTestTool) ProviderOptions() fantasy.ProviderOptions {
 }
 
 func (*channelTestTool) SetProviderOptions(fantasy.ProviderOptions) {}
+
+// TestSyncSessionChannelLifecycle covers the full lifecycle of the persisted
+// session-channel binding: a channel turn binds the session, a push from a
+// different channel rebinds it (newest wins), and a local turn clears it —
+// the reaping path for sessions the user takes over.
+func TestSyncSessionChannelLifecycle(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	// Release only this test's pooled connection; a global db.ResetPool()
+	// here would close the databases of tests still running in parallel.
+	t.Cleanup(func() {
+		require.NoError(t, db.Release(dataDir))
+	})
+
+	conn, err := db.Connect(t.Context(), dataDir)
+	require.NoError(t, err)
+	sessions := session.NewService(db.New(conn), conn)
+	c := &coordinator{sessions: sessions}
+
+	created, err := sessions.Create(t.Context(), "channel session")
+	require.NoError(t, err)
+
+	// A channel-originated turn binds the session to its channel.
+	c.syncSessionChannel(t.Context(), created.ID, "signal")
+	got, err := sessions.Get(t.Context(), created.ID)
+	require.NoError(t, err)
+	require.Equal(t, "signal", got.Channel)
+
+	// A push from another channel rebinds: the newest push wins.
+	c.syncSessionChannel(t.Context(), created.ID, "switchboard")
+	got, err = sessions.Get(t.Context(), created.ID)
+	require.NoError(t, err)
+	require.Equal(t, "switchboard", got.Channel)
+
+	// A local turn (no originating channel) clears the binding.
+	c.syncSessionChannel(t.Context(), created.ID, "")
+	got, err = sessions.Get(t.Context(), created.ID)
+	require.NoError(t, err)
+	require.Empty(t, got.Channel)
+
+	// A missing session is a no-op, not an error.
+	c.syncSessionChannel(t.Context(), "does-not-exist", "signal")
+}

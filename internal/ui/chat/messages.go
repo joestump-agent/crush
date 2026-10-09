@@ -154,6 +154,13 @@ type cacheClearable interface {
 	clearCache()
 }
 
+// animRestyler is implemented by message items that own an animated
+// spinner whose colors are baked into pre-rendered frames and therefore
+// need rebuilding when the theme changes.
+type animRestyler interface {
+	restyleAnim()
+}
+
 // ClearItemCaches drops any cached rendered output on each item so the
 // next render uses the current styles. It also bumps each item's
 // version so the F6 list-level memo invalidates frozen entries on
@@ -162,6 +169,9 @@ func ClearItemCaches(items []MessageItem) {
 	for _, item := range items {
 		if cc, ok := item.(cacheClearable); ok {
 			cc.clearCache()
+		}
+		if ar, ok := item.(animRestyler); ok {
+			ar.restyleAnim()
 		}
 		if v, ok := item.(interface{ Bump() }); ok {
 			v.Bump()
@@ -564,15 +574,7 @@ func ExtractMessageItems(sty *styles.Styles, msg *message.Message, toolResults m
 		if len(items) > 0 {
 			return items
 		}
-		r := attachments.NewRenderer(
-			sty.Attachments.Normal,
-			sty.Attachments.Deleting,
-			sty.Attachments.Image,
-			sty.Attachments.Text,
-			sty.Attachments.Skill,
-			sty.Attachments.Prompt,
-			sty.Attachments.Remove,
-		)
+		r := attachments.NewRenderer(sty.Attachments)
 		items = []MessageItem{NewUserMessageItem(sty, msg, r)}
 		if IsChannelMessage(msg) {
 			items = append(items, NewChannelInfoItem(sty, msg))

@@ -165,15 +165,7 @@ func TestRefreshStylesRepushesHighlighterStyles(t *testing.T) {
 	// refreshStyles pushes into every subcomponent, so they all have to be
 	// real for it to run at all.
 	sty := m.com.Styles
-	m.attachments = attachments.New(attachments.NewRenderer(
-		sty.Attachments.Normal,
-		sty.Attachments.Deleting,
-		sty.Attachments.Image,
-		sty.Attachments.Text,
-		sty.Attachments.Skill,
-		sty.Attachments.Prompt,
-		sty.Attachments.Remove,
-	), attachments.Keymap{})
+	m.attachments = attachments.New(attachments.NewRenderer(sty.Attachments), attachments.Keymap{})
 	m.promptHighlighter = newPromptHighlighter(
 		lipgloss.NewStyle().Foreground(lipgloss.Color("1")),
 		lipgloss.NewStyle().Foreground(lipgloss.Color("2")),

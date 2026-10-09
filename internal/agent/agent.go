@@ -184,7 +184,17 @@ type SessionAgentCall struct {
 	turnText func(call SessionAgentCall, text string)
 }
 
+// filterToolsForChannel scopes the tool list for a turn. A channel-originated
+// turn (channel != "") sees only the originating channel server's tools plus
+// all non-channel tools — the model's reach is restricted to the channel it
+// is replying through, so it cannot accidentally send via a different
+// messaging backend. A local turn (channel == "") keeps every tool,
+// including channel server tools, so a user in the TUI can still ask the
+// agent to send a message through Signal or any other enabled channel.
 func filterToolsForChannel(agentTools []fantasy.AgentTool, channel string, states map[string]mcp.ClientInfo) []fantasy.AgentTool {
+	if channel == "" {
+		return agentTools
+	}
 	filtered := make([]fantasy.AgentTool, 0, len(agentTools))
 	for _, agentTool := range agentTools {
 		mcpTool, ok := agentTool.(interface{ MCP() string })
@@ -1053,8 +1063,13 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 				prepared.Messages[i].ProviderOptions = nil
 			}
 
-			// Use latest tools (updated by SetTools when MCP tools change).
-			prepared.Tools = filterToolsForChannel(a.tools.Copy(), call.Channel, mcp.GetStates())
+			// Use latest tools (updated by SetTools when MCP tools
+			// change), filtered for the session's channel and minus MCP
+			// servers disabled for this repository.
+			prepared.Tools = a.filterDisabledMCPTools(
+				callContext,
+				filterToolsForChannel(a.tools.Copy(), call.Channel, mcp.GetStates()),
+			)
 
 			// Drain queued follow-up prompts for this step. Calls covered
 			// by a cancel recorded while they sat in the queue are dropped:
@@ -1454,6 +1469,15 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		updateErr := a.messages.Update(cleanupCtx, *currentAssistant)
 		if updateErr != nil {
 			return nil, updateErr
+		}
+		// A channel-originated turn has no caller watching the error, so
+		// tell the channel side something went wrong instead of leaving
+		// the sender hanging. sendChannelReply detaches from the run
+		// context so the notice survives a provider error that tore it down.
+		if channelErrorReplyWanted(call.Channel, err) {
+			a.sendChannelReply(ctx, call,
+				"Something went wrong while handling your message. Please try again.",
+				completedToolCalls)
 		}
 		return nil, err
 	}
@@ -1935,6 +1959,36 @@ If not, please feel free to ignore. Again do not mention this message to the use
 	return history, files
 }
 
+// filterDisabledMCPTools removes tools from MCP servers disabled via the
+// "Toggle MCPs" dialog. The override set is repository-scoped and shared
+// by every session in the repository, including sub-agent sessions.
+// Connections are process-global and left untouched; only the tool list
+// changes.
+func (a *sessionAgent) filterDisabledMCPTools(ctx context.Context, toolList []fantasy.AgentTool) []fantasy.AgentTool {
+	disabledServers, err := a.sessions.MCPDisabledServers(ctx)
+	if err != nil {
+		slog.Error("Failed to list disabled MCP servers", "error", err)
+		return toolList
+	}
+	if len(disabledServers) == 0 {
+		return toolList
+	}
+	disabled := make(map[string]struct{}, len(disabledServers))
+	for _, name := range disabledServers {
+		disabled[name] = struct{}{}
+	}
+	filtered := make([]fantasy.AgentTool, 0, len(toolList))
+	for _, t := range toolList {
+		if mcpTool, ok := t.(*tools.Tool); ok {
+			if _, off := disabled[mcpTool.MCP()]; off {
+				continue
+			}
+		}
+		filtered = append(filtered, t)
+	}
+	return filtered
+}
+
 // filterFileParts removes fantasy.FilePart entries from a slice of message
 // parts. Used to strip image attachments from historical user messages when
 // the current model does not support them.
@@ -2186,7 +2240,7 @@ func (a *sessionAgent) GenerateTitle(ctx context.Context, sessionID string, user
 		cost = 0
 	}
 
-	promptTokens := resp.TotalUsage.InputTokens + resp.TotalUsage.CacheCreationTokens
+	promptTokens := contextTokens(resp.TotalUsage)
 	completionTokens := resp.TotalUsage.OutputTokens
 
 	// Atomically update only title and usage fields to avoid overriding other
@@ -2290,11 +2344,22 @@ func (a *sessionAgent) updateSessionUsage(model Model, session *session.Session,
 	updateSessionTokenCounters(session, usage)
 }
 
+// contextTokens returns the size of the prompt the provider processed for
+// a step. Providers with prompt caching (Anthropic, Bedrock, Vercel) report
+// the prompt as three disjoint buckets: tokens served from cache, tokens
+// newly written to the cache, and the uncached remainder. All three occupy
+// the context window, so all three count. Providers without cache writes
+// leave CacheCreationTokens at zero, and the OpenAI-style providers already
+// subtract cached tokens from InputTokens, so nothing is counted twice.
+func contextTokens(usage fantasy.Usage) int64 {
+	return usage.InputTokens + usage.CacheReadTokens + usage.CacheCreationTokens
+}
+
 func updateSessionTokenCounters(session *session.Session, usage fantasy.Usage) {
 	if usage.OutputTokens != 0 {
 		session.CompletionTokens = usage.OutputTokens
 	}
-	if promptTokens := usage.InputTokens + usage.CacheReadTokens; promptTokens != 0 {
+	if promptTokens := contextTokens(usage); promptTokens != 0 {
 		session.PromptTokens = promptTokens
 	}
 }

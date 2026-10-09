@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
@@ -15,6 +14,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/completions"
 	"github.com/charmbracelet/crush/internal/ui/dialog"
+	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/crush/internal/ui/textarea"
 	"github.com/charmbracelet/crush/internal/workspace"
 	"github.com/stretchr/testify/require"
@@ -37,12 +37,7 @@ func newCompletionBackspaceUIWith(ws workspace.Workspace) *UI {
 		chat:     NewChat(com, config.ScrollbarDefault),
 		textarea: ta,
 		attachments: attachments.New(
-			attachments.NewRenderer(
-				lipgloss.NewStyle(), lipgloss.NewStyle(),
-				lipgloss.NewStyle(), lipgloss.NewStyle(),
-				lipgloss.NewStyle(), lipgloss.NewStyle(),
-				lipgloss.NewStyle(),
-			),
+			attachments.NewRenderer(styles.AttachmentStyles{}),
 			attachments.Keymap{},
 		),
 		state:  uiChat,
