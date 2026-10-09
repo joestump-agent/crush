@@ -54,6 +54,10 @@ docs-site/
    `onBrokenAnchors` are both `throw`, so a dead internal link or a link to a
    heading that does not exist fails the build rather than shipping.
 
+The build must run inside a git checkout: `showLastUpdateTime` reads each
+page's last commit, and a plain directory copy or tarball fails with
+`This Docusaurus site is outside any Git worktree`.
+
 Internal links are absolute, site-root-relative, and carry no `/docs` prefix —
 `/features/mcp`, not `../features/mcp.md` — because docs are served from the
 site root.
