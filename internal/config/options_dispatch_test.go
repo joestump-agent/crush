@@ -175,6 +175,20 @@ func TestValidateDispatchDefaultAgent(t *testing.T) {
 			options: &Options{},
 			agents:  agents(map[string]Agent{AgentWorker: {ID: AgentWorker, Role: AgentRoleDispatch, Disabled: true}}),
 		},
+		{
+			// An external agent every dispatch would refuse is a
+			// misconfiguration, not a warning (#560).
+			name:    "unusable external agent",
+			options: &Options{Dispatch: &DispatchOptions{DefaultAgent: "reviewer"}},
+			agents: agents(map[string]Agent{
+				AgentWorker: worker,
+				"reviewer": {
+					ID: "reviewer", Role: AgentRoleDispatch, Runtime: AgentRuntimeA2A,
+					Unusable: "agents.reviewer.card: a runtime a2a agent needs the URL of its Agent Card",
+				},
+			}),
+			wantErr: `options.dispatch.default_agent: agent "reviewer" cannot be dispatched: agents.reviewer.card: a runtime a2a agent needs the URL of its Agent Card`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

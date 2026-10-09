@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -762,14 +761,16 @@ func closeSilentConnsOnShutdown(srv *http.Server) {
 }
 
 // ensureHost lazily starts the process-wide listener: the socket lives
-// under the data directory (created 0700) and is named after the pid —
-// and, on the temp-dir fallback, a hash of the data directory — so a
-// stale file always belongs to a dead process and plain removal before
-// the bind is safe; no live-server probing is needed. The socket is
-// chmod-ed 0600 right after the bind (non-Windows) and a per-process
-// bearer token is minted for it (#357): only a caller holding the token
-// — and, where the platform reports peer credentials, only one running
-// as the same user — reaches the JSON-RPC surface.
+// under the data directory (created 0700 and verified before the bind,
+// #558) and is named after the pid — and, on the runtime-dir fallback,
+// a hash of the data directory — so a stale file always belongs to a
+// dead process and plain removal before the bind is safe; no
+// live-server probing is needed. The socket is chmod-ed 0600 right
+// after the bind, without following symlinks (non-Windows), and a
+// per-process bearer token is minted for it (#357): only a caller
+// holding the token — and, where the platform reports peer
+// credentials, only one running as the same user — reaches the
+// JSON-RPC surface.
 func (f *ServerFactory) ensureHost(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -792,11 +793,9 @@ func (f *ServerFactory) ensureHost(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("a2a: bind unix listener: %w", err)
 	}
-	if runtime.GOOS != "windows" {
-		if err := os.Chmod(path, 0o600); err != nil {
-			_ = listener.Close()
-			return fmt.Errorf("a2a: chmod socket: %w", err)
-		}
+	if err := chmodSocket(path); err != nil {
+		_ = listener.Close()
+		return err
 	}
 
 	// The bearer token is minted when the host binds (#357): 32 bytes
@@ -848,7 +847,9 @@ func (f *ServerFactory) ensureHost(ctx context.Context) error {
 
 // a2aSocketPath returns where the process host binds its socket:
 // under the data directory when the path fits the 104-byte sun_path
-// limit, otherwise under a per-user, 0700 directory in [os.TempDir].
+// limit, otherwise under a per-user, 0700 directory in the runtime
+// directory (see fallbackSocketRoot). Either directory is verified
+// before it is used (#558); see ensureSocketDir.
 //
 // Both paths are unique per (process, data directory). The primary path
 // gets that from its directory; the fallback directory is shared by
@@ -867,19 +868,58 @@ func a2aSocketPath(dataDir string) (string, error) {
 		uid = usr.Uid
 	}
 	dir := filepath.Join(dataDir, a2aSocketDirName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("a2a: create socket dir: %w", err)
+	if err := ensureSocketDir(dir); err != nil {
+		return "", err
 	}
 	path := filepath.Join(dir, fmt.Sprintf("%d.sock", os.Getpid()))
 	if len(path) <= maxUnixSocketPathLen {
 		return path, nil
 	}
-	dir = filepath.Join(os.TempDir(), "crush-a2a-"+fallbackUserTag(uid))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("a2a: create fallback socket dir: %w", err)
+	dir = filepath.Join(fallbackSocketRoot(), "crush-a2a-"+fallbackUserTag(uid))
+	if err := ensureSocketDir(dir); err != nil {
+		return "", err
 	}
 	name := fmt.Sprintf("%d-%s.sock", os.Getpid(), shortHash(fallbackDataDirKey(dataDir), 4))
 	return filepath.Join(dir, name), nil
+}
+
+// fallbackSocketRoot is where the fallback socket directory lives:
+// $XDG_RUNTIME_DIR when set — systemd's per-user, 0700 runtime
+// directory on Linux, which no other user can plant a directory in —
+// otherwise [os.TempDir], the per-user private $TMPDIR on macOS but
+// the shared, sticky /tmp on Linux (#558), as internal/server does.
+func fallbackSocketRoot() string {
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return dir
+	}
+	return os.TempDir()
+}
+
+// ensureSocketDir creates dir 0700 and refuses to use it unless it is
+// what the host expects (#558). [os.MkdirAll] is a no-op on an existing
+// directory or symlink, so a directory pre-planted by another local
+// user — easy under the shared /tmp, where the fallback name is
+// predictable — would otherwise be used as found, and the planter could
+// swap the socket under the in-process client, which sends the host's
+// bearer token and dispatch prompts to whatever listens at the path.
+// The directory must be a real directory, not a symlink; on POSIX it
+// must also be owned by this user, and is tightened to 0700 if wider.
+// Every refusal names the path and the check that failed.
+func ensureSocketDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("a2a: create socket dir: %w", err)
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("a2a: stat socket dir: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("a2a: socket dir %s is a symlink", dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("a2a: socket dir %s is not a directory", dir)
+	}
+	return verifySocketDir(dir, fi)
 }
 
 // maxFallbackUserTagLen is the longest uid the fallback directory names

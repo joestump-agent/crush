@@ -141,21 +141,26 @@ See [Multi-agent dispatch](/agents/overview).
 
 | Tool | Does |
 | --- | --- |
-| `dispatch_agent` | Start an independent agent in its own git worktree, on a fresh `crush-dispatch-*` branch cut from a committed revision. It runs in the background and the tool returns a running handle at once; the result — findings plus a diff summary — arrives as a follow-up turn when it finishes. Parameters: `prompt` (required), `model` (`large` or `small`; default `small`), `skills` (default: every discovered skill), `branch` (base revision; default the current branch), `handle`, and `role` |
-| `message_agent` | Steer a running dispatched agent: the message lands as its next input, and the reply appears on the agent's block in the chat, not as the tool's result. Address it by `session_id` or `handle`, with the text in `message`. A finished agent refuses — dispatch a new one |
+| `dispatch_agent` | Start an independent agent in its own git worktree, on a fresh `crush-dispatch-*` branch cut from a committed revision. It runs in the background and the tool returns a running handle at once; the result — findings plus a diff summary — arrives as a follow-up turn when it finishes. Parameters: `prompt` (required); `agent` (an enabled dispatch agent definition — `worker`, or one you added; default `options.dispatch.default_agent`); `model` (`large` or `small`; default the selected agent's slot, refused for an agent pinned to an explicit model); `skills` (default: the agent's list); `branch` (base revision; default the current branch); `handle`; `role`. Fails at the concurrency cap with `dispatch at capacity` |
+| `message_agent` | Steer a running dispatched agent: the message lands as its next input, and the reply appears on the agent's block in the chat, not as the tool's result. Exactly one of `handle` or `session_id`, plus `message`. Finished and external agents refuse |
+| `cancel_dispatch` | Stop one running dispatched agent. Exactly one of `dispatch_id` or `handle`. The run ends killed with reason `canceled by user`, the parent receives the salvageable diff, and the workspace is kept |
+| `apply_dispatch` | Bring a finished dispatch's work into your checkout and remove its workspace. Exactly one of `dispatch_id` or `handle`, plus `mode`: `merge` (default, a `--no-ff` merge commit), `squash` (lands **staged, not committed**) or `cherry-pick`. Uncommitted work in the worktree is committed on the dispatch branch first. Refuses, changing nothing, while the dispatch runs, when your checkout is dirty or mid-merge, on a conflict (paths listed, merge aborted), and for an external dispatch. Asks permission first |
+| `dismiss_dispatch` | Discard a finished dispatch: delete the worktree, the branch and the registry entry, freeing its handle. Exactly one of `dispatch_id` or `handle`. Refuses while the dispatch runs and for an external dispatch. Asks permission first. No undo |
 
-Both are main-agent tools: neither sub-agents nor dispatched agents get them,
-so delegation is one level deep. Both are on by default; deny them to turn
-dispatch off:
+All five are main-agent tools, offered only while the session is interactive:
+sub-agents and dispatched agents never get them, so delegation is one level
+deep, and `crush run` does not offer them at all. They are on by default and
+disappear together when no dispatch agent is enabled. Deny them, or disable
+the `worker`, to turn dispatch off:
 
 ```bash
-permissions deny dispatch_agent message_agent
+permissions deny dispatch_agent message_agent cancel_dispatch apply_dispatch dismiss_dispatch
+# or
+agent set worker --disabled true
 ```
 
 `dispatch_agent` needs a git repository — anywhere else it returns
-`dispatch unavailable`. The `message_agent` schema currently marks
-`session_id` as required even when the model addresses the agent by handle.
-Tracked as [#400](https://github.com/joestump-agent/crush/issues/400).
+`dispatch unavailable`.
 
 ## What sub-agents get
 
@@ -165,29 +170,28 @@ fire your hooks N times. The outer sub-agent tool call itself *is* hooked.
 
 ## What dispatched agents get
 
-A dispatched agent gets the `agent` sub-agent's read-only set — `glob`,
-`grep`, `ls`, `view`, and, when language servers are on, `lsp_definition`,
-`lsp_symbols`, and `lsp_call_hierarchy` — plus `bash`, `edit`, `multiedit`,
-`write`, and `todos`. Every path-based tool is rooted at the agent's worktree.
+A dispatched agent's tools come from its
+[agent definition](/agents/configuration#agent-definitions), filtered by
+your deny list. The built-in `worker` allows `@read` (`glob`, `grep`, `ls`,
+`view`, and the `lsp_definition`, `lsp_symbols` and `lsp_call_hierarchy`
+lookups when language servers are on), `@write` (`bash`, `edit`,
+`multiedit`, `write`, `todos`), plus `job_output`, `job_kill` and
+`lsp_diagnostics`. `fetch`, `download`, `lsp_references`, `lsp_rename`,
+`lsp_replace_symbol`, `lsp_restart` and `crush_logs` can be added to its
+`tools.allow`; MCP tools come from its `mcp.allow`, empty by default. Every
+path-based tool is rooted at the agent's worktree.
 
 While the session is interactive it also gets `question`: each question
 pauses the dispatched run and appears in your question prompt labeled with the
 agent's `@handle`, and the run resumes with your answer.
 
-It never gets `agent`, `agentic_fetch`, MCP tools, semantic search,
-`dispatch_agent`, or `message_agent`. The outer `dispatch_agent` and
-`message_agent` calls are hooked like any top-level tool call.
-
-:::warning[Known issue]
-- Dispatched agents are **not** intercepted by `PreToolUse` hooks, although
-  unlike sub-agents they can run `bash` and write files. A hook that blocks
-  `git push -f` does not stop one. Tracked as [#377](https://github.com/joestump-agent/crush/issues/377).
-- `permissions deny` and `options.disabled_tools` can narrow the read-only
-  tools, but a dispatched agent always gets `bash`, `edit`, `multiedit`,
-  `write`, and `todos` back. Tracked as [#376](https://github.com/joestump-agent/crush/issues/376).
-- `job_output` and `job_kill` are missing, so a long-running command that
-  `bash` moves to the background cannot be read back. Tracked as [#384](https://github.com/joestump-agent/crush/issues/384).
-:::
+It never gets `agent`, `agentic_fetch`, `semantic_search`, `sourcegraph` or
+the five dispatch tools. Unlike `agent` sub-agents, a dispatched agent's own
+tool calls **are** intercepted by your `PreToolUse` hooks, with the dispatched
+session's ID in the payload, and `permissions deny` removes any tool from it —
+a dispatch is refused outright only when the deny list removes all of `bash`,
+`edit`, `multiedit` and `write`. The outer `dispatch_agent` call is hooked
+like any top-level tool call.
 
 ## Checking what's live
 

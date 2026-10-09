@@ -50,15 +50,9 @@ not already on screen — so anything you type goes to the parent.
 <kbd>ctrl+[</kbd> returns to the parent's chat.
 
 Task sessions are never continuable. To follow up on a finished dispatched
-agent, dispatch a new one.
-
-:::warning[Known issue]
-- `crush run --continue` can resume a task session, because "most recent"
-  includes sub-agents, and `crush --session` accepts a task-session ID and
-  makes it the active session. Tracked as [#413](https://github.com/joestump-agent/crush/issues/413).
-- Deleting a parent leaves its task sessions behind, with nothing left that
-  lists them. Tracked as [#418](https://github.com/joestump-agent/crush/issues/418).
-:::
+agent, dispatch a new one. `crush --session <id>` and `crush run --continue`
+skip task sessions, so neither can make one active, and deleting a parent
+session removes its task sessions with it.
 
 ## Resuming from the CLI
 

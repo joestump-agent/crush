@@ -251,6 +251,14 @@ type Workspace interface {
 	WorkingDir() string
 	GitBranch(ctx context.Context) (string, error)
 	Resolver() config.VariableResolver
+	// LoadDiagnostics returns the load diagnostics the config load
+	// collected and the command recorded (#560, #578): the problems
+	// that did not fail the load but that the user should hear about,
+	// such as an external agent that cannot be dispatched or an
+	// allow-commands entry that subtracts nothing from the banned
+	// list. A client workspace returns nil; the server process that
+	// loaded the config logs them itself.
+	LoadDiagnostics() []config.LoadDiagnostic
 
 	// Config mutations (proxied to server in client mode)
 	UpdatePreferredModel(scope config.Scope, modelType config.SelectedModelType, model config.SelectedModel) error

@@ -189,6 +189,35 @@ Show usage statistics — tokens, cost, and activity patterns.
 | `--all` | Aggregate stats from every known project |
 | `--crawl-dir <dir>` | Crawl a directory recursively for Crush projects and aggregate |
 
+## `dispatch`
+
+:::info[Fork feature]
+See [Dispatched agents](/agents/overview).
+:::
+
+Inspect and clean up [dispatched agent](/agents/overview) workspaces from
+outside a session. Both subcommands take the global `--cwd` and `--data-dir`
+flags and resolve the same worktrees directory the TUI uses,
+`<data dir>/worktrees/<repo-key>/`; run them inside the repository.
+
+```text
+crush dispatch list [--json]
+crush dispatch prune [--dry-run] [--all-dead] [--force] [--dismissed=false]
+```
+
+| Flag | Does |
+| --- | --- |
+| `list --json` | One JSON object per workspace instead of the table (a header-less TSV when stdout is not a terminal) |
+| `prune` | Remove dead-owner workspaces whose disposition is applied or dismissed |
+| `prune --dismissed=false` | Keep dismissed ones |
+| `prune --all-dead` | Remove every dead owner's workspace, skipping ones that hold changes |
+| `prune --all-dead --force` | Remove those too |
+| `prune --dry-run` | Print the plan and delete nothing |
+
+`list` prints the id, handle, branch, disposition, whether the owning process
+is alive, and whether the workspace holds changes. `prune` never removes a
+workspace whose owner is alive, or one with no lock file.
+
 ## `dirs`
 
 Print the resolved config and data directories. The first thing to run when

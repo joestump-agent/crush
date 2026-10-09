@@ -2,7 +2,7 @@
 id: a2a-protocol
 title: A2A wire reference
 sidebar_label: A2A protocol
-description: What each dispatched agent's A2A server exposes today — the Agent Card, endpoints, the JSON-RPC methods Crush calls, the event stream and its todo metadata, the security model, and the planned protocol surface.
+description: What the per-process A2A host exposes — the Agent Card, endpoints, the JSON-RPC methods Crush calls, the event stream and its todo metadata, the SQLite task store, the security model, the TCP listener and external agents.
 ---
 
 # A2A wire reference
@@ -12,17 +12,19 @@ The A2A layer is an addition in the `joestump-agent/crush` fork.
 :::
 
 Every dispatched agent is served over the
-[A2A protocol](https://a2a-protocol.org) while it runs. This page documents
-exactly what is on the wire today, so you can debug it, read logs against
-it, or plan against it. How the server fits into a dispatch is on
-[Architecture](./architecture.md).
+[A2A protocol](https://a2a-protocol.org) while it runs, and every agent
+definition has a route on the same host. This page documents exactly what is
+on the wire, so you can debug it, read logs against it, or build against it.
+How the host fits into a dispatch is on [Architecture](./architecture.md);
+what a team can do with it is on [Working with other agents](./team.md).
 
-:::warning[Internal interface]
+:::info[Who can call it]
 Crush's own coordinator is the only client that can drive a run. The
 opt-in [TCP listener](#tcp-listener) requires TLS and authenticates every
-call, but it exposes no local dispatch or sub-agent run yet. A dispatch's
-endpoint exists only while that dispatch runs, and the UI does not show
-it.
+call, but it exposes no local dispatch or sub-agent run yet, and the agent
+cards are not served over the wire. A dispatch's route exists only while
+that dispatch runs; a definition's route is permanent and rejects every task
+until an entry point serves a turn on it.
 :::
 
 ## At a glance
@@ -32,10 +34,10 @@ it.
 | SDK | [`github.com/a2aproject/a2a-go/v2`](https://github.com/a2aproject/a2a-go) v2.5.0 |
 | Protocol version | `1.0`, stamped on the card's interface |
 | Binding | JSON-RPC 2.0 over HTTP; streaming responses are Server-Sent Events |
-| Listener | One host per process on a unix socket: `<data dir>/a2a/<pid>.sock`, socket mode `0600` in a `0700` directory. Optionally also TLS on TCP; see [TCP listener](#tcp-listener) |
-| Lifetime | From just after provisioning until the run returns; 5-second graceful shutdown |
-| Discovery | In memory: endpoint and card are stamped on the dispatch registry entry |
-| Task store | The SDK's in-memory store, one per server |
+| Listener | One host per process on a unix socket: `<data dir>/a2a/<pid>.sock`, socket mode `0600` in a `0700` directory the host verifies before binding, or `$TMPDIR/crush-a2a-<uid>/<pid>-<hash>.sock` when that path would exceed the 104-byte socket limit. Optionally also TLS on TCP; see [TCP listener](#tcp-listener) |
+| Lifetime | The host starts with the process and serves every definition's route for its lifetime; a dispatch's route lasts from just after provisioning until the run returns, with a 5-second graceful shutdown |
+| Discovery | In memory: a dispatch's endpoint and card are stamped on its registry entry, and the definition cards are kept in the host's listing. No card is served over HTTP: the router answers `404` for every sub-path of a route, the well-known card path included |
+| Task store | SQLite: the `a2a_tasks` table of the session database, shared by every route, so tasks survive a restart. Each dispatch also leaves a durable record in `a2a_dispatches`, reconciled at startup |
 | Authentication | The host's per-process bearer token; on the TCP listener, a verified client certificate when `client_ca` is set |
 
 Method names below are the A2A 1.0 names the SDK uses. Older A2A material
@@ -44,9 +46,11 @@ calls `SendStreamingMessage` `message/stream`, and `CancelTask`
 
 ## Agent Card
 
-The coordinator builds the card from the dispatch and stamps it on the
-registry entry; discovery is in-memory and the card is not served over
-the wire:
+The coordinator builds a card for each dispatch and stamps it on the registry
+entry, and one for each enabled agent definition, kept in the host's listing.
+Each route mounts the card's well-known handler, but the host's router does
+not reach it (see [Endpoints](#endpoints)), so discovery is in-memory and no
+card is served over the wire. A dispatch's card:
 
 ```json
 {
@@ -76,20 +80,21 @@ the wire:
 
 | Field | Source |
 | --- | --- |
-| `name` | The dispatch's assigned `@handle`, without the `@`. |
-| `description` | The dispatch's `role`, which may be empty. |
+| `name` | The dispatch's assigned `@handle`, without the `@`. A definition card carries the definition's `name` (`Worker`, `Coder`, …). |
+| `description` | The dispatch's `role`, which may be empty. A definition card carries the definition's `description`. |
 | `version` | The Crush build version. |
 | `supportedInterfaces[0]` | The routed endpoint, `http://crush-a2a/agents/<dispatch id>`, JSON-RPC binding, protocol `1.0`. Always first. |
 | `supportedInterfaces[1]` | Only while the [TCP listener](#tcp-listener) runs and has an address to advertise: `https://<host:port>/agents/<dispatch id>`, same binding and protocol. |
 | `capabilities` | `streaming: true` and the declared `extensions`: `todos/v1`, `usage/v1`, `questions/v1`, `answers/v1`, `permissions/v1`, `permission-decisions/v1`, `undelivered-steers/v1` and `steer-refusals/v1`, each with its JSON Schema in its params. No push notifications, no extended card. |
 | `defaultInputModes`, `defaultOutputModes` | `text/plain` both ways. |
-| `skills` | One entry per Crush skill the dispatch was given: every discovered skill when the dispatch named none. `id` and `name` are the skill name, and every entry carries the single tag `crush-skill`. |
+| `skills` | One entry per Crush skill the dispatch was given: every discovered skill when the dispatch named none. `id` and `name` are the skill name, and every entry carries the single tag `crush-skill`. Empty on a definition card. |
 
 The card declares the `crush-bearer` security scheme (see
 [Security model](#security-model)) and, when the TCP listener requires
 client certificates, a `crush-mtls` scheme as the alternative. It declares
-no `provider`. The coordinator never fetches the card over HTTP. It reads
-the same object from the registry entry.
+no `provider`. The coordinator never fetches a card over HTTP; it reads the
+same object from the registry entry, and the agent index carries it to the
+TUI.
 
 ## Endpoints
 
@@ -100,18 +105,19 @@ dialer maps it onto the unix socket.
 | Request | Path | Behaviour |
 | --- | --- | --- |
 | `POST` | `/agents/<dispatch id>` | JSON-RPC 2.0. `SendStreamingMessage` and `SubscribeToTask` answer as an SSE stream; every other method answers with one JSON response. |
-| `GET` | `/agents` | The agent index: see [below](#agent-index). |
-| anything else | any | `404`. The well-known card path is not served; discovery is in-memory. |
+| `POST` | `/agents/<definition id>` | One route per enabled agent definition (`coder`, `plan`, `task`, `worker`, yours). Same handler, but no run is bound to it: a message is rejected with `no running agent for context <id>; task sessions are not continuable` until an entry point serves a turn on the route. Over TCP it still requires a credential first. |
+| `GET` | `/agents` | The agent index: see [below](#agent-index). Socket only. |
+| anything else | any | `404` — an unknown id, and every sub-path of a route, so `/agents/<id>/.well-known/agent-card.json` is not served although each route mounts the handler. |
 
 Middleware in front of the route table rejects a request before any
 dispatch work runs: `403` when an `Origin` header is present, `415`
-unless `Content-Type` parses to `application/json`, and `400` unless the
-`Host` is `crush-a2a`.
+unless `Content-Type` parses to `application/json` (on every request, `GET`
+included), and `400` unless the `Host` is `crush-a2a` on the socket or one
+the TCP listener answers to.
 
 ### Agent index
 
-The host lists the dispatches it serves at `GET /agents`
-([#421](https://github.com/joestump-agent/crush/issues/421)). This is how
+The host lists the dispatches it serves at `GET /agents`. This is how
 a UI meets dispatched agents over the wire rather than through the
 dispatch registry. Sub-agent turns are not listed. The index lives with
 the process: a restart starts it empty, and a finished dispatch's
@@ -164,12 +170,13 @@ host judges those as the client sent them.
 
 ## TCP listener
 
-The host can also listen on TCP
-([#358](https://github.com/joestump-agent/crush/issues/358)). This is the
-transport groundwork for agents on other hosts or in other sandboxes.
-Nothing a remote client can call is served on it yet: see
-[Local runs stay local](#local-runs-stay-local). It is off unless you set a
-listen address, and it only speaks TLS. A listen address without both a
+The host can also listen on TCP. This is the transport groundwork for
+agents on other hosts or in other sandboxes: an authenticated remote caller
+reaches every route, but no run is served to it yet (see
+[Local runs stay local](#local-runs-stay-local)) and no card is served on
+the wire. It is off unless you set a listen address, and it only speaks TLS.
+A certificate recipe and the team workflow are on
+[Working with other agents](./team.md). A listen address without both a
 certificate and a key fails the load with
 `a2a.listen requires tls_cert and tls_key; plain TCP is not supported`.
 
@@ -225,10 +232,11 @@ How the listener behaves:
   same `/agents/<id>` routes the socket serves, with the same `Origin`,
   `Content-Type` and version checks. The [agent index](#agent-index) is the
   exception: it lists every dispatch the host serves, so only the socket
-  answers `GET /agents`. TLS 1.2 is the minimum. A request body
-  is capped at 32 MiB, enough for a message carrying several full-size
-  attachments. An idle keep-alive connection is closed after two minutes.
-  Plain HTTP to the port fails at the TLS layer and never reaches a route.
+  answers `GET /agents`. TLS 1.2 is the minimum. The handshake and request
+  headers must complete within 30 seconds. A request body is capped at
+  32 MiB, enough for a message carrying several full-size attachments. An
+  idle keep-alive connection is closed after two minutes. Plain HTTP to the
+  port fails at the TLS layer and never reaches a route.
 - **Host check.** The `Host` header must be the listen address (as
   configured, or with the port the kernel picked for `:0`) or a DNS or IP
   name in the server certificate's subject alternative names, at any port.
@@ -274,7 +282,7 @@ mid-run — the two resume methods.
 | --- | --- | --- |
 | `SendStreamingMessage` | Yes: the dispatch, steers, and one per answered question | Runs the turn, delivers the steer, or resumes the parked run, and streams the events below. |
 | `SendMessage` | No | Runs the turn and returns the final result in one response. |
-| `GetTask`, `ListTasks` | `GetTask` on resume | Answer from the per-server in-memory store. |
+| `GetTask`, `ListTasks` | `GetTask` on resume | Answer from the SQLite task store, scoped to the caller's identity. |
 | `CancelTask` | Yes — wander kills, user cancels, and questions no answer is coming for | Calls the agent's `Cancel` and emits `TASK_STATE_CANCELED`, the request's reason as the status message. |
 | `SubscribeToTask` | On resume | Re-attaches to a live task's stream. |
 | Push-notification config methods | No | Return "push notifications not supported". |
@@ -335,9 +343,8 @@ The steer's reply streams on the dispatch's own surfaces — the parent's
 dispatch block, `@handle` inspection — never on the steer's task.
 
 A steer is accepted once it is queued, and that is when `message_agent`
-returns ("queued"). A run that ends before reading a queued steer drops
-it ([#398](https://github.com/joestump-agent/crush/issues/398)): the
-dispatch's terminal status names every steer the agent accepted but
+returns ("queued"). A run that ends before reading a queued steer drops it:
+the dispatch's terminal status names every steer the agent accepted but
 never read under the `undelivered-steers/v1` extension
 (`{"steers": [...]}`), and the parent's result lists them as
 `undelivered_steers`. A steer the agent read — folded into a step or
@@ -346,8 +353,7 @@ fails.
 
 ### Questions
 
-A dispatched agent can ask the parent's user a question
-([#352](https://github.com/joestump-agent/crush/issues/352)). It gets the
+A dispatched agent can ask the parent's user a question. It gets the
 `question` tool when the parent session is interactive at dispatch time,
 and the tool asks through the dispatch's own question service, never the
 parent's:
@@ -415,8 +421,7 @@ call returns an error, and the task ends `TASK_STATE_CANCELED`. A
 ### Permission prompts
 
 A dispatched agent's tool calls ask for permission through the dispatch's
-own scoped permission service
-([#353](https://github.com/joestump-agent/crush/issues/353)). Yolo and the
+own scoped permission service. Yolo and the
 allowlists resolve inside that service, so only a request that needs a
 person ever reaches the protocol. Such a request parks the run exactly like
 a question:
@@ -532,11 +537,9 @@ A progress event looks like this:
 
 Every post-run terminal status — `TASK_STATE_COMPLETED`, both
 `TASK_STATE_FAILED` paths and an out-of-band `TASK_STATE_CANCELED` —
-carries the declared `usage/v1` extension's metadata key
-([#364](https://github.com/joestump-agent/crush/issues/364)). Each todo
+carries the declared `usage/v1` extension's metadata key. Each todo
 progress event carries it too, with the usage so far, so a watcher's
-token count moves while the agent works
-([#421](https://github.com/joestump-agent/crush/issues/421)):
+token count moves while the agent works:
 
 ```json
 {
@@ -606,7 +609,7 @@ rides the result.
 | --- | --- |
 | `TASK_STATE_COMPLETED` | `completed`. `key_findings` is the message text. `diff_summary` comes from the `diff` artifact: `(no changes)` when it is empty, `(diff unavailable: …)` when the result artifact carries a `diffError`. |
 | `TASK_STATE_FAILED`, `TASK_STATE_REJECTED` | `failed`. `error` is the message text. |
-| `TASK_STATE_CANCELED` | A status message that is a kill reason (#316) maps through the kill assembly: `killed`, with that reason. Anything else is `failed`, with `error` "dispatch canceled: …". |
+| `TASK_STATE_CANCELED` | A status message that is a kill reason maps through the kill assembly: `killed`, with that reason. Anything else is `failed`, with `error` "dispatch canceled: …". |
 | Stream error the resume cannot recover | `failed`, with `error` "a2a: dispatch stream: …". |
 | Stream ends with no terminal state | `failed`, with "…ended without a terminal state". |
 
@@ -615,8 +618,7 @@ rides the result.
 The stream's first event names the task, and the coordinator records that
 ID on the dispatch registry entry. When the connection drops before a
 terminal state, the task is still running — or already finished — on the
-server, so the client resumes instead of failing the dispatch
-([#349](https://github.com/joestump-agent/crush/issues/349)):
+server, so the client resumes instead of failing the dispatch:
 
 - Up to three attempts, 250ms, 1s and 4s apart. Each calls
   `SubscribeToTask`, which replays the stored task snapshot — the
@@ -630,8 +632,7 @@ server, so the client resumes instead of failing the dispatch
   snapshot never counts as progress, so a Working event is never
   counted twice.
 - When every attempt is exhausted the dispatch fails with the original
-  stream error, and the orphaned run is canceled before teardown
-  ([#344](https://github.com/joestump-agent/crush/issues/344)).
+  stream error, and the orphaned run is canceled before teardown.
 
 A terminal `task` snapshot is accepted when no terminal status event
 arrived. `Working` events are counted, not re-published: the agent block
@@ -641,8 +642,7 @@ renders from the in-process todo collector.
 
 Every kill — the wander watchdog's hard timeout and stall kill, the todo
 ladder's kill rung, and the user's cancel — records its reason on the
-run's kill state, then sends one `CancelTask` carrying it
-([#348](https://github.com/joestump-agent/crush/issues/348)):
+run's kill state, then sends one `CancelTask` carrying it:
 
 - The reason rides the request's metadata under `crush.dispatch.cancel_reason`.
 - The send is asynchronous: the SDK resolves a `tasks/cancel` only when
@@ -653,16 +653,24 @@ run's kill state, then sends one `CancelTask` carrying it
   live stream and lands in the task store, so an out-of-process kill
   reads the same as an in-process one.
 - The parent maps a `TASK_STATE_CANCELED` whose status message is a kill
-  reason onto `killed` through the kill assembly (#343).
+  reason onto `killed` through the kill assembly.
 - The direct in-process cancel remains as the fallback for the paths no
   `tasks/cancel` can serve: an unserved dispatch, a kill that lands
-  before the stream has named the task ID, or a cancel that errors
-  (#430). First reason wins; a late kill after natural completion is
-  discarded.
+  before the stream has named the task ID, or a cancel that errors. First
+  reason wins; a late kill after natural completion is discarded.
 
-:::warning[Known issue]
-A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/crush/issues/345)).
-:::
+## Durable state
+
+Served tasks live in the `a2a_tasks` table of the session database, through
+a SQLite implementation of the SDK's task store, so `GetTask` and the resume
+path read the same state after a restart. Every dispatch also leaves one
+durable record in `a2a_dispatches`: written at start, updated with the
+terminal result, and stamped delivered when the parent's delivery turn
+succeeds. On startup, before the UI loads a session, the reconciler fails
+every task and dispatch record whose owning process died — the dispatch error
+names the preserved workspace — and re-delivers every terminal result the
+parent never received, stamping it on the parent's persisted `dispatch_agent`
+tool result. That stamp is what a reloaded agent block renders.
 
 ## Not implemented
 
@@ -670,14 +678,18 @@ A panic inside the run crashes Crush ([#345](https://github.com/joestump-agent/c
   the same task is refused while the execution stays active. Permission
   prompts use `input-required` instead; see
   [Permission prompts](#permission-prompts).
-- **Durable task state.** A restart loses every task ([#354](https://github.com/joestump-agent/crush/issues/354)).
+- **Serving cards over HTTP.** Each route mounts the well-known card handler,
+  but the host's router answers `404` for every sub-path, so no card is
+  fetchable on either listener. Discovery is the registry and the agent
+  index.
+- **Runs for remote callers.** A TCP caller reaches every route and is
+  rejected by every one; see [Local runs stay local](#local-runs-stay-local).
 
 ## Security model
 
 :::info[Bearer-authenticated, socket-reachable]
 Every served call must carry the host's bearer token, declared on the
-card as a `crush-bearer` HTTP bearer `securitySchemes` entry
-([#357](https://github.com/joestump-agent/crush/issues/357)). The dispatch
+card as a `crush-bearer` HTTP bearer `securitySchemes` entry. The dispatch
 client attaches it automatically; anything else is rejected with the
 JSON-RPC unauthenticated error before the handler runs. The reach
 restriction is the socket, layered under the credential:
@@ -688,11 +700,17 @@ restriction is the socket, layered under the credential:
   credentials, the peer must also be the host's own OS user, and tasks
   are stored under that identity.
 - **Who can reach it.** Only processes running as the same OS user: the
-  socket is `0600` inside a `0700` directory under the data directory
-  (a per-user temp dir when the path would overflow the socket length
-  limit). Other local users cannot connect to the socket. The host
-  listens on TCP only when you configure the
-  [TCP listener](#tcp-listener), and then only with TLS
+  socket is `0600` inside a `0700` directory, `<data dir>/a2a/`. When
+  that path would overflow the unix socket length limit, the host falls
+  back to `crush-a2a-<uid>/` under `$XDG_RUNTIME_DIR`, or under the temp
+  directory when that is unset. Either directory is verified before the
+  bind ([#558](https://github.com/joestump-agent/crush/issues/558)): a
+  symlink or non-directory at its path, or a directory owned by another
+  user, is refused with an error naming the path and the failed check,
+  and a directory left wider than `0700` is tightened. The socket is
+  then made `0600` without following symlinks. Other local users cannot
+  connect to the socket. The host listens on TCP only when you configure
+  the [TCP listener](#tcp-listener), and then only with TLS
   ([#358](https://github.com/joestump-agent/crush/issues/358)).
 - **TCP callers.** A TCP connection carries no peer credentials, so a TCP
   call is never treated as the local user: it needs the bearer token or,
@@ -715,8 +733,7 @@ To turn dispatch off, run `permissions deny dispatch_agent`.
 ## External agents
 
 A `runtime: a2a` dispatch agent is the one case where Crush is the client of
-someone else's A2A server
-([#434](https://github.com/joestump-agent/crush/issues/434)). The wire
+someone else's A2A server. The wire
 differs from a served dispatch in these ways:
 
 - The card comes from `GET` on the configured URL, with no `Authorization`
@@ -743,30 +760,20 @@ differs from a served dispatch in these ways:
 Configuration and the trust model are in
 [External agents](./configuration.md#external-agents).
 
-## Planned protocol surface
+## What is next
 
-The 2026-10-04 re-base makes A2A carry the whole agent lifecycle. Stage 1
-holds ship-blockers, stage 2 must land before
-[Clustered Crush (#331)](https://github.com/joestump-agent/crush/issues/331),
-and stage 3 comes after. The reasoning is in
-[Design decisions](./design-decisions.md).
+Everything the 2026-10-04 re-base planned for the protocol has shipped: one
+path through the client with no direct-run fallback, `contextId` as the
+session and `taskId` as the run, steering as a message on the context,
+questions and permissions as `input-required` pauses, kills as
+`tasks/cancel`, declared extensions, the chunked diff artifact and typed
+result, usage and trace metadata, the SQLite task store with startup
+reconciliation, the TLS listener, and the a2a-go TCK in CI. The reasoning
+is in [Design decisions](./design-decisions.md).
 
-| Ticket | Change | Stage |
-| --- | --- | --- |
-| [#347](https://github.com/joestump-agent/crush/issues/347) | Delete the direct-run fallback; a server start failure fails the dispatch. | 2 |
-| [#350](https://github.com/joestump-agent/crush/issues/350) | `contextId` maps to the Crush session, `taskId` to one run. | 2 |
-| [#351](https://github.com/joestump-agent/crush/issues/351) | Steering is an A2A message on the running context, completed once consumed. | 2 |
-| [#354](https://github.com/joestump-agent/crush/issues/354) | A durable SQLite implementation of the SDK's task store. | 2 |
-| [#355](https://github.com/joestump-agent/crush/issues/355) | Wire the durable store; on startup, fail orphaned tasks and deliver undelivered results. | 2 |
-| [#357](https://github.com/joestump-agent/crush/issues/357) | `securitySchemes` on the card; auth interceptors on server and client. | 2 |
-| [#359](https://github.com/joestump-agent/crush/issues/359) | Declared, statically typed extensions (todos first); undeclared metadata keys rejected. | 2 |
-| [#360](https://github.com/joestump-agent/crush/issues/360) | The SDK's agent inactivity timeout as a stall backstop. | 2 |
-| [#361](https://github.com/joestump-agent/crush/issues/361) | The diff as a chunked `text/x-diff` file artifact, plus a summary and a typed `DispatchResult`. | 2 |
-| [#364](https://github.com/joestump-agent/crush/issues/364) | Usage, cost, model and `traceparent` in task metadata. | 2 |
-| [#352](https://github.com/joestump-agent/crush/issues/352) | Questions from dispatched agents through `input-required`. | 3 |
-| [#353](https://github.com/joestump-agent/crush/issues/353) | Permission prompts through `input-required`, decided by the parent's permission service. | 3 |
-| [#358](https://github.com/joestump-agent/crush/issues/358) | Optional TCP listener, TLS required, `Host` validated. | 3 |
-| [#356](https://github.com/joestump-agent/crush/issues/356) | Spike: can the SDK's cluster mode carry Clustered Crush peers? | 3 |
-| [#363](https://github.com/joestump-agent/crush/issues/363) | Run the a2a-go TCK against Crush's served card in CI. | 3 |
-
-Everything is tracked on [#341](https://github.com/joestump-agent/crush/issues/341).
+What remains is the peer registry
+([#334](https://github.com/joestump-agent/crush/issues/334)): the piece that
+lets a remote, authenticated caller reach a run on this host and that
+publishes the definition cards it can dial. Until it lands, a Crush host is a
+secure dead end for other agents, and the way to work with another agent is
+to [consume it](./configuration.md#external-agents).

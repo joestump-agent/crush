@@ -16,6 +16,10 @@
  * Features and Reference for the dispatch / A2A pages, ordered from the
  * overview and tutorial through configuration to the architecture, protocol,
  * troubleshooting and design-decision pages.
+ *
+ * @joestump-agent 10/09/2026 - Added the "Team" page after configuration:
+ * what a team can do with A2A today, the TLS listener and its certificate
+ * recipe, and how to read a teammate's definition cards.
  */
 
 import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
@@ -76,6 +80,7 @@ const sidebars: SidebarsConfig = {
         'agents/handles-and-inspect',
         'agents/todo-enforcement',
         'agents/configuration',
+        'agents/team',
         'agents/architecture',
         'agents/a2a-protocol',
         'agents/troubleshooting',
