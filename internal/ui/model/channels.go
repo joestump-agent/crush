@@ -23,8 +23,9 @@ func (m *UI) channelsInfo(width, maxItems int, isSection bool) string {
 
 	channels := m.channelStatusItems()
 	if len(channels) == 0 {
-		list := t.Resource.AdditionalText.Render("None")
-		return lipgloss.NewStyle().Width(width).Render(fmt.Sprintf("%s\n\n%s", title, list))
+		// Channels are opt-in, so an empty roster hides the section
+		// entirely rather than rendering a "None" placeholder.
+		return ""
 	}
 
 	list := channelList(t, channels, width, maxItems)
