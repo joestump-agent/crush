@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
+	"strings"
 
 	"github.com/charmbracelet/crush/internal/backend"
 	"github.com/charmbracelet/crush/internal/proto"
@@ -84,12 +86,48 @@ func (c *controllerV1) handlePostWorkspaces(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// The workspace path and data dir name directories this server reads
+	// and writes under (config, the SQLite data dir, git metadata), so a
+	// ".." segment that survives cleaning is refused rather than resolved:
+	// the caller spells the directory out and the server does not
+	// navigate for it. The backend sees the cleaned form.
+	path, err := cleanWorkspacePath("path", args.Path)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	args.Path = path
+	if args.DataDir != "" {
+		dataDir, err := cleanWorkspacePath("data_dir", args.DataDir)
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		args.DataDir = dataDir
+	}
+
 	_, result, err := c.backend.CreateWorkspace(args)
 	if err != nil {
 		c.handleError(w, r, err)
 		return
 	}
 	jsonEncode(w, result)
+}
+
+// cleanWorkspacePath returns the cleaned form of a caller-supplied
+// directory path. It refuses an empty path and one that still contains
+// ".." after filepath.Clean: "a/../b" cleans to "b" and is accepted,
+// while a path that cannot be normalized away from a parent reference
+// is not. field names the request field in the error.
+func cleanWorkspacePath(field, raw string) (string, error) {
+	if raw == "" {
+		return "", fmt.Errorf("%s is required", field)
+	}
+	cleaned := filepath.Clean(raw)
+	if strings.Contains(cleaned, "..") {
+		return "", fmt.Errorf("%s must not contain \"..\"", field)
+	}
+	return cleaned, nil
 }
 
 // requireClientID reads the client_id query parameter and validates it

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/charmbracelet/crush/internal/backend"
@@ -69,6 +70,79 @@ func TestPostWorkspaces_RejectsMalformedClientID(t *testing.T) {
 	c.handlePostWorkspaces(rec, req)
 
 	require.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestPostWorkspaces_RefusesParentReferences pins the API boundary for the
+// directories the server works under: a ".." that survives cleaning (one
+// that climbs above the path's own start) is refused in both path and
+// data_dir, an empty path is refused, and a path that cleans to a plain
+// directory is accepted as far as this check goes.
+func TestPostWorkspaces_RefusesParentReferences(t *testing.T) {
+	t.Parallel()
+
+	post := func(t *testing.T, ws proto.Workspace) *httptest.ResponseRecorder {
+		t.Helper()
+		c := newTestController()
+		body, err := json.Marshal(ws)
+		require.NoError(t, err)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/workspaces", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		c.handlePostWorkspaces(rec, req)
+		return rec
+	}
+	message := func(t *testing.T, rec *httptest.ResponseRecorder) string {
+		t.Helper()
+		var perr proto.Error
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &perr))
+		return perr.Message
+	}
+
+	t.Run("parent reference in path", func(t *testing.T) {
+		t.Parallel()
+		rec := post(t, proto.Workspace{Path: "../../../etc"})
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		require.Contains(t, message(t, rec), `path must not contain ".."`)
+	})
+	t.Run("parent reference in data_dir", func(t *testing.T) {
+		t.Parallel()
+		rec := post(t, proto.Workspace{Path: t.TempDir(), DataDir: "../../elsewhere"})
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		require.Contains(t, message(t, rec), `data_dir must not contain ".."`)
+	})
+	t.Run("empty path", func(t *testing.T) {
+		t.Parallel()
+		rec := post(t, proto.Workspace{})
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		require.Contains(t, message(t, rec), "path is required")
+	})
+	t.Run("clean path passes this check", func(t *testing.T) {
+		t.Parallel()
+		// An absolute path with a ".." segment cleans to a plain directory
+		// and is accepted; the request still fails later (no client_id),
+		// which proves the path check let it through.
+		rec := post(t, proto.Workspace{Path: t.TempDir() + "/sub/../other"})
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		require.Contains(t, message(t, rec), "client_id")
+	})
+}
+
+func TestCleanWorkspacePath(t *testing.T) {
+	t.Parallel()
+	got, err := cleanWorkspacePath("path", "/a/b/./c/../d")
+	require.NoError(t, err)
+	require.Equal(t, filepath.Clean("/a/b/d"), got)
+	// Parent references inside an absolute path normalize away; only a
+	// relative path can keep one.
+	got, err = cleanWorkspacePath("path", "/a/../../b")
+	require.NoError(t, err)
+	require.Equal(t, filepath.Clean("/b"), got)
+	_, err = cleanWorkspacePath("path", "../b")
+	require.Error(t, err)
+	_, err = cleanWorkspacePath("data_dir", "x/../../y")
+	require.Error(t, err)
+	_, err = cleanWorkspacePath("path", "")
+	require.Error(t, err)
 }
 
 func TestDeleteWorkspace_RejectsMissingClientID(t *testing.T) {
