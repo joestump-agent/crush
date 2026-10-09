@@ -477,12 +477,17 @@ so is `workspace: worktree`. The `dispatch_agent` call refuses `model`,
 `skills` and `branch` for the same reason.
 
 A definition with a missing or refused `card`, `auth` without a `token`, or a
-negative `idle_timeout` does not fail the whole config. The agent drops out
-of `dispatch_agent`'s agent list, and a call that names it anyway is refused
-with `agent "<id>" cannot be dispatched: <the problem>`. Making such an agent
-the `dispatch-default-agent` also loads, and then every dispatch without an
-`agent` argument is refused the same way — check the refusal text, since the
-load itself stays silent about it.
+negative `idle_timeout` does not fail the whole config. It loads with a
+warning that names the agent and the problem, drops out of `dispatch_agent`'s
+agent list, and a call that names it anyway is refused with the same reason.
+`crush run` prints the warning to stderr, one line per agent
+(`warning: agent "reviewer": cannot be dispatched: agents.reviewer.card: …`);
+the TUI shows it as a startup notice in the status bar and writes it to
+`crush.log`. The same channels carry the warning for a field a builtin agent
+parses but does not honor, such as `workspace` on a local dispatch agent. The
+one exception is `options.dispatch.default_agent`: a default that names an
+agent Crush cannot dispatch fails the load, since every dispatch that omits
+`agent` would be refused.
 
 What happens on each dispatch:
 

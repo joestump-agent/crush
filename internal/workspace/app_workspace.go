@@ -440,6 +440,10 @@ func (w *AppWorkspace) Resolver() config.VariableResolver {
 	return w.store.Resolver()
 }
 
+func (w *AppWorkspace) LoadDiagnostics() []config.LoadDiagnostic {
+	return w.store.LoadDiagnostics()
+}
+
 // -- Config mutations --
 
 func (w *AppWorkspace) UpdatePreferredModel(scope config.Scope, modelType config.SelectedModelType, model config.SelectedModel) error {

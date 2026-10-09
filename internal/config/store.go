@@ -98,13 +98,20 @@ type RuntimeOverrides struct {
 // as immutable: a mutator clones, mutates the clone, and swaps it in under
 // writeMu rather than mutating the live Config in place.
 type ConfigStore struct {
-	config             *Config
-	workingDir         string
-	resolver           VariableResolver
-	globalDataPath     string   // ~/.local/share/crush/crush.json
-	workspacePath      string   // .crush/crush.json
-	loadedPaths        []string // config files that were successfully loaded
-	knownProviders     []catwalk.Provider
+	config         *Config
+	workingDir     string
+	resolver       VariableResolver
+	globalDataPath string   // ~/.local/share/crush/crush.json
+	workspacePath  string   // .crush/crush.json
+	loadedPaths    []string // config files that were successfully loaded
+	knownProviders []catwalk.Provider
+	// loadDiagnostics is what SetupAgents reported for the published
+	// config (#560): the agent-definition problems that did not fail
+	// the load. Load collects them before any logger exists; the
+	// command replays them once it does. A reload replaces the set
+	// with the new config's, and a rolled-back reload keeps the old.
+	// Guarded by writeMu.
+	loadDiagnostics    []LoadDiagnostic
 	overrides          RuntimeOverrides
 	trackedConfigPaths []string                // unique, normalized config file paths
 	snapshots          map[string]fileSnapshot // path -> snapshot at last capture
@@ -311,9 +318,20 @@ func (s *ConfigStore) RefetchHyperProvider(ctx context.Context) error {
 	return nil
 }
 
-// SetupAgents configures the coder and task agents on the config.
+// SetupAgents resolves the agents on the live config and records the
+// load diagnostics that raised (#560). Load calls it while holding
+// writeMu, which is what guards loadDiagnostics.
 func (s *ConfigStore) SetupAgents() {
-	s.Config().SetupAgents()
+	s.loadDiagnostics = s.Config().SetupAgents()
+}
+
+// LoadDiagnostics returns the agent-definition diagnostics the last
+// successful load or reload raised (#560), in a stable order. Empty
+// when every definition behaves as written.
+func (s *ConfigStore) LoadDiagnostics() []LoadDiagnostic {
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
+	return slices.Clone(s.loadDiagnostics)
 }
 
 // Overrides returns the runtime overrides for this store.
@@ -1440,6 +1458,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	// old publish-then-SetupAgents window. s.SetupAgents reads the live
 	// pointer, so run setup directly on cfg instead.
 	var setupErr error
+	var diags []LoadDiagnostic
 	// A bad agents block rolls the reload back the same way a failed
 	// model resolution does: nothing from the new config is published.
 	if err := cfg.ValidateAgents(s.workingDir); err != nil {
@@ -1458,7 +1477,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 				if err := cfg.ValidateAgentModelRefs(); err != nil {
 					setupErr = fmt.Errorf("invalid agent definitions: %w", err)
 				} else {
-					cfg.SetupAgents()
+					diags = cfg.SetupAgents()
 					if err := cfg.ValidateDispatchDefaultAgent(); err != nil {
 						setupErr = fmt.Errorf("invalid dispatch configuration: %w", err)
 					} else if err := cfg.ValidateAgentToolsets(); err != nil {
@@ -1488,6 +1507,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 	s.knownProviders = providers
 	s.overrides = overrides
 	s.workspacePath = workspacePath
+	s.loadDiagnostics = diags
 
 	// Rebuild staleness tracking. Track every discovered config path, not
 	// just the ones that loaded, so a config file created after this reload

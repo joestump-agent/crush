@@ -34,7 +34,7 @@ until an entry point serves a turn on it.
 | SDK | [`github.com/a2aproject/a2a-go/v2`](https://github.com/a2aproject/a2a-go) v2.5.0 |
 | Protocol version | `1.0`, stamped on the card's interface |
 | Binding | JSON-RPC 2.0 over HTTP; streaming responses are Server-Sent Events |
-| Listener | One host per process on a unix socket: `<data dir>/a2a/<pid>.sock`, socket mode `0600` in a `0700` directory, or `$TMPDIR/crush-a2a-<uid>/<pid>-<hash>.sock` when that path would exceed the 104-byte socket limit. Optionally also TLS on TCP; see [TCP listener](#tcp-listener) |
+| Listener | One host per process on a unix socket: `<data dir>/a2a/<pid>.sock`, socket mode `0600` in a `0700` directory the host verifies before binding, or `$TMPDIR/crush-a2a-<uid>/<pid>-<hash>.sock` when that path would exceed the 104-byte socket limit. Optionally also TLS on TCP; see [TCP listener](#tcp-listener) |
 | Lifetime | The host starts with the process and serves every definition's route for its lifetime; a dispatch's route lasts from just after provisioning until the run returns, with a 5-second graceful shutdown |
 | Discovery | In memory: a dispatch's endpoint and card are stamped on its registry entry, and the definition cards are kept in the host's listing. No card is served over HTTP: the router answers `404` for every sub-path of a route, the well-known card path included |
 | Task store | SQLite: the `a2a_tasks` table of the session database, shared by every route, so tasks survive a restart. Each dispatch also leaves a durable record in `a2a_dispatches`, reconciled at startup |
@@ -700,11 +700,18 @@ restriction is the socket, layered under the credential:
   credentials, the peer must also be the host's own OS user, and tasks
   are stored under that identity.
 - **Who can reach it.** Only processes running as the same OS user: the
-  socket is `0600` inside a `0700` directory under the data directory
-  (a per-user temp dir when the path would overflow the socket length
-  limit). Other local users cannot connect to the socket. The host
-  listens on TCP only when you configure the
-  [TCP listener](#tcp-listener), and then only with TLS.
+  socket is `0600` inside a `0700` directory, `<data dir>/a2a/`. When
+  that path would overflow the unix socket length limit, the host falls
+  back to `crush-a2a-<uid>/` under `$XDG_RUNTIME_DIR`, or under the temp
+  directory when that is unset. Either directory is verified before the
+  bind ([#558](https://github.com/joestump-agent/crush/issues/558)): a
+  symlink or non-directory at its path, or a directory owned by another
+  user, is refused with an error naming the path and the failed check,
+  and a directory left wider than `0700` is tightened. The socket is
+  then made `0600` without following symlinks. Other local users cannot
+  connect to the socket. The host listens on TCP only when you configure
+  the [TCP listener](#tcp-listener), and then only with TLS
+  ([#358](https://github.com/joestump-agent/crush/issues/358)).
 - **TCP callers.** A TCP connection carries no peer credentials, so a TCP
   call is never treated as the local user: it needs the bearer token or,
   with `client_ca`, a client certificate the handshake verified, checked

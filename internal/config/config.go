@@ -566,9 +566,11 @@ func (d *DispatchOptions) Validate(path string) error {
 // agent, so a dispatch that names no agent never fails at dispatch time
 // on a bad default. An explicitly named disabled id is an error; the
 // implicit default resolving to a disabled worker is not — that is the
-// opt-out, and the dispatch tools simply go away with it. It runs after
-// SetupAgents, at load and reload time, and names the config path in
-// every error.
+// opt-out, and the dispatch tools simply go away with it. An external
+// agent that cannot be dispatched is an error too (#560): a default
+// every dispatch would refuse is a misconfiguration, not a warning. It
+// runs after SetupAgents, at load and reload time, and names the config
+// path in every error.
 func (c *Config) ValidateDispatchDefaultAgent() error {
 	const path = "options.dispatch.default_agent"
 	explicit := c.Options != nil && c.Options.Dispatch != nil && c.Options.Dispatch.DefaultAgent != ""
@@ -582,6 +584,9 @@ func (c *Config) ValidateDispatchDefaultAgent() error {
 	}
 	if agent.Disabled && explicit {
 		return fmt.Errorf("%s: agent %q is disabled", path, id)
+	}
+	if agent.Unusable != "" {
+		return fmt.Errorf("%s: agent %q cannot be dispatched: %s", path, id, agent.Unusable)
 	}
 	return nil
 }
@@ -1517,21 +1522,30 @@ func filterSlice(data []string, mask []string, include bool) []string {
 // SetupAgents resolves the agent map from the built-in definitions plus
 // the user's agents block (#333). It stays error-free: validation runs
 // in ValidateAgents and ValidateAgentModelRefs at load and reload time,
-// so a bad definition never reaches this point.
-func (c *Config) SetupAgents() {
+// so a bad definition never reaches this point. What it returns are the
+// load diagnostics (#560): the problems that do not fail the load but
+// change how a definition behaves, in a stable order. The ConfigStore
+// keeps them for the command to show once the logger exists.
+func (c *Config) SetupAgents() []LoadDiagnostic {
 	agents := make(map[string]Agent, len(c.AgentDefinitions)+4)
+	var diags []LoadDiagnostic
 	for id, def := range effectiveAgentDefinitions(c.AgentDefinitions) {
-		agents[id] = c.agentFromDefinition(id, def)
+		agent, agentDiags := c.agentFromDefinition(id, def)
+		agents[id] = agent
+		diags = append(diags, agentDiags...)
 	}
 	c.Agents = agents
+	sortLoadDiagnostics(diags)
+	return diags
 }
 
 // agentFromDefinition resolves one definition into the Agent the
-// coordinator reads. Effective tools are expand(allow) minus
-// expand(deny) minus the user's disabled_tools, so a definition can
-// narrow but never widen user policy.
-func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
-	warnUnhonoredFields(id, def)
+// coordinator reads, plus the diagnostics resolving it raised.
+// Effective tools are expand(allow) minus expand(deny) minus the user's
+// disabled_tools, so a definition can narrow but never widen user
+// policy.
+func (c *Config) agentFromDefinition(id string, def AgentDefinition) (Agent, []LoadDiagnostic) {
+	diags := unhonoredFieldDiagnostics(id, def)
 
 	// The alias's kill knobs are dispatch-only (#402): on any other role
 	// they are dropped here and warned about, not a load error. The
@@ -1559,7 +1573,9 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 	var unusable string
 	if orString(def.Runtime, AgentRuntimeBuiltin) == AgentRuntimeA2A {
 		unusable = externalDefinitionProblem("agents."+id, def)
-		warnUnusableExternal(id, unusable)
+		if diag, ok := unusableExternalDiagnostic(id, unusable); ok {
+			diags = append(diags, diag)
+		}
 	}
 
 	modelType := SelectedModelTypeLarge
@@ -1590,7 +1606,7 @@ func (c *Config) agentFromDefinition(id string, def AgentDefinition) Agent {
 		Auth:            def.Auth,
 		Transport:       def.Transport,
 		Unusable:        unusable,
-	}
+	}, diags
 }
 
 // definitionWorkspace resolves a definition's workspace: a runtime a2a

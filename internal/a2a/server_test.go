@@ -440,8 +440,8 @@ func TestHostRoutesTwoDispatches(t *testing.T) {
 }
 
 // A deep data directory would overflow the 104-byte sun_path limit: the
-// host falls back to a per-user directory under [os.TempDir] and serves
-// from there (#346).
+// host falls back to a per-user directory under the runtime directory
+// and serves from there (#346).
 func TestHostLongDataDirFallsBack(t *testing.T) {
 	deep := filepath.Join(t.TempDir(), strings.Repeat("sub/", 60))
 	primary := filepath.Join(deep, a2aSocketDirName, fmt.Sprintf("%d.sock", os.Getpid()))
@@ -456,8 +456,8 @@ func TestHostLongDataDirFallsBack(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = factory.Close(context.Background()) })
-	require.True(t, strings.HasPrefix(factory.socketPath(), filepath.Join(os.TempDir(), "crush-a2a-")),
-		"the socket must fall back to the per-user temp dir, got %s", factory.socketPath())
+	require.True(t, strings.HasPrefix(factory.socketPath(), filepath.Join(fallbackSocketRoot(), "crush-a2a-")),
+		"the socket must fall back to the per-user runtime dir, got %s", factory.socketPath())
 
 	client := unixDialClient(factory)
 	resp, err := postJSONRPCAuthed(t, factory, client, server.Endpoint, sendMessageBody(t, "dispatch-session", "run the task"))
@@ -498,10 +498,10 @@ func TestHostFallbackSocketIsPerDataDir(t *testing.T) {
 	}
 	first, second := start(), start()
 
-	fallback := filepath.Join(os.TempDir(), "crush-a2a-")
+	fallback := filepath.Join(fallbackSocketRoot(), "crush-a2a-")
 	for _, h := range []host{first, second} {
 		require.True(t, strings.HasPrefix(h.factory.socketPath(), fallback),
-			"the socket must fall back to the per-user temp dir, got %s", h.factory.socketPath())
+			"the socket must fall back to the per-user runtime dir, got %s", h.factory.socketPath())
 		require.LessOrEqual(t, len(h.factory.socketPath()), maxUnixSocketPathLen,
 			"the fallback exists to fit the socket path limit, got %s", h.factory.socketPath())
 	}
@@ -574,6 +574,95 @@ func TestHostReplacesStaleSocket(t *testing.T) {
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// The socket directory is used only when it is what the host expects
+// (#558): MkdirAll accepts a directory or symlink planted there by
+// another local user as is, and a directory the planter owns lets them
+// swap the socket under the in-process client, which sends the host's
+// bearer token to whatever listens at the path. A symlink at the
+// directory's path is refused by name, and its target is left alone.
+func TestSocketDirRefusesSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks on Windows needs a privilege the runners lack")
+	}
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	target := t.TempDir()
+	dir := filepath.Join(dataDir, a2aSocketDirName)
+	require.NoError(t, os.Symlink(target, dir))
+
+	_, err := a2aSocketPath(dataDir)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), dir)
+	require.Contains(t, err.Error(), "is a symlink")
+	entries, err := os.ReadDir(target)
+	require.NoError(t, err)
+	require.Empty(t, entries, "the symlink target must not be touched")
+}
+
+// A regular file at the socket directory's path is refused by name
+// rather than used or replaced (#558).
+func TestSocketDirRefusesNonDirectory(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	dir := filepath.Join(dataDir, a2aSocketDirName)
+	require.NoError(t, os.WriteFile(dir, []byte("not a directory"), 0o600))
+
+	_, err := a2aSocketPath(dataDir)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), dir)
+	data, err := os.ReadFile(dir)
+	require.NoError(t, err)
+	require.Equal(t, "not a directory", string(data), "the file must be left in place")
+}
+
+// A socket directory that already exists wider than 0700 is tightened
+// before the host binds in it (#558): MkdirAll leaves an existing
+// directory's mode alone, so a directory once created loose stayed
+// loose, and every local user could reach the socket's directory.
+func TestSocketDirTightensLooseMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix directory modes are a POSIX assertion")
+	}
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	dir := filepath.Join(dataDir, a2aSocketDirName)
+	require.NoError(t, os.Mkdir(dir, 0o777))
+	require.NoError(t, os.Chmod(dir, 0o777)) // Past the umask.
+
+	_, err := a2aSocketPath(dataDir)
+	require.NoError(t, err)
+	fi, err := os.Stat(dir)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o700), fi.Mode().Perm(), "the socket directory must be tightened to 0700")
+}
+
+// The fallback socket directory prefers $XDG_RUNTIME_DIR — systemd's
+// per-user, 0700 runtime directory — over the shared /tmp, where any
+// local user can plant a directory under the predictable name (#558).
+// The temp directory stays the last resort.
+func TestFallbackSocketRootPrefersXDGRuntimeDir(t *testing.T) {
+	runtimeDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	require.Equal(t, runtimeDir, fallbackSocketRoot())
+
+	deep := filepath.Join(t.TempDir(), strings.Repeat("sub/", 60))
+	path, err := a2aSocketPath(deep)
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(path, filepath.Join(runtimeDir, "crush-a2a-")),
+		"the fallback socket must live under $XDG_RUNTIME_DIR, got %s", path)
+	fi, err := os.Stat(filepath.Dir(path))
+	require.NoError(t, err)
+	if runtime.GOOS != "windows" {
+		require.Equal(t, os.FileMode(0o700), fi.Mode().Perm(), "the fallback directory must be 0700")
+	}
+
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	require.Equal(t, os.TempDir(), fallbackSocketRoot())
 }
 
 // A call without the host's bearer token never reaches the runner

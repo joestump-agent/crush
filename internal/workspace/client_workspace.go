@@ -649,6 +649,12 @@ func (w *ClientWorkspace) Resolver() config.VariableResolver {
 	return config.IdentityResolver()
 }
 
+// LoadDiagnostics is nil in client mode: the server loaded the config
+// with its logger already up, so the diagnostics are in its log.
+func (w *ClientWorkspace) LoadDiagnostics() []config.LoadDiagnostic {
+	return nil
+}
+
 // -- Config mutations --
 
 func (w *ClientWorkspace) UpdatePreferredModel(scope config.Scope, modelType config.SelectedModelType, model config.SelectedModel) error {
