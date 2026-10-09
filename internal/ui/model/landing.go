@@ -2,7 +2,6 @@ package model
 
 import (
 	"image"
-	"strings"
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/ui/common"
@@ -63,13 +62,19 @@ func (m *UI) landingView() string {
 		m.agentsInfo(columnWidth, columnHeight, false),
 		m.channelsInfo(columnWidth, columnHeight, false),
 	}
-	visible := columns[:0]
+	// Join side by side with a one-space gutter. strings.Join would glue
+	// multi-line blocks end to end and stack the columns vertically.
+	visible := make([]string, 0, len(columns)*2)
 	for _, column := range columns {
-		if column != "" {
-			visible = append(visible, column)
+		if column == "" {
+			continue
 		}
+		if len(visible) > 0 {
+			visible = append(visible, " ")
+		}
+		visible = append(visible, column)
 	}
-	content := strings.Join(visible, " ")
+	content := lipgloss.JoinHorizontal(lipgloss.Left, visible...)
 
 	return lipgloss.NewStyle().
 		Width(width).
