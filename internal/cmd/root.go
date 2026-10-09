@@ -301,15 +301,22 @@ func resolveAllowCommands(cmd *cobra.Command) (allowCommands []string, allowAllC
 	return allowCommands, allowAllCommands
 }
 
-// warnUnknownAllowedCommands logs a startup warning for allow-command entries
-// (from config and flags/env) that aren't in the default banned list, since
-// they subtract nothing and usually indicate a typo.
-func warnUnknownAllowedCommands(configAllowed, flagAllowed []string) {
+// warnUnknownAllowedCommands records a startup diagnostic for
+// allow-command entries (from config and flags/env) that aren't in the
+// default banned list, since they subtract nothing and usually indicate
+// a typo. It goes to the ConfigStore, not the logger: this runs before
+// crushlog.Setup, so a direct slog.Warn reaches the discard handler and
+// is lost (#578). The replays that run once the logger exists carry it
+// to crush.log, to `crush run`'s stderr and to the TUI startup notice.
+func warnUnknownAllowedCommands(store *config.ConfigStore, configAllowed, flagAllowed []string) {
 	combined := make([]string, 0, len(configAllowed)+len(flagAllowed))
 	combined = append(combined, configAllowed...)
 	combined = append(combined, flagAllowed...)
 	if unknown := tools.UnknownAllowedCommands(combined); len(unknown) > 0 {
-		slog.Warn("Ignoring allow-commands entries not in the default banned list", "commands", unknown)
+		store.AddLoadDiagnostic(config.LoadDiagnostic{
+			Severity: config.DiagnosticWarning,
+			Message:  "ignoring allow-commands entries not in the default banned list: " + strings.Join(unknown, ", "),
+		})
 	}
 }
 
@@ -340,7 +347,7 @@ func setupLocalWorkspace(cmd *cobra.Command) (workspace.Workspace, func(), error
 	// config reloads triggered by MCP reconnects and model changes.
 	store.Overrides().AllowAllCommands = allowAllCommands
 	store.Overrides().AllowedCommands = allowCommands
-	warnUnknownAllowedCommands(cfg.Options.AllowedCommands, allowCommands)
+	warnUnknownAllowedCommands(store, cfg.Options.AllowedCommands, allowCommands)
 
 	if err := os.MkdirAll(cfg.Options.DataDirectory, 0o700); err != nil {
 		return nil, nil, fmt.Errorf("failed to create data directory: %q %w", cfg.Options.DataDirectory, err)

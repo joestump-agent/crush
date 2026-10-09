@@ -74,4 +74,17 @@ func TestLoadDiagnosticsNotice(t *testing.T) {
 		require.Equal(t, util.InfoTypeWarn, msg.Type)
 		require.Equal(t, `Agent "rev": cannot be dispatched: agents.rev.card: must use https; plain http is allowed only for loopback hosts (+2 more in crush.log)`, msg.Msg)
 	})
+
+	t.Run("a diagnostic that names no agent is shown without an agent", func(t *testing.T) {
+		t.Parallel()
+		allowed := config.LoadDiagnostic{
+			Severity: config.DiagnosticWarning,
+			Message:  "ignoring allow-commands entries not in the default banned list: shh",
+		}
+		m := newDiagnosticsUI(&diagnosticsWorkspace{diags: []config.LoadDiagnostic{allowed}})
+		msg, ok := m.loadDiagnosticsNotice().(util.InfoMsg)
+		require.True(t, ok, "the notice is a status-bar info message")
+		require.Equal(t, util.InfoTypeWarn, msg.Type)
+		require.Equal(t, `ignoring allow-commands entries not in the default banned list: shh (see crush.log)`, msg.Msg)
+	})
 }

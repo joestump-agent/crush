@@ -20,16 +20,20 @@ func (s DiagnosticSeverity) Level() slog.Level {
 	return slog.LevelWarn
 }
 
-// LoadDiagnostic is one finding about an agent definition that did not
-// fail the load but that the user should hear about (#560): an
-// external agent that cannot be dispatched, a field the runtime parses
-// but does not honor, or kill knobs dropped from a non-dispatch agent.
+// LoadDiagnostic is one finding about a config load that did not fail
+// the load but that the user should hear about (#560, #578): an external
+// agent that cannot be dispatched, a field the runtime parses but does
+// not honor, kill knobs dropped from a non-dispatch agent, or
+// allow-commands entries that subtract nothing from the banned list.
 //
 // Load runs before the file logger exists — its path comes from the
 // loaded config — so a warning logged during load reaches nobody. The
 // diagnostics are kept on the ConfigStore instead and replayed by the
 // command once the logger is up: to stderr in `crush run`, to crush.log
 // and a startup notice in the TUI.
+//
+// Agent is empty for a diagnostic about the config as a whole, such as
+// the allow-commands entries, rather than one agent definition.
 type LoadDiagnostic struct {
 	Severity DiagnosticSeverity
 	Agent    string
@@ -37,8 +41,12 @@ type LoadDiagnostic struct {
 }
 
 // String renders the diagnostic as the one-line form the CLI prints:
-// `warning: agent "rev": cannot be dispatched: agents.rev.card: …`.
+// `warning: agent "rev": cannot be dispatched: agents.rev.card: …`, or
+// `warning: ignoring allow-commands entries …` when it names no agent.
 func (d LoadDiagnostic) String() string {
+	if d.Agent == "" {
+		return fmt.Sprintf("%s: %s", d.Severity, d.Message)
+	}
 	return fmt.Sprintf("%s: agent %q: %s", d.Severity, d.Agent, d.Message)
 }
 
