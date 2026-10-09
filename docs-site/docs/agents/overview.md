@@ -47,11 +47,11 @@ session is interactive — it appears in your question prompt labeled with its
 `@handle`, and the agent waits for your answer — but it can't ask anything in a
 non-interactive run, so make the request stand on its own.
 
-:::warning[Known issue]
-Dispatched agents don't get your context files (`AGENTS.md`, `CRUSH.md`,
-`CLAUDE.md`) ([#386](https://github.com/joestump-agent/crush/issues/386)). Put any convention that matters in your request so the
-main agent passes it on.
-:::
+Dispatched agents get your context files (`AGENTS.md`, `CRUSH.md`,
+`CLAUDE.md`) ([#386](https://github.com/joestump-agent/crush/issues/386)),
+read from your checkout rather than from the branch they were dispatched to
+([#561](https://github.com/joestump-agent/crush/issues/561)). A convention
+that lives only on that branch has to go in your request.
 
 ## Requirements
 

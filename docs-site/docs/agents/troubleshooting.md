@@ -58,6 +58,19 @@ That is by design. The worktree is cut from a **committed** revision: your
 current branch, or the `branch` the main agent passed. It never includes
 uncommitted changes. Commit before you dispatch.
 
+The one exception is context files. `AGENTS.md`, `CRUSH.md`, `CLAUDE.md` and
+the rest are read from **your checkout**, not from the worktree, so an
+uncommitted edit to `AGENTS.md` reaches the dispatched agent at once.
+
+### The agent ignores the `AGENTS.md` on the branch it was dispatched to
+
+Also by design. Context files come from your checkout, never from the base
+revision, because the main agent picks that revision: an `AGENTS.md` committed
+on a branch could otherwise plant instructions in the dispatched agent's
+system prompt ([#561](https://github.com/joestump-agent/crush/issues/561)).
+If a branch needs different conventions, put them in your request so the
+main agent passes them on.
+
 ## Running agents
 
 ### A dispatched agent stays at running and never progresses

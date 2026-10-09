@@ -168,8 +168,14 @@ on the base revision, a revision the main agent chooses, is read or executed
 - Policy (permissions, command allow-lists, LSP servers, skills, MCP) is your
   session's config: global plus the launch directory's project config,
   whether committed or not.
-- Context files (`AGENTS.md`, `CRUSH.md`, …) and skills paths, resolved inside
-  the worktree.
+- Context files (`AGENTS.md`, `CRUSH.md`, `CLAUDE.md`, …) are read from
+  **your checkout**, the launch directory, exactly as your own agent reads
+  them, uncommitted edits included. They are never read from the worktree:
+  the base revision is the main agent's choice, so an `AGENTS.md` committed
+  there is as untrusted as a `.crushrc` would be
+  ([#561](https://github.com/joestump-agent/crush/issues/561)). The same
+  goes for a dispatch agent's `context_paths` and for relative
+  `global_context_paths`.
 - The data directory is shared with your session, so logs and the database
   stay in one place.
 
@@ -337,6 +343,8 @@ How the runtime applies each field:
 - **`skills`.** This list filters the agent's available skills. A dispatch's
   `skills` argument can narrow the worker's list, never widen it.
 - **`context_paths`.** These replace `options.context_paths` for that agent.
+  For a dispatch agent, relative paths resolve against your checkout, not
+  the worktree ([#561](https://github.com/joestump-agent/crush/issues/561)).
 - **`disabled`.**
   - A disabled `task` removes the `agent` tool.
   - A disabled `plan` cannot be switched to.

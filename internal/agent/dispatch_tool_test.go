@@ -799,9 +799,10 @@ func TestBuildDispatchedAgent(t *testing.T) {
 	cfg.OverridePreferredModel(config.SelectedModelTypeSmall, config.SelectedModel{Provider: smallProviderID, Model: modelID})
 	cfg.SetupAgents()
 
-	// The dispatched agent sees the context files committed at its
-	// base revision (#386): commit a marker AGENTS.md before
-	// provisioning so the worktree carries it.
+	// The dispatched agent sees the project's context files (#386),
+	// read from the parent checkout rather than the worktree (#561):
+	// the marker AGENTS.md is committed so main and the worktree both
+	// carry it, and the parent's copy is the one rendered.
 	const projectMarker = "dispatch-project-context-marker-386"
 	require.NoError(t, os.WriteFile(filepath.Join(env.workingDir, "AGENTS.md"), []byte(projectMarker), 0o644))
 	git := func(args ...string) {
@@ -870,11 +871,14 @@ func TestBuildDispatchedAgent(t *testing.T) {
 	require.Contains(t, rendered, filepath.ToSlash(entry.Path))
 	require.Contains(t, rendered, "Do NOT merge, rebase, push")
 
-	// The worktree's AGENTS.md is rendered under the project context
-	// section, and the user's global context file under the user
-	// context section (#386).
+	// The parent checkout's AGENTS.md is rendered under the project
+	// context section, and the user's global context file under the
+	// user context section (#386). The path is the parent's, not the
+	// worktree's (#561).
 	require.Contains(t, rendered, "# Project-Specific Context")
 	require.Contains(t, rendered, projectMarker)
+	require.Contains(t, rendered, filepath.Join(env.workingDir, "AGENTS.md"))
+	require.NotContains(t, rendered, filepath.Join(entry.Path, "AGENTS.md"))
 	require.Contains(t, rendered, "# User context")
 	require.Contains(t, rendered, globalMarker)
 

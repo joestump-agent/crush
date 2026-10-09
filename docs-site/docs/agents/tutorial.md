@@ -46,7 +46,9 @@ forever and the agent stalls ([#371](https://github.com/joestump-agent/crush/iss
 ## Ask for parallel work
 
 Ask for the split in plain language. Name a role, and pass along any
-conventions, because the dispatched agent doesn't see `AGENTS.md` ([#386](https://github.com/joestump-agent/crush/issues/386)).
+conventions that are not in your checkout's `AGENTS.md`: the dispatched agent
+reads that file from your checkout, not from the branch it works on
+([#561](https://github.com/joestump-agent/crush/issues/561)).
 
 ```text
 Fix the off-by-one in pkg/x/parse.go yourself. In parallel, dispatch a
