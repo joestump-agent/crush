@@ -148,6 +148,8 @@ func TestIsSafeReadOnly_Allowed(t *testing.T) {
 		{"git branch -a --list with pattern", "git branch -a --list 'origin/*'"},
 		{"git tag -l with pattern", "git tag -l 'v1.*'"},
 		{"git tag --list after the pattern", "git tag v1.0.0 --list"},
+		{"git branch -l after a value-taking flag", "git branch -l --sort refname 'feat/*'"},
+		{"git branch --format attached value with -l", "git branch --format='%(refname)' -l 'feat/*'"},
 		// -n keeps `git remote show` off the network; without it the
 		// subcommand queries the remote, so it is denied below.
 		{"git remote show with -n", "git remote show -n origin"},
@@ -238,6 +240,12 @@ func TestIsSafeReadOnly_Denied(t *testing.T) {
 		{"git tag create via operand", "git tag v9.9.9"},
 		{"git tag create with -n", "git tag -n v9.9.9"},
 		{"git tag list with a message flag", "git tag -l v9.9.9 -m msg"},
+		// A value-taking flag consumes the next token, so a literal `-l`
+		// there never reaches git: the operand stays a branch/tag name.
+		{"git branch create via -l eaten as format value", "git branch --format -l evilbranch"},
+		{"git tag create via -l eaten as format value", "git tag --format -l eviltag"},
+		{"git branch create via -l eaten as sort value", "git branch --sort -l evilbranch"},
+		{"git tag create via -l eaten as contains value", "git tag --contains -l eviltag"},
 		{"git remote add", "git remote add evil https://evil.example/x.git"},
 		{"git remote set-url", "git remote set-url origin https://evil.example/x.git"},
 		{"git remote remove", "git remote remove origin"},

@@ -44,10 +44,16 @@ type safeCommand struct {
 	// patterns: `git branch --list 'feat/*'` and `git tag -l 'v1.*'`
 	// filter the listing, while the same operand without the flag
 	// creates a branch or tag. When set, operands are accepted only if
-	// one of these flags is present anywhere in the arguments; the flag
-	// must also be in allowFlags, which keeps the rest of the entry's
-	// policy in force.
+	// one of these flags is present anywhere in the arguments as a real
+	// flag — not swallowed as the value of a value-taking flag (`git
+	// branch --format -l <name>` creates, because git consumes `-l` as
+	// the format string); the flag must also be in allowFlags, which
+	// keeps the rest of the entry's policy in force.
 	operandsWithFlags []string
+	// valueFlags lists the flags of this entry that consume a separate
+	// value token, so the operandsWithFlags scan can tell a real flag
+	// from a token eaten as a value.
+	valueFlags []string
 }
 
 // gitCodeExecFlags are flags that make an otherwise read-only git
@@ -159,6 +165,11 @@ var safeCommands = []safeCommand{
 		},
 		allowOperands:     false,
 		operandsWithFlags: []string{"-l", "--list"},
+		valueFlags: []string{
+			"--format", "--sort",
+			"--contains", "--no-contains",
+			"--merged", "--no-merged", "--points-at",
+		},
 	},
 	{
 		argv:          []string{"git", "tag"},
@@ -170,6 +181,11 @@ var safeCommands = []safeCommand{
 		},
 		allowOperands:     false,
 		operandsWithFlags: []string{"-l", "--list"},
+		valueFlags: []string{
+			"--format", "--sort",
+			"--contains", "--no-contains",
+			"--merged", "--no-merged", "--points-at",
+		},
 	},
 	// The filter flags above take a commit-ish operand. Requiring one of
 	// them to be present is what keeps `git branch <name>` (creates) and
@@ -528,13 +544,23 @@ func (sc safeCommand) matches(argv []string) bool {
 	// --list` lists too), so settle that before walking the arguments.
 	allowOperands := sc.allowOperands
 	if !allowOperands && len(sc.operandsWithFlags) > 0 {
-		for _, arg := range rest {
+		for i := 0; i < len(rest); i++ {
+			arg := rest[i]
 			if arg == "--" {
 				break
 			}
-			if isFlag(arg) && slices.Contains(sc.operandsWithFlags, flagName(arg)) {
+			if !isFlag(arg) {
+				continue
+			}
+			if slices.Contains(sc.operandsWithFlags, flagName(arg)) {
 				allowOperands = true
 				break
+			}
+			// A value-taking flag eats the next token (`git branch
+			// --format -l <name>` creates, since `-l` is the format),
+			// so skip over it instead of mistaking it for a flag.
+			if slices.Contains(sc.valueFlags, flagName(arg)) && !strings.Contains(arg, "=") {
+				i++
 			}
 		}
 	}
