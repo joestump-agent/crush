@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sort"
+	"sync"
 
 	mcptools "github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/proto"
@@ -27,14 +28,15 @@ type channelSessionStore interface {
 // including zero, which keeps the "a pushed event is never dropped"
 // contract for a headless `crush serve`.
 //
-// Events are processed sequentially on one goroutine, so pushes keep
-// their arrival order and the init/inject sequence per event does not
-// race with itself.
+// Events are drained sequentially from the subscription, so pushes keep
+// their arrival order. Delivery to multiple workspaces within one event
+// is dispatched concurrently so a slow agent init on one workspace does
+// not block the others.
 func (b *Backend) startChannelRouter() {
-	events := mcptools.SubscribeEvents(b.ctx)
+	events := mcptools.SubscribeChannelEvents(b.ctx)
 	go func() {
 		for ev := range events {
-			if ev.Payload.Type != mcptools.EventChannelMessage || ev.Payload.ChannelMessage == "" {
+			if ev.Payload.ChannelMessage == "" {
 				continue
 			}
 			b.routeChannelMessage(ev.Payload)
@@ -44,10 +46,12 @@ func (b *Backend) startChannelRouter() {
 
 // routeChannelMessage delivers one channel push to every hosted workspace
 // that both declares the originating MCP server in its config and opted it
-// in via --channels. The MCP event broker is process-global, so the
+// in via --channels or channel_enabled. The MCP event broker is process-global, so the
 // config check is what scopes a push to the workspace(s) that actually
-// enabled the channel.
+// enabled the channel. Delivery to each workspace is dispatched on its
+// own goroutine so a slow agent init on one does not block the rest.
 func (b *Backend) routeChannelMessage(ev mcptools.Event) {
+	var wg sync.WaitGroup
 	for _, ws := range b.workspaces.Seq2() {
 		mcpCfg, declared := ws.Cfg.Config().MCP[ev.Name]
 		if !declared {
@@ -56,8 +60,11 @@ func (b *Backend) routeChannelMessage(ev mcptools.Event) {
 		if !mcptools.ChannelOptIn(mcpCfg, ws.Cfg.Overrides().EnabledChannels, ev.Name) {
 			continue
 		}
-		b.injectChannelMessage(ws, ev.Name, ev.ChannelMessage)
+		wg.Go(func() {
+			b.injectChannelMessage(ws, ev.Name, ev.ChannelMessage)
+		})
 	}
+	wg.Wait()
 }
 
 // injectChannelMessage runs one rendered <channel> element as an agent
@@ -73,7 +80,7 @@ func (b *Backend) injectChannelMessage(ws *Workspace, serverName, content string
 			return
 		}
 	}
-	sessionID, err := channelTargetSession(ws.ctx, ws.viewedSessions(), ws.Sessions)
+	sessionID, err := channelTargetSession(ws.ctx, serverName, ws.viewedSessions(), ws.Sessions)
 	if err != nil {
 		slog.Warn("Channel message dropped: no target session",
 			"workspace", ws.ID, "server", serverName, "error", err)
@@ -98,15 +105,29 @@ func (b *Backend) injectChannelMessage(ws *Workspace, serverName, content string
 //   - several distinct sessions are viewed: use the most recently
 //     updated of them (ties broken by smallest ID for determinism);
 //   - none viewed (all clients on the landing screen, or no clients):
-//     use the most recently updated top-level session so repeated
-//     pushes coalesce into one conversation, creating a session only
-//     when the workspace has none.
-func channelTargetSession(ctx context.Context, viewed []string, sessions channelSessionStore) (string, error) {
+//     the most recent top-level session already bound to this channel
+//     wins, so a push lands in the conversation it has been driving
+//     rather than whatever unrelated session a local edit touched last;
+//     otherwise the most recently updated top-level session, so
+//     repeated pushes coalesce into one conversation, creating a
+//     session only when the workspace has none.
+//
+// The fallback relies on session.Service.List returning only top-level
+// sessions (no sub-agent sessions) ordered by updated_at DESC, so the
+// first hit in the list is the most recently updated top-level session.
+// The underlying query (ListSessions) enforces both: WHERE
+// parent_session_id IS NULL ORDER BY updated_at DESC.
+func channelTargetSession(ctx context.Context, channel string, viewed []string, sessions channelSessionStore) (string, error) {
 	switch len(viewed) {
 	case 0:
 		existing, err := sessions.List(ctx)
 		if err != nil {
 			return "", err
+		}
+		for _, sess := range existing {
+			if sess.Channel == channel {
+				return sess.ID, nil
+			}
 		}
 		if len(existing) > 0 {
 			return existing[0].ID, nil
@@ -140,7 +161,7 @@ func channelTargetSession(ctx context.Context, viewed []string, sessions channel
 	}
 	// Every viewed session failed to load; fall back to the no-viewed
 	// path.
-	return channelTargetSession(ctx, nil, sessions)
+	return channelTargetSession(ctx, channel, nil, sessions)
 }
 
 // viewedSessions returns the distinct sessions currently being viewed by

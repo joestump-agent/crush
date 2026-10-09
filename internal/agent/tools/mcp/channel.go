@@ -159,18 +159,12 @@ func hasChannelCapability(res *mcp.InitializeResult) bool {
 	return ok
 }
 
-// channelEnabled reports whether the given server name was opted in via the
-// --channels flag. A server present in MCP config is not a channel until it is
-// explicitly enabled, matching the "listed is not enabled" model. Entries may
-// be written as "server:<name>" or as a bare "<name>".
-func channelEnabled(enabled []string, name string) bool {
-	return ChannelEnabled(enabled, name)
-}
-
 // ChannelEnabled reports whether the given server name was opted in via the
-// --channels flag, matching either a bare "<name>" or "server:<name>" entry
-// case-insensitively. Exported for the workspace-side channel routing (reply
-// routing) and the channel list marker, which live outside this package.
+// --channels flag. A server present in MCP config is not a channel until it
+// is explicitly enabled, matching the "listed is not enabled" model. Entries
+// may be written as "server:<name>" or as a bare "<name>". Exported for the
+// server backend, which routes channel events per workspace and needs the
+// same opt-in semantics.
 func ChannelEnabled(enabled []string, name string) bool {
 	for _, e := range enabled {
 		e = strings.TrimSpace(e)
@@ -188,7 +182,7 @@ func ChannelEnabled(enabled []string, name string) bool {
 // considering both enablement sources: persistently via crush.json
 // (m.ChannelEnabled) or per-launch via the --channels overrides list. Every
 // site that gates channel behaviour — session creation, session renewal, and
-// backend routing — must use this so the two sources are always ORed together
+// message routing — must use this so the two sources are always ORed together
 // and no site drifts out of sync.
 func ChannelOptIn(m config.MCPConfig, enabled []string, name string) bool {
 	return m.ChannelEnabled || ChannelEnabled(enabled, name)

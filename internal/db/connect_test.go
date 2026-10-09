@@ -208,3 +208,36 @@ func TestConnect_ServerPathFailsWhenDataDirLocked(t *testing.T) {
 	require.Error(t, err, "server-path Connect must refuse to open a locked data dir")
 	require.ErrorIs(t, err, ErrDataDirLocked)
 }
+
+// TestConnect_AppliesMigrationsNumberedBeforeTheCurrentVersion pins the
+// fork's upgrade path. Upstream syncs bring in migrations whose version
+// stamps sit below migrations the fork already applied, so a database
+// migrated by an earlier fork build has a gap goose calls "missing".
+// Connect must fill the gap rather than refuse to open the database.
+func TestConnect_AppliesMigrationsNumberedBeforeTheCurrentVersion(t *testing.T) {
+	t.Cleanup(ResetPool)
+
+	ctx := context.Background()
+	dataDir := t.TempDir()
+
+	conn, err := Connect(ctx, dataDir)
+	require.NoError(t, err)
+
+	// Roll one upstream migration back by hand, leaving the database the
+	// way an earlier fork build left it: the fork's newer migrations are
+	// applied and this one was never seen.
+	const missing = 20260928000000 // add_mcp_disabled_servers
+	_, err = conn.ExecContext(ctx, `DROP TABLE mcp_disabled_servers`)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(ctx, `DELETE FROM goose_db_version WHERE version_id = ?`, missing)
+	require.NoError(t, err)
+	require.NoError(t, Release(dataDir))
+
+	conn, err = Connect(ctx, dataDir)
+	require.NoError(t, err, "a migration numbered below the current version must be applied, not refused")
+	var tables int
+	require.NoError(t, conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'mcp_disabled_servers'`).Scan(&tables))
+	require.Equal(t, 1, tables, "the skipped migration must have been applied on reconnect")
+	require.NoError(t, Release(dataDir))
+}

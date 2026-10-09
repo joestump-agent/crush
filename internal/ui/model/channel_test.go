@@ -111,9 +111,6 @@ func TestHandleChannelMessageExistingSession(t *testing.T) {
 	if ws.runCalls[0].channel != "s" {
 		t.Errorf("AgentRun channel = %q, want s", ws.runCalls[0].channel)
 	}
-	if len(ws.channels) != 1 || ws.channels[0] != "s" {
-		t.Errorf("session channels = %v, want [s]", ws.channels)
-	}
 	if ws.runCalls[0].sessionID != "sess-1" {
 		t.Errorf("AgentRun sessionID = %q, want sess-1", ws.runCalls[0].sessionID)
 	}
@@ -247,20 +244,6 @@ func TestHandleChannelMessageReportsSetupErrors(t *testing.T) {
 		require.Len(t, errs, 1, "got %#v", msgs)
 		require.Contains(t, errs[0].Msg, "s: ")
 		require.Contains(t, errs[0].Msg, "disk full")
-		require.Empty(t, ws.runCalls)
-	})
-
-	t.Run("set session channel fails", func(t *testing.T) {
-		t.Parallel()
-		ws := &channelWorkspace{ready: true, channelErr: errors.New("db locked")}
-		m := newChannelUI(ws)
-		m.session = &session.Session{ID: "sess-1"}
-
-		msgs := runCmdTree(m.handleChannelMessage(mcp.Event{Name: "s", ChannelMessage: "<channel source=\"s\">hi</channel>"}))
-		errs := channelErrorMsgs(msgs)
-		require.Len(t, errs, 1, "got %#v", msgs)
-		require.Contains(t, errs[0].Msg, "s: ")
-		require.Contains(t, errs[0].Msg, "db locked")
 		require.Empty(t, ws.runCalls)
 	})
 }

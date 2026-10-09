@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -28,6 +29,15 @@ const (
 	defaultGroupTargetMeta = "group"
 	defaultMessageParam    = "message"
 )
+
+// targetMetaParams maps channel meta attributes to the tool parameter
+// names that typically carry the reply target. During auto-discovery,
+// each candidate tool's InputSchema is checked against these in priority
+// order.
+var targetMetaParams = map[string][]string{
+	"sender": {"user_id", "to", "recipient", "target", "phone", "number"},
+	"group":  {"group_id", "room", "channel", "conversation_id"},
+}
 
 // parseChannelMeta extracts the attributes of the <channel> element a
 // channel-originated turn was started with. The prompt of such a turn is
@@ -107,22 +117,152 @@ func channelReplyDelivered(reply *config.MCPChannelReply, channel string, comple
 	return false
 }
 
+// channelErrorReplyWanted reports whether a failed turn should notify the
+// channel sender that something went wrong. Only channel-originated turns
+// qualify, and cancellation is excluded: it is the operator stopping the
+// turn (Esc, or CancelAll on shutdown), not a failure, and answering it
+// would message every in-flight sender each time Crush quits.
+func channelErrorReplyWanted(channel string, err error) bool {
+	return channel != "" && !errors.Is(err, context.Canceled)
+}
+
+// discoverChannelReply scans the tool list of the MCP server named channel
+// and attempts to find tools that can serve as reply routes. It looks for
+// tools that:
+//   - Accept a "message" (string) parameter
+//   - AND accept a target parameter that matches a channel meta attribute
+//     (e.g. "user_id" for "sender", "group_id" for "group")
+//
+// Returns nil when no suitable tool is found, which is a no-op fallback
+// that preserves the current behaviour when the server has no obvious
+// send-capable tools.
+func discoverChannelReply(channel string) *config.MCPChannelReply {
+	tools, ok := mcp.GetTools(channel)
+	if !ok {
+		return nil
+	}
+	return discoverReplyFromTools(tools)
+}
+
+// discoverReplyFromTools scans a slice of MCP tools and builds a reply
+// config from any that look like message-sending tools. It is extracted
+// so tests can call it without setting up global MCP state.
+func discoverReplyFromTools(tools []*mcp.Tool) *config.MCPChannelReply {
+	const msgParam = "message"
+	var userTool, groupTool string
+	var userTargetParam, groupTargetParam string
+
+	for _, tool := range tools {
+		if tool.Name == "" {
+			continue
+		}
+		schema, ok := tool.InputSchema.(map[string]any)
+		if !ok {
+			continue
+		}
+		props, ok := schema["properties"].(map[string]any)
+		if !ok {
+			continue
+		}
+		// Check for a "message" parameter (string type).
+		msgProp, hasMsg := props[msgParam]
+		if !hasMsg {
+			continue
+		}
+		if msgMap, ok := msgProp.(map[string]any); !ok || msgMap["type"] != "string" {
+			continue
+		}
+
+		// Check for a target parameter matching any known meta attribute.
+		for meta, candidates := range targetMetaParams {
+			for _, candidate := range candidates {
+				prop, hasTarget := props[candidate]
+				if !hasTarget {
+					continue
+				}
+				if propMap, ok := prop.(map[string]any); ok && propMap["type"] == "string" {
+					switch meta {
+					case "sender":
+						if userTool == "" {
+							userTool = tool.Name
+							userTargetParam = candidate
+						}
+					case "group":
+						if groupTool == "" {
+							groupTool = tool.Name
+							groupTargetParam = candidate
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Build the reply config from what we found.
+	reply := &config.MCPChannelReply{
+		MessageParam: msgParam,
+	}
+	if userTool != "" {
+		reply.User = &config.MCPChannelReplyRoute{
+			Tool:        userTool,
+			TargetParam: userTargetParam,
+		}
+	}
+	if groupTool != "" {
+		reply.Group = &config.MCPChannelReplyRoute{
+			Tool:        groupTool,
+			TargetParam: groupTargetParam,
+		}
+	}
+	if reply.User == nil && reply.Group == nil {
+		return nil
+	}
+	return reply
+}
+
+// autoReplyDelivered is channelReplyDelivered with a nil guard, so a
+// channel with no reply routes (neither configured nor discovered) never
+// counts as already replied. It serves explicit and auto-discovered
+// routes alike.
+func autoReplyDelivered(reply *config.MCPChannelReply, channel string, completedTools map[string]struct{}) bool {
+	if reply == nil {
+		return false
+	}
+	return channelReplyDelivered(reply, channel, completedTools)
+}
+
 // sendChannelReply routes the final assistant text of a channel-originated
 // turn back through the channel's configured reply tool. It is a no-op for
 // local turns, channels without a channel_reply config, empty responses,
 // and turns where the model already replied on the channel itself. Failures
 // are logged and dropped: the turn has finished and there is no caller to
 // return an error to.
+//
+// When the channel has no explicit channel_reply config, sendChannelReply
+// falls back to auto-discovering the reply tools from the MCP server's tool
+// list. This allows channels like Signal MCP to work without manual
+// channel_reply configuration.
 func (a *sessionAgent) sendChannelReply(ctx context.Context, call SessionAgentCall, text string, completedTools map[string]struct{}) {
 	if call.Channel == "" || a.cfg == nil {
 		return
 	}
 	mcpCfg, ok := a.cfg.Config().MCP[call.Channel]
-	if !ok || mcpCfg.ChannelReply == nil {
+	if !ok {
 		return
 	}
+
+	// Use the explicit config when available, otherwise auto-discover.
 	reply := mcpCfg.ChannelReply
-	if channelReplyDelivered(reply, call.Channel, completedTools) {
+	autoDiscovered := false
+	if reply == nil {
+		reply = discoverChannelReply(call.Channel)
+		if reply == nil {
+			return
+		}
+		autoDiscovered = true
+	}
+
+	if autoReplyDelivered(reply, call.Channel, completedTools) {
 		slog.Debug("Channel reply already delivered by the model", "channel", call.Channel)
 		return
 	}
@@ -137,6 +277,17 @@ func (a *sessionAgent) sendChannelReply(ctx context.Context, call SessionAgentCa
 	tool, args, ok := resolveChannelReply(reply, call.channelMeta, text)
 	if !ok {
 		slog.Warn("Channel reply skipped: no reply route matches the push metadata", "channel", call.Channel)
+		return
+	}
+	// An explicit channel_reply config is itself the consent to use the
+	// tool for replies. An auto-discovered route, however, was not
+	// explicitly opted into — only proceed when permissions are globally
+	// skipped (--dangerously-skip-permissions), so a user who has
+	// declined the tool in a normal turn does not get a message sent on
+	// their behalf without consent.
+	if autoDiscovered && !a.isYolo {
+		slog.Info("Channel reply skipped: auto-discovered route requires --dangerously-skip-permissions or explicit channel_reply config",
+			"channel", call.Channel, "tool", tool)
 		return
 	}
 	input, err := json.Marshal(args)

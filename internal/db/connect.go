@@ -160,7 +160,13 @@ func Connect(ctx context.Context, dataDir string, opts ...ConnectOption) (*sql.D
 		return nil, fmt.Errorf("failed to initialize goose: %w", err)
 	}
 
-	if err := goose.Up(conn, "migrations"); err != nil {
+	// Upstream syncs bring in migrations stamped earlier than migrations
+	// the fork has already applied (the fork's A2A tables are dated after
+	// upstream's MCP overrides), so a database migrated by an earlier fork
+	// build holds "missing" migrations in goose's terms. Apply them
+	// instead of refusing to open the database; every migration here is
+	// additive and independent of the ones around it.
+	if err := goose.Up(conn, "migrations", goose.WithAllowMissing()); err != nil {
 		conn.Close()
 		releaseLock()
 		slog.Error("Failed to apply migrations", "error", err)
