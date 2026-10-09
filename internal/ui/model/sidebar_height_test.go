@@ -120,3 +120,66 @@ func TestSidebarAllSectionTitlesVisibleAtTightHeight(t *testing.T) {
 			"section title %q must be visible at height %d", title, height)
 	}
 }
+
+// TestSidebarAgentSectionBudget pins the six-section height budget: with
+// dispatch agents configured alongside channels, the tight height that
+// fits every section at its minimum grows by one section (header 7 +
+// (6*2 + 5) separators/overhead + 6*2 item lines = 36) and all six
+// titles stay visible.
+func TestSidebarAgentSectionBudget(t *testing.T) {
+	t.Parallel()
+
+	m := newSidebarHeightTestUI(t)
+	ws := m.com.Workspace.(*sidebarHeightTestWorkspace)
+	ws.cfg.Agents = map[string]config.Agent{
+		config.AgentWorker: {ID: config.AgentWorker, Name: "Worker", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeBuiltin},
+		"reviewer":         {ID: "reviewer", Name: "Reviewer", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeA2A},
+		"auditor":          {ID: "auditor", Name: "Auditor", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeA2A},
+		"searcher":         {ID: "searcher", Name: "Searcher", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeBuiltin},
+	}
+
+	const width, height = 32, 36
+	m.layout.sidebar = uv.Rect(0, 0, width, height)
+
+	scr := uv.NewScreenBuffer(width, height)
+	m.drawSidebar(scr, m.layout.sidebar)
+	out := ansi.Strip(scr.Render())
+
+	for _, title := range []string{"Modified Files", "LSPs", "MCPs", "Skills", "Agents", "Channels"} {
+		require.Contains(t, out, title,
+			"section title %q must be visible at height %d", title, height)
+	}
+}
+
+// TestSidebarHidesEmptyOptionalSections pins the hide-when-empty rule for
+// the opt-in sections: with no channels and no dispatch agents, neither
+// title renders, while the always-on sections keep theirs.
+func TestSidebarHidesEmptyOptionalSections(t *testing.T) {
+	t.Parallel()
+
+	m := newSidebarHeightTestUI(t)
+	ws := m.com.Workspace.(*sidebarHeightTestWorkspace)
+
+	mcps := config.MCPs{}
+	states := map[string]mcp.ClientInfo{}
+	for i := range 4 {
+		name := fmt.Sprintf("mcp-%d", i)
+		mcps[name] = config.MCPConfig{}
+		states[name] = mcp.ClientInfo{Name: name, State: mcp.StateConnected}
+	}
+	ws.cfg.MCP = mcps
+	m.mcpStates = states
+
+	const width, height = 32, 40
+	m.layout.sidebar = uv.Rect(0, 0, width, height)
+
+	scr := uv.NewScreenBuffer(width, height)
+	m.drawSidebar(scr, m.layout.sidebar)
+	out := ansi.Strip(scr.Render())
+
+	for _, title := range []string{"Modified Files", "LSPs", "MCPs", "Skills"} {
+		require.Contains(t, out, title, "always-on section title %q must be visible", title)
+	}
+	require.NotContains(t, out, "Channels", "an empty Channels section must hide entirely")
+	require.NotContains(t, out, "Agents", "an empty Agents section must hide entirely")
+}

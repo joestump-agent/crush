@@ -58,47 +58,60 @@ func (m *UI) modelInfo(width int) string {
 	return common.ModelInfo(m.com.Styles, modelName, providerName, reasoningInfo, modelContext, width, m.hyperCredits)
 }
 
-// getDynamicHeightLimits will give us the num of items to show in each section based on the height
-// some items are more important than others.
-func getDynamicHeightLimits(availableHeight, fileCount, lspCount, mcpCount, skillCount, channelCount int) (maxFiles, maxLSPs, maxMCPs, maxSkills, maxChannels int) {
+// sidebarSection is one collapsible block of the sidebar body: how many
+// items it has and how to render it with an item budget.
+type sidebarSection struct {
+	count  int
+	render func(maxItems int) string
+}
+
+// getDynamicHeightLimits will give us the num of items to show in each
+// section based on the height; some items are more important than others.
+// It takes one count per visible section, in draw order, and returns the
+// per-section item budget in the same order.
+func getDynamicHeightLimits(availableHeight int, sectionCounts ...int) []int {
 	const (
 		minItemsPerSection = 2
 		// Keep these high so dynamic layout uses available sidebar space
 		// instead of hitting small hard limits.
-		defaultMaxFilesShown    = 1000
-		defaultMaxLSPsShown     = 1000
-		defaultMaxMCPsShown     = 1000
-		defaultMaxSkillsShown   = 1000
-		defaultMaxChannelsShown = 1000
+		defaultMaxItemsShown    = 1000
 		minAvailableHeightLimit = 10
 	)
 
-	if availableHeight < minAvailableHeightLimit {
-		return minItemsPerSection, minItemsPerSection, minItemsPerSection, minItemsPerSection, minItemsPerSection
+	sectionCount := len(sectionCounts)
+	if sectionCount == 0 {
+		return nil
 	}
 
-	maxFiles = minItemsPerSection
-	maxLSPs = minItemsPerSection
-	maxMCPs = minItemsPerSection
-	maxSkills = minItemsPerSection
-	maxChannels = minItemsPerSection
+	maxes := make([]int, sectionCount)
+	if availableHeight < minAvailableHeightLimit {
+		for i := range maxes {
+			maxes[i] = minItemsPerSection
+		}
+		return maxes
+	}
 
-	remainingHeight := max(0, availableHeight-(minItemsPerSection*5))
+	for i := range maxes {
+		maxes[i] = minItemsPerSection
+	}
 
-	sectionValues := []*int{&maxFiles, &maxLSPs, &maxMCPs, &maxSkills, &maxChannels}
-	sectionCaps := []int{defaultMaxFilesShown, defaultMaxLSPsShown, defaultMaxMCPsShown, defaultMaxSkillsShown, defaultMaxChannelsShown}
-	sectionNeeds := []int{max(0, fileCount-maxFiles), max(0, lspCount-maxLSPs), max(0, mcpCount-maxMCPs), max(0, skillCount-maxSkills), max(0, channelCount-maxChannels)}
+	remainingHeight := max(0, availableHeight-(minItemsPerSection*sectionCount))
+
+	sectionNeeds := make([]int, sectionCount)
+	for i, count := range sectionCounts {
+		sectionNeeds[i] = max(0, count-maxes[i])
+	}
 
 	for remainingHeight > 0 {
 		allocated := false
-		for i, section := range sectionValues {
+		for i := range maxes {
 			if remainingHeight == 0 {
 				break
 			}
-			if sectionNeeds[i] == 0 || *section >= sectionCaps[i] {
+			if sectionNeeds[i] == 0 || maxes[i] >= defaultMaxItemsShown {
 				continue
 			}
-			*section = *section + 1
+			maxes[i] = maxes[i] + 1
 			sectionNeeds[i]--
 			remainingHeight--
 			allocated = true
@@ -110,14 +123,14 @@ func getDynamicHeightLimits(availableHeight, fileCount, lspCount, mcpCount, skil
 
 	for remainingHeight > 0 {
 		allocated := false
-		for i, section := range sectionValues {
+		for i := range maxes {
 			if remainingHeight == 0 {
 				break
 			}
-			if *section >= sectionCaps[i] {
+			if maxes[i] >= defaultMaxItemsShown {
 				continue
 			}
-			*section = *section + 1
+			maxes[i] = maxes[i] + 1
 			remainingHeight--
 			allocated = true
 		}
@@ -126,7 +139,7 @@ func getDynamicHeightLimits(availableHeight, fileCount, lspCount, mcpCount, skil
 		}
 	}
 
-	return maxFiles, maxLSPs, maxMCPs, maxSkills, maxChannels
+	return maxes
 }
 
 // scrollSidebarOnWheel scrolls the sidebar when a wheel event lands over it,
@@ -246,47 +259,60 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 	}
 
 	skillsCount := len(m.skillStatusItems())
+	agentsCount := len(m.agentStatusItems())
 	channelsCount := len(m.channelStatusItems())
+
+	// The always-on sections render even when empty (a "None"
+	// placeholder); the opt-in ones (Agents, the dispatch roster per
+	// #434, and Channels) hide entirely when they have nothing to list.
+	sections := []sidebarSection{
+		{count: filesCount, render: func(maxItems int) string {
+			return m.filesInfo(m.com.Workspace.WorkingDir(), contentWidth, maxItems, true)
+		}},
+		{count: lspsCount, render: func(maxItems int) string { return m.lspInfo(contentWidth, maxItems, true) }},
+		{count: mcpsCount, render: func(maxItems int) string { return m.mcpInfo(contentWidth, maxItems, true) }},
+		{count: skillsCount, render: func(maxItems int) string { return m.skillsInfo(contentWidth, maxItems, true) }},
+		{count: agentsCount, render: func(maxItems int) string { return m.agentsInfo(contentWidth, maxItems, true) }},
+		{count: channelsCount, render: func(maxItems int) string { return m.channelsInfo(contentWidth, maxItems, true) }},
+	}
+	visible := make([]sidebarSection, 0, len(sections))
+	for _, section := range sections {
+		if section.count == 0 {
+			continue
+		}
+		visible = append(visible, section)
+	}
 
 	// Each section below the header renders a title line plus a blank line
 	// before its items, and adjacent sections are joined with one blank
 	// separator line (see fullContent below). That overhead must come out
 	// of the height before budgeting item lines, or the bottom section is
 	// silently clipped by the MaxHeight applied at the end.
-	sectionCounts := []int{filesCount, lspsCount, mcpsCount, skillsCount, channelsCount}
-	sectionOverhead := len(sectionCounts)*2 + len(sectionCounts) - 1
+	sectionOverhead := len(visible)*2 + len(visible) - 1
 	remainingHeight := remainingHeightArea.Dy() - sectionOverhead
 
-	maxFiles, maxLSPs, maxMCPs, maxSkills, maxChannels := getDynamicHeightLimits(remainingHeight, filesCount, lspsCount, mcpsCount, skillsCount, channelsCount)
+	sectionCounts := make([]int, len(visible))
+	for i, section := range visible {
+		sectionCounts[i] = section.count
+	}
+	maxes := getDynamicHeightLimits(remainingHeight, sectionCounts...)
 
 	// When focused, show all items so scroll can reveal truncated content.
 	if focused {
-		maxFiles = max(maxFiles, filesCount)
-		maxLSPs = max(maxLSPs, lspsCount)
-		maxMCPs = max(maxMCPs, mcpsCount)
-		maxSkills = max(maxSkills, skillsCount)
-		maxChannels = max(maxChannels, channelsCount)
+		for i, section := range visible {
+			maxes[i] = max(maxes[i], section.count)
+		}
 	}
 
-	lspSection := m.lspInfo(contentWidth, maxLSPs, true)
-	mcpSection := m.mcpInfo(contentWidth, maxMCPs, true)
-	skillsSection := m.skillsInfo(contentWidth, maxSkills, true)
-	channelsSection := m.channelsInfo(contentWidth, maxChannels, true)
-	filesSection := m.filesInfo(m.com.Workspace.WorkingDir(), contentWidth, maxFiles, true)
-
-	fullContent := lipgloss.JoinVertical(
-		lipgloss.Left,
-		sidebarHeader,
-		filesSection,
-		"",
-		lspSection,
-		"",
-		mcpSection,
-		"",
-		skillsSection,
-		"",
-		channelsSection,
-	)
+	contentBlocks := make([]string, 0, len(visible)*2+1)
+	contentBlocks = append(contentBlocks, sidebarHeader)
+	for i, section := range visible {
+		if i > 0 {
+			contentBlocks = append(contentBlocks, "")
+		}
+		contentBlocks = append(contentBlocks, section.render(maxes[i]))
+	}
+	fullContent := lipgloss.JoinVertical(lipgloss.Left, contentBlocks...)
 
 	// Apply scroll offset. Clamp against real content height.
 	contentLines := strings.Split(fullContent, "\n")

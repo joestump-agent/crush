@@ -2,6 +2,7 @@ package model
 
 import (
 	"image"
+	"strings"
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/ui/common"
@@ -42,14 +43,33 @@ func (m *UI) landingView() string {
 		layout.Fill(1),
 	).Split(m.layout.main).Assign(new(image.Rectangle), &remainingHeightArea)
 
-	mcpLspSectionWidth := min(30, (width-3)/4)
+	// The always-on columns are joined by the opt-in ones: Agents (the
+	// dispatch roster, #434) and Channels render only when they have
+	// entries, so the column count, and each column's width, adapts.
+	columnCount := 3
+	if len(m.agentStatusItems()) > 0 {
+		columnCount++
+	}
+	if len(m.channelStatusItems()) > 0 {
+		columnCount++
+	}
+	columnWidth := min(30, max(1, (width-(columnCount-1))/columnCount))
+	columnHeight := max(1, remainingHeightArea.Dy())
 
-	lspSection := m.lspInfo(mcpLspSectionWidth, max(1, remainingHeightArea.Dy()), false)
-	mcpSection := m.mcpInfo(mcpLspSectionWidth, max(1, remainingHeightArea.Dy()), false)
-	skillsSection := m.skillsInfo(mcpLspSectionWidth, max(1, remainingHeightArea.Dy()), false)
-	channelsSection := m.channelsInfo(mcpLspSectionWidth, max(1, remainingHeightArea.Dy()), false)
-
-	content := lipgloss.JoinHorizontal(lipgloss.Left, lspSection, " ", mcpSection, " ", skillsSection, " ", channelsSection)
+	columns := []string{
+		m.lspInfo(columnWidth, columnHeight, false),
+		m.mcpInfo(columnWidth, columnHeight, false),
+		m.skillsInfo(columnWidth, columnHeight, false),
+		m.agentsInfo(columnWidth, columnHeight, false),
+		m.channelsInfo(columnWidth, columnHeight, false),
+	}
+	visible := columns[:0]
+	for _, column := range columns {
+		if column != "" {
+			visible = append(visible, column)
+		}
+	}
+	content := strings.Join(visible, " ")
 
 	return lipgloss.NewStyle().
 		Width(width).
