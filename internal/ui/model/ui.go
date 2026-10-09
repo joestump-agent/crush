@@ -719,6 +719,9 @@ func (m *UI) Init() tea.Cmd {
 	}
 	cmds = append(cmds, m.hyperCreditsTicker())
 	cmds = append(cmds, m.checkPendingMCPAuth())
+	// Tell the user about any agent definition the config load could
+	// not honor (#560); the load ran before anything could show it.
+	cmds = append(cmds, m.loadDiagnosticsNotice)
 	return tea.Batch(cmds...)
 }
 

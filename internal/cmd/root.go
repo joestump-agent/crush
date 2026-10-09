@@ -200,6 +200,9 @@ func Execute() {
 	// stderr. We discard early logs here as a workaround. The proper
 	// fix is to remove slog calls from config.Load and have it return
 	// warnings/diagnostics instead of logging them as a side effect.
+	// The agent-definition warnings already work that way (#560): Load
+	// keeps them on the ConfigStore and setupLocalWorkspace replays
+	// them once the logger exists.
 	slog.SetDefault(slog.New(slog.DiscardHandler))
 
 	// NOTE: very hacky: we create a colorprofile writer with STDOUT, then make
@@ -361,6 +364,9 @@ func setupLocalWorkspace(cmd *cobra.Command) (workspace.Workspace, func(), error
 
 	logFile := filepath.Join(cfg.Options.DataDirectory, "logs", "crush.log")
 	crushlog.Setup(logFile, debug)
+	// The logger exists now, so the diagnostics Load collected while
+	// nothing was listening reach crush.log (#560).
+	logLoadDiagnostics(store.LoadDiagnostics())
 
 	// Discover skills once before app.New. Local mode hosts a single
 	// workspace per process, so WithGlobalMirror keeps the package
