@@ -106,11 +106,12 @@ type ConfigStore struct {
 	loadedPaths    []string // config files that were successfully loaded
 	knownProviders []catwalk.Provider
 	// loadDiagnostics is what SetupAgents reported for the published
-	// config (#560): the agent-definition problems that did not fail
-	// the load. Load collects them before any logger exists; the
-	// command replays them once it does. A reload replaces the set
-	// with the new config's, and a rolled-back reload keeps the old.
-	// Guarded by writeMu.
+	// config (#560), plus what the command recorded from inputs the
+	// load cannot see, like the flag and env allow-commands values
+	// (#578): the problems that did not fail the load. Load collects
+	// them before any logger exists; the command replays them once it
+	// does. A reload replaces the set with the new config's, and a
+	// rolled-back reload keeps the old. Guarded by writeMu.
 	loadDiagnostics    []LoadDiagnostic
 	overrides          RuntimeOverrides
 	trackedConfigPaths []string                // unique, normalized config file paths
@@ -325,13 +326,27 @@ func (s *ConfigStore) SetupAgents() {
 	s.loadDiagnostics = s.Config().SetupAgents()
 }
 
-// LoadDiagnostics returns the agent-definition diagnostics the last
-// successful load or reload raised (#560), in a stable order. Empty
-// when every definition behaves as written.
+// LoadDiagnostics returns the diagnostics the last successful load or
+// reload raised (#560), plus the ones the command recorded (#578), in a
+// stable order. Empty when the load was clean and nothing was recorded.
 func (s *ConfigStore) LoadDiagnostics() []LoadDiagnostic {
 	s.writeMu.RLock()
 	defer s.writeMu.RUnlock()
 	return slices.Clone(s.loadDiagnostics)
+}
+
+// AddLoadDiagnostic records a diagnostic the command found from inputs
+// the load itself cannot see — the flag and env allow-commands values
+// (#578) — into the set LoadDiagnostics returns, keeping its stable
+// order. The replays that run once the logger exists (crush.log,
+// `crush run`'s stderr, the TUI startup notice) carry it like a
+// load-raised one; a later reload replaces the set with the new
+// config's.
+func (s *ConfigStore) AddLoadDiagnostic(d LoadDiagnostic) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.loadDiagnostics = append(s.loadDiagnostics, d)
+	sortLoadDiagnostics(s.loadDiagnostics)
 }
 
 // Overrides returns the runtime overrides for this store.

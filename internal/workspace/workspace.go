@@ -250,11 +250,13 @@ type Workspace interface {
 	Config() *config.Config
 	WorkingDir() string
 	Resolver() config.VariableResolver
-	// LoadDiagnostics returns the agent-definition diagnostics the
-	// config load collected (#560): the problems that did not fail the
-	// load but that the user should hear about, such as an external
-	// agent that cannot be dispatched. A client workspace returns nil;
-	// the server process that loaded the config logs them itself.
+	// LoadDiagnostics returns the load diagnostics the config load
+	// collected and the command recorded (#560, #578): the problems
+	// that did not fail the load but that the user should hear about,
+	// such as an external agent that cannot be dispatched or an
+	// allow-commands entry that subtracts nothing from the banned
+	// list. A client workspace returns nil; the server process that
+	// loaded the config logs them itself.
 	LoadDiagnostics() []config.LoadDiagnostic
 
 	// Config mutations (proxied to server in client mode)
