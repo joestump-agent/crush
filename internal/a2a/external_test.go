@@ -626,8 +626,15 @@ func TestExternalAgentRefusesInputRequired(t *testing.T) {
 			require.Equal(t, DispatchStatusFailed, outcome.Status)
 			require.Contains(t, outcome.Text, "crush does not forward an external agent's input, permission, or auth requests")
 			require.NotContains(t, outcome.Text, "rm -rf", "the remote's question is not relayed")
-			require.Len(t, es.exec.canceled(), 1, "the paused task is canceled")
-			require.Contains(t, es.exec.canceled()[0], "crush does not forward")
+			// A cancel that lost the race against the delivery of the
+			// pause (client.go cancelTask) is re-issued once, so the
+			// executor can see the same refusal twice: every cancel
+			// must carry it, and the task must be canceled.
+			canceled := es.exec.canceled()
+			require.NotEmpty(t, canceled, "the paused task is canceled")
+			for _, reason := range canceled {
+				require.Contains(t, reason, "crush does not forward")
+			}
 		})
 	}
 }
