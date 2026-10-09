@@ -32,7 +32,7 @@ it.
 | SDK | [`github.com/a2aproject/a2a-go/v2`](https://github.com/a2aproject/a2a-go) v2.5.0 |
 | Protocol version | `1.0`, stamped on the card's interface |
 | Binding | JSON-RPC 2.0 over HTTP; streaming responses are Server-Sent Events |
-| Listener | One host per process on a unix socket: `<data dir>/a2a/<pid>.sock`, socket mode `0600` in a `0700` directory. Optionally also TLS on TCP; see [TCP listener](#tcp-listener) |
+| Listener | One host per process on a unix socket: `<data dir>/a2a/<pid>.sock`, socket mode `0600` in a `0700` directory the host verifies before binding; see [Who can reach it](#security-model). Optionally also TLS on TCP; see [TCP listener](#tcp-listener) |
 | Lifetime | From just after provisioning until the run returns; 5-second graceful shutdown |
 | Discovery | In memory: endpoint and card are stamped on the dispatch registry entry |
 | Task store | The SDK's in-memory store, one per server |
@@ -688,11 +688,17 @@ restriction is the socket, layered under the credential:
   credentials, the peer must also be the host's own OS user, and tasks
   are stored under that identity.
 - **Who can reach it.** Only processes running as the same OS user: the
-  socket is `0600` inside a `0700` directory under the data directory
-  (a per-user temp dir when the path would overflow the socket length
-  limit). Other local users cannot connect to the socket. The host
-  listens on TCP only when you configure the
-  [TCP listener](#tcp-listener), and then only with TLS
+  socket is `0600` inside a `0700` directory, `<data dir>/a2a/`. When
+  that path would overflow the unix socket length limit, the host falls
+  back to `crush-a2a-<uid>/` under `$XDG_RUNTIME_DIR`, or under the temp
+  directory when that is unset. Either directory is verified before the
+  bind ([#558](https://github.com/joestump-agent/crush/issues/558)): a
+  symlink or non-directory at its path, or a directory owned by another
+  user, is refused with an error naming the path and the failed check,
+  and a directory left wider than `0700` is tightened. The socket is
+  then made `0600` without following symlinks. Other local users cannot
+  connect to the socket. The host listens on TCP only when you configure
+  the [TCP listener](#tcp-listener), and then only with TLS
   ([#358](https://github.com/joestump-agent/crush/issues/358)).
 - **TCP callers.** A TCP connection carries no peer credentials, so a TCP
   call is never treated as the local user: it needs the bearer token or,
