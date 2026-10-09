@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/charmbracelet/crush/internal/backend"
@@ -125,6 +126,44 @@ func TestPostWorkspaces_RefusesParentReferences(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		require.Contains(t, message(t, rec), "client_id")
 	})
+}
+
+// TestSanitizedWorkspaceRequestCopiesEveryField fills every field of
+// proto.Workspace and checks the rebuilt request carries each one, with
+// only the directory fields cleaned, so a field added to proto.Workspace
+// cannot be silently dropped on the way to the backend.
+func TestSanitizedWorkspaceRequestCopiesEveryField(t *testing.T) {
+	t.Parallel()
+
+	var args proto.Workspace
+	v := reflect.ValueOf(&args).Elem()
+	for i := range v.NumField() {
+		f := v.Field(i)
+		switch f.Kind() {
+		case reflect.String:
+			f.SetString("/x/./" + v.Type().Field(i).Name)
+		case reflect.Bool:
+			f.SetBool(true)
+		case reflect.Slice:
+			f.Set(reflect.MakeSlice(f.Type(), 1, 1))
+		case reflect.Ptr:
+			f.Set(reflect.New(f.Type().Elem()))
+		default:
+			t.Fatalf("field %s has kind %s; teach this test to fill it", v.Type().Field(i).Name, f.Kind())
+		}
+	}
+
+	got, err := sanitizedWorkspaceRequest(args)
+	require.NoError(t, err)
+	gv := reflect.ValueOf(got)
+	for i := range v.NumField() {
+		name := v.Type().Field(i).Name
+		want := v.Field(i).Interface()
+		if name == "Path" || name == "DataDir" {
+			want = filepath.Clean(v.Field(i).String())
+		}
+		require.Equal(t, want, gv.Field(i).Interface(), "field %s must reach the backend", name)
+	}
 }
 
 func TestCleanWorkspacePath(t *testing.T) {

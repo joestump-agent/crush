@@ -86,32 +86,55 @@ func (c *controllerV1) handlePostWorkspaces(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// The workspace path and data dir name directories this server reads
-	// and writes under (config, the SQLite data dir, git metadata), so a
-	// ".." segment that survives cleaning is refused rather than resolved:
-	// the caller spells the directory out and the server does not
-	// navigate for it. The backend sees the cleaned form.
-	path, err := cleanWorkspacePath("path", args.Path)
+	req, err := sanitizedWorkspaceRequest(args)
 	if err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	args.Path = path
-	if args.DataDir != "" {
-		dataDir, err := cleanWorkspacePath("data_dir", args.DataDir)
-		if err != nil {
-			jsonError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		args.DataDir = dataDir
-	}
 
-	_, result, err := c.backend.CreateWorkspace(args)
+	_, result, err := c.backend.CreateWorkspace(req)
 	if err != nil {
 		c.handleError(w, r, err)
 		return
 	}
 	jsonEncode(w, result)
+}
+
+// sanitizedWorkspaceRequest rebuilds a decoded create-workspace request
+// with its directory fields cleaned. The workspace path and data dir
+// name directories this server reads and writes under (config, the
+// SQLite data dir, git metadata), so a ".." segment that survives
+// cleaning is refused rather than resolved: the caller spells the
+// directory out and the server does not navigate for it. The request is
+// rebuilt field by field rather than copied so the backend only ever
+// sees the cleaned paths; TestSanitizedWorkspaceRequestCopiesEveryField
+// fails when proto.Workspace gains a field this does not carry.
+func sanitizedWorkspaceRequest(args proto.Workspace) (proto.Workspace, error) {
+	path, err := cleanWorkspacePath("path", args.Path)
+	if err != nil {
+		return proto.Workspace{}, err
+	}
+	dataDir := ""
+	if args.DataDir != "" {
+		if dataDir, err = cleanWorkspacePath("data_dir", args.DataDir); err != nil {
+			return proto.Workspace{}, err
+		}
+	}
+	return proto.Workspace{
+		ID:               args.ID,
+		Path:             path,
+		YOLO:             args.YOLO,
+		Debug:            args.Debug,
+		DataDir:          dataDir,
+		Version:          args.Version,
+		ClientID:         args.ClientID,
+		Config:           args.Config,
+		Env:              args.Env,
+		Channels:         args.Channels,
+		AllowAllCommands: args.AllowAllCommands,
+		AllowedCommands:  args.AllowedCommands,
+		Skills:           args.Skills,
+	}, nil
 }
 
 // cleanWorkspacePath returns the cleaned form of a caller-supplied
