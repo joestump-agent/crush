@@ -183,3 +183,33 @@ func TestSidebarHidesEmptyOptionalSections(t *testing.T) {
 	require.NotContains(t, out, "Channels", "an empty Channels section must hide entirely")
 	require.NotContains(t, out, "Agents", "an empty Agents section must hide entirely")
 }
+
+// TestSidebarKeepsEmptyAlwaysOnSections pins the other half of the
+// hide-when-empty rule: an always-on section with nothing to list still
+// renders its title and "None" placeholder, while the optional ones
+// (Agents, Channels) stay hidden.
+func TestSidebarKeepsEmptyAlwaysOnSections(t *testing.T) {
+	t.Parallel()
+
+	m := newSidebarHeightTestUI(t)
+	ws := m.com.Workspace.(*sidebarHeightTestWorkspace)
+	m.lspStates = nil
+	m.skillStates = nil
+	m.sessionFiles = nil
+
+	ws.cfg.MCP = config.MCPs{"mcp-0": {}}
+	m.mcpStates = map[string]mcp.ClientInfo{"mcp-0": {Name: "mcp-0", State: mcp.StateConnected}}
+
+	const width, height = 32, 40
+	m.layout.sidebar = uv.Rect(0, 0, width, height)
+
+	scr := uv.NewScreenBuffer(width, height)
+	m.drawSidebar(scr, m.layout.sidebar)
+	out := ansi.Strip(scr.Render())
+
+	for _, title := range []string{"Modified Files", "LSPs", "MCPs", "Skills"} {
+		require.Contains(t, out, title, "always-on section title %q must stay visible when empty", title)
+	}
+	require.NotContains(t, out, "Agents", "an empty Agents section must hide entirely")
+	require.NotContains(t, out, "Channels", "an empty Channels section must hide entirely")
+}

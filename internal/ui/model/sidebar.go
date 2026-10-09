@@ -59,10 +59,13 @@ func (m *UI) modelInfo(width int) string {
 }
 
 // sidebarSection is one collapsible block of the sidebar body: how many
-// items it has and how to render it with an item budget.
+// items it has and how to render it with an item budget. An optional
+// section (Agents, Channels) hides entirely when it has nothing to list;
+// the always-on ones render a "None" placeholder instead.
 type sidebarSection struct {
-	count  int
-	render func(maxItems int) string
+	count    int
+	optional bool
+	render   func(maxItems int) string
 }
 
 // getDynamicHeightLimits will give us the num of items to show in each
@@ -272,12 +275,12 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 		{count: lspsCount, render: func(maxItems int) string { return m.lspInfo(contentWidth, maxItems, true) }},
 		{count: mcpsCount, render: func(maxItems int) string { return m.mcpInfo(contentWidth, maxItems, true) }},
 		{count: skillsCount, render: func(maxItems int) string { return m.skillsInfo(contentWidth, maxItems, true) }},
-		{count: agentsCount, render: func(maxItems int) string { return m.agentsInfo(contentWidth, maxItems, true) }},
-		{count: channelsCount, render: func(maxItems int) string { return m.channelsInfo(contentWidth, maxItems, true) }},
+		{count: agentsCount, optional: true, render: func(maxItems int) string { return m.agentsInfo(contentWidth, maxItems, true) }},
+		{count: channelsCount, optional: true, render: func(maxItems int) string { return m.channelsInfo(contentWidth, maxItems, true) }},
 	}
 	visible := make([]sidebarSection, 0, len(sections))
 	for _, section := range sections {
-		if section.count == 0 {
+		if section.optional && section.count == 0 {
 			continue
 		}
 		visible = append(visible, section)
