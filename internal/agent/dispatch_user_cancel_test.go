@@ -42,9 +42,9 @@ func waitTerminalDispatch(t *testing.T, c *coordinator, dispatchID string, want 
 }
 
 // CancelDispatch stops one running dispatched agent by any of its three
-// addresses — dispatch ID, @handle, or child session ID — and the run
-// ends killed with the user-cancel reason, the workspace and its salvage
-// diff preserved (#373). The kill path is the watchdog's, so the kill
+// addresses — dispatch ID, @handle, or child session ID — when the
+// dispatching session asks, and the run ends killed with the user-cancel
+// reason, the workspace and its salvage diff preserved (#373). The kill path is the watchdog's, so the kill
 // reason lands before the agent's cancel and the dispatch's root context
 // survives long enough to capture the diff.
 func TestCancelDispatchStopsRunningDispatch(t *testing.T) {
@@ -66,7 +66,7 @@ func TestCancelDispatchStopsRunningDispatch(t *testing.T) {
 			artifact := filepath.Join(handle.WorkspacePath, "notes.md")
 			require.NoError(t, os.WriteFile(artifact, []byte("salvage me"), 0o644))
 
-			require.NoError(t, c.CancelDispatch(t.Context(), tt.ref(handle)))
+			require.NoError(t, c.CancelDispatch(t.Context(), "dispatch-parent-session", tt.ref(handle)))
 
 			require.Equal(t, []string{handle.SessionID}, agent.cancels(),
 				"the dispatched agent is canceled, never the parent")
@@ -87,18 +87,18 @@ func TestCancelDispatchStopsRunningDispatch(t *testing.T) {
 func TestCancelDispatchRefusesUnknownAndFinished(t *testing.T) {
 	c, agent, handle := dispatchForCancelTest(t)
 
-	require.ErrorContains(t, c.CancelDispatch(t.Context(), "no-such-dispatch"), "no dispatch")
-	require.ErrorContains(t, c.CancelDispatch(t.Context(), "@no-such-handle"), "no dispatch")
+	require.ErrorContains(t, c.CancelDispatch(t.Context(), "dispatch-parent-session", "no-such-dispatch"), "no dispatch")
+	require.ErrorContains(t, c.CancelDispatch(t.Context(), "dispatch-parent-session", "@no-such-handle"), "no dispatch")
 	require.Empty(t, agent.cancels())
 
 	agent.release()
 	waitTerminalDispatch(t, c, handle.DispatchID, dispatch.StatusCompleted)
 
-	require.ErrorContains(t, c.CancelDispatch(t.Context(), handle.DispatchID), "already finished")
-	require.ErrorContains(t, c.CancelDispatch(t.Context(), handle.SessionID), "already finished")
+	require.ErrorContains(t, c.CancelDispatch(t.Context(), "dispatch-parent-session", handle.DispatchID), "already finished")
+	require.ErrorContains(t, c.CancelDispatch(t.Context(), "dispatch-parent-session", handle.SessionID), "already finished")
 	require.Empty(t, agent.cancels(), "a refusal never reaches the agent")
 
-	require.ErrorContains(t, c.CancelDispatch(t.Context(), "no-such-dispatch"), "no dispatch",
+	require.ErrorContains(t, c.CancelDispatch(t.Context(), "dispatch-parent-session", "no-such-dispatch"), "no dispatch",
 		"an unknown ref is refused after a dispatch exists too")
 }
 
@@ -119,7 +119,7 @@ func TestCancelDispatchNeverCancelsParent(t *testing.T) {
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, tool, DispatchAgentParams{Prompt: "fix the bug", Branch: "main"}))
 	agent.waitRunning(t)
 
-	require.NoError(t, c.CancelDispatch(t.Context(), handle.SessionID))
+	require.NoError(t, c.CancelDispatch(t.Context(), "dispatch-parent-session", handle.SessionID))
 	require.Equal(t, []string{handle.SessionID}, agent.cancels())
 	require.Empty(t, parent.cancelled, "the parent agent is never canceled")
 	entry := waitTerminalDispatch(t, c, handle.DispatchID, dispatch.StatusKilled)

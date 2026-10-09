@@ -120,6 +120,12 @@ the agent's `session_id`) and a `message`. The message is queued the same way,
 the tool returns once it's queued, and the reply appears on the agent's block.
 Unknown and finished agents are refused. Only the main agent has the tool.
 
+`message_agent`, `cancel_dispatch`, `apply_dispatch` and `dismiss_dispatch` act
+only on agents dispatched from the calling session: another session's handle,
+dispatch ID or session ID is refused exactly like an unknown one
+([#399](https://github.com/joestump-agent/crush/issues/399),
+[#559](https://github.com/joestump-agent/crush/issues/559)).
+
 :::warning[Known issue]
 The schema marks `session_id` required, though either field works ([#400](https://github.com/joestump-agent/crush/issues/400)).
 :::

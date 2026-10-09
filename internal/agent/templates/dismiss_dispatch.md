@@ -1,5 +1,5 @@
 Discard a finished dispatched agent's work and remove its workspace: the worktree, its crush-dispatch-* branch, and the registry entry (which frees its @handle) are all deleted. Use it when you have reviewed the dispatched agent's terminal result and decided the work is not worth keeping — this is the dismiss half of the review decision, and it replaces hand-run git. The work is gone for good once dismissed; there is no undo.
 
-Address the agent by its dispatch ID or its @handle (the "dispatch_id" and "handle" fields of its dispatch handle); exactly one. Only a finished dispatch can be dismissed: a running one refuses — cancel it first with cancel_dispatch.
+Address the agent by its dispatch ID or its @handle (the "dispatch_id" and "handle" fields of its dispatch handle); exactly one. You can only dismiss dispatches from your own session — another session's agents are invisible to this tool. Only a finished dispatch can be dismissed: a running one refuses — cancel it first with cancel_dispatch.
 
 A permission check guards every dismissal. An unknown dispatch refuses cleanly. Dismissing one dispatched agent never touches your own run or any other dispatched agent; if the work might matter later, prefer apply_dispatch or just leave the workspace — it survives until a decision is made.

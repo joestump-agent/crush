@@ -107,8 +107,10 @@ Stop one dispatched agent yourself: focus its block in the chat (or inspect
 it) and press <kbd>ctrl+x</kbd> — the run ends killed with reason "canceled by
 user", the card shows **canceled**, and the workspace and branch stay for
 review or a re-dispatch. You can also ask the main agent, which cancels by
-handle through its `cancel_dispatch` tool. The main agent's own cancel is
-unchanged: <kbd>esc</kbd> twice cancels only the parent's turn.
+handle through its `cancel_dispatch` tool; like steering, it reaches only
+agents dispatched from its own session ([#559](https://github.com/joestump-agent/crush/issues/559)).
+The main agent's own cancel is unchanged: <kbd>esc</kbd> twice cancels only
+the parent's turn.
 
 ## What happens to the work
 
@@ -145,8 +147,9 @@ You record your decision with the `apply_dispatch` and `dismiss_dispatch`
 tools ([#368](https://github.com/joestump-agent/crush/issues/368)): apply brings the work into your checkout —
 merge, squash, or cherry-pick, uncommitted changes included — and removes the
 workspace; dismiss discards the work and removes it. Both refuse while the
-dispatch is still running (cancel it first) and ask your permission before
-they change anything.
+dispatch is still running (cancel it first), act only on dispatches from the
+calling session ([#559](https://github.com/joestump-agent/crush/issues/559)), and ask your permission before they
+change anything; the prompt names the agent's handle, branch and session.
 
 ## Under the hood: A2A
 

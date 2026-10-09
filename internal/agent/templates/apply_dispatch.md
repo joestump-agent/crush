@@ -1,6 +1,6 @@
 Bring a finished dispatched agent's work into your own checkout: merge, squash-merge, or cherry-pick the dispatch branch, then remove the workspace. Use it after you have reviewed the dispatched agent's terminal result and decided the work is worth keeping — this is the merge half of the review decision, and it replaces hand-run git.
 
-Address the agent by its dispatch ID or its @handle (the "dispatch_id" and "handle" fields of its dispatch handle); exactly one. Only a finished dispatch can be applied: a running one refuses — cancel it first with cancel_dispatch.
+Address the agent by its dispatch ID or its @handle (the "dispatch_id" and "handle" fields of its dispatch handle); exactly one. You can only apply dispatches from your own session — another session's agents are invisible to this tool. Only a finished dispatch can be applied: a running one refuses — cancel it first with cancel_dispatch.
 
 Modes:
 • "merge" (default): git merge --no-ff of the dispatch branch into your current branch — history and all work preserved as a merge commit.
