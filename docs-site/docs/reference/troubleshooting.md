@@ -46,9 +46,8 @@ causes:
 - Shebang'd scripts need the interpreter on `PATH`. Crush falls back to a `PATH`
   lookup of the base name and logs it at debug level.
 - Sub-agent tool calls are not hooked by design. See
-  [scope](/features/hooks#pretooluse).
-- Dispatched agents' tool calls are not hooked either — including their
-  `bash`, `edit`, and `write` calls. That one is a bug, tracked as [#377](https://github.com/joestump-agent/crush/issues/377).
+  [scope](/features/hooks#pretooluse). Dispatched agents' tool calls **are**
+  hooked, with the dispatched session's ID in the payload.
 
 ## An MCP server won't start
 
@@ -131,13 +130,14 @@ does not change them. A debug log line records the mismatch. See
 | Symptom | Short answer |
 | --- | --- |
 | `dispatch unavailable: … is not a git repository` | Dispatch needs a git repository. The failure is remembered until Crush restarts |
-| A dispatched agent's work vanished | Exit keeps dispatch work ([#367](https://github.com/joestump-agent/crush/issues/367)): only dispatches you applied or dismissed, or ones that produced no work, are removed with their branches, and a crash is reconciled at the next launch the same way ([#365](https://github.com/joestump-agent/crush/issues/365)). If work still vanished, it was likely removed by hand or by an older Crush — committed work may survive as unreachable commits |
+| A dispatched agent's work vanished | Exit keeps dispatch work: only dispatches you applied or dismissed, or ones that produced no work, are removed with their branches, and a crash is reconciled at the next launch the same way. The worktrees live under `<data dir>/worktrees/<repo-key>/`, not in your checkout — `crush dispatch list` finds them. If work still vanished, it was removed by hand or with `crush dispatch prune --force`; committed work may survive as unreachable commits |
 | An agent shows **Killed** | The wander kill stopped it: ignored todo nudges, stalled todos, a hard timeout, or a tool loop. See [Todo enforcement](/agents/todo-enforcement) |
-| The main agent's turn was canceled after two todo reminders | The todo ladder's kill reaches more than dispatched agents today. Set `options.todo_enforcement.kill_after_nudges` to `0` in `crush.json`. Tracked as [#393](https://github.com/joestump-agent/crush/issues/393) |
-| `@tester …` went to the main agent | The handle must be the very first token and match a running agent, and routing does not work against a [server](/features/server-and-workspaces#dispatched-agents-against-a-server) |
-| <kbd>esc</kbd> canceled the main agent while inspecting | Leave inspect mode with <kbd>ctrl+[</kbd> — see [Inspect mode](/reference/keybindings#inspect-mode). Tracked as [#404](https://github.com/joestump-agent/crush/issues/404) |
-| A dispatched agent ran a command a hook should have blocked | Dispatched agents are not hooked. Tracked as [#377](https://github.com/joestump-agent/crush/issues/377) |
-| A dispatched agent still auto-approves after yolo was toggled off | It follows the startup `--yolo`. Tracked as [#378](https://github.com/joestump-agent/crush/issues/378) |
+| `dispatch at capacity: …` | At most `options.dispatch.max_concurrent` (4) run at once. Wait, cancel one, or `option dispatch-max-concurrent 8` |
+| The main agent keeps getting todo reminders | The todo ladder nudges every agent with a `todos` tool and kills only dispatched ones. `option todo-nudge false` turns the nudges off |
+| `@tester …` went to the main agent | The handle must be the very first token (optionally followed by `: , . ? !`) and match an agent dispatched from this session; see [Handles](/agents/handles-and-inspect#handles) |
+| No `dispatch_agent` tool | It is interactive-only: `crush run` never offers it. Or the `worker` is disabled, or the tools are denied |
+| A dispatched agent ran a command a hook should have blocked | Dispatched agents' tool calls are hooked; check the matcher against the tool name in the hook payload |
+| `dispatch to external agent "…" failed: …` | See [External agents](/agents/troubleshooting#external-agents) |
 
 ## Reporting a bug
 

@@ -25,6 +25,7 @@ import (
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/version"
 	"github.com/modelcontextprotocol/go-sdk/auth"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/oauth2"
 )
@@ -55,7 +56,7 @@ type ClientSession struct {
 	oauthHandler *mcpoauth.Handler
 	// channel reports whether this server is an active channel (it declared
 	// the claude/channel capability and was opted in via --channels or
-	// channel_enabled).
+	// channel_enabled in config).
 	channel bool
 }
 
@@ -256,14 +257,41 @@ func (c ClientInfo) ServesA2UITool(toolName string) bool {
 // SubscribeEvents returns a channel for MCP events, including channel-message
 // events (EventChannelMessage).
 //
-// This fork implements the workspace-scoped channel routing upstream defers:
-// channel events flow through this fan-out and are routed to the correct
-// workspace/session downstream (internal/backend/channels.go,
-// internal/server/events.go, internal/workspace/client_workspace.go). The
-// cross-workspace concern is handled at that routing layer, not by filtering
-// at the source, so the events must remain visible here.
+// Channel message events (EventChannelMessage) are excluded: they carry no
+// workspace or session identity, and the MCP broker is process-global. Without
+// this filter, every workspace that calls SubscribeEvents would receive every
+// other workspace's channel events — a cross-workspace injection path.
+// Consumers that deliver channel messages use SubscribeChannelEvents and are
+// responsible for scoping each event to the workspaces that declared and
+// opted in the originating server.
 func SubscribeEvents(ctx context.Context) <-chan pubsub.Event[Event] {
 	return broker.Subscribe(ctx)
+}
+
+// SubscribeChannelEvents returns a channel carrying only channel message
+// events (EventChannelMessage). The MCP broker is process-global, so these
+// events are not scoped to any workspace: every consumer must check that the
+// originating server is declared in the target workspace's MCP config and
+// opted in (ChannelOptIn) before delivering, otherwise one workspace's
+// channel messages leak into another — the injection path SubscribeEvents
+// filters out.
+func SubscribeChannelEvents(ctx context.Context) <-chan pubsub.Event[Event] {
+	raw := broker.Subscribe(ctx)
+	channelOnly := make(chan pubsub.Event[Event], 64)
+	go func() {
+		defer close(channelOnly)
+		for ev := range raw {
+			if ev.Payload.Type != EventChannelMessage {
+				continue
+			}
+			select {
+			case channelOnly <- ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return channelOnly
 }
 
 // GetStates returns the current state of all MCP clients
@@ -307,7 +335,11 @@ func Close(ctx context.Context) error {
 }
 
 // Initialize initializes MCP clients based on the provided configuration.
-func Initialize(ctx context.Context, permissions permission.Service, cfg *config.ConfigStore) {
+// forceStart lists config-disabled servers with a repository-scoped enabled
+// override; they are started even though their config entry is disabled.
+// localDisabled lists servers with a repository-scoped disabled override;
+// they are not started.
+func Initialize(ctx context.Context, permissions permission.Service, cfg *config.ConfigStore, forceStart, localDisabled []string) {
 	ArmInit()
 	slog.Info("Initializing MCP clients")
 	start := time.Now()
@@ -315,10 +347,18 @@ func Initialize(ctx context.Context, permissions permission.Service, cfg *config
 	var wg sync.WaitGroup
 	// Initialize states for all configured MCPs
 	for name, m := range cfg.Config().MCP {
-		if m.Disabled {
+		if slices.Contains(localDisabled, name) {
 			updateState(name, StateDisabled, nil, nil, Counts{})
-			slog.Debug("Skipping disabled MCP", "name", name)
+			slog.Debug("Skipping MCP disabled for this repository", "name", name)
 			continue
+		}
+		if m.Disabled {
+			if !slices.Contains(forceStart, name) {
+				updateState(name, StateDisabled, nil, nil, Counts{})
+				slog.Debug("Skipping disabled MCP", "name", name)
+				continue
+			}
+			slog.Info("Starting config-disabled MCP with repository enabled override", "name", name)
 		}
 
 		// Set initial starting state
@@ -404,6 +444,19 @@ func InitializeSingle(ctx context.Context, name string, cfg *config.ConfigStore)
 		updateState(name, StateDisabled, nil, nil, Counts{})
 		slog.Debug("Skipping disabled MCP", "name", name)
 		return nil
+	}
+
+	return initClient(ctx, cfg, name, m, currentGen(name), cfg.Resolver())
+}
+
+// InitializeSingleForced starts the named MCP client even when its config
+// entry is disabled. Used by the repository-scoped "Toggle MCPs" override.
+// The startup counterpart is the forceStart argument of Initialize, which
+// replays the persisted enabled overrides. Config files are not touched.
+func InitializeSingleForced(ctx context.Context, name string, cfg *config.ConfigStore) error {
+	m, exists := cfg.Config().MCP[name]
+	if !exists {
+		return fmt.Errorf("mcp '%s' not found in configuration", name)
 	}
 
 	return initClient(ctx, cfg, name, m, currentGen(name), cfg.Resolver())
@@ -524,7 +577,7 @@ func BeginAuth(cfg *config.ConfigStore, name string) (finish func(ctx context.Co
 // suppression enabled on the freshly created handler.
 func runAuthFlow(ctx context.Context, cfg *config.ConfigStore, name string, m config.MCPConfig) error {
 	updateState(name, StateStarting, nil, nil, Counts{}, withPending(m))
-	_, err := connectAndRegister(ctx, cfg, name, m, currentGen(name), cfg.Resolver(), channelEnabled(cfg.Overrides().EnabledChannels, name))
+	_, err := connectAndRegister(ctx, cfg, name, m, currentGen(name), cfg.Resolver(), ChannelOptIn(m, cfg.Overrides().EnabledChannels, name))
 	return err
 }
 
@@ -659,6 +712,34 @@ func connectAndRegister(ctx context.Context, cfg *config.ConfigStore, name strin
 	}, withConfig(m))
 
 	return session, nil
+}
+
+// persistOAuthToken saves the OAuth token from a session to the global
+// config so it survives restarts.
+
+// SetConfigDisabled persists the disabled flag of a single MCP server in
+// the given config scope and applies the change to the running client:
+// disabling tears the connection down, enabling starts it even if it was
+// disabled before. A repository-scoped override takes precedence, so when
+// localOverride is set only the config is written.
+func SetConfigDisabled(ctx context.Context, cfg *config.ConfigStore, scope config.Scope, name string, disabled, localOverride bool) error {
+	if err := cfg.SetMCPServerDisabledConfig(scope, name, disabled); err != nil {
+		return err
+	}
+	if localOverride {
+		return nil
+	}
+	return SetLocalDisabled(ctx, cfg, name, disabled)
+}
+
+// SetLocalDisabled applies a repository-scoped toggle to the running
+// client: disabling tears the connection down, enabling starts it even if
+// its config entry is disabled. Persisting the override is the caller's job.
+func SetLocalDisabled(ctx context.Context, cfg *config.ConfigStore, name string, disabled bool) error {
+	if disabled {
+		return DisableSingle(cfg, name)
+	}
+	return InitializeSingleForced(ctx, name, cfg)
 }
 
 // DisableSingle disables and closes a single MCP client by name.
@@ -890,7 +971,13 @@ func renewClient(ctx context.Context, cfg *config.ConfigStore, name string, forc
 func pingSession(ctx context.Context, s *ClientSession, timeout time.Duration) error {
 	pingCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return s.Ping(pingCtx, nil)
+	err := s.Ping(pingCtx, nil)
+	// MethodNotFound means the server answered; it just doesn't implement ping.
+	var wireErr *jsonrpc.Error
+	if errors.As(err, &wireErr) && wireErr.Code == jsonrpc.CodeMethodNotFound {
+		return nil
+	}
+	return err
 }
 
 // closeSession closes an MCP session, logging only unexpected errors. EOF,
@@ -1036,8 +1123,9 @@ func createSession(ctx context.Context, cfg *config.ConfigStore, name string, m 
 	// gate starts undecided: notifications that arrive during capability
 	// negotiation are buffered. After Connect resolves, the gate is opened
 	// (and the buffer drained) only when the server declares the channel
-	// capability AND was opted in via --channels; otherwise it is closed
-	// (buffer discarded). This prevents early notifications from being lost.
+	// capability AND was opted in (--channels or channel_enabled);
+	// otherwise it is closed (buffer discarded). This prevents early
+	// notifications from being lost.
 	channelGate := newChannelGate()
 	transport = &channelTransport{inner: transport, name: name, gate: channelGate}
 
@@ -1124,8 +1212,9 @@ func createSession(ctx context.Context, cfg *config.ConfigStore, name string, m 
 	slog.Debug("MCP client initialized", "name", name)
 
 	// Resolve the channel gate: open only for a server that both declares
-	// the claude/channel capability and was opted in via --channels.
-	// Otherwise close it (fail closed). Resolving drains buffered messages
+	// the claude/channel capability and was opted in — via --channels or
+	// channel_enabled in config. Merely listing a server under mcp is not
+	// enough. Otherwise close the gate (fail closed). Resolving drains buffered messages
 	// that arrived during negotiation so a fast server does not lose early
 	// events.
 	isChannel := channelOptIn && hasChannelCapability(session.InitializeResult())

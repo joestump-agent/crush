@@ -272,3 +272,29 @@ func TestRegisterWithExternalDataDir(t *testing.T) {
 		t.Errorf("Expected data_dir /var/data/crush/myproject, got %s", projects[0].DataDir)
 	}
 }
+
+func TestRegisterOrdersByRecency(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", tmpDir)
+	t.Setenv("CRUSH_GLOBAL_DATA", filepath.Join(tmpDir, "crush"))
+
+	for _, path := range []string{"/p1", "/p2", "/p3", "/p1"} {
+		if err := Register(path, path+"/.crush"); err != nil {
+			t.Fatalf("Register failed: %v", err)
+		}
+	}
+
+	projects, err := List()
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+
+	var got []string
+	for _, p := range projects {
+		got = append(got, p.Path)
+	}
+	want := []string{"/p1", "/p3", "/p2"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Expected order %v, got %v", want, got)
+	}
+}

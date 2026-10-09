@@ -37,3 +37,10 @@ jobs:
         with:
           version: v2.13.1
           args: --path-mode=abs --config=.golangci.yml --timeout=10m ./...
+      # schema.json is generated from the config types. The workflow that
+      # used to regenerate and commit it on push is gone (CI gates PRs and
+      # nothing else), so drift fails the PR instead: run `task schema`.
+      - name: schema.json is current
+        run: |
+          go run . schema > schema.json
+          git diff --exit-code -- schema.json

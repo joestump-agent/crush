@@ -3,6 +3,40 @@
   "$id": "https://github.com/charmbracelet/crush/internal/config/config",
   "$ref": "#/$defs/Config",
   "$defs": {
+    "A2AOptions": {
+      "properties": {
+        "listen": {
+          "type": "string",
+          "description": "host:port for the A2A host's TCP listener. Requires tls_cert and tls_key: plain TCP is refused",
+          "examples": [
+            "127.0.0.1:7443"
+          ]
+        },
+        "tls_cert": {
+          "type": "string",
+          "description": "PEM certificate file for the A2A TCP listener. Must be an absolute path or start with ~/",
+          "examples": [
+            "~/.config/crush/certs/a2a.pem"
+          ]
+        },
+        "tls_key": {
+          "type": "string",
+          "description": "PEM private key file for tls_cert. Must be an absolute path or start with ~/",
+          "examples": [
+            "~/.config/crush/certs/a2a-key.pem"
+          ]
+        },
+        "client_ca": {
+          "type": "string",
+          "description": "PEM CA certificates. When set, the A2A TCP listener requires and verifies client certificates (mutual TLS). Must be an absolute path or start with ~/",
+          "examples": [
+            "~/.config/crush/certs/clients-ca.pem"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
     "AgentAuth": {
       "properties": {
         "type": {
@@ -100,6 +134,10 @@
         "kill": {
           "$ref": "#/$defs/AgentKill",
           "description": "Kill thresholds for this agent; dispatch agents only"
+        },
+        "todo_enforcement": {
+          "$ref": "#/$defs/TodoEnforcementConfig",
+          "description": "Legacy alias for the todos and kill blocks"
         },
         "card": {
           "type": "string",
@@ -362,6 +400,11 @@
           "examples": [
             2
           ]
+        },
+        "default_agent": {
+          "type": "string",
+          "description": "Agent id dispatch_agent runs when the call names no agent; must be an enabled dispatch agent",
+          "default": "worker"
         }
       },
       "additionalProperties": false,
@@ -984,6 +1027,10 @@
         "dispatch": {
           "$ref": "#/$defs/DispatchOptions",
           "description": "Dispatched agent options"
+        },
+        "a2a": {
+          "$ref": "#/$defs/A2AOptions",
+          "description": "A2A host options: an optional TLS-only TCP listener beside the per-process unix socket"
         }
       },
       "additionalProperties": false,
@@ -1281,7 +1328,7 @@
         },
         "hard_gate": {
           "type": "boolean",
-          "description": "Reject mutating tools (write, edit, multiedit, bash) until a todo list exists",
+          "description": "Reject mutating tools (file writers, non-read-only bash commands, MCP tools without a read-only hint) until a todo list exists",
           "default": false
         },
         "kill_after_nudges": {

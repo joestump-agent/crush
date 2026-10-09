@@ -143,6 +143,7 @@ func (h *header) drawHeader(
 	width int,
 	lspErrorCount int,
 	hyperCredits *int,
+	gitBranch string,
 ) {
 	t := h.com.Styles
 	if width != h.width || compact != h.compact {
@@ -172,6 +173,7 @@ func (h *header) drawHeader(
 		detailsOpen,
 		availDetailWidth,
 		hyperCredits,
+		gitBranch,
 	)
 
 	remainingWidth := width -
@@ -204,6 +206,7 @@ func renderHeaderDetails(
 	detailsOpen bool,
 	availWidth int,
 	hyperCredits *int,
+	gitBranch string,
 ) string {
 	t := com.Styles
 
@@ -256,6 +259,17 @@ func renderHeaderDetails(
 	if lipgloss.Width(dir+metadata) > availWidth && lipgloss.Width(cwd+metadata) <= availWidth {
 		dir = cwd
 	}
-	result := t.Header.WorkingDir.Render(dir) + metadata
+	dirStr := t.Header.WorkingDir.Render(dir)
+	if gitBranch != "" {
+		// Reserve space for the dot separator between branch and path and
+		// at least some of the path.
+		branchSep := t.Header.Separator.Render(" • ")
+		maxBranchWidth := max(0, availWidth-lipgloss.Width(metadata)-lipgloss.Width(dirStr)-lipgloss.Width(branchSep))
+		if maxBranchWidth > 0 {
+			truncBranch := ansi.Truncate(gitBranch, maxBranchWidth, "…")
+			dirStr = t.Header.GitBranch.Render(truncBranch) + branchSep + dirStr
+		}
+	}
+	result := dirStr + metadata
 	return ansi.Truncate(result, max(0, availWidth), "…")
 }

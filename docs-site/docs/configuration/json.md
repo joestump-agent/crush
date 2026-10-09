@@ -94,8 +94,10 @@ with your shell's privileges, before the UI appears.
 | `option context-path …` | `options.context_paths[]` |
 | `option global-context-path …` | `options.global_context_paths[]` |
 | `option attribution-*` | `options.attribution.*` |
-| `option todo-*/dispatch-*` | `options.todo_enforcement.<key>` |
+| `option todo-*`, `option dispatch-stall\|dispatch-timeout` | `options.todo_enforcement.<key>` |
+| `option dispatch-max-concurrent\|dispatch-default-agent` | `options.dispatch.{max_concurrent,default_agent}` |
 | `option a2a-listen\|a2a-tls-cert\|a2a-tls-key\|a2a-client-ca` | `options.a2a.{listen,tls_cert,tls_key,client_ca}` |
+| `agent add\|set\|defaults\|remove` | `agents.<id>`, `agents.$defaults` |
 | `option ui <key> <value>` | `options.tui.<key>` |
 
 Note that the JSON names are not a mechanical transliteration of the builtin
@@ -107,14 +109,18 @@ names: `permissions deny` writes `options.disabled_tools`, and several
 
 The top-level `options` object also carries a few keys with no `crushrc`
 builtin yet: `allowed_commands`, `allow_all_commands` (see
-[Permissions](/configuration/permissions#blocked-commands)), and `disable_a2ui`
-(see [A2UI](/features/a2ui)). Top-level `tools` tunes the
-`glob`, `grep`, and `ls` tool limits.
+[Permissions](/configuration/permissions#blocked-commands)), `disable_a2ui`
+(see [A2UI](/features/a2ui)), and `todo_enforcement.inactivity_timeout` (the
+A2A backstop for dispatched runs; see
+[Todo enforcement](/agents/todo-enforcement#wander-kill)). Top-level `tools`
+tunes the `glob`, `grep`, and `ls` tool limits.
 
 :::info[Fork feature]
 These `crush.json` keys do not exist upstream: `options.allowed_commands`,
 `options.allow_all_commands`, `options.disable_a2ui`,
 `options.todo_enforcement` ([multi-agent](/agents/todo-enforcement)),
+`options.dispatch` (`max_concurrent`, default 4, and `default_agent`, default
+`worker`; see [multi-agent configuration](/agents/configuration)),
 `options.a2a` (the A2A host's [TLS-only TCP listener](/agents/a2a-protocol#tcp-listener);
 `listen` without `tls_cert` and `tls_key` fails the load), the
 top-level `agents` block ([multi-agent](/agents/configuration)), the
@@ -151,7 +157,8 @@ rather than append, and `0` or `"off"` disables the knob it configures.
 
 The built-ins are `coder`, `plan`, and `task`, plus `worker`, the dispatch
 agent definition the multi-agent runtime uses. Their roles (`main`,
-`subagent`, `dispatch`) cannot be changed, and `coder` cannot be disabled.
+`subagent`, `dispatch`) cannot be changed, and `coder` cannot be disabled. A
+new id must match `^[a-z][a-z0-9-]{0,31}$` and must be a `dispatch` agent.
 
 ```json
 {
@@ -160,16 +167,21 @@ agent definition the multi-agent runtime uses. Their roles (`main`,
     "$defaults": { "todos": { "hard_gate": true } },
     "coder": {
       "description": "Ship it.",
-      "tools": { "deny": ["sourcegraph"] },
-      "mcp": { "allow": ["github"] }
+      "tools": { "deny": ["sourcegraph"] }
     },
     "worker": {
-      "model": { "provider": "deepseek", "model": "deepseek-chat" },
+      "model": "large",
       "kill": { "after_ignored_nudges": 3, "stall": "5m", "timeout": "30m" }
     }
   }
 }
 ```
+
+That block loads as written. To give the coder an MCP server
+(`"mcp": { "allow": ["github"] }`) or pin the worker to a model
+(`"model": { "provider": "deepseek", "model": "deepseek-chat" }`), the server
+and the provider must be configured in the same config, or the load fails
+naming the path.
 
 Field guide:
 
@@ -177,7 +189,8 @@ Field guide:
 | --- | --- |
 | `role` | `main`, `subagent`, or `dispatch`. A new agent must be `dispatch`. |
 | `runtime` | `builtin` (in process) or `a2a` (an external [Agent Card](https://a2a-protocol.org)). |
-| `model` | `"large"`, `"small"`, or `{ "provider": "...", "model": "..." }`. |
+| `name`, `description` | Display values; `name` is also the agent's A2A card name. |
+| `model` | `"large"`, `"small"`, or `{ "provider": "...", "model": "..." }`. A pin must name a configured provider and model. |
 | `prompt` | `builtin:<id>` (`coder`, `plan`, `task`, `dispatch`) or `file:<path>`, a Go template; relative paths resolve against the working directory. |
 | `prompt_append` | `file:<path>`, appended verbatim after the rendered prompt. |
 | `skills` | Skill names the agent sees. A dispatch's `skills` argument can narrow the worker's list, never widen it. |
@@ -186,23 +199,22 @@ Field guide:
 | `mcp` | `allow` list; entries are `*`, a server id from `mcp`, or `server:tool`. |
 | `todos` | `nudge`, `nudge_after_tool_calls`, `hard_gate` (see [Todo enforcement](/agents/todo-enforcement)). |
 | `kill` | `after_ignored_nudges`, `stall`, `timeout`. Dispatch agents only. |
+| `todo_enforcement` | Legacy alias for `todos` and `kill`, with the `options.todo_enforcement` shape. Cannot be combined with either block. |
 | `context_paths` | Context files for the agent, overriding `options.context_paths`. |
+| `workspace` | `worktree` or `none`. A builtin dispatch agent always runs in a worktree (`none` is accepted and ignored); an `a2a` agent always runs with `none`. |
+| `card`, `auth`, `transport` | [External agents](/agents/configuration#external-agents) only: the card URL, `{ "type": "bearer", "token": "$VAR" }`, and `{ "idle_timeout": "2m" }`. |
 | `$defaults` | Only `todos` and `kill`: the knobs every agent inherits. |
 
 An `a2a` agent is defined by its external card, so it may only set `role`,
 `name`, `description`, `disabled`, `card`, `auth`, `workspace` (must be
 `none`), `transport`, and `kill` (only `timeout`).
 
-The runtime builds every agent from its definition
-([#432](https://github.com/joestump-agent/crush/issues/432)). Fields it parses
-but does not act on yet load with a one-time warning: `workspace: none`, and
-the `a2a` machinery (`runtime: a2a`, `card`, `auth`, `transport`).
-[#433](https://github.com/joestump-agent/crush/issues/433) adds the agent
-parameter to `dispatch_agent`, and
-[#434](https://github.com/joestump-agent/crush/issues/434) fetches external
-cards.
-The `agent` builtin defines the same block from `crushrc`
-([#431](https://github.com/joestump-agent/crush/issues/431)).
+The runtime builds every agent from its definition, and `dispatch_agent` runs
+whichever dispatch agent its `agent` argument names — `options.dispatch.default_agent`
+when it names none. The full field semantics, a worked example of adding a
+dispatch agent, and the load errors are on
+[Multi-agent configuration](/agents/configuration#agent-definitions). The
+`agent` builtin defines the same block from `crushrc`.
 
 ## Full example
 

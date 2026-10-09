@@ -140,6 +140,11 @@ crush run --continue "Follow up on your last response"
 		}
 		defer cleanup()
 
+		// A definition that loaded with a warning is told to the user
+		// here, not only to crush.log, so a refused dispatch later in
+		// the run is no surprise (#560).
+		writeLoadDiagnostics(os.Stderr, ws.LoadDiagnostics())
+
 		event.AppInitialized()
 
 		if !ws.Config().IsConfigured() {

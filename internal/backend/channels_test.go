@@ -57,7 +57,7 @@ func TestChannelTargetSession(t *testing.T) {
 
 	t.Run("single viewed session wins", func(t *testing.T) {
 		t.Parallel()
-		got, err := channelTargetSession(ctx, []string{"s1"}, &fakeChannelSessions{})
+		got, err := channelTargetSession(ctx, "signal", []string{"s1"}, &fakeChannelSessions{})
 		require.NoError(t, err)
 		require.Equal(t, "s1", got)
 	})
@@ -68,7 +68,7 @@ func TestChannelTargetSession(t *testing.T) {
 			"old": {ID: "old", UpdatedAt: 100},
 			"new": {ID: "new", UpdatedAt: 200},
 		}}
-		got, err := channelTargetSession(ctx, []string{"new", "old"}, store)
+		got, err := channelTargetSession(ctx, "signal", []string{"new", "old"}, store)
 		require.NoError(t, err)
 		require.Equal(t, "new", got)
 	})
@@ -79,7 +79,7 @@ func TestChannelTargetSession(t *testing.T) {
 			"b": {ID: "b", UpdatedAt: 100},
 			"a": {ID: "a", UpdatedAt: 100},
 		}}
-		got, err := channelTargetSession(ctx, []string{"b", "a"}, store)
+		got, err := channelTargetSession(ctx, "signal", []string{"b", "a"}, store)
 		require.NoError(t, err)
 		require.Equal(t, "a", got)
 	})
@@ -89,16 +89,27 @@ func TestChannelTargetSession(t *testing.T) {
 		store := &fakeChannelSessions{listed: []session.Session{
 			{ID: "recent"}, {ID: "older"},
 		}}
-		got, err := channelTargetSession(ctx, nil, store)
+		got, err := channelTargetSession(ctx, "signal", nil, store)
 		require.NoError(t, err)
 		require.Equal(t, "recent", got)
+		require.Empty(t, store.created)
+	})
+
+	t.Run("none viewed prefers session bound to the channel", func(t *testing.T) {
+		t.Parallel()
+		store := &fakeChannelSessions{listed: []session.Session{
+			{ID: "unrelated"}, {ID: "channel-chat", Channel: "signal"}, {ID: "older-channel", Channel: "signal"},
+		}}
+		got, err := channelTargetSession(ctx, "signal", nil, store)
+		require.NoError(t, err)
+		require.Equal(t, "channel-chat", got)
 		require.Empty(t, store.created)
 	})
 
 	t.Run("none viewed and no sessions creates one", func(t *testing.T) {
 		t.Parallel()
 		store := &fakeChannelSessions{}
-		got, err := channelTargetSession(ctx, nil, store)
+		got, err := channelTargetSession(ctx, "signal", nil, store)
 		require.NoError(t, err)
 		require.Equal(t, "created-New Session", got)
 		require.Equal(t, []string{"New Session"}, store.created)
@@ -107,7 +118,7 @@ func TestChannelTargetSession(t *testing.T) {
 	t.Run("all viewed sessions unloadable falls back", func(t *testing.T) {
 		t.Parallel()
 		store := &fakeChannelSessions{getErr: errors.New("boom")}
-		got, err := channelTargetSession(ctx, []string{"x", "y"}, store)
+		got, err := channelTargetSession(ctx, "signal", []string{"x", "y"}, store)
 		require.NoError(t, err)
 		require.Equal(t, "created-New Session", got)
 	})
@@ -188,13 +199,23 @@ func (f *fullFakeSessions) List(ctx context.Context) ([]session.Session, error) 
 // declares an MCP server named srvName, opted in as a channel iff
 // enabled is true, mirroring the fields the channel router reads.
 func insertChannelWorkspace(t *testing.T, b *Backend, srvName string, enabled bool, coord agent.Coordinator, sessions session.Service) *Workspace {
+	return insertChannelWorkspaceCfg(t, b, srvName, enabled, false, coord, sessions)
+}
+
+// insertChannelWorkspaceCfg is insertChannelWorkspace with control over both
+// enablement sources: `enabled` opts the server in via the --channels
+// override, `configEnabled` writes channel_enabled: true into the workspace's
+// crush.json.
+func insertChannelWorkspaceCfg(t *testing.T, b *Backend, srvName string, enabled, configEnabled bool, coord agent.Coordinator, sessions session.Service) *Workspace {
 	t.Helper()
 
 	wd := t.TempDir()
+	mcpEntry := map[string]any{"type": "http", "url": "http://127.0.0.1:0/mcp"}
+	if configEnabled {
+		mcpEntry["channel_enabled"] = true
+	}
 	cfgJSON, err := json.Marshal(map[string]any{
-		"mcp": map[string]any{
-			srvName: map[string]any{"type": "http", "url": "http://127.0.0.1:0/mcp"},
-		},
+		"mcp": map[string]any{srvName: mcpEntry},
 	})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(wd, "crush.json"), cfgJSON, 0o644))
@@ -301,43 +322,9 @@ func TestRouteChannelMessage_ConfigEnabled(t *testing.T) {
 	b, _ := newTestBackend(t)
 
 	coord := newRecordingCoordinator()
-
-	// Build a workspace whose MCP config sets channel_enabled: true on
-	// the server, but does NOT set any override (no --channels).
-	wd := t.TempDir()
-	cfgJSON, err := json.Marshal(map[string]any{
-		"mcp": map[string]any{
-			"webhook": map[string]any{
-				"type":            "http",
-				"url":             "http://127.0.0.1:0/mcp",
-				"channel_enabled": true,
-			},
-		},
-	})
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(wd, "crush.json"), cfgJSON, 0o644))
-
-	cfg, err := config.Init(wd, "", false)
-	require.NoError(t, err)
-	// Deliberately do NOT set cfg.Overrides().EnabledChannels.
-
-	ws := &Workspace{
-		ID:           uuid.New().String(),
-		Path:         wd,
-		Cfg:          cfg,
-		resolvedPath: wd,
-		clients:      make(map[string]*clientState),
-		shutdownFn:   func() {},
-	}
-	ws.App = &app.App{
-		AgentCoordinator: coord,
-		Sessions:         &fullFakeSessions{fakeChannelSessions: &fakeChannelSessions{listed: []session.Session{{ID: "recent"}}}},
-	}
-	ws.ctx, ws.cancel = context.WithCancel(b.ctx)
-	b.mu.Lock()
-	b.workspaces.Set(ws.ID, ws)
-	b.pathIndex[ws.resolvedPath] = ws.ID
-	b.mu.Unlock()
+	sessions := &fullFakeSessions{fakeChannelSessions: &fakeChannelSessions{listed: []session.Session{{ID: "recent"}}}}
+	// channel_enabled in config, deliberately no --channels override.
+	ws := insertChannelWorkspaceCfg(t, b, "webhook", false, true, coord, sessions)
 
 	const content = `<channel source="webhook">config-enabled push</channel>`
 	b.routeChannelMessage(mcptools.Event{

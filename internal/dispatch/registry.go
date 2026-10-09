@@ -278,10 +278,12 @@ func (r *AgentRegistry) List() []Entry {
 // Update applies fn to the entry for id under the registry lock and
 // reports whether the entry exists. Later phases use it for the fields
 // they own: #64 stamps the session and status, #65 the timestamps and
-// terminal result, #313 the handle, #70 the endpoint and card. Every
-// successful mutation is published as an UpdatedEvent on the entry
-// stream ([AgentRegistry.Subscribe]) so the todo collector can
-// re-emit.
+// terminal result, #313 the handle, #70 the endpoint and card. A
+// successful mutation on a non-terminal entry is published as an
+// UpdatedEvent on the entry stream ([AgentRegistry.Subscribe]) so the
+// todo collector can re-emit. A terminal entry is a frozen record
+// (#568): the mutation still applies, but nothing publishes, so each
+// run streams exactly one terminal-status event.
 func (r *AgentRegistry) Update(id string, fn func(*Entry)) bool {
 	if fn == nil {
 		return false
@@ -292,9 +294,12 @@ func (r *AgentRegistry) Update(id string, fn func(*Entry)) bool {
 	if !ok {
 		return false
 	}
+	wasTerminal := e.Status.IsTerminal()
 	fn(&e)
 	r.entries[id] = e
-	r.events.Publish(pubsub.UpdatedEvent, e)
+	if !wasTerminal {
+		r.events.Publish(pubsub.UpdatedEvent, e)
+	}
 	return true
 }
 
@@ -302,20 +307,30 @@ func (r *AgentRegistry) Update(id string, fn func(*Entry)) bool {
 // time bounds as it goes: StartedAt on the first transition to
 // running, FinishedAt on the first terminal state. Both are stamped at
 // most once, so re-setting the same state does not restart the clock.
+// A terminal status is final (#568): once the entry is terminal,
+// SetStatus refuses and publishes nothing, so a late write can never
+// rewrite the record or stream a second terminal event.
 func (r *AgentRegistry) SetStatus(id string, status Status) bool {
-	return r.Update(id, func(e *Entry) {
-		e.Status = status
-		switch status {
-		case StatusRunning:
-			if e.StartedAt.IsZero() {
-				e.StartedAt = time.Now()
-			}
-		case StatusCompleted, StatusFailed, StatusKilled:
-			if e.FinishedAt.IsZero() {
-				e.FinishedAt = time.Now()
-			}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.entries[id]
+	if !ok || e.Status.IsTerminal() {
+		return false
+	}
+	e.Status = status
+	switch status {
+	case StatusRunning:
+		if e.StartedAt.IsZero() {
+			e.StartedAt = time.Now()
 		}
-	})
+	case StatusCompleted, StatusFailed, StatusKilled:
+		if e.FinishedAt.IsZero() {
+			e.FinishedAt = time.Now()
+		}
+	}
+	r.entries[id] = e
+	r.events.Publish(pubsub.UpdatedEvent, e)
+	return true
 }
 
 // SetResult records the terminal DispatchResult (#66) on the entry, so

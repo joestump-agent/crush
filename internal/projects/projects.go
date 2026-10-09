@@ -108,7 +108,7 @@ func Register(workingDir, dataDir string) error {
 	return Save(list)
 }
 
-// List returns all tracked projects sorted by last accessed.
+// List returns all tracked projects, most recently registered first.
 func List() ([]Project, error) {
 	list, err := Load()
 	if err != nil {

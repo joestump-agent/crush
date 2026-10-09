@@ -289,8 +289,7 @@ Flags:
 ```
 
 ```bash
-agent add worker --role dispatch --model openai/gpt-5-mini \
-  --prompt builtin:dispatch --prompt-append .crush/prompts/worker.md \
+agent add tester --role dispatch --model small \
   --tools @read @write job_output job_kill lsp_diagnostics \
   --kill-after-nudges 2 --stall 5m --timeout 30m
 agent add reviewer --role dispatch --runtime a2a \
@@ -299,9 +298,13 @@ agent add reviewer --role dispatch --runtime a2a \
 ```
 
 Counts take a non-negative integer or `off`; durations take a Go duration
-(`5m`), a bare number of seconds, or `off`. Unknown tools, role changes on
-built-ins, and other semantic errors are reported when the config loads, not
-here.
+(`5m`), a bare number of seconds, or `off`. A `--model provider/model` pin
+must name a configured provider and model, a `--prompt`/`--prompt-append`
+file must exist (relative to the working directory), and a `--mcp` entry
+must name a configured server. Unknown tools, role changes on built-ins, and
+other semantic errors are reported when the config loads, not here. A new
+agent that omits `--tools` is allowed every tool; see
+[Adding a dispatch agent](/agents/configuration#adding-a-dispatch-agent).
 
 ### `agent set`
 
@@ -515,6 +518,22 @@ option todo-nudge false
 option todo-kill-after-nudges 3
 option dispatch-stall 5m
 option dispatch-timeout 1h
+```
+
+### Dispatch keys
+
+These keys configure the `dispatch_agent` tool itself, under
+`options.dispatch` in the JSON form. See
+[Multi-agent configuration](/agents/configuration).
+
+| Key | JSON | Effect |
+| --- | --- | --- |
+| `dispatch-max-concurrent N` | `options.dispatch.max_concurrent` | How many dispatched agents may run at once, counting ones still provisioning. Default 4; `0` or a negative value fails the load |
+| `dispatch-default-agent ID` | `options.dispatch.default_agent` | The agent definition a `dispatch_agent` call without an `agent` argument runs. Default `worker`; an unknown or non-dispatch id fails the load |
+
+```bash
+option dispatch-max-concurrent 2
+option dispatch-default-agent worker   # or an agent you added with agent add
 ```
 
 ### A2A listener keys
