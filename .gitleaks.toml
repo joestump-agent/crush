@@ -1,0 +1,32 @@
+# gitleaks configuration for the security workflow (full-history scan).
+#
+# Extends the built-in rules; the allowlist below covers the twelve
+# historical findings a first full-history scan produced, all of them
+# placeholders: fixtures in tests that exercise redaction, documented
+# example values, a GitHub OAuth client ID (not a secret), model IDs
+# matched by name, and upstream's PostHog project key, which is a public
+# write-only client token. Anything new fails the PR.
+#
+# @joestump 10/09/2026 - Added with the gitleaks CI gate.
+
+title = "crush"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fixtures, examples and public client tokens"
+paths = [
+  '''_test\.go$''',
+  '''(^|/)testdata/''',
+  '''^README\.md$''',
+  '''^docs-site/''',
+  '''^internal/config/VALIDATION\.md$''',
+  '''^internal/llm/models/models\.go$''',
+]
+regexes = [
+  # PostHog project API key: a public, write-only client token.
+  '''phc_[A-Za-z0-9]{40,}''',
+  # GitHub OAuth App client IDs are public identifiers.
+  '''Iv1\.[0-9a-f]{16}''',
+]
