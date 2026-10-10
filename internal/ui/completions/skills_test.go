@@ -12,7 +12,7 @@ import (
 func TestSetSkillItemsOpensWithSkills(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	require.False(t, c.IsOpen())
 
 	c.SetSkillItems([]SkillCompletionValue{
@@ -30,7 +30,7 @@ func TestSetSkillItemsOpensWithSkills(t *testing.T) {
 func TestSkillCompletionFilter(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems([]SkillCompletionValue{
 		{Name: "code-review"},
 		{Name: "commit"},
@@ -49,7 +49,7 @@ func TestSkillCompletionFilter(t *testing.T) {
 func TestSkillDescriptionShownAndSearchable(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems([]SkillCompletionValue{
 		{Name: "skill-creator", Description: "Use for naming skills\nand writing frontmatter."},
 		{Name: "commit", Description: "Write a conventional commit."},
@@ -76,7 +76,7 @@ func TestSkillDescriptionShownAndSearchable(t *testing.T) {
 func TestSkillDescriptionTruncatedToPopupWidth(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems([]SkillCompletionValue{
 		{Name: "commit", Description: strings.Repeat("long ", 200)},
 	}, nil)
@@ -93,7 +93,7 @@ func TestSkillDescriptionDroppedWhenNameEatsTheRow(t *testing.T) {
 	// A name long enough to leave no room for a useful description renders
 	// bare rather than as a row of ellipsis.
 	long := strings.Repeat("a", maxWidth)
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems([]SkillCompletionValue{{Name: long, Description: "does things"}}, nil)
 
 	first, ok := c.filtered[0].(*CompletionItem)
@@ -105,7 +105,7 @@ func TestSkillDescriptionDroppedWhenNameEatsTheRow(t *testing.T) {
 func TestSelectCurrentReturnsSkillSelectionMsg(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems([]SkillCompletionValue{
 		{Name: "commit", Path: "/skills/commit/SKILL.md"},
 	}, nil)
@@ -122,7 +122,7 @@ func TestSelectCurrentReturnsSkillSelectionMsg(t *testing.T) {
 func TestSelectCurrentSkillKeepOpen(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems([]SkillCompletionValue{{Name: "commit"}}, nil)
 
 	msg := c.selectCurrent(true)
@@ -135,7 +135,7 @@ func TestSelectCurrentSkillKeepOpen(t *testing.T) {
 func TestSetSkillItemsEmpty(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems(nil, nil)
 
 	require.True(t, c.IsOpen())
@@ -148,7 +148,7 @@ func TestSkillItemsDoNotAffectFileSelectionDispatch(t *testing.T) {
 
 	// Regression: file/resource values must still dispatch their own
 	// SelectionMsg types after the skill case was added.
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetItems([]FileCompletionValue{{Path: "foo.go"}}, nil, nil)
 
 	msg := c.selectCurrent(false)
@@ -163,7 +163,7 @@ func TestSkillItemsDoNotAffectFileSelectionDispatch(t *testing.T) {
 func TestSetSkillItemsIncludesPrompts(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems(
 		[]SkillCompletionValue{{Name: "code-review", Description: "Review a diff."}},
 		[]PromptCompletionValue{
@@ -192,7 +192,7 @@ func TestSetSkillItemsIncludesPrompts(t *testing.T) {
 func TestSetSkillItemsPromptsOnly(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems(nil, []PromptCompletionValue{
 		{Name: "gitea:review", MCPName: "gitea", PromptID: "review"},
 	})
@@ -207,7 +207,7 @@ func TestSetSkillItemsPromptsOnly(t *testing.T) {
 func TestSelectCurrentReturnsPromptSelection(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems(nil, []PromptCompletionValue{
 		{Name: "gitea:review", MCPName: "gitea", PromptID: "review"},
 	})
@@ -225,7 +225,7 @@ func TestSelectCurrentReturnsPromptSelection(t *testing.T) {
 func TestSelectCurrentStillReturnsSkillSelection(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetSkillItems([]SkillCompletionValue{{Name: "code-review"}}, nil)
 
 	msg := c.selectCurrent(false)

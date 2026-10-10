@@ -26,6 +26,13 @@ const (
 	ModelIcon       string = "◇"
 	HypercreditIcon string = "◆"
 
+	// AgentIcon marks a dispatched sub-agent surface: the @ popup's agent
+	// rows, the inspect-mode sidebar banner, and the agent tag on an
+	// inspected transcript's metadata lines. Nerd Font md-robot; renders
+	// as one cell on Nerd Font terminals and as a replacement glyph
+	// elsewhere.
+	AgentIcon string = "󰚩"
+
 	ArrowRightIcon string = "→"
 
 	// CodespanPadding is the padding rendered around inline code spans in
@@ -281,6 +288,9 @@ type Styles struct {
 	Sidebar struct {
 		SessionTitle lipgloss.Style // Current session title at top of sidebar
 		WorkingDir   lipgloss.Style // Working directory path (PrettyPath)
+		// AgentInspect is the highlighted banner naming the sub-agent
+		// whose transcript the inspect view is showing.
+		AgentInspect lipgloss.Style
 	}
 
 	// ModelInfo (model name, provider, reasoning, token/cost summary)
@@ -658,6 +668,9 @@ type Styles struct {
 		Normal  lipgloss.Style
 		Focused lipgloss.Style
 		Match   lipgloss.Style
+		// Agent styles the live-agent rows in the @ popup so they read
+		// as actors rather than file paths.
+		Agent lipgloss.Style
 	}
 
 	// Attachments styles

@@ -24,6 +24,7 @@ import (
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/ui/chat"
+	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/crush/internal/ui/util"
 )
 
@@ -109,6 +110,7 @@ func (m *UI) inspectingSessionID() string {
 // again.
 func (m *UI) clearInspectState() {
 	m.inspecting = nil
+	m.inspectTask = nil
 	m.inspectRing = nil
 	m.inspectRingPos = 0
 	m.inspectDispatchTargets = nil
@@ -310,6 +312,11 @@ func (m *UI) enterInspect(ref agentBlockRef) tea.Cmd {
 		m.inspectRing = m.liveAgentSessionIDs()
 		m.inspectDispatchTargets = m.liveDispatchSessionIDs()
 	}
+	// The editor is read-only while inspecting (#415), so a popup left
+	// open over the input would be dead weight; drop it on entry.
+	if m.completionsOpen {
+		m.closeCompletions()
+	}
 	m.inspectRingPos = slices.Index(m.inspectRing, ref.sessionID)
 	return m.loadInspectSession(ref.sessionID)
 }
@@ -364,6 +371,14 @@ func (m *UI) handleInspectLoaded(msg inspectSessionLoadedMsg) tea.Cmd {
 	buffer := m.inspectWindow.events
 	m.inspectWindow = nil
 	m.inspecting = msg.sess
+	// Resolve the viewed agent's handle, role and status once per load
+	// (#415): the placeholder, the sidebar banner and the transcript's
+	// metadata lines all name it, and handleAgentTask keeps it fresh.
+	if task, ok := m.com.Workspace.AgentTask(msg.sess.ID); ok {
+		m.inspectTask = &task
+	} else {
+		m.inspectTask = nil
+	}
 
 	// Liveness comes from the ring captured off the parent's blocks at
 	// entry: when cycling, the chat holds the previous child, not them.
@@ -508,26 +523,71 @@ func (m *UI) handleInspectFetchFailed(msg inspectFetchFailedMsg) tea.Cmd {
 	return util.ReportError(msg.err)
 }
 
-// inspectPlaceholder renders the editor placeholder shown while
-// inspecting: a persistent reminder of what is on screen, where prompts
-// land, and how to leave. The title is what gets truncated, so the way
-// back stays visible however long the child session's title is.
-func (m *UI) inspectPlaceholder() string {
-	title := "sub-agent"
-	if m.inspecting != nil && m.inspecting.Title != "" {
-		title = m.inspecting.Title
+// inspectAgentHandle names the viewed sub-agent for the placeholder, the
+// sidebar banner and the metadata lines: the @handle when the workspace
+// knows the task, else the child session's title, else "sub-agent".
+func (m *UI) inspectAgentHandle() string {
+	if m.inspectTask != nil && m.inspectTask.Handle != "" {
+		return "@" + m.inspectTask.Handle
 	}
+	if m.inspecting != nil && m.inspecting.Title != "" {
+		return m.inspecting.Title
+	}
+	return "sub-agent"
+}
+
+// stampInspectAgentLabels labels assistant metadata lines with the viewed
+// sub-agent's name while its transcript is on screen (#415): every
+// response footer in the child transcript names the agent that wrote it.
+func (m *UI) stampInspectAgentLabels(items ...chat.MessageItem) {
+	if !m.isInspecting() {
+		return
+	}
+	name := m.inspectAgentHandle()
+	for _, item := range items {
+		if info, ok := item.(*chat.AssistantInfoItem); ok {
+			info.SetSourceAgent(name)
+		}
+	}
+}
+
+// inspectBanner renders the highlighted sidebar line naming the viewed
+// sub-agent and its live status (#415), shown under the session title
+// while the inspect view is open — the persistent answer to "which agent
+// am I looking at".
+func (m *UI) inspectBanner(width int) string {
+	t := m.com.Styles
+	text := styles.AgentIcon + " " + m.inspectAgentHandle()
+	if m.inspectTask != nil {
+		if label := completionStateLabel(m.inspectTask.Status); label != "" {
+			text += " · " + label
+		}
+	}
+	return t.Sidebar.AgentInspect.
+		Width(width).
+		MaxHeight(1).
+		Render(ansi.Truncate(text, max(1, width), "…"))
+}
+
+// inspectPlaceholder renders the editor placeholder shown while
+// inspecting: a persistent reminder of which agent is on screen and how
+// to leave. The handle is what gets truncated, so the way back stays
+// visible however long the handle is. The editor itself is read-only
+// (#415), so the placeholder says so instead of explaining where prompts
+// land.
+func (m *UI) inspectPlaceholder() string {
+	name := m.inspectAgentHandle()
 	pos := ""
 	if len(m.inspectRing) > 1 && m.inspectRingPos >= 0 {
 		pos = fmt.Sprintf(" (%d/%d)", m.inspectRingPos+1, len(m.inspectRing))
 	}
 	const prefix = "Inspecting "
-	suffix := pos + " · esc returns · prompts go to the parent"
+	suffix := pos + " · esc returns · editor read-only"
 	width := m.textarea.Width() - 1
 	if width <= 0 {
 		width = inspectPlaceholderWidth
 	}
 	room := max(1, width-ansi.StringWidth(prefix)-ansi.StringWidth(suffix))
-	text := prefix + ansi.Truncate(title, room, "…") + suffix
+	text := prefix + ansi.Truncate(name, room, "…") + suffix
 	return ansi.Truncate(text, width, "…")
 }

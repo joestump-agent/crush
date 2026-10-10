@@ -310,6 +310,22 @@ type AssistantInfoItem struct {
 	sty                 *styles.Styles
 	cfg                 *config.Config
 	lastUserMessageTime time.Time
+
+	// sourceAgent names the sub-agent whose transcript this line belongs
+	// to, set by the model while a child session is on screen in the
+	// inspect view (#415). Empty on the parent's own lines.
+	sourceAgent string
+}
+
+// SetSourceAgent labels this metadata line with the inspected sub-agent's
+// name and drops any cached render so the tag appears immediately.
+func (a *AssistantInfoItem) SetSourceAgent(name string) {
+	if a.sourceAgent == name {
+		return
+	}
+	a.sourceAgent = name
+	a.clearCache()
+	a.Bump()
 }
 
 // NewAssistantInfoItem creates a new AssistantInfoItem.
@@ -390,11 +406,17 @@ func (a *AssistantInfoItem) renderContent(width int) string {
 		modelFormatted = fmt.Sprintf("%s %s %s", modelFormatted, arrow, routedModel)
 	}
 	savings := prismSavingsSuffix(a.sty, a.message)
+	// An inspected sub-agent's line carries its handle next to the
+	// model, so the transcript reads as that agent's work (#415).
+	agentTag := ""
+	if a.sourceAgent != "" {
+		agentTag = a.sty.Messages.AssistantInfoProvider.Render(styles.AgentIcon+" "+a.sourceAgent) + " "
+	}
 	if !isFinalTurn {
 		if savings != "" {
-			return fmt.Sprintf("%s %s %s", icon, modelFormatted, savings)
+			return fmt.Sprintf("%s %s%s %s", icon, agentTag, modelFormatted, savings)
 		}
-		return fmt.Sprintf("%s %s", icon, modelFormatted)
+		return fmt.Sprintf("%s %s%s", icon, agentTag, modelFormatted)
 	}
 	providerName := a.message.Provider
 	if providerConfig, ok := a.cfg.Providers.Get(a.message.Provider); ok {
@@ -403,7 +425,7 @@ func (a *AssistantInfoItem) renderContent(width int) string {
 	provider := a.sty.Messages.AssistantInfoProvider.Render(fmt.Sprintf("via %s", providerName))
 	duration := time.Unix(finishData.Time, 0).Sub(a.lastUserMessageTime)
 	infoMsg := a.sty.Messages.AssistantInfoDuration.Render(fmt.Sprintf("in %s", duration))
-	assistant := fmt.Sprintf("%s %s %s %s", icon, modelFormatted, provider, infoMsg)
+	assistant := fmt.Sprintf("%s %s%s %s %s", icon, agentTag, modelFormatted, provider, infoMsg)
 	if savings != "" {
 		assistant = fmt.Sprintf("%s %s", assistant, savings)
 	}

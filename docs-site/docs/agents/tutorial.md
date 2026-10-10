@@ -149,11 +149,13 @@ through the live agents. Press <kbd>esc</kbd> or <kbd>ctrl+[</kbd> to go
 back; the chat's scroll position is restored. Both keys work on every
 terminal, and <kbd>esc</kbd> never cancels the main agent from inspect mode.
 
-While you inspect, the editor still belongs to the main agent: anything you
-send goes to the main conversation, as the editor placeholder reminds you:
-`Inspecting <title> · ctrl+[ returns · prompts go to the parent`. In yolo mode
-the placeholder reads `Go crazy` instead. <kbd>ctrl+x</kbd> cancels the agent
-you are viewing.
+While you inspect, the editor is read-only: typing, paste and submit are
+ignored, so nothing can land unseen in the main conversation. The editor
+placeholder reminds you which agent is on screen:
+`Inspecting @handle · esc returns · editor read-only`. In yolo mode the
+placeholder reads `Go crazy` instead. <kbd>ctrl+x</kbd> cancels the agent
+you are viewing, and the sidebar shows a highlighted banner with the agent's
+handle and live status.
 
 ## Review and apply
 

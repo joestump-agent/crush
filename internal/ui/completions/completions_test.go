@@ -1,8 +1,10 @@
 package completions
 
 import (
+	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/stretchr/testify/require"
 )
@@ -10,7 +12,7 @@ import (
 func TestFilterPrefersExactBasenameStem(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetItems([]FileCompletionValue{
 		{Path: "internal/ui/chat/search.go"},
 		{Path: "internal/ui/chat/user.go"},
@@ -29,7 +31,7 @@ func TestFilterPrefersExactBasenameStem(t *testing.T) {
 func TestFilterPrefersBasenamePrefix(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetItems([]FileCompletionValue{
 		{Path: "internal/ui/chat/mcp.go"},
 		{Path: "internal/ui/model/chat.go"},
@@ -92,7 +94,7 @@ func TestNamePriorityTier(t *testing.T) {
 func TestFilterPrefersPathSegmentExact(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetItems([]FileCompletionValue{
 		{Path: "internal/ui/model/xychat.go"},
 		{Path: "internal/ui/chat/mcp.go"},
@@ -113,7 +115,7 @@ func TestFilterPrefersPathSegmentExact(t *testing.T) {
 func TestSetItemsIncludesLiveAgents(t *testing.T) {
 	t.Parallel()
 
-	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
 	c.SetItems([]FileCompletionValue{{Path: "internal/ui/chat/search.go"}}, nil, []AgentCompletionValue{
 		{Handle: "tester", Detail: "writes tests · ● working · wiring form validation"},
 	})
@@ -130,4 +132,54 @@ func TestSetItemsIncludesLiveAgents(t *testing.T) {
 	sel, ok := first.Value().(AgentCompletionValue)
 	require.True(t, ok)
 	require.Equal(t, "tester", sel.Handle)
+}
+
+// TestSelectAgentEmitsSelectionMsg pins the agent-completion enter path
+// (#313 regression): selecting a live agent's row must emit a
+// SelectionMsg[AgentCompletionValue] and close the popup. Before the fix,
+// Enter fell through selectCurrent's type switch, so the popup half-closed
+// — the component stopped rendering while the model still believed it was
+// open, and no @handle was inserted.
+func TestSelectAgentEmitsSelectionMsg(t *testing.T) {
+	t.Parallel()
+
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c.SetItems(nil, nil, []AgentCompletionValue{
+		{Handle: "go-review", Detail: "reviewer · working"},
+		{Handle: "sec-review", Detail: "security · working"},
+	})
+
+	msg, handled := c.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	require.True(t, handled, "enter must be consumed while the popup is open")
+	selection, ok := msg.(SelectionMsg[AgentCompletionValue])
+	require.True(t, ok, "enter on an agent row must emit an agent selection, got %T", msg)
+	require.Equal(t, "go-review", selection.Value.Handle)
+	require.False(t, selection.KeepOpen)
+	require.False(t, c.IsOpen(), "the popup must be fully closed after selection")
+
+	// The glyph prefix must not leak into the inserted value or the sort
+	// key: the model inserts the bare handle and name-priority tiering
+	// matches what the user typed after the @.
+	require.Equal(t, "go-review", selection.Value.Handle)
+	first := c.allItems[0].(*CompletionItem)
+	require.Equal(t, "@go-review", first.SortKey())
+}
+
+// TestAgentSortKeyIsTheBareHandleWhenDetailDrops pins the ranking key for
+// a row too wide to carry its description: the tier must still see the
+// bare "@handle", not the glyph-prefixed row text, which never matches
+// what the user typed after the @.
+func TestAgentSortKeyIsTheBareHandleWhenDetailDrops(t *testing.T) {
+	t.Parallel()
+
+	handle := strings.Repeat("a", 96)
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c.SetItems(nil, nil, []AgentCompletionValue{
+		{Handle: handle, Detail: "reviewer"},
+	})
+
+	first, ok := c.filtered[0].(*CompletionItem)
+	require.True(t, ok)
+	require.Equal(t, -1, first.detailStart, "the description must be dropped on a row this wide")
+	require.Equal(t, "@"+handle, first.SortKey(), "the sort key must stay the bare @handle")
 }
