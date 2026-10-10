@@ -37,6 +37,8 @@ type fakeEnv struct {
 	history     history.Service
 	filetracker *filetracker.Service
 	lspClients  *csync.Map[string, *lsp.Client]
+	// cleanup is the owning test's t.Cleanup.
+	cleanup func(func())
 }
 
 type builderFunc func(t *testing.T, r *vcr.Recorder) (fantasy.LanguageModel, error)
@@ -99,7 +101,12 @@ func testEnvAtDir(t *testing.T, workingDir string) fakeEnv {
 	lspClients := csync.NewMap[string, *lsp.Client]()
 
 	t.Cleanup(func() {
-		conn.Close()
+		require.NoError(t, conn.Close())
+		// Close closes only idle connections; one a run left checked
+		// out keeps crush.db open, and Windows then fails TempDir's
+		// cleanup.
+		require.Zero(t, conn.Stats().OpenConnections,
+			"a DB connection was still checked out when the test closed the database")
 	})
 
 	return fakeEnv{
@@ -110,6 +117,7 @@ func testEnvAtDir(t *testing.T, workingDir string) fakeEnv {
 		history,
 		&filetrackerService,
 		lspClients,
+		t.Cleanup,
 	}
 }
 
@@ -137,7 +145,18 @@ func testSessionAgent(env fakeEnv, large, small fantasy.LanguageModel, systemPro
 		Messages:     env.messages,
 		Tools:        tools,
 	})
+	env.joinTitles(agent)
 	return agent
+}
+
+// joinTitles makes the test wait for sa's detached title generations
+// before the env closes the database. Registered after the env's own
+// cleanup, it runs first, so no title write still holds a connection when
+// the zero-connection check runs.
+func (e fakeEnv) joinTitles(sa SessionAgent) {
+	if a, ok := sa.(*sessionAgent); ok {
+		e.cleanup(a.titles.Wait)
+	}
 }
 
 func coderAgent(r *vcr.Recorder, env fakeEnv, large, small fantasy.LanguageModel) (SessionAgent, error) {

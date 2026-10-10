@@ -1082,6 +1082,9 @@ func newDeliveryEnv(t *testing.T) (*coordinator, *fakeMainAgent, string) {
 		mainAgent:     main,
 		mainAgentName: config.AgentCoder,
 	}
+	// A delivery turn stays a detached run: join it before the env's
+	// cleanup closes the database and deletes the directory (#422).
+	reapDispatchRuns(t, c)
 
 	parent, err := env.sessions.Create(t.Context(), "parent")
 	require.NoError(t, err)

@@ -26,6 +26,7 @@ func TestSessionAgentRun_QueueStripsOnComplete(t *testing.T) {
 		Sessions: env.sessions,
 		Messages: env.messages,
 	}).(*sessionAgent)
+	env.joinTitles(a)
 
 	const sessionID = "queued-session"
 	// Mark the session as busy so Run takes the queue branch
@@ -74,6 +75,7 @@ func TestDrainQueueForStep_FiltersUnderDispatchLock(t *testing.T) {
 		Sessions: env.sessions,
 		Messages: env.messages,
 	}).(*sessionAgent)
+	env.joinTitles(a)
 
 	const sessionID = "drain-session"
 	a.messageQueue.Set(sessionID, []SessionAgentCall{
@@ -107,6 +109,7 @@ func TestDrainQueueForStep_NoMarkFoldsAllNonRunID(t *testing.T) {
 		Sessions: env.sessions,
 		Messages: env.messages,
 	}).(*sessionAgent)
+	env.joinTitles(a)
 
 	const sessionID = "drain-nomark"
 	a.messageQueue.Set(sessionID, []SessionAgentCall{
@@ -134,6 +137,7 @@ func TestDrainQueueForStep_KeepsRunIDPromptsQueued(t *testing.T) {
 		Sessions: env.sessions,
 		Messages: env.messages,
 	}).(*sessionAgent)
+	env.joinTitles(a)
 
 	const sessionID = "drain-runid"
 	a.messageQueue.Set(sessionID, []SessionAgentCall{
@@ -168,6 +172,7 @@ func TestDrainQueueForStep_ReportsCanceledRunIDDrops(t *testing.T) {
 		Sessions: env.sessions,
 		Messages: env.messages,
 	}).(*sessionAgent)
+	env.joinTitles(a)
 
 	const sessionID = "drain-cancel-runid"
 	a.messageQueue.Set(sessionID, []SessionAgentCall{
@@ -264,6 +269,7 @@ func TestCancel_QueuedRunIDPromptPublishesCancelledRunComplete(t *testing.T) {
 		Messages:    env.messages,
 		RunComplete: broker,
 	}).(*sessionAgent)
+	env.joinTitles(a)
 
 	subCtx, subCancel := context.WithCancel(t.Context())
 	defer subCancel()
@@ -302,6 +308,7 @@ func TestDrainQueueForStep_DroppedRunIDPublishesCancelledRunComplete(t *testing.
 		Messages:    env.messages,
 		RunComplete: broker,
 	}).(*sessionAgent)
+	env.joinTitles(a)
 
 	subCtx, subCancel := context.WithCancel(t.Context())
 	defer subCancel()

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -306,6 +307,47 @@ func TestChannelHealthCheckRebuildsAStreamDownSessionThatPingsFine(t *testing.T)
 	require.True(t, ok, "the rebuilt session must be registered — the bug left the registry empty")
 	require.NotSame(t, live, got, "the dead session must have been replaced")
 	require.NoError(t, pingSession(context.Background(), got, time.Second))
+}
+
+func TestChannelHealthCheckRetriesAfterFailedRebuild(t *testing.T) {
+	const name = "test-retry-failed-rebuild"
+	t.Cleanup(cleanupSession(name))
+	cfg := config.NewTestStore(&config.Config{MCP: config.MCPs{
+		name: {Type: config.MCPStdio, ChannelEnabled: true},
+	}})
+
+	seedDeadSession(t, name, true)
+	dead, ok := sessions.Get(name)
+	require.True(t, ok)
+	updateState(name, StateConnected, nil, dead, Counts{})
+
+	origNewSession := newSession
+	calls := 0
+	newSession = func(context.Context, *config.ConfigStore, string, config.MCPConfig, config.VariableResolver, bool) (*ClientSession, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("temporary server outage")
+		}
+		sess, _ := liveSession(t, "send_message")
+		sess.channel = true
+		return sess, nil
+	}
+	t.Cleanup(func() { newSession = origNewSession })
+
+	checkChannelSessions(context.Background(), cfg)
+	require.Equal(t, 1, calls)
+	_, ok = sessions.Get(name)
+	require.False(t, ok, "a failed rebuild leaves no live session")
+	info, ok := GetState(name)
+	require.True(t, ok)
+	require.Equal(t, StateError, info.State)
+	require.True(t, info.Channel, "the error state must retain channel identity for retries")
+
+	checkChannelSessions(context.Background(), cfg)
+	require.Equal(t, 2, calls, "the next health check must retry the missing channel session")
+	renewed, ok := sessions.Get(name)
+	require.True(t, ok, "a later successful attempt must restore the session")
+	require.NoError(t, pingSession(context.Background(), renewed, time.Second))
 }
 
 // A channel session with a healthy stream must be left alone: forcing a rebuild every minute

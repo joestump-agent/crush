@@ -333,6 +333,16 @@ func builtinAgentDefinitions() map[string]AgentDefinition {
 	}
 }
 
+// IsBuiltinAgentID reports whether id names one of the built-in agent
+// definitions Crush ships (coder, plan, task, worker): ids that exist
+// with no user configuration, unlike agents defined in crushrc or
+// crush.json. A built-in id keeps its origin even when the user's
+// config overrides fields on it.
+func IsBuiltinAgentID(id string) bool {
+	_, ok := builtinAgentDefinitions()[id]
+	return ok
+}
+
 // planToolNames is the plan agent's tool list, the literal behind
 // resolvePlanTools.
 func planToolNames() []string {

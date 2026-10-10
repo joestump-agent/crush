@@ -280,6 +280,11 @@ type sessionAgent struct {
 	messageQueue   *csync.Map[string, []SessionAgentCall]
 	activeRequests *csync.Map[string, *activeCancel]
 
+	// titles tracks the detached title generations Run starts. They
+	// outlive Run and write to the session store, so anything that closes
+	// the store must wait on it first.
+	titles sync.WaitGroup
+
 	// dispatchMu holds a per-session mutex that serializes the
 	// accepted -> (cancel-on-entry | queued | active) transition in
 	// Run against a concurrent Cancel. The lock is held only during
@@ -953,7 +958,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// detached context so the title goroutine survives Run's cancel.
 	if !hasUserTextMessage(msgs) {
 		titleCtx := context.WithoutCancel(ctx)
-		go a.GenerateTitle(titleCtx, call.SessionID, call.Prompt)
+		a.titles.Go(func() { a.GenerateTitle(titleCtx, call.SessionID, call.Prompt) })
 	}
 
 	// Add the user message to the session.

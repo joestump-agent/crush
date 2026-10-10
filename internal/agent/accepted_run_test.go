@@ -19,6 +19,7 @@ func newCancelTestAgent(t *testing.T) (*sessionAgent, fakeEnv) {
 		Sessions: env.sessions,
 		Messages: env.messages,
 	}).(*sessionAgent)
+	env.joinTitles(sa)
 	return sa, env
 }
 
