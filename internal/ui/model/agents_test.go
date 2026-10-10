@@ -23,13 +23,16 @@ func newAgentsTestUI(t *testing.T, agents map[string]config.Agent) *UI {
 
 // TestAgentStatusItems_FiltersSortsAndMapsRuntime covers the core logic:
 // only enabled dispatch agents are listed (main and subagent roles are not
-// dispatch targets), they are sorted by id, and the runtime maps to the
-// description while an unusable a2a agent surfaces its reason.
+// dispatch targets), they are sorted by id, and the description carries
+// the two labels a bare runtime token collapsed — origin (built-in vs
+// user-defined) and transport (in-process vs external a2a) — while an
+// unusable a2a agent surfaces its reason.
 func TestAgentStatusItems_FiltersSortsAndMapsRuntime(t *testing.T) {
 	t.Parallel()
 
 	m := newAgentsTestUI(t, map[string]config.Agent{
 		"worker":   {ID: "worker", Name: "Worker", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeBuiltin},
+		"go-coder": {ID: "go-coder", Name: "Go Coder", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeBuiltin},
 		"reviewer": {ID: "reviewer", Name: "Reviewer", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeA2A},
 		"broken":   {ID: "broken", Name: "Broken", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeA2A, Unusable: "agents.broken.card: must use https"},
 		"coder":    {ID: "coder", Name: "Coder", Role: config.AgentRoleMain, Runtime: config.AgentRuntimeBuiltin},
@@ -39,14 +42,16 @@ func TestAgentStatusItems_FiltersSortsAndMapsRuntime(t *testing.T) {
 
 	items := m.agentStatusItems()
 
-	require.Len(t, items, 3, "only enabled dispatch agents are listed")
+	require.Len(t, items, 4, "only enabled dispatch agents are listed")
 	require.Equal(t, "broken", items[0].id)
-	require.Equal(t, "reviewer", items[1].id)
-	require.Equal(t, "worker", items[2].id)
+	require.Equal(t, "go-coder", items[1].id)
+	require.Equal(t, "reviewer", items[2].id)
+	require.Equal(t, "worker", items[3].id)
 
 	require.Contains(t, ansi.Strip(items[0].description), "error: agents.broken.card: must use https")
-	require.Contains(t, ansi.Strip(items[1].description), "a2a")
-	require.Contains(t, ansi.Strip(items[2].description), "builtin")
+	require.Equal(t, "user · in-process", ansi.Strip(items[1].description), "a user-defined builtin-runtime agent is custom but in-process")
+	require.Equal(t, "user · external a2a", ansi.Strip(items[2].description), "an external card agent runs over the wire")
+	require.Equal(t, "built-in · in-process", ansi.Strip(items[3].description), "worker is the one dispatch agent Crush ships")
 }
 
 // TestAgentsInfo_EmptyHidden verifies the empty state hides the section:

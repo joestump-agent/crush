@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
@@ -14,14 +15,16 @@ import (
 )
 
 // agentMentionWorkspace stubs the agent surface (#313, #421) the routing
-// and completion code reads: agents keyed by handle and a recording
-// delivery sink.
+// and completion code reads: agents keyed by handle, a recording
+// delivery sink, and an optional resolved config for the definition
+// completions.
 type agentMentionWorkspace struct {
 	slashCommandWorkspace
 	byHandle   map[string]workspace.AgentTask
 	delivered  []deliveredMessage
 	deliverErr error
 	agentRuns  int
+	cfg        *config.Config
 }
 
 type deliveredMessage struct {
@@ -46,6 +49,8 @@ func (w *agentMentionWorkspace) AgentTaskByHandle(sessionID, handle string) (wor
 	}
 	return task, ok
 }
+
+func (w *agentMentionWorkspace) Config() *config.Config { return w.cfg }
 
 func (w *agentMentionWorkspace) SendAgentMessage(ctx context.Context, sessionID, handle, text string, attachments []message.Attachment) error {
 	if w.deliverErr != nil {
@@ -327,8 +332,9 @@ func TestAgentMentionAttachments(t *testing.T) {
 	require.Contains(t, string(cards[0].Content), "@tester")
 }
 
-// The completions' live-agents source carries handle, role, a status
-// dot, and the current todo — live agents only.
+// The completions' agents source carries handle, role, a status dot, and
+// the current todo for live agents — finished handles never appear — and
+// offers the dispatch agent definitions after them.
 func TestAgentCompletionValues(t *testing.T) {
 	t.Parallel()
 
@@ -344,6 +350,65 @@ func TestAgentCompletionValues(t *testing.T) {
 	require.Contains(t, values[0].Detail, "writes tests")
 	require.Contains(t, values[0].Detail, "●")
 	require.Contains(t, values[0].Detail, "wiring form validation")
+}
+
+// Dispatch agent definitions from the config offer in the @ completions
+// after every live handle: a definition is not a running agent, so its
+// detail says what it is instead of a status, definitions that cannot
+// be dispatched never offer, and a live handle shadows the definition
+// of the same name — the running agent is what a submit routes to.
+func TestAgentCompletionValuesIncludeDefinitions(t *testing.T) {
+	t.Parallel()
+
+	ws := &agentMentionWorkspace{
+		byHandle: map[string]workspace.AgentTask{
+			"tester": runningTask("tester", "writes tests"),
+		},
+		cfg: &config.Config{Agents: map[string]config.Agent{
+			"worker":   {ID: "worker", Name: "Worker", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeBuiltin},
+			"go-coder": {ID: "go-coder", Name: "Go Coder", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeBuiltin},
+			"infra":    {ID: "infra", Name: "Infra", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeA2A},
+			"tester":   {ID: "tester", Name: "Tester", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeBuiltin},
+			"broken":   {ID: "broken", Name: "Broken", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeA2A, Unusable: "agents.broken.card: must use https"},
+			"ghost":    {ID: "ghost", Name: "Ghost", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeBuiltin, Disabled: true},
+			"coder":    {ID: "coder", Name: "Coder", Role: config.AgentRoleMain, Runtime: config.AgentRuntimeBuiltin},
+		}},
+	}
+	m := newAgentMentionUI(ws)
+
+	values := m.agentCompletionValues()
+	require.Len(t, values, 4)
+	require.Equal(t, "tester", values[0].Handle, "the live handle leads")
+	require.Contains(t, values[0].Detail, "working", "the live row is a status row")
+
+	require.Equal(t, "go-coder", values[1].Handle)
+	require.Equal(t, "definition · user · in-process", values[1].Detail)
+	require.Equal(t, "infra", values[2].Handle)
+	require.Equal(t, "definition · user · external a2a", values[2].Detail)
+	require.Equal(t, "worker", values[3].Handle)
+	require.Equal(t, "definition · built-in · in-process", values[3].Detail)
+
+	for _, v := range values[1:] {
+		require.NotContains(t, v.Detail, "working", "a definition row must not read as a live agent")
+	}
+}
+
+// With no live dispatches the definitions still offer: "@go-coder"
+// should complete before anything is running. A nil config (the stub
+// default) offers nothing.
+func TestAgentCompletionValuesDefinitionsOnly(t *testing.T) {
+	t.Parallel()
+
+	ws := &agentMentionWorkspace{cfg: &config.Config{Agents: map[string]config.Agent{
+		"go-coder": {ID: "go-coder", Name: "Go Coder", Role: config.AgentRoleDispatch, Runtime: config.AgentRuntimeBuiltin},
+	}}}
+	m := newAgentMentionUI(ws)
+	values := m.agentCompletionValues()
+	require.Len(t, values, 1)
+	require.Equal(t, "go-coder", values[0].Handle)
+
+	empty := newAgentMentionUI(&agentMentionWorkspace{})
+	require.Empty(t, empty.agentCompletionValues())
 }
 
 // The UI's dispatch surfaces are scoped to the session the UI is

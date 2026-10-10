@@ -57,7 +57,7 @@ func (m *UI) agentStatusItems() []agentStatusItem {
 			continue
 		}
 		icon := t.Resource.OnlineIcon.String()
-		description := agent.Runtime
+		description := agentOriginTransportLabel(id, agent)
 		if agent.Runtime == config.AgentRuntimeA2A && agent.Unusable != "" {
 			icon = t.Resource.ErrorIcon.String()
 			description = fmt.Sprintf("error: %s", agent.Unusable)
@@ -75,6 +75,24 @@ func (m *UI) agentStatusItems() []agentStatusItem {
 	})
 
 	return items
+}
+
+// agentOriginTransportLabel builds one roster row's description from
+// the two facts a bare runtime token collapsed into one word: where
+// the definition comes from — a built-in Crush ships (only worker is a
+// dispatch agent) or one defined in the user's config — and where it
+// runs — in-process on the internal A2A host, or over the wire behind
+// an external Agent Card (runtime a2a).
+func agentOriginTransportLabel(id string, agent config.Agent) string {
+	origin := "user"
+	if config.IsBuiltinAgentID(id) {
+		origin = "built-in"
+	}
+	transport := "in-process"
+	if agent.Runtime == config.AgentRuntimeA2A {
+		transport = "external a2a"
+	}
+	return origin + " · " + transport
 }
 
 func agentList(t *styles.Styles, items []agentStatusItem, width, maxItems int) string {
