@@ -24,11 +24,14 @@ type ResourceCompletionValue struct {
 	MIMEType string
 }
 
-// AgentCompletionValue represents a live dispatched agent offered by the
-// "@" popup alongside files (#313). Handle is the bare handle (no "@");
-// Detail is the composed "role · status · current todo" tail shown after
-// it. Only live agents ever become values — finished handles never
-// linger in the popup, which keeps the not-continuable rule honest.
+// AgentCompletionValue represents an agent offered by the "@" popup
+// alongside files (#313): a live dispatched agent, whose Detail is the
+// composed "role · status · current todo" tail, or a dispatch agent
+// definition, whose Detail opens with "definition · ". Handle is the
+// bare handle or definition id (no "@"). Only live agents route a
+// submit — finished handles never linger in the popup, which keeps the
+// not-continuable rule honest — while a definition names the agent the
+// coder should dispatch.
 type AgentCompletionValue struct {
 	Handle string
 	Detail string

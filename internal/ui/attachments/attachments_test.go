@@ -14,15 +14,7 @@ import (
 
 func newTestRenderer() *Renderer {
 	sty := styles.CharmtonePantera()
-	return NewRenderer(
-		sty.Attachments.Normal,
-		sty.Attachments.Deleting,
-		sty.Attachments.Image,
-		sty.Attachments.Text,
-		sty.Attachments.Skill,
-		sty.Attachments.Prompt,
-		sty.Attachments.Remove,
-	)
+	return NewRenderer(sty.Attachments)
 }
 
 func TestRender_IncludesRemoveButton(t *testing.T) {

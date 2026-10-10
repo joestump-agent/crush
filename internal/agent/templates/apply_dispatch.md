@@ -9,4 +9,4 @@ Modes:
 
 Uncommitted changes in the dispatch workspace count as part of the work: they are committed on the dispatch branch first (as "crush-dispatch <id>: uncommitted work"), so every mode brings both committed and uncommitted work in.
 
-Refusals, none of which change anything: your own checkout is dirty (commit or stash first — a merge cannot safely start on top of your uncommitted work), a merge/rebase/cherry-pick is already in progress in your checkout, the dispatch is unknown or still running, or the work conflicts with yours — the conflicting paths are listed, the merge is aborted, and your checkout is left exactly as it was.
+Refusals, none of which change anything: your own checkout is dirty (commit or stash first — a merge cannot safely start on top of your uncommitted work), a merge/rebase/cherry-pick is already in progress in your checkout, the dispatch is unknown or still running, the dispatch ran on an external A2A agent (it wrote nothing to disk, so there is no workspace or branch to apply), or the work conflicts with yours — the conflicting paths are listed, the merge is aborted, and your checkout is left exactly as it was.

@@ -85,9 +85,10 @@ func TestChannelStatusItems_StateVariants(t *testing.T) {
 	require.Contains(t, got["unknown"], "offline", "unknown state falls back to offline")
 }
 
-// TestChannelsInfo_EmptyShowsNone verifies the empty state renders the section
-// title plus "None" when no channels are configured.
-func TestChannelsInfo_EmptyShowsNone(t *testing.T) {
+// TestChannelsInfo_EmptyHidden verifies the empty state hides the section
+// entirely: channels are opt-in, so no channels means no "Channels" title
+// and no "None" placeholder.
+func TestChannelsInfo_EmptyHidden(t *testing.T) {
 	t.Parallel()
 
 	m := newChannelsTestUI(t, []string{"plain"}, map[string]mcp.ClientInfo{
@@ -95,8 +96,7 @@ func TestChannelsInfo_EmptyShowsNone(t *testing.T) {
 	})
 
 	out := ansi.Strip(m.channelsInfo(40, 10, false))
-	require.Contains(t, out, "Channels")
-	require.Contains(t, out, "None")
+	require.Empty(t, out)
 }
 
 // TestChannelList_Truncation covers the "…and N more" overflow behavior and the

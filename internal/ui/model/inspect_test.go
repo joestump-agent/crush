@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/charmbracelet/crush/internal/agent"
+	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/lsp"
@@ -121,7 +122,11 @@ func (w *inspectWorkspace) AgentClearQueue(sessionID string) {
 	w.agentClearQueues = append(w.agentClearQueues, sessionID)
 }
 
-func (w *inspectWorkspace) AgentIsReady() bool                               { return true }
+func (w *inspectWorkspace) AgentIsReady() bool { return true }
+
+// MCPGetStates satisfies the session-load MCP refresh upstream schedules
+// (requestMCPRefresh); inspect tests have no MCP servers.
+func (w *inspectWorkspace) MCPGetStates() map[string]mcp.ClientInfo          { return nil }
 func (w *inspectWorkspace) AgentIsBusy() bool                                { return false }
 func (w *inspectWorkspace) AgentIsSessionBusy(string) bool                   { return false }
 func (w *inspectWorkspace) AgentReadyErr() error                             { return nil }

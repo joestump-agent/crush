@@ -247,7 +247,9 @@ func newTodoTestAgentOpts(t *testing.T, env fakeEnv, model fantasy.LanguageModel
 	for _, opt := range opts {
 		opt(&options)
 	}
-	return NewSessionAgent(options).(*sessionAgent)
+	sa := NewSessionAgent(options).(*sessionAgent)
+	env.joinTitles(sa)
+	return sa
 }
 
 func catwalkModelCfg() catwalk.Model {

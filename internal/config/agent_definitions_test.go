@@ -386,11 +386,76 @@ func TestAgentDefinitions_UnusableExternalAgentLoads(t *testing.T) {
 			require.Equal(t, tc.want, reviewer.Unusable)
 			require.NotContains(t, reviewer.Unusable, "secret", "the reason never echoes the card URL")
 			require.Empty(t, cfg.Agents[config.AgentWorker].Unusable, "the other agents are untouched")
+
+			// The load ran before any logger existed, so the problem
+			// survives as a diagnostic the command can show (#560).
+			require.Equal(t, []config.LoadDiagnostic{{
+				Severity: config.DiagnosticWarning,
+				Agent:    "reviewer",
+				Message:  "cannot be dispatched: " + tc.want,
+			}}, store.LoadDiagnostics())
 		})
 	}
 
 	good := loadAgentsJSON(t, `{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json", "auth": {"token": "$T"}}}`)
 	require.Empty(t, good.Config().Agents["reviewer"].Unusable)
+	require.Empty(t, good.LoadDiagnostics(), "a usable external agent loads silently")
+}
+
+// TestAgentDefinitions_LoadDiagnostics checks the diagnostics Load keeps
+// on the store (#560): a field a builtin-runtime agent does not honor,
+// kill knobs dropped from a non-dispatch agent, and an unusable external
+// agent each name their agent and problem; they come out in a stable
+// order; a clean config has none; and a reload replaces the set.
+func TestAgentDefinitions_LoadDiagnostics(t *testing.T) {
+	store := loadAgentsJSON(t, `{
+		"worker": {"workspace": "none"},
+		"coder": {"todo_enforcement": {"kill_after_nudges": 2}},
+		"reviewer": {"role": "dispatch", "runtime": "a2a"}
+	}`)
+	require.Equal(t, []config.LoadDiagnostic{
+		{
+			Severity: config.DiagnosticWarning,
+			Agent:    config.AgentCoder,
+			Message:  "agents.coder.todo_enforcement: kill thresholds apply to dispatch agents only and are ignored",
+		},
+		{
+			Severity: config.DiagnosticWarning,
+			Agent:    "reviewer",
+			Message:  "cannot be dispatched: agents.reviewer.card: a runtime a2a agent needs the URL of its Agent Card",
+		},
+		{
+			Severity: config.DiagnosticWarning,
+			Agent:    config.AgentWorker,
+			Message:  "agents.worker.workspace: parsed but not honored by a builtin-runtime agent",
+		},
+	}, store.LoadDiagnostics())
+
+	// The same file loaded again raises the same diagnostics: the log
+	// line is deduped per process, the diagnostics are not.
+	again := loadAgentsJSON(t, `{"reviewer": {"role": "dispatch", "runtime": "a2a"}}`)
+	require.Len(t, again.LoadDiagnostics(), 1)
+	require.Equal(t, "reviewer", again.LoadDiagnostics()[0].Agent)
+
+	// Fixing the definition on disk and reloading clears it; breaking
+	// it again brings it back.
+	configPath := filepath.Join(os.Getenv("CRUSH_GLOBAL_CONFIG"), "crush.json")
+	write := func(agentsJSON string) {
+		t.Helper()
+		body := agentsBaseConfig[:len(agentsBaseConfig)-1] + `,"agents":` + agentsJSON + `}`
+		require.NoError(t, os.WriteFile(configPath, []byte(body), 0o600))
+	}
+	write(`{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "https://example.com/agent.json"}}`)
+	require.NoError(t, again.ReloadFromDisk(context.Background()))
+	require.Empty(t, again.LoadDiagnostics(), "a reload that fixes the agent clears its diagnostic")
+
+	write(`{"reviewer": {"role": "dispatch", "runtime": "a2a", "card": "http://example.com/agent.json"}}`)
+	require.NoError(t, again.ReloadFromDisk(context.Background()))
+	diags := again.LoadDiagnostics()
+	require.Len(t, diags, 1)
+	require.Equal(t, "cannot be dispatched: agents.reviewer.card: must use https; plain http is allowed only for loopback hosts", diags[0].Message)
+
+	require.Empty(t, loadAgentsJSON(t, "").LoadDiagnostics(), "an untouched config starts up silent")
 }
 
 // TestValidateAgentCardURL pins the card URL rule the loader and the
@@ -846,5 +911,22 @@ func TestAgentDefinitions_LoadTimeSanityChecks(t *testing.T) {
 		_, err := config.Load(workDir, dataDir, false)
 		require.ErrorContains(t, err, "invalid dispatch configuration:")
 		require.ErrorContains(t, err, `options.dispatch.default_agent: agent "reviewer" is disabled`)
+	})
+
+	t.Run("an unusable external default_agent fails at load", func(t *testing.T) {
+		// On its own the cardless reviewer loads with a warning; as the
+		// default every dispatch would refuse, it is an error that names
+		// the agent and the problem (#560).
+		workDir, dataDir := isolateReloadEnv(t)
+		globalDir := os.Getenv("CRUSH_GLOBAL_CONFIG")
+		require.NoError(t, os.MkdirAll(globalDir, 0o755))
+		body := agentsBaseConfig[:len(agentsBaseConfig)-1] +
+			`,"agents":{"reviewer":{"role":"dispatch","runtime":"a2a"}}` +
+			`,"options":{"dispatch":{"default_agent":"reviewer"}}}`
+		require.NoError(t, os.WriteFile(filepath.Join(globalDir, "crush.json"), []byte(body), 0o600))
+
+		_, err := config.Load(workDir, dataDir, false)
+		require.ErrorContains(t, err, "invalid dispatch configuration:")
+		require.ErrorContains(t, err, `options.dispatch.default_agent: agent "reviewer" cannot be dispatched: agents.reviewer.card: a runtime a2a agent needs the URL of its Agent Card`)
 	})
 }

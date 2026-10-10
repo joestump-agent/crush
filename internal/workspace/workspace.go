@@ -249,7 +249,16 @@ type Workspace interface {
 	// Config (read-only data)
 	Config() *config.Config
 	WorkingDir() string
+	GitBranch(ctx context.Context) (string, error)
 	Resolver() config.VariableResolver
+	// LoadDiagnostics returns the load diagnostics the config load
+	// collected and the command recorded (#560, #578): the problems
+	// that did not fail the load but that the user should hear about,
+	// such as an external agent that cannot be dispatched or an
+	// allow-commands entry that subtracts nothing from the banned
+	// list. A client workspace returns nil; the server process that
+	// loaded the config logs them itself.
+	LoadDiagnostics() []config.LoadDiagnostic
 
 	// Config mutations (proxied to server in client mode)
 	UpdatePreferredModel(scope config.Scope, modelType config.SelectedModelType, model config.SelectedModel) error
@@ -299,6 +308,11 @@ type Workspace interface {
 	// OAuth/OIDC token refresh commands) and is the mechanism for
 	// refreshing expired credentials.
 	MCPReconnect(ctx context.Context, name string) error
+	MCPServersDisabled(ctx context.Context) ([]string, error)
+	MCPSetServerDisabled(ctx context.Context, name string, disabled bool) error
+	MCPSetServerConfigDisabled(ctx context.Context, name string, disabled bool) error
+	MCPServersEnabled(ctx context.Context) ([]string, error)
+	MCPStartServer(ctx context.Context, name string) error
 	MCPAuthenticate(ctx context.Context, name string) error
 	MCPPendingAuth() []mcptools.PendingAuthServer
 	MCPAuthURL(name string) string

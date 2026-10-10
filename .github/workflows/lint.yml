@@ -32,8 +32,22 @@ jobs:
         run: ./scripts/check_log_capitalization.sh
       # Mirrors the `lint` task: same config, same flags, same pinned
       # golangci-lint version, so a local run and CI cannot disagree.
+      # Built from source with the toolchain go.mod pins rather than taken
+      # as a release binary: a binary built with an older Go cannot read
+      # the export data of packages compiled by a newer one (the
+      # "export data version N is greater than maximum supported" typecheck
+      # failure), and go.mod's toolchain directive moves ahead of the
+      # golangci-lint release cadence.
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13.1
+          version: v2.14.0
+          install-mode: goinstall
           args: --path-mode=abs --config=.golangci.yml --timeout=10m ./...
+      # schema.json is generated from the config types. The workflow that
+      # used to regenerate and commit it on push is gone (CI gates PRs and
+      # nothing else), so drift fails the PR instead: run `task schema`.
+      - name: schema.json is current
+        run: |
+          go run . schema > schema.json
+          git diff --exit-code -- schema.json

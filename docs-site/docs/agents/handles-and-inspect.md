@@ -24,19 +24,20 @@ A dispatched agent's handle is the `handle` the main agent passed to
 leading `@`, lower-cases, collapses each run of characters other than `a-z` and
 `0-9` into one `-`, and trims dashes: `@Team Lead` becomes `team-lead`.
 
-Handles are unique across the Crush process, not per session: a second `tester`
-becomes `tester-2`, then `tester-3`. Assignment is atomic, so agents dispatched
-together never collide. A handle stays reserved until Crush exits, even after
-its agent finishes.
+Handles are unique among **running** agents across the Crush process. A
+handle that is already held by a live agent, or that is one of the reserved
+names `coder`, `plan`, `task`, `worker` and `all`, gets a numeric suffix:
+`tester-2`, then `tester-3`. Assignment is atomic, so agents dispatched
+together never collide. A handle is at most 32 bytes; a longer slug is cut,
+and the cut makes room for the suffix.
+
+A handle lives as long as its run. When the agent finishes, its handle is free
+for the next dispatch — a second `tester` after the first completed is plain
+`tester` again. The finished agent's block and card keep the handle they were
+given.
 
 The handle shows in the agent block's header, the @ completions, the dispatch
 result's `handle` field, and as the name on the agent's A2A card.
-
-:::info[Planned]
-A handle will be released when its run ends. Lookups will be scoped to the
-caller's session tree, and handles will get a length cap and reserved names
-([#399](https://github.com/joestump-agent/crush/issues/399)).
-:::
 
 ## Leading @handle: steering
 
@@ -46,27 +47,25 @@ A message whose first token is a handle goes to that agent, not the main agent:
 @tester skip the benchmarks; just the table tests
 ```
 
-The handle must open the first line (leading spaces are ignored) and be
-followed by whitespace or the end of the message. Handle tokens are letters,
-digits, `-`, and `_`, matched case-insensitively.
+The handle must open the first line (leading spaces are ignored) and end at
+whitespace, the end of the message, or one of `: , . ? !` when that character
+is itself followed by whitespace or the end — `@tester: stop` and
+`@tester, stop` both route, with the punctuation dropped. Handle tokens are
+letters, digits, `-`, and `_`, matched case-insensitively.
 
 | You send | What happens |
 | --- | --- |
 | A running agent's handle, then text | Queued for that agent. Your message and its reply show on its block; nothing lands in the main conversation. |
-| A finished agent's handle, then text | Refused: `agent @tester finished (completed); task sessions are never continuable — dispatch a new agent instead`. The message is consumed. |
-| A handle-shaped token alone | Warning: `Nothing to send @handle — …`. The message is consumed. |
-| Anything else | An ordinary prompt to the main agent. |
+| A finished agent's handle, then text | Refused: `agent @tester finished (completed); task sessions are never continuable — dispatch a new agent instead`. The text stays in the editor. |
+| An external agent's handle, then text | Refused: `steering external agents is not supported yet`. Cancel and re-dispatch instead. |
+| A handle-shaped token alone | Warning: `Nothing to send @handle — write the message after the handle, e.g. "@tester stop writing Rust".` |
+| Anything else, including an unknown handle | An ordinary prompt to the main agent. |
 
-A queued message is folded into the agent's turn at its next model step, or
-runs as its immediate follow-up turn, in the order you sent it.
-
-:::warning[Known issue]
-A routed message drops its attachments, and a refused message's text is lost
-rather than kept in history ([#414](https://github.com/joestump-agent/crush/issues/414)). The grammar is strict ([#415](https://github.com/joestump-agent/crush/issues/415)):
-`@tester: stop` and `@tester, stop` go to the main agent, and a lone
-`@Makefile` is swallowed by the empty-message warning although no agent has
-that handle.
-:::
+Handles resolve against the agents dispatched from your current session's
+tree. A queued message is folded into the agent's turn at its next model step,
+or runs as its immediate follow-up turn, in the order you sent it. If the run
+ends before the agent reads it, the dispatch result lists it under
+`undelivered_steers`.
 
 ## Mid-sentence mentions: agent cards
 
@@ -83,13 +82,14 @@ carries its handle, role, status, current todo, and session ID, and says how to
 steer it. A finished agent's card is marked read-only and adds its key findings
 and diff summary.
 
-A mention must start a word and end at whitespace or a line end, so `@tester?`
-and `@tester's` attach nothing ([#415](https://github.com/joestump-agent/crush/issues/415)). Unknown handles stay plain text.
+A mention must start a word and end the same way a leading handle does, so
+`@tester?` and `@tester,` attach a card while `@tester's` is prose. Unknown
+handles stay plain text.
 
 ## @ completions
 
 Typing <kbd>@</kbd> lists live dispatched agents first, above files and MCP
-resources, from every session in this Crush process:
+resources:
 
 ```text
 @tester        tester · ● · working · Writing edge-case tests
@@ -99,26 +99,20 @@ resources, from every session in this Crush process:
 Each row shows the role, a status dot (● working, ○ queued), and the current
 todo. Finished agents never appear. Selecting a row inserts `@<handle>`.
 
-:::warning[Known issue]
-In a git repository, typing <kbd>@</kbd> creates `.crush/worktrees` in the
-launch directory even if nothing was dispatched. Launched from a subdirectory,
-that new `.crush` can change the data directory the next launch picks ([#370](https://github.com/joestump-agent/crush/issues/370)).
-:::
-
 ## Handles and @file mentions
 
 Handles never contain `.` or `/`, so `@main.go` and `@internal/ui` are always
-files. A bare token such as `@Makefile` is a handle candidate, and if an agent
-has that handle, the agent wins. A file attached from the completions is then
-dropped from the routed message ([#414](https://github.com/joestump-agent/crush/issues/414)).
+files. A bare token such as `@Makefile` is a handle candidate only if an agent
+has that handle; otherwise it is an ordinary file mention or plain text.
 
 ## The `message_agent` tool
 
 `message_agent` is the main agent's version of a leading @handle: ask it to
-"tell @tester to skip the benchmarks" and it calls the tool with a `handle` (or
-the agent's `session_id`) and a `message`. The message is queued the same way,
-the tool returns once it's queued, and the reply appears on the agent's block.
-Unknown and finished agents are refused. Only the main agent has the tool.
+"tell @tester to skip the benchmarks" and it calls the tool with exactly one
+of `handle` or `session_id`, plus a `message`. The message is queued the same
+way, the tool returns once it's queued, and the reply appears on the agent's
+block. Unknown, finished and external agents are refused. Only the main agent
+has the tool, and only for agents dispatched from its own session.
 
 `message_agent`, `cancel_dispatch`, `apply_dispatch` and `dismiss_dispatch` act
 only on agents dispatched from the calling session: another session's handle,
@@ -126,34 +120,26 @@ dispatch ID or session ID is refused exactly like an unknown one
 ([#399](https://github.com/joestump-agent/crush/issues/399),
 [#559](https://github.com/joestump-agent/crush/issues/559)).
 
-:::warning[Known issue]
-The schema marks `session_id` required, though either field works ([#400](https://github.com/joestump-agent/crush/issues/400)).
-:::
-
 ## The agent block
 
 Each `dispatch_agent` call renders as an agent block in the main chat. Its
 header reads like `tester · working · 2m14s · 14.2K tokens · 2/5 todos`: handle,
-state (`queued`, `working`, `complete`, `failed`, `killed` — shown as `canceled` when you stopped it yourself), elapsed time,
-tokens, and todo progress. Below it come the task prompt, the current todo
-(`→ …`), the messages you've sent with the agent's replies, and its tool calls.
+state (`queued`, `working`, `complete`, `failed`, `killed` — shown as
+`canceled` when you stopped it yourself), elapsed time, tokens, and todo
+progress. Below it come the task prompt, the current todo (`→ …`), the
+messages you've sent with the agent's replies, and its tool calls.
 
 When the agent finishes, the block becomes a durable record that never clears:
 `Killed` (rendered as `Canceled` with the reason `canceled by user` when you
-stopped it with <kbd>ctrl+x</kbd>) or `Error` with a reason if the run didn't complete, then
-**Findings** (its final message) and **Diff** (per-file stat and diff, cut off
-at 250 lines). Focus the block and press <kbd>space</kbd> to expand clipped
-sections.
+stopped it with <kbd>ctrl+x</kbd>) or `Error` with a reason if the run didn't
+complete, then **Findings** (its final message) and **Diff** (per-file stat
+and diff, cut off at 250 lines). Focus the block and press <kbd>space</kbd> to
+expand clipped sections. The terminal state is stamped on the parent's
+`dispatch_agent` tool result when the result is delivered, so a reloaded or
+restarted session renders the finished block from that record.
 
 `agent`-tool blocks can be inspected too, but have no handle and can't be
 steered or canceled — <kbd>ctrl+x</kbd> is dispatch-only.
-
-:::warning[Known issue]
-Messages you send an agent are kept only in memory ([#410](https://github.com/joestump-agent/crush/issues/410)). They vanish from
-the block whenever the transcript is rebuilt, leaving inspect mode included,
-and messages sent while inspecting never show. After a restart, a finished
-agent's block reads `working`, from the handle saved at dispatch.
-:::
 
 ## Inspect mode
 
@@ -163,9 +149,8 @@ results, todo nudges — in the chat window while the main session stays active.
 | Key | Not inspecting | Inspecting |
 | --- | --- | --- |
 | <kbd>ctrl+]</kbd> | Open the selected agent block, or the first live agent if none is selected | Cycle to the next live agent |
-| <kbd>ctrl+[</kbd> | Acts as <kbd>esc</kbd> where the terminal can't tell them apart | Back to the chat, scroll restored |
+| <kbd>esc</kbd> or <kbd>ctrl+[</kbd> | Unchanged (<kbd>esc</kbd> keeps its chat meaning) | Back to the chat, scroll restored. Works on every terminal; <kbd>esc</kbd> never cancels the main agent from here |
 | <kbd>ctrl+x</kbd> | Cancel the selected live dispatch block | Cancel the dispatch you are viewing |
-| <kbd>esc</kbd> | Unchanged | Depends on the terminal; see below |
 
 - The keys work from the editor or the chat; an open dialog takes them first.
   With no live agents, Crush reports `No live sub-agents to inspect`.
@@ -180,33 +165,6 @@ results, todo nudges — in the chat window while the main session stays active.
   history stay with the main session. Its new messages don't render while you
   inspect; the transcript reloads when you return.
 - Switching sessions or <kbd>ctrl+n</kbd> leaves inspect mode.
-
-:::warning[Known issue]
-<kbd>esc</kbd> depends on the terminal ([#404](https://github.com/joestump-agent/crush/issues/404)). Without the kitty keyboard
-protocol (macOS Terminal.app, tmux), <kbd>ctrl+[</kbd> arrives as
-<kbd>esc</kbd>, so <kbd>esc</kbd> leaves inspect mode. With it (kitty, Ghostty,
-WezTerm, foot), <kbd>esc</kbd> keeps its chat meaning: while the main agent is
-busy, it clears any queued prompts (a pending dispatch result included), and a
-double press cancels the main agent's turn, stopping any `agent` sub-agent
-you're watching. Use <kbd>ctrl+[</kbd> to leave.
-:::
-
-:::info[Planned]
-<kbd>esc</kbd> and <kbd>ctrl+[</kbd> will both leave inspect mode on every
-terminal, and <kbd>esc</kbd> will never cancel the main agent from inspect mode
-([#404](https://github.com/joestump-agent/crush/issues/404)).
-:::
-
-:::warning[Known issue]
-- Finished `agent`-tool blocks count as live, so <kbd>ctrl+]</kbd> can open the
-  oldest finished agent, and the ring and counter include finished agents
-  ([#405](https://github.com/joestump-agent/crush/issues/405)).
-- Entering from a finished block makes the first <kbd>ctrl+]</kbd> skip the
-  first live agent, and the ring misses agents with no block in the transcript
-  ([#416](https://github.com/joestump-agent/crush/issues/416)).
-- A2UI forms in an inspected transcript stay live; submitting one starts a turn
-  on the main agent ([#407](https://github.com/joestump-agent/crush/issues/407)).
-:::
 
 ## Sessions tree
 
@@ -226,22 +184,16 @@ The list holds every agent-tool task session: dispatched agents, `agent`
 sub-agents, and `agentic_fetch` runs, but not title-generation helpers. If the
 sub-agent's parent isn't the active session, Crush loads the parent first, so
 prompts go to the session the transcript belongs to. Sub-agent sessions open
-read-only and can't be continued; dispatch a new agent instead.
-
-:::warning[Known issue]
-- `crush -s <sub-agent session id>` and `crush run --continue` can still make a
-  sub-agent session active ([#413](https://github.com/joestump-agent/crush/issues/413)).
-- Sub-agents are listed in an order that shifts as they work ([#417](https://github.com/joestump-agent/crush/issues/417)).
-- Deleting a session leaves its sub-agent sessions behind, unlisted ([#418](https://github.com/joestump-agent/crush/issues/418)).
-:::
+read-only and can't be continued; dispatch a new agent instead. Neither
+`crush -s <id>` nor `crush run --continue` will make a task session the active
+one.
 
 ## Client/server mode
 
 In [client/server mode](/features/server-and-workspaces#dispatched-agents-against-a-server)
 (`CRUSH_CLIENT_SERVER=1`), every surface on this page works as it does in
-process ([#421](https://github.com/joestump-agent/crush/issues/421)). The TUI
-follows the server's dispatched agents over A2A, through the server's proxy to
-the workspace's agent host:
+process. The TUI follows the server's dispatched agents over A2A, through the
+server's proxy to the workspace's agent host:
 - the agent block updates live;
 - the @ completions list running agents;
 - a leading `@handle` steers the agent;

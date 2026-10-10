@@ -130,19 +130,19 @@ Your deny list holds inside a dispatched agent: `permissions deny` and
 Denying all of `bash`, `edit`, `multiedit`, and `write` disables dispatch
 entirely.
 
-Dispatch is on by default. Turn it off by denying both of its tools:
+Dispatch is on by default. Turn it off by denying its five tools, or by
+disabling the `worker` agent definition:
 
 ```bash
-permissions deny dispatch_agent message_agent
+permissions deny dispatch_agent message_agent cancel_dispatch apply_dispatch dismiss_dispatch
+# or
+agent set worker --disabled true
 ```
 
-:::warning[Known issues]
-- A dispatched agent follows the yolo setting Crush **started** with, not the
-  <kbd>ctrl+y</kbd> toggle. Start with `--yolo`, toggle it off, and dispatched
-  agents still approve everything without asking. Tracked as [#378](https://github.com/joestump-agent/crush/issues/378).
-- [Hooks](/features/hooks#pretooluse) do not run inside dispatched agents, so
-  a hook policy does not cover them. Tracked as [#377](https://github.com/joestump-agent/crush/issues/377).
-:::
+A dispatched agent follows your **live** yolo setting — the <kbd>ctrl+y</kbd>
+toggle applies to its next request — and its own tool calls run through your
+`PreToolUse` [hooks](/features/hooks#pretooluse), so a hook policy covers it.
+See [Permissions and yolo](/agents/configuration#permissions-and-yolo).
 
 ## Disabling skills
 

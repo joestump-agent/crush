@@ -333,6 +333,16 @@ func builtinAgentDefinitions() map[string]AgentDefinition {
 	}
 }
 
+// IsBuiltinAgentID reports whether id names one of the built-in agent
+// definitions Crush ships (coder, plan, task, worker): ids that exist
+// with no user configuration, unlike agents defined in crushrc or
+// crush.json. A built-in id keeps its origin even when the user's
+// config overrides fields on it.
+func IsBuiltinAgentID(id string) bool {
+	_, ok := builtinAgentDefinitions()[id]
+	return ok
+}
+
 // planToolNames is the plan agent's tool list, the literal behind
 // resolvePlanTools.
 func planToolNames() []string {
@@ -938,19 +948,32 @@ func (c *Config) ValidateAgentModelRefs() error {
 	return nil
 }
 
-// warnedDefinitionFields deduplicates the not-honored-yet warnings so a
-// reload or a config-field write does not repeat them.
+// warnedDefinitionFields deduplicates the logged copies of the
+// definition diagnostics so a reload or a config-field write does not
+// repeat them. The LoadDiagnostic values themselves are never deduped:
+// every SetupAgents reports the full set for the config it resolved.
 var warnedDefinitionFields sync.Map
 
-// warnUnhonoredFields logs one warning per definition field the runtime
-// parses but does not honor, skipping values that merely restate the
-// built-in default so an untouched config starts up silent. #432
-// honored model, prompt, prompt_append, skills, context paths, tools,
-// MCP, and disabled; #434 honored the a2a runtime with its card, auth,
-// transport, and none workspace. A builtin-runtime definition that
-// sets card, auth, or transport still has them ignored, and a builtin
-// dispatch agent always runs in a worktree, so those warn.
-func warnUnhonoredFields(id string, def AgentDefinition) {
+// logDefinitionDiagnostic logs one diagnostic, once per key for the life
+// of the process. At load time the default logger is still discarding
+// (#560), so this copy is for the reloads that follow; the command
+// replays the collected diagnostics once the file logger exists.
+func logDefinitionDiagnostic(key, msg string, args ...any) {
+	if _, loaded := warnedDefinitionFields.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	slog.Warn(msg, args...)
+}
+
+// unhonoredFieldDiagnostics reports one diagnostic per definition field
+// the runtime parses but does not honor, skipping values that merely
+// restate the built-in default so an untouched config starts up silent.
+// #432 honored model, prompt, prompt_append, skills, context paths,
+// tools, MCP, and disabled; #434 honored the a2a runtime with its card,
+// auth, transport, and none workspace. A builtin-runtime definition
+// that sets card, auth, or transport still has them ignored, and a
+// builtin dispatch agent always runs in a worktree, so those warn.
+func unhonoredFieldDiagnostics(id string, def AgentDefinition) []LoadDiagnostic {
 	builtin := builtinAgentDefinitions()[id]
 	isA2A := orString(def.Runtime, AgentRuntimeBuiltin) == AgentRuntimeA2A
 	fields := []struct {
@@ -962,36 +985,46 @@ func warnUnhonoredFields(id string, def AgentDefinition) {
 		{"auth", !isA2A && def.Auth != nil},
 		{"transport", !isA2A && def.Transport != nil},
 	}
+	var diags []LoadDiagnostic
 	for _, field := range fields {
 		if !field.isSet {
 			continue
 		}
-		key := id + "." + field.name
-		if _, loaded := warnedDefinitionFields.LoadOrStore(key, struct{}{}); loaded {
-			continue
-		}
-		slog.Warn("Agent definition field is parsed but not honored yet", "agent", id, "field", field.name)
+		logDefinitionDiagnostic(id+"."+field.name,
+			"Agent definition field is parsed but not honored yet", "agent", id, "field", field.name)
+		diags = append(diags, LoadDiagnostic{
+			Severity: DiagnosticWarning,
+			Agent:    id,
+			Message:  fmt.Sprintf("agents.%s.%s: parsed but not honored by a builtin-runtime agent", id, field.name),
+		})
 	}
 	// The alias's kill rung is dispatch-only (#402); agentFromDefinition
 	// drops it on every other role, so a user tuning a kill knob on, say,
 	// the coder hears why nothing changed.
 	if alias := def.TodoEnforcement; alias != nil && definitionRole(id, def) != AgentRoleDispatch &&
 		(alias.KillAfterNudges != nil || alias.StallWindow != nil || alias.HardTimeout != nil) {
-		key := id + ".todo_enforcement.kill"
-		if _, loaded := warnedDefinitionFields.LoadOrStore(key, struct{}{}); !loaded {
-			slog.Warn("Kill thresholds apply to dispatch agents only and are ignored", "agent", id, "field", "todo_enforcement")
-		}
+		logDefinitionDiagnostic(id+".todo_enforcement.kill",
+			"Kill thresholds apply to dispatch agents only and are ignored", "agent", id, "field", "todo_enforcement")
+		diags = append(diags, LoadDiagnostic{
+			Severity: DiagnosticWarning,
+			Agent:    id,
+			Message:  fmt.Sprintf("agents.%s.todo_enforcement: kill thresholds apply to dispatch agents only and are ignored", id),
+		})
 	}
+	return diags
 }
 
-// warnUnusableExternal logs, once per agent and reason, why a runtime
-// a2a definition cannot be dispatched (#434).
-func warnUnusableExternal(id, problem string) {
+// unusableExternalDiagnostic reports why a runtime a2a definition cannot
+// be dispatched (#434), or false when problem is empty and it can.
+func unusableExternalDiagnostic(id, problem string) (LoadDiagnostic, bool) {
 	if problem == "" {
-		return
+		return LoadDiagnostic{}, false
 	}
-	if _, loaded := warnedDefinitionFields.LoadOrStore(id+".external:"+problem, struct{}{}); loaded {
-		return
-	}
-	slog.Warn("External agent definition cannot be dispatched", "agent", id, "reason", problem)
+	logDefinitionDiagnostic(id+".external:"+problem,
+		"External agent definition cannot be dispatched", "agent", id, "reason", problem)
+	return LoadDiagnostic{
+		Severity: DiagnosticWarning,
+		Agent:    id,
+		Message:  "cannot be dispatched: " + problem,
+	}, true
 }

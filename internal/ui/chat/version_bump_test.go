@@ -77,15 +77,7 @@ func TestUserMessageItem_MutatorsBumpVersion(t *testing.T) {
 	t.Parallel()
 
 	sty := styles.CharmtonePantera()
-	r := attachments.NewRenderer(
-		sty.Attachments.Normal,
-		sty.Attachments.Deleting,
-		sty.Attachments.Image,
-		sty.Attachments.Text,
-		sty.Attachments.Skill,
-		sty.Attachments.Prompt,
-		sty.Attachments.Remove,
-	)
+	r := attachments.NewRenderer(sty.Attachments)
 	msg := &message.Message{
 		ID:   "u-mut",
 		Role: message.User,
@@ -252,15 +244,7 @@ func TestUserMessageItem_FinishedAlwaysTrue(t *testing.T) {
 	t.Parallel()
 
 	sty := styles.CharmtonePantera()
-	r := attachments.NewRenderer(
-		sty.Attachments.Normal,
-		sty.Attachments.Deleting,
-		sty.Attachments.Image,
-		sty.Attachments.Text,
-		sty.Attachments.Skill,
-		sty.Attachments.Prompt,
-		sty.Attachments.Remove,
-	)
+	r := attachments.NewRenderer(sty.Attachments)
 	msg := &message.Message{
 		ID:    "u-fin",
 		Role:  message.User,

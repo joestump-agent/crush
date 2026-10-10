@@ -255,6 +255,8 @@ func TestQueuedDeliveryStampedWhenConsumed(t *testing.T) {
 		Messages:   c.messages,
 		Tools:      []fantasy.AgentTool{echo},
 	}).(*sessionAgent)
+	// Wait for its title generation before the env closes the database.
+	t.Cleanup(sa.titles.Wait)
 	main := &queueingMainAgent{sessionAgent: sa}
 	c.agents[config.AgentCoder] = main
 	c.mainAgent = main

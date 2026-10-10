@@ -151,11 +151,12 @@ Every flag for every one of them is in the
 
 ## Todo enforcement and dispatch
 
-`option` also sets the [multi-agent todo ladder](/agents/todo-enforcement):
+`option` also sets the [multi-agent todo ladder](/agents/todo-enforcement) —
 the nudging, the hard gate, and the dispatched-run timeouts (the JSON form
-keeps them under `options.todo_enforcement`). Durations accept a Go duration
-(`5m`) or a bare number of seconds; `off` means zero, and a negative value
-or an unparseable one fails the load, naming the key.
+keeps them under `options.todo_enforcement`) — and the two dispatch settings
+under `options.dispatch`. Durations accept a Go duration (`5m`) or a bare
+number of seconds; `off` means zero, and a negative value or an unparseable
+one fails the load, naming the key.
 
 ## Agent definitions
 
@@ -187,6 +188,13 @@ lands in the config file. Every flag is in the
 | `todo-kill-after-nudges N\|off` | Nudges a dispatched agent may ignore before it is killed |
 | `dispatch-stall DUR\|off` | Kill a dispatched run whose todos stop updating for this long |
 | `dispatch-timeout DUR\|off` | Kill a dispatched run after this long, whatever its progress |
+| `dispatch-max-concurrent N` | How many dispatched agents may run at once (default 4; at least 1) |
+| `dispatch-default-agent ID` | The agent definition `dispatch_agent` runs when the call names none (default `worker`; must be an enabled dispatch agent) |
+
+```bash
+option dispatch-max-concurrent 2
+option dispatch-default-agent worker
+```
 
 ## A2A TCP listener
 
@@ -219,7 +227,7 @@ appears, with your privileges.
 Dispatched agents follow the same rule in both directions: a dispatch reuses
 the config your session already loaded and never reads or executes the
 worktree's own `crushrc` or `crush.json`, so a branch the model picks cannot
-run code when the dispatch starts ([#374](https://github.com/joestump-agent/crush/issues/374)).
+run code when the dispatch starts.
 
 ## What about JSON?
 
