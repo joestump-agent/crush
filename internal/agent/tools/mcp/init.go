@@ -597,6 +597,10 @@ func suppressLock(name string) *sync.Mutex {
 // resulting session is only committed if the generation is still current, so
 // a config change that restarts the server mid-connect discards this attempt.
 func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m config.MCPConfig, gen uint64, resolver config.VariableResolver) error {
+	return initClientWithSessionFactory(ctx, cfg, name, m, gen, resolver, createSession)
+}
+
+func initClientWithSessionFactory(ctx context.Context, cfg *config.ConfigStore, name string, m config.MCPConfig, gen uint64, resolver config.VariableResolver, sessionFactory func(context.Context, *config.ConfigStore, string, config.MCPConfig, config.VariableResolver, bool) (*ClientSession, error)) error {
 	// OAuth MCPs without a usable cached token require user interaction
 	// (browser auth). If a cached token exists with an access token
 	// (even if expired), try connecting first so the SDK can attempt a
@@ -613,7 +617,7 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 	}
 
 	updateState(name, StateStarting, nil, nil, Counts{}, withPending(m))
-	_, err := connectAndRegister(ctx, cfg, name, m, gen, resolver, ChannelOptIn(m, cfg.Overrides().EnabledChannels, name))
+	_, err := connectAndRegisterWithSessionFactory(ctx, cfg, name, m, gen, resolver, ChannelOptIn(m, cfg.Overrides().EnabledChannels, name), sessionFactory)
 	if err != nil {
 		// If an OAuth MCP fails because the saved token is no longer
 		// valid (e.g. refresh token expired or revoked) or no token
@@ -644,7 +648,11 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 // newer attempt is doing. This is what makes a config change that lands
 // mid-connect converge on the latest config rather than a stale one.
 func connectAndRegister(ctx context.Context, cfg *config.ConfigStore, name string, m config.MCPConfig, gen uint64, resolver config.VariableResolver, channelOptIn bool) (*ClientSession, error) {
-	session, err := createSession(ctx, cfg, name, m, resolver, channelOptIn)
+	return connectAndRegisterWithSessionFactory(ctx, cfg, name, m, gen, resolver, channelOptIn, createSession)
+}
+
+func connectAndRegisterWithSessionFactory(ctx context.Context, cfg *config.ConfigStore, name string, m config.MCPConfig, gen uint64, resolver config.VariableResolver, channelOptIn bool, sessionFactory func(context.Context, *config.ConfigStore, string, config.MCPConfig, config.VariableResolver, bool) (*ClientSession, error)) (*ClientSession, error) {
+	session, err := sessionFactory(ctx, cfg, name, m, resolver, channelOptIn)
 	if err != nil {
 		return nil, err
 	}
@@ -1033,8 +1041,14 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 	info.Client = client
 	info.Counts = counts
 	// Channel marks a server that is an active channel, for the MCP list
-	// marker and the channels dialog.
-	info.Channel = client != nil && client.channel
+	// marker and the channels dialog. Keep the last known value while an
+	// active channel is in StateError: the health check needs it to retry a
+	// failed rebuild after the dead session has been removed from sessions.
+	if client != nil {
+		info.Channel = client.channel
+	} else if state == StateDisabled || state == StateNeedsAuth {
+		info.Channel = false
+	}
 	// Snapshot the a2ui_* capability alongside the counts so a remote
 	// client learns it without reading this process's tool registry.
 	info.A2UITools = a2uiToolNames(name)
