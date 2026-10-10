@@ -196,9 +196,7 @@ func (c *Completions) SetItems(files []FileCompletionValue, resources []Resource
 			}
 		}
 		item := NewCompletionItem(text, agent, c.agentStyle, c.focusedStyle, c.matchStyle)
-		if detailStart >= 0 {
-			item = item.withDetail(detailStart, name)
-		}
+		item = item.withDetail(detailStart, name)
 		items = append(items, item)
 	}
 

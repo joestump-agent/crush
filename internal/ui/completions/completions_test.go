@@ -1,6 +1,7 @@
 package completions
 
 import (
+	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -162,4 +163,23 @@ func TestSelectAgentEmitsSelectionMsg(t *testing.T) {
 	require.Equal(t, "go-review", selection.Value.Handle)
 	first := c.allItems[0].(*CompletionItem)
 	require.Equal(t, "@go-review", first.SortKey())
+}
+
+// TestAgentSortKeyIsTheBareHandleWhenDetailDrops pins the ranking key for
+// a row too wide to carry its description: the tier must still see the
+// bare "@handle", not the glyph-prefixed row text, which never matches
+// what the user typed after the @.
+func TestAgentSortKeyIsTheBareHandleWhenDetailDrops(t *testing.T) {
+	t.Parallel()
+
+	handle := strings.Repeat("a", 96)
+	c := New(lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle(), lipgloss.NewStyle())
+	c.SetItems(nil, nil, []AgentCompletionValue{
+		{Handle: handle, Detail: "reviewer"},
+	})
+
+	first, ok := c.filtered[0].(*CompletionItem)
+	require.True(t, ok)
+	require.Equal(t, -1, first.detailStart, "the description must be dropped on a row this wide")
+	require.Equal(t, "@"+handle, first.SortKey(), "the sort key must stay the bare @handle")
 }
