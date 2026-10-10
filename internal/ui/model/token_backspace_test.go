@@ -283,6 +283,7 @@ func TestBackspaceWhileCompletingDeletesOneChar(t *testing.T) {
 		m.com.Styles.Completions.Normal,
 		m.com.Styles.Completions.Focused,
 		m.com.Styles.Completions.Match,
+		m.com.Styles.Completions.Agent,
 	)
 	m.completionsOpen = true
 	m.completionsTrigger = completions.TriggerFile

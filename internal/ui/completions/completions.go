@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/ui/list"
+	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/exp/ordered"
 )
@@ -77,6 +78,7 @@ type Completions struct {
 	normalStyle  lipgloss.Style
 	focusedStyle lipgloss.Style
 	matchStyle   lipgloss.Style
+	agentStyle   lipgloss.Style
 
 	allItems []list.FilterableItem
 	filtered []list.FilterableItem
@@ -109,7 +111,7 @@ var namePriorityRules = []namePriorityRule{
 }
 
 // New creates a new completions component.
-func New(normalStyle, focusedStyle, matchStyle lipgloss.Style) *Completions {
+func New(normalStyle, focusedStyle, matchStyle, agentStyle lipgloss.Style) *Completions {
 	l := list.NewFilterableList()
 	l.SetGap(0)
 	l.SetReverse(true)
@@ -120,16 +122,18 @@ func New(normalStyle, focusedStyle, matchStyle lipgloss.Style) *Completions {
 		normalStyle:  normalStyle,
 		focusedStyle: focusedStyle,
 		matchStyle:   matchStyle,
+		agentStyle:   agentStyle,
 	}
 }
 
 // SetStyles updates the styles used when rendering completion items.
 // Existing items are not restyled; subsequent SetItems calls pick up the
 // new styles.
-func (c *Completions) SetStyles(normalStyle, focusedStyle, matchStyle lipgloss.Style) {
+func (c *Completions) SetStyles(normalStyle, focusedStyle, matchStyle, agentStyle lipgloss.Style) {
 	c.normalStyle = normalStyle
 	c.focusedStyle = focusedStyle
 	c.matchStyle = matchStyle
+	c.agentStyle = agentStyle
 }
 
 // IsOpen returns whether the completions popup is open.
@@ -175,9 +179,27 @@ func (c *Completions) SetItems(files []FileCompletionValue, resources []Resource
 	items := make([]list.FilterableItem, 0, len(files)+len(resources)+len(agents))
 
 	// Live agents lead: an @handle routes a message, so it outranks a
-	// file path when both match what the user typed.
+	// file path when both match what the user typed. The row carries the
+	// robot glyph and the agent style so agents read as actors, not
+	// paths; the sort key stays the bare "@handle" so name-priority
+	// tiering still matches what the user typed after the @.
 	for _, agent := range agents {
-		items = append(items, c.completionRow("@"+agent.Handle, agent.Detail, agent))
+		name := "@" + agent.Handle
+		display := styles.AgentIcon + " " + name
+		text := display
+		detailStart := -1
+		if detail := flattenSkillDescription(agent.Detail); detail != "" {
+			budget := maxWidth - 2 - ansi.StringWidth(display) - len(skillDetailSeparator)
+			if budget >= minSkillDetailWidth {
+				detailStart = len(display)
+				text = display + skillDetailSeparator + ansi.Truncate(detail, budget, "…")
+			}
+		}
+		item := NewCompletionItem(text, agent, c.agentStyle, c.focusedStyle, c.matchStyle)
+		if detailStart >= 0 {
+			item = item.withDetail(detailStart, name)
+		}
+		items = append(items, item)
 	}
 
 	// Add files.
@@ -477,34 +499,44 @@ func (c *Completions) selectCurrent(keepOpen bool) tea.Msg {
 		return nil
 	}
 
-	if !keepOpen {
-		c.open = false
-	}
-
+	var msg tea.Msg
 	switch item := item.Value().(type) {
 	case SkillCompletionValue:
-		return SelectionMsg[SkillCompletionValue]{
+		msg = SelectionMsg[SkillCompletionValue]{
 			Value:    item,
 			KeepOpen: keepOpen,
 		}
 	case ResourceCompletionValue:
-		return SelectionMsg[ResourceCompletionValue]{
+		msg = SelectionMsg[ResourceCompletionValue]{
 			Value:    item,
 			KeepOpen: keepOpen,
 		}
 	case FileCompletionValue:
-		return SelectionMsg[FileCompletionValue]{
+		msg = SelectionMsg[FileCompletionValue]{
 			Value:    item,
 			KeepOpen: keepOpen,
 		}
 	case PromptCompletionValue:
-		return SelectionMsg[PromptCompletionValue]{
+		msg = SelectionMsg[PromptCompletionValue]{
+			Value:    item,
+			KeepOpen: keepOpen,
+		}
+	case AgentCompletionValue:
+		msg = SelectionMsg[AgentCompletionValue]{
 			Value:    item,
 			KeepOpen: keepOpen,
 		}
 	default:
+		// An unknown value type leaves the popup fully open. Closing
+		// here would half-close it — the component stops rendering
+		// while the model still believes it is open, and an empty
+		// popup rect blanks the chat beneath until the next keypress.
 		return nil
 	}
+	if !keepOpen {
+		c.open = false
+	}
+	return msg
 }
 
 // Render renders the completions popup.

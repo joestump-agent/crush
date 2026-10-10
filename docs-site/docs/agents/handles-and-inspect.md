@@ -152,12 +152,16 @@ results, todo nudges — in the chat window while the main session stays active.
   dispatched later join on the next entry.
 - A live transcript follows the stream.
 - The editor placeholder reads
-  `Inspecting <title> (2/3) · ctrl+[ returns · prompts go to the parent`, with
+  `Inspecting @handle (2/3) · esc returns · editor read-only`, with
   the counter only when several agents are live. Yolo mode replaces it with
   `Go crazy`.
-- **Viewed is not active.** Prompts, `/compact`, the sidebar, todo pills, and
+- **Viewed is not active, and the editor is read-only.** While you inspect,
+  typing, paste and submit are all ignored — nothing can land in the main
+  conversation you cannot see. `/compact`, the sidebar, todo pills, and
   history stay with the main session. Its new messages don't render while you
-  inspect; the transcript reloads when you return.
+  inspect; the transcript reloads when you return. The sidebar carries a
+  highlighted banner naming the inspected agent and its live status, and each
+  response's metadata line in the transcript shows the agent's handle.
 - Switching sessions or <kbd>ctrl+n</kbd> leaves inspect mode.
 
 ## Sessions tree
