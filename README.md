@@ -776,6 +776,14 @@ permissions. Use this with care.
 permissions allow view ls grep edit mcp_context7_get-library-doc
 ```
 
+The `bash` tool additionally runs a small set of read-only commands (`ls`,
+`pwd`, `git status`, `git log`, …) without prompting. Crush parses the command
+to decide, so it applies only when the whole command is provably inert: a
+redirection, a variable assignment, a command substitution, a pipeline, a
+wrapper such as `timeout` or `env` around anything that is not itself
+read-only, or an argument that mutates state (`git branch -D`,
+`git remote set-url`) all fall back to the normal permission prompt.
+
 ### Allowing Blocked Commands
 
 The `bash` tool blocks a set of potentially dangerous commands by default (for

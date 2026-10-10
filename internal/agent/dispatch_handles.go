@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 )
@@ -64,6 +65,20 @@ func scopedSnapshots(snaps []dispatch.TodoSnapshot, sessionID string) []dispatch
 // parent — one no session created — matches nothing (#399).
 func inScope(entry dispatch.Entry, sessionID string) bool {
 	return sessionID != "" && entry.ParentSessionID == sessionID
+}
+
+// dispatchCallerSession is the session a dispatch decision tool runs in
+// (#559). cancel_dispatch, apply_dispatch and dismiss_dispatch act only
+// on the calling session's dispatches, so a call with no session behind
+// it refuses here instead of falling through to an unscoped lookup. The
+// agent loop always stamps the session on a tool call's context; this
+// is the backstop for anything that does not.
+func dispatchCallerSession(ctx context.Context, toolName string) (string, error) {
+	sessionID := tools.GetSessionFromContext(ctx)
+	if sessionID == "" {
+		return "", fmt.Errorf("%s has no calling session; it acts only on dispatches of the session it runs in", toolName)
+	}
+	return sessionID, nil
 }
 
 // DeliverAgentMessageByHandle delivers a message to the dispatched agent

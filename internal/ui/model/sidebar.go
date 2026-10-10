@@ -227,12 +227,14 @@ func (m *UI) drawSidebar(scr uv.Screen, area uv.Rectangle) {
 	blocks := []string{
 		sidebarLogo,
 		title,
-		"",
-		cwd,
-		"",
-		m.modelInfo(contentWidth),
-		"",
 	}
+	// While a sub-agent's transcript is on screen, a highlighted banner
+	// under the title names it (#415): the sidebar stays about the parent
+	// session, and the banner is the persistent "which agent is this".
+	if m.isInspecting() {
+		blocks = append(blocks, m.inspectBanner(contentWidth))
+	}
+	blocks = append(blocks, "", cwd, "", m.modelInfo(contentWidth), "")
 
 	sidebarHeader := lipgloss.JoinVertical(
 		lipgloss.Left,

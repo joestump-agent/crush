@@ -74,6 +74,13 @@ func newInspectWorkspace() *inspectWorkspace {
 	}
 }
 
+// AgentTask answers the inspect view's per-load handle lookup (#415):
+// unknown sessions report not-found so the placeholder falls back to the
+// child session's title.
+func (w *inspectWorkspace) AgentTask(_ string) (workspace.AgentTask, bool) {
+	return workspace.AgentTask{}, false
+}
+
 func (w *inspectWorkspace) GetSession(_ context.Context, id string) (session.Session, error) {
 	w.getSessions = append(w.getSessions, id)
 	sess, ok := w.sessions[id]
@@ -271,11 +278,12 @@ func requireBlockLive(t *testing.T, m *UI, sessionID string, live bool, msgAndAr
 	t.Fatalf("no agent block for session %q", sessionID)
 }
 
-// TestInspectSubmitGoesToActiveSession pins the split invariant (#314):
-// while the chat views a task session, a prompt submitted from the
-// editor lands in the parent (the active session), never in the viewed
-// task session.
-func TestInspectSubmitGoesToActiveSession(t *testing.T) {
+// TestInspectEditorReadOnly pins the read-only editor (#415): while the
+// chat views a task session, the editor neither edits nor submits — an
+// Enter press runs nothing, and typed keys reach no textarea, because a
+// prompt would land in the parent the user cannot see. Leaving inspect
+// mode restores the normal editor.
+func TestInspectEditorReadOnly(t *testing.T) {
 	ws := newInspectWorkspace()
 	m := newInspectUI(t, ws)
 	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
@@ -286,13 +294,46 @@ func TestInspectSubmitGoesToActiveSession(t *testing.T) {
 	require.Equal(t, inspectParentID, m.session.ID, "the parent must stay the active session")
 	require.Contains(t, m.textarea.Placeholder, "Inspecting")
 
-	// Submit a prompt through the real editor path.
+	// Enter submits nothing while inspecting.
 	m.textarea.SetValue("keep working")
 	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	runInspectCmds(m, cmd)
+	require.Empty(t, ws.agentRuns,
+		"a prompt submitted while inspecting must run nowhere: the editor is read-only")
 
+	// Typing reaches no textarea: the draft the parent would inherit
+	// stays whatever it was before the drill-in.
+	m.textarea.SetValue("")
+	m.Update(tea.KeyPressMsg{Code: 'h'})
+	m.Update(tea.KeyPressMsg{Code: 'i'})
+	require.Empty(t, m.textarea.Value(), "typed keys must not edit the draft while inspecting")
+
+	// Leaving inspect mode restores the normal editor.
+	runInspectCmds(m, m.exitInspect())
+	require.False(t, m.isInspecting())
+	m.textarea.SetValue("keep working")
+	_, cmd = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	runInspectCmds(m, cmd)
 	require.Equal(t, []string{inspectParentID}, ws.agentRuns,
-		"a prompt submitted while inspecting must run against the parent session")
+		"after leaving inspect mode a submitted prompt runs against the parent session")
+}
+
+// TestInspectTabStillMovesFocus pins the one editor-focus key the
+// read-only swallow (#415) must let through: Tab moves focus to the
+// chat, which is the only keyboard way to scroll the inspect
+// transcript when the drill-in started from the editor.
+func TestInspectTabStillMovesFocus(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+
+	require.Equal(t, uiFocusEditor, m.focus)
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	require.True(t, m.isInspecting())
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	require.Equal(t, uiFocusMain, m.focus,
+		"Tab must still move focus to the chat while inspecting")
 }
 
 // TestTaskSessionNeverBecomesActive pins the no-editor-route rule: the
@@ -877,8 +918,7 @@ func TestInspectPlaceholderKeepsTheWayBack(t *testing.T) {
 // TestInitialTaskSessionOpensParentInInspect pins the crush -s routing
 // (#413): starting on the landing screen with a task session ID loads
 // the parent as the active session and opens the task session in the
-// read-only inspect view, and a prompt submitted there runs on the
-// parent.
+// read-only inspect view, whose editor submits nothing (#415).
 func TestInitialTaskSessionOpensParentInInspect(t *testing.T) {
 	ws := newInspectWorkspace()
 	m := newInspectUI(t, ws)
@@ -898,13 +938,14 @@ func TestInitialTaskSessionOpensParentInInspect(t *testing.T) {
 	require.True(t, m.isInspecting(), "the task session must open in inspect mode")
 	require.Equal(t, inspectChildID, m.inspectingSessionID())
 
-	// A prompt submitted from the inspect view runs on the parent.
+	// The inspect view's editor is read-only: an Enter press runs
+	// nothing until the user leaves the view.
 	m.textarea.SetValue("keep working")
 	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	runInspectCmds(m, cmd)
 
-	require.Equal(t, []string{inspectParentID}, ws.agentRuns,
-		"a prompt submitted after a -s start must run against the parent")
+	require.Empty(t, ws.agentRuns,
+		"a prompt submitted from the inspect view must run nowhere: the editor is read-only")
 }
 
 // TestInitialTopLevelSessionLoadsActive pins the unchanged -s behavior:

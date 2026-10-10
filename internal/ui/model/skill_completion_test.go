@@ -32,6 +32,7 @@ func newSkillCompletionUI() *UI {
 		com.Styles.Completions.Normal,
 		com.Styles.Completions.Focused,
 		com.Styles.Completions.Match,
+		com.Styles.Completions.Agent,
 	)
 	return m
 }

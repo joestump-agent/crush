@@ -414,8 +414,13 @@ type UI struct {
 	// whose snapshot is in flight: its target session and the message
 	// events buffered for it until the snapshot lands (#406).
 	// inspectPending is a task session picked from the sessions dialog,
-	// waiting for its parent to load.
+	// waiting for its parent to load. inspectTask caches the viewed
+	// agent's workspace task (handle, role, status, current todo),
+	// resolved once per inspect load and refreshed by handleAgentTask —
+	// never per frame, which would be a workspace round-trip in
+	// client/server mode.
 	inspecting             *session.Session
+	inspectTask            *workspace.AgentTask
 	inspectScroll          [2]int
 	inspectFollow          bool
 	inspectRing            []string
@@ -600,6 +605,7 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 		com.Styles.Completions.Normal,
 		com.Styles.Completions.Focused,
 		com.Styles.Completions.Match,
+		com.Styles.Completions.Agent,
 	)
 
 	todoSpinner := spinner.New(
@@ -1670,6 +1676,11 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			}
 		}
+		// The editor is read-only while inspecting (#415): pasted text
+		// would land in the hidden parent's draft.
+		if m.isInspecting() {
+			return m, tea.Batch(cmds...)
+		}
 		if cmd := m.handlePasteMsg(msg); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
@@ -1834,9 +1845,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.bangMode {
 			m.textarea.Placeholder = "Run a shell command"
 		} else if m.isInspecting() {
-			// Inspecting a sub-agent (#314): the editor still edits the
-			// parent's prompt, so say where a submission will land and
-			// how to leave.
+			// Inspecting a sub-agent (#314): the editor is read-only
+			// (#415), so the placeholder names the viewed agent and the
+			// way back.
 			m.textarea.Placeholder = m.inspectPlaceholder()
 		} else if m.isAgentBusy() {
 			m.textarea.Placeholder = m.workingPlaceholder
@@ -1937,6 +1948,7 @@ func (m *UI) setSessionMessages(msgs []message.Message) tea.Cmd {
 			items = append(items, chat.ExtractMessageItems(m.com.Styles, msg, toolResultMap, m.com.Workspace.WorkingDir())...)
 		}
 	}
+	m.stampInspectAgentLabels(items...)
 
 	// Load nested tool calls for agent/agentic_fetch tools.
 	m.loadNestedToolCalls(items)
@@ -2124,6 +2136,7 @@ func (m *UI) appendSessionMessage(msg message.Message) tea.Cmd {
 		}
 		if chat.ShouldShowAssistantInfo(&msg) {
 			infoItem := chat.NewAssistantInfoItem(m.com.Styles, &msg, m.com.Config(), time.Unix(m.lastUserMessageTime, 0))
+			m.stampInspectAgentLabels(infoItem)
 			m.chat.AppendMessages(infoItem)
 			if m.chat.Follow() {
 				m.chat.ScrollToBottom()
@@ -2241,6 +2254,7 @@ func (m *UI) updateSessionMessage(msg message.Message) tea.Cmd {
 	if infoItem := m.chat.MessageItem(chat.AssistantInfoID(msg.ID)); chat.ShouldShowAssistantInfo(&msg) {
 		if infoItem == nil {
 			newInfoItem := chat.NewAssistantInfoItem(m.com.Styles, &msg, m.com.Config(), time.Unix(m.lastUserMessageTime, 0))
+			m.stampInspectAgentLabels(newInfoItem)
 			m.chat.AppendMessages(newInfoItem)
 		}
 	} else if infoItem != nil {
@@ -2432,6 +2446,13 @@ func (m *UI) feedDispatchConversation(block *chat.DispatchToolMessageItem, event
 func (m *UI) handleAgentTask(task workspace.AgentTask) {
 	if m.session == nil || task.SessionID == "" {
 		return
+	}
+	// Keep the inspect view's cached task fresh (#415): the placeholder,
+	// the sidebar banner and new metadata lines name the viewed agent's
+	// live state.
+	if m.isInspecting() && task.SessionID == m.inspecting.ID {
+		fresh := task
+		m.inspectTask = &fresh
 	}
 	_, toolCallID, ok := m.com.Workspace.ParseAgentToolSessionID(task.SessionID)
 	if !ok {
@@ -3654,6 +3675,18 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 	case uiChat, uiLanding:
 		switch m.focus {
 		case uiFocusEditor:
+			// The editor is read-only while inspecting a sub-agent
+			// (#415): the transcript on screen is the child's, and a
+			// prompt typed here would land in the parent the user
+			// cannot see. Inspect keys (esc, ctrl+], ctrl+x) were
+			// routed earlier by handleInspectKeys; everything else —
+			// typing, paste, submit, @ and / triggers — is swallowed,
+			// except Tab: moving focus to the chat is the only keyboard
+			// way to scroll the transcript.
+			if m.isInspecting() && !key.Matches(msg, m.keyMap.Tab) {
+				return tea.Batch(cmds...)
+			}
+
 			// Handle completions if open.
 			if m.completionsOpen {
 				if msg, ok := m.completions.Update(msg); ok {
@@ -6298,7 +6331,7 @@ func (m *UI) refreshStyles() {
 		m.promptHighlighter.SetStyles(t.Editor.TokenFile, t.Editor.TokenSkill)
 		m.promptHighlighter.Rescan(m.textarea.Value())
 	}
-	m.completions.SetStyles(t.Completions.Normal, t.Completions.Focused, t.Completions.Match)
+	m.completions.SetStyles(t.Completions.Normal, t.Completions.Focused, t.Completions.Match, t.Completions.Agent)
 	m.attachments.Renderer().SetStyles(t.Attachments)
 	m.todoSpinner.Style = t.Pills.TodoSpinner
 	m.status.help.Styles = t.Help

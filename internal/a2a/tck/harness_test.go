@@ -36,6 +36,7 @@ func startHarness(t *testing.T) (baseURL string, factory *a2a.ServerFactory) {
 	t.Cleanup(func() {
 		_ = factory.Close(context.Background())
 	})
+	require.NoError(t, publishDefinition(context.Background(), factory))
 
 	proxy, err := NewProxy(context.Background(), factory, server, sessionID, 0)
 	require.NoError(t, err)
@@ -295,4 +296,35 @@ func TestHarnessProxyForwardsWithoutOriginHeader(t *testing.T) {
 	// the handler, never the host's 403/415/400 pre-checks: reaching
 	// the handler at all means Origin, Content-Type and Host passed.
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// A route's own card path passes through the proxy as spelled (#580), so
+// a hand probe of the harness reads what the host serves there — the
+// dispatch's card, and the definition's — rather than the proxy's
+// rewritten root card.
+func TestHarnessPassesRouteCardsThrough(t *testing.T) {
+	baseURL, factory := startHarness(t)
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	for id, wantName := range map[string]string{"tck-test": "Crush TCK Agent", definitionID: "Coder"} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, baseURL+a2a.AgentPath(id)+wellKnownCardPath, nil)
+		require.NoError(t, err)
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		var card struct {
+			Name                string `json:"name"`
+			SupportedInterfaces []struct {
+				URL string `json:"url"`
+			} `json:"supportedInterfaces"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&card)
+		_ = resp.Body.Close()
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode, id)
+		require.Equal(t, wantName, card.Name, id)
+		require.Len(t, card.SupportedInterfaces, 1, id)
+		require.Equal(t, "http://crush-a2a"+a2a.AgentPath(id), card.SupportedInterfaces[0].URL,
+			"%s: the host's own card, as served on the socket", id)
+	}
+	require.Len(t, factory.AgentCards(), 1, "the harness publishes one definition")
 }
