@@ -6,7 +6,11 @@ package model
 // card. The kill goes through the workspace's CancelAgentTask — A2A
 // tasks/cancel (#421) — which refuses unknown, finished and not yet
 // started agents; the card flips to "canceled" once the agent surface
-// reports it.
+// reports it. This is the human's path and is deliberately not scoped
+// to a session (#559): the workspace resolves any dispatch it follows.
+// The model's cancel_dispatch tool is the scoped one — see the
+// coordinator's CancelDispatch — and this binding never routes through
+// it.
 
 import (
 	"context"

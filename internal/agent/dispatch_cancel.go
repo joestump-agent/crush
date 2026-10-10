@@ -47,7 +47,18 @@ type CancelDispatchParams struct {
 // the dispatch's root context, which terminal assembly still needs to
 // capture the salvage diff. The dispatch ends killed with the reason and
 // its workspace is preserved (#367).
-func (c *coordinator) CancelDispatch(ctx context.Context, ref string) error {
+//
+// callerSessionID scopes the cancel to the session asking (#559), the
+// way steering is scoped (#399): a dispatch another session created
+// refuses exactly like an unknown ref, before its status is revealed,
+// so one session's model cannot kill another session's agent. The
+// model-facing cancel_dispatch tool always passes its own session and
+// refuses to run without one. An empty callerSessionID is the explicit
+// unscoped path, for a caller with no session behind it; none takes it
+// today — the human's ctrl+x (#373) is the workspace's CancelAgentTask,
+// a tasks/cancel on the dispatch's own A2A server, and never enters
+// here. Keep it that way: a model-driven caller must never pass "".
+func (c *coordinator) CancelDispatch(ctx context.Context, callerSessionID, ref string) error {
 	ref = strings.TrimSpace(ref)
 	reg := c.dispatchRegistry()
 
@@ -64,6 +75,9 @@ func (c *coordinator) CancelDispatch(ctx context.Context, ref string) error {
 	}
 	if !ok {
 		return fmt.Errorf("no dispatch %q is known; dispatch one first", ref)
+	}
+	if callerSessionID != "" && !inScope(entry, callerSessionID) {
+		return fmt.Errorf("no dispatch %q in this session; dispatch one first", ref)
 	}
 	if entry.Status.IsTerminal() {
 		return fmt.Errorf("dispatch %s already finished (%s); task sessions are never continuable — dispatch a new agent instead", entry.ID, entry.Status)
@@ -178,7 +192,8 @@ func (c *coordinator) cancelDispatchRun(entryID string) {
 
 // cancelDispatchTool builds the CancelDispatch tool (#373): the model's
 // front door for stopping one dispatched agent mid-run, next to the
-// dispatch_agent tool that starts them.
+// dispatch_agent tool that starts them. The call is scoped to the
+// session it runs in (#559) and refuses without one.
 func (c *coordinator) cancelDispatchTool() fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		CancelDispatchToolName,
@@ -191,7 +206,11 @@ func (c *coordinator) cancelDispatchTool() fantasy.AgentTool {
 			if ref == "" {
 				return fantasy.NewTextErrorResponse("dispatch_id or handle is required"), nil
 			}
-			if err := c.CancelDispatch(ctx, ref); err != nil {
+			caller, err := dispatchCallerSession(ctx, CancelDispatchToolName)
+			if err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
+			if err := c.CancelDispatch(ctx, caller, ref); err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
 			named := params.DispatchID
