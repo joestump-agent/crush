@@ -393,13 +393,7 @@ func TestClientWorkspace_MCPGetStatesTimeout(t *testing.T) {
 // "coder agent is offline"), and that Shutdown stops the loop.
 func TestClientWorkspace_ReconnectsOnStreamDrop(t *testing.T) {
 	// Shrink the backoff so several reconnects happen quickly.
-	origInitial, origMax := sseReconnectInitialBackoff, sseReconnectMaxBackoff
-	sseReconnectInitialBackoff = 5 * time.Millisecond
-	sseReconnectMaxBackoff = 20 * time.Millisecond
-	t.Cleanup(func() {
-		sseReconnectInitialBackoff = origInitial
-		sseReconnectMaxBackoff = origMax
-	})
+	t.Cleanup(SetSSEBackoffForTest(5*time.Millisecond, 20*time.Millisecond))
 
 	var subscribes atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -451,13 +445,7 @@ func TestClientWorkspace_ReconnectsOnStreamDrop(t *testing.T) {
 // reconnect loop does not spin forever after Shutdown even when it can
 // never connect (server unreachable).
 func TestClientWorkspace_SubscriptionStopsWhenServerDown(t *testing.T) {
-	origInitial, origMax := sseReconnectInitialBackoff, sseReconnectMaxBackoff
-	sseReconnectInitialBackoff = 5 * time.Millisecond
-	sseReconnectMaxBackoff = 20 * time.Millisecond
-	t.Cleanup(func() {
-		sseReconnectInitialBackoff = origInitial
-		sseReconnectMaxBackoff = origMax
-	})
+	t.Cleanup(SetSSEBackoffForTest(5*time.Millisecond, 20*time.Millisecond))
 
 	// Port 1 is not listening: SubscribeEvents fails on every attempt.
 	c, err := client.NewClient(t.TempDir(), "tcp", "127.0.0.1:1")

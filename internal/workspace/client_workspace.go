@@ -75,12 +75,31 @@ type ClientWorkspace struct {
 	herdrClient *herdr.Client
 }
 
-// SSE reconnect backoff bounds for the workspace event stream. Declared
-// as vars (not consts) so tests can shrink the delays.
+// SSE reconnect backoff bounds for the workspace event stream. Stored
+// atomically because the subscription goroutine reads them while tests
+// shrink and restore them from cleanup: a plain var read there is a data
+// race (caught by CI's race detector when a leaked subscription goroutine
+// outlived its test). Read through the same-named accessors.
 var (
-	sseReconnectInitialBackoff = 250 * time.Millisecond
-	sseReconnectMaxBackoff     = 10 * time.Second
+	sseReconnectInitialBackoffNS atomic.Int64 // nanoseconds
+	sseReconnectMaxBackoffNS     atomic.Int64 // nanoseconds
 )
+
+func init() {
+	sseReconnectInitialBackoffNS.Store(int64(250 * time.Millisecond))
+	sseReconnectMaxBackoffNS.Store(int64(10 * time.Second))
+}
+
+// sseReconnectInitialBackoff is the delay before the first reconnect
+// attempt after the workspace event stream drops.
+func sseReconnectInitialBackoff() time.Duration {
+	return time.Duration(sseReconnectInitialBackoffNS.Load())
+}
+
+// sseReconnectMaxBackoff caps the reconnect backoff growth.
+func sseReconnectMaxBackoff() time.Duration {
+	return time.Duration(sseReconnectMaxBackoffNS.Load())
+}
 
 // NewClientWorkspace creates a new ClientWorkspace that proxies all
 // operations through the given client SDK. The ws parameter is the
@@ -1035,8 +1054,18 @@ const maxRecoveryEscalate = 20
 // generous because workspace startup is slow (config, database, LSP, MCP);
 // it exists only so an unresponsive server cannot pin the subscription
 // goroutine indefinitely, and the loop simply retries when it trips.
-// A var, not a const, so tests can shrink it.
-var recoveryCreateTimeout = 30 * time.Second
+// Stored atomically for the same reason as the backoff bounds above, and
+// read through the same-named accessor.
+var recoveryCreateTimeoutNS atomic.Int64 // nanoseconds
+
+func init() {
+	recoveryCreateTimeoutNS.Store(int64(30 * time.Second))
+}
+
+// recoveryCreateTimeout is the bound on a single re-registration attempt.
+func recoveryCreateTimeout() time.Duration {
+	return time.Duration(recoveryCreateTimeoutNS.Load())
+}
 
 // runSubscription subscribes to the workspace event stream and forwards
 // translated events to send, reconnecting with capped exponential
@@ -1054,7 +1083,7 @@ func (w *ClientWorkspace) runSubscription(send func(tea.Msg)) {
 	w.subStarted.Store(true)
 	defer close(w.subDone)
 
-	backoff := sseReconnectInitialBackoff
+	backoff := sseReconnectInitialBackoff()
 	degraded := false
 	recoveryFailures := 0
 	markDegraded := func(err error, stuck bool) {
@@ -1082,7 +1111,7 @@ func (w *ClientWorkspace) runSubscription(send func(tea.Msg)) {
 			} else if w.recoverWorkspace() == nil {
 				// Re-registered: resubscribe immediately under the fresh
 				// workspace ID.
-				backoff = sseReconnectInitialBackoff
+				backoff = sseReconnectInitialBackoff()
 				continue
 			} else if w.subCtx.Err() == nil {
 				recoveryFailures++
@@ -1093,7 +1122,7 @@ func (w *ClientWorkspace) runSubscription(send func(tea.Msg)) {
 			if !w.sleepOrDone(backoff) {
 				return
 			}
-			backoff = min(backoff*2, sseReconnectMaxBackoff)
+			backoff = min(backoff*2, sseReconnectMaxBackoff())
 			continue
 		}
 
@@ -1102,7 +1131,7 @@ func (w *ClientWorkspace) runSubscription(send func(tea.Msg)) {
 			recoveryFailures = 0
 			w.afterReconnect(send)
 		}
-		backoff = sseReconnectInitialBackoff
+		backoff = sseReconnectInitialBackoff()
 		w.consumeEvents(evc, send)
 
 		// The event channel closed: the server restarted, the stream was
@@ -1118,7 +1147,7 @@ func (w *ClientWorkspace) runSubscription(send func(tea.Msg)) {
 		if !w.sleepOrDone(backoff) {
 			return
 		}
-		backoff = min(backoff*2, sseReconnectMaxBackoff)
+		backoff = min(backoff*2, sseReconnectMaxBackoff())
 	}
 }
 
@@ -1139,7 +1168,7 @@ func (w *ClientWorkspace) runSubscription(send func(tea.Msg)) {
 // SDK sets no request timeout of its own.
 func (w *ClientWorkspace) recoverWorkspace() error {
 	ctx, cancel := context.WithTimeout(
-		context.WithoutCancel(w.subCtx), recoveryCreateTimeout,
+		context.WithoutCancel(w.subCtx), recoveryCreateTimeout(),
 	)
 	defer cancel()
 	created, err := w.client.CreateWorkspace(ctx, w.recreateArgs())

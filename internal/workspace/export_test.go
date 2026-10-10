@@ -29,19 +29,23 @@ func (w *ClientWorkspace) WorkspaceIDForTest() string {
 }
 
 // SetSSEBackoffForTest shrinks the subscription reconnect backoff and
-// returns a restore function for t.Cleanup.
+// returns a restore function for t.Cleanup. Stored atomically: the
+// subscription goroutine reads the bounds while a test's cleanup restores
+// them, and unsynchronized reads and writes there are a data race.
 func SetSSEBackoffForTest(initial, maxBackoff time.Duration) (restore func()) {
-	origInitial, origMax := sseReconnectInitialBackoff, sseReconnectMaxBackoff
-	sseReconnectInitialBackoff, sseReconnectMaxBackoff = initial, maxBackoff
+	origInitial, origMax := sseReconnectInitialBackoffNS.Load(), sseReconnectMaxBackoffNS.Load()
+	sseReconnectInitialBackoffNS.Store(int64(initial))
+	sseReconnectMaxBackoffNS.Store(int64(maxBackoff))
 	return func() {
-		sseReconnectInitialBackoff, sseReconnectMaxBackoff = origInitial, origMax
+		sseReconnectInitialBackoffNS.Store(origInitial)
+		sseReconnectMaxBackoffNS.Store(origMax)
 	}
 }
 
 // recoveryCreateTimeoutForTest shrinks the bound on a single workspace
 // re-registration attempt and returns a restore function for t.Cleanup.
 func recoveryCreateTimeoutForTest(d time.Duration) (restore func()) {
-	orig := recoveryCreateTimeout
-	recoveryCreateTimeout = d
-	return func() { recoveryCreateTimeout = orig }
+	orig := recoveryCreateTimeoutNS.Load()
+	recoveryCreateTimeoutNS.Store(int64(d))
+	return func() { recoveryCreateTimeoutNS.Store(orig) }
 }
