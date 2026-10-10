@@ -157,10 +157,11 @@ func TestApplyAndDismissRefuseUnknownAndRunning(t *testing.T) {
 func TestApplyAndDismissRefuseExternalDispatch(t *testing.T) {
 	c, _ := newInjectionEnv(t, newGatedDispatchAgent())
 	c.dispatchRegistry().Register(dispatch.Entry{
-		ID:     "external-1",
-		Handle: "remote",
-		Status: dispatch.StatusCompleted,
-		Source: "https://agents.example/card.json",
+		ID:              "external-1",
+		Handle:          "remote",
+		ParentSessionID: "dispatch-parent-session",
+		Status:          dispatch.StatusCompleted,
+		Source:          "https://agents.example/card.json",
 	})
 
 	resp := runTool(t, c.applyDispatchTool(), ApplyDispatchToolName, ApplyDispatchParams{Handle: "remote"})

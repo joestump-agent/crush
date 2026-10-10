@@ -102,22 +102,30 @@ func pathInside(dir, path string) bool {
 
 // resolveFinishedDispatch resolves the dispatch an address pair names and
 // enforces the shared preconditions of apply and dismiss: exactly one
-// address, a known dispatch, and a finished one — a running dispatch
-// refuses with the cancel hint, so neither tool ever races a live run.
-func (c *coordinator) resolveFinishedDispatch(id, handle string) (dispatch.Entry, error) {
+// address, a known dispatch the calling session created, and a finished
+// one — a running dispatch refuses with the cancel hint, so neither tool
+// ever races a live run. callerSessionID scopes the lookup (#559) the
+// way steering is scoped (#399): a dispatch another session created
+// refuses exactly like an unknown one, before its status or branch is
+// revealed. Unlike CancelDispatch there is no human front door here, so
+// there is no unscoped path: an empty caller resolves nothing.
+func (c *coordinator) resolveFinishedDispatch(callerSessionID, id, handle string) (dispatch.Entry, error) {
 	if (id == "") == (handle == "") {
 		return dispatch.Entry{}, fmt.Errorf("provide dispatch_id or handle, exactly one")
+	}
+	ref := id
+	if ref == "" {
+		ref = handle
 	}
 	entry, ok := c.dispatchRegistry().Get(id)
 	if !ok {
 		entry, ok = c.dispatchRegistry().ByHandle(dispatch.HandleSlug(handle))
 	}
 	if !ok {
-		ref := id
-		if ref == "" {
-			ref = handle
-		}
 		return dispatch.Entry{}, fmt.Errorf("no dispatch %q is known; dispatch one first", ref)
+	}
+	if !inScope(entry, callerSessionID) {
+		return dispatch.Entry{}, fmt.Errorf("no dispatch %q in this session; dispatch one first", ref)
 	}
 	if !entry.Status.IsTerminal() {
 		return dispatch.Entry{}, fmt.Errorf("dispatch %s is still running; cancel it first", entry.ID)
@@ -131,6 +139,24 @@ func (c *coordinator) resolveFinishedDispatch(id, handle string) (dispatch.Entry
 		return dispatch.Entry{}, err
 	}
 	return entry, nil
+}
+
+// dispatchPermissionSubject names a dispatch the way the apply and
+// dismiss permission prompts show it (#559): the ID the model used, the
+// @handle the user knows the agent by, the branch about to be merged or
+// deleted, and the session that dispatched it — so the person approving
+// is told whose work this is, not just an ID. Identity the entry lacks
+// is left out rather than printed blank.
+func dispatchPermissionSubject(entry dispatch.Entry) string {
+	parts := make([]string, 0, 3)
+	if entry.Handle != "" {
+		parts = append(parts, "@"+entry.Handle)
+	}
+	parts = append(parts, "branch "+entry.Branch)
+	if entry.ParentSessionID != "" {
+		parts = append(parts, "dispatched from session "+entry.ParentSessionID)
+	}
+	return fmt.Sprintf("%s (%s)", entry.ID, strings.Join(parts, ", "))
 }
 
 // requestDispatchPermission asks the parent's permission service before
@@ -338,7 +364,8 @@ func (c *coordinator) settleDispatch(ctx context.Context, entry dispatch.Entry, 
 // applyDispatchTool builds the ApplyDispatch tool (#368): the model's
 // front door for bringing a finished dispatch's work in, next to the
 // dispatch_agent tool that starts them. Resolution and the permission
-// ask live in the handler so a refused or denied call never touches git.
+// ask live in the handler so a refused or denied call never touches git;
+// both are scoped to the session the call runs in (#559).
 func (c *coordinator) applyDispatchTool() fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		ApplyDispatchToolName,
@@ -352,12 +379,16 @@ func (c *coordinator) applyDispatchTool() fantasy.AgentTool {
 			default:
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("invalid mode %q: must be \"merge\", \"squash\", or \"cherry-pick\"", params.Mode)), nil
 			}
-			entry, err := c.resolveFinishedDispatch(params.DispatchID, params.Handle)
+			caller, err := dispatchCallerSession(ctx, ApplyDispatchToolName)
+			if err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
+			entry, err := c.resolveFinishedDispatch(caller, params.DispatchID, params.Handle)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
 			if resp, ok := c.requestDispatchPermission(ctx, ApplyDispatchToolName,
-				fmt.Sprintf("Apply dispatch %s (branch %s) into your checkout via %s", entry.ID, entry.Branch, mode), call); !ok {
+				fmt.Sprintf("Apply dispatch %s into your checkout via %s", dispatchPermissionSubject(entry), mode), call); !ok {
 				return resp, nil
 			}
 			summary, err := c.ApplyDispatch(ctx, entry, mode)
@@ -372,18 +403,23 @@ func (c *coordinator) applyDispatchTool() fantasy.AgentTool {
 // dismissDispatchTool builds the DismissDispatch tool (#368): the model's
 // front door for discarding a finished dispatch's work and freeing its
 // workspace. Resolution and the permission ask live in the handler so a
-// refused or denied call never touches the workspace.
+// refused or denied call never touches the workspace; both are scoped to
+// the session the call runs in (#559).
 func (c *coordinator) dismissDispatchTool() fantasy.AgentTool {
 	return fantasy.NewAgentTool(
 		DismissDispatchToolName,
 		dismissDispatchToolDescription,
 		func(ctx context.Context, params DismissDispatchParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			entry, err := c.resolveFinishedDispatch(params.DispatchID, params.Handle)
+			caller, err := dispatchCallerSession(ctx, DismissDispatchToolName)
+			if err != nil {
+				return fantasy.NewTextErrorResponse(err.Error()), nil
+			}
+			entry, err := c.resolveFinishedDispatch(caller, params.DispatchID, params.Handle)
 			if err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
 			if resp, ok := c.requestDispatchPermission(ctx, DismissDispatchToolName,
-				fmt.Sprintf("Dismiss dispatch %s (branch %s): discard its work and remove its workspace", entry.ID, entry.Branch), call); !ok {
+				fmt.Sprintf("Dismiss dispatch %s: discard its work and remove its workspace", dispatchPermissionSubject(entry)), call); !ok {
 				return resp, nil
 			}
 			summary, err := c.DismissDispatch(ctx, entry)

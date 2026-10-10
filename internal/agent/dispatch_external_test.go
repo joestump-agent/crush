@@ -383,7 +383,7 @@ func TestExternalDispatchSteeringRefused(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, dispatch.StatusRunning, entry.Status, "a refused steer leaves the run alone")
 
-	require.NoError(t, c.CancelDispatch(t.Context(), handle.DispatchID))
+	require.NoError(t, c.CancelDispatch(t.Context(), "dispatch-parent-session", handle.DispatchID))
 	waitExternalTerminal(t, c, handle.DispatchID)
 }
 
@@ -396,7 +396,7 @@ func TestExternalDispatchCancel(t *testing.T) {
 
 	handle := decodeDispatchHandle(t, runDispatchToolCall(t, c.dispatchTool(), DispatchAgentParams{Prompt: "p", Agent: "reviewer", Handle: "rev"}))
 	<-ext.started
-	require.NoError(t, c.CancelDispatch(t.Context(), "rev"))
+	require.NoError(t, c.CancelDispatch(t.Context(), "dispatch-parent-session", "rev"))
 
 	entry := waitExternalTerminal(t, c, handle.DispatchID)
 	require.Equal(t, dispatch.StatusKilled, entry.Status)
@@ -534,7 +534,7 @@ func TestExternalDispatchReservesSlotBeforeToken(t *testing.T) {
 	require.Contains(t, resp.Content, "dispatch at capacity", "the cap answers before the token is resolved")
 	require.Len(t, host.resolutions(), 1)
 
-	require.NoError(t, c.CancelDispatch(t.Context(), running.DispatchID))
+	require.NoError(t, c.CancelDispatch(t.Context(), "dispatch-parent-session", running.DispatchID))
 	waitExternalTerminal(t, c, running.DispatchID)
 }
 

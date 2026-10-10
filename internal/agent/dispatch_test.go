@@ -364,12 +364,16 @@ func provisionProviderEntry(t *testing.T, provider *dispatch.GitWorktreeProvider
 	return entry
 }
 
+// runTool invokes a tool as the session runDispatchToolCall dispatches
+// from, the way the agent loop runs a tool call in production: the
+// session-scoped dispatch tools (#399, #559) resolve only that session's
+// dispatches, so a fixture's tool call must come from the same one.
 func runTool(t *testing.T, tool fantasy.AgentTool, name string, params any) fantasy.ToolResponse {
 	t.Helper()
 
 	input, err := json.Marshal(params)
 	require.NoError(t, err)
-	ctx := context.WithValue(context.Background(), tools.SessionIDContextKey, "dispatch-test-session")
+	ctx := context.WithValue(context.Background(), tools.SessionIDContextKey, "dispatch-parent-session")
 	resp, err := tool.Run(ctx, fantasy.ToolCall{
 		ID:    "dispatch-test-call",
 		Name:  name,
