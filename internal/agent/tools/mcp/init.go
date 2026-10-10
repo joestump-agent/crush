@@ -1033,8 +1033,14 @@ func updateState(name string, state State, err error, client *ClientSession, cou
 	info.Client = client
 	info.Counts = counts
 	// Channel marks a server that is an active channel, for the MCP list
-	// marker and the channels dialog.
-	info.Channel = client != nil && client.channel
+	// marker and the channels dialog. Keep the last known value while an
+	// active channel is in StateError: the health check needs it to retry a
+	// failed rebuild after the dead session has been removed from sessions.
+	if client != nil {
+		info.Channel = client.channel
+	} else if state == StateDisabled || state == StateNeedsAuth {
+		info.Channel = false
+	}
 	// Snapshot the a2ui_* capability alongside the counts so a remote
 	// client learns it without reading this process's tool registry.
 	info.A2UITools = a2uiToolNames(name)

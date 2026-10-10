@@ -57,6 +57,41 @@ func runChannelHealthCheck(ctx context.Context, cfg *config.ConfigStore, interva
 // stream has stayed down past the reconnect grace the session is forced
 // through the same rebuild path a failed ping takes.
 func checkChannelSessions(ctx context.Context, cfg *config.ConfigStore) {
+	// A failed renewal removes the dead session before rebuilding it. If the
+	// rebuild also fails, there is no session left for the loop below to visit
+	// on the next tick. Retry those channel servers from their retained error
+	// state so a temporary outage cannot leave the channel permanently deaf.
+	for name, info := range states.Seq2() {
+		if info.State != StateError || !info.Channel {
+			continue
+		}
+		m, ok := cfg.Config().MCP[name]
+		if !ok || !ChannelOptIn(m, cfg.Overrides().EnabledChannels, name) {
+			continue
+		}
+		if _, ok := sessions.Get(name); ok {
+			continue
+		}
+
+		mu := renewLock(name)
+		mu.Lock()
+		// Recheck after taking the same lock used by ordinary renewals. A
+		// reconnect or config change may have completed while we waited.
+		info, ok = states.Get(name)
+		m, configured := cfg.Config().MCP[name]
+		_, connected := sessions.Get(name)
+		if !ok || info.State != StateError || !info.Channel || !configured ||
+			!ChannelOptIn(m, cfg.Overrides().EnabledChannels, name) || connected {
+			mu.Unlock()
+			continue
+		}
+		err := initClient(ctx, cfg, name, m, currentGen(name), cfg.Resolver())
+		mu.Unlock()
+		if err != nil {
+			slog.Warn("MCP channel health check failed to retry session", "name", name, "error", err)
+		}
+	}
+
 	for name, sess := range sessions.Seq2() {
 		if !sess.IsChannel() {
 			continue
