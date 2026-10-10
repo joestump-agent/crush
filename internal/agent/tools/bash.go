@@ -253,13 +253,13 @@ func NewBashTool(permissions permission.Service, workingDir, spillDir string, at
 			// Determine working directory
 			execWorkingDir := cmp.Or(params.WorkingDir, workingDir)
 
-			isSafeReadOnly := prefixMatchesReadOnlyCommand(params.Command, safeCommands)
+			safeReadOnly := isSafeReadOnly(params.Command)
 
 			sessionID := GetSessionFromContext(ctx)
 			if sessionID == "" {
 				return fantasy.ToolResponse{}, fmt.Errorf("session ID is required for executing shell command")
 			}
-			if !isSafeReadOnly {
+			if !safeReadOnly {
 				p, err := permissions.Request(
 					ctx,
 					permission.CreatePermissionRequest{
