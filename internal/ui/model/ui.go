@@ -1845,9 +1845,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.bangMode {
 			m.textarea.Placeholder = "Run a shell command"
 		} else if m.isInspecting() {
-			// Inspecting a sub-agent (#314): the editor still edits the
-			// parent's prompt, so say where a submission will land and
-			// how to leave.
+			// Inspecting a sub-agent (#314): the editor is read-only
+			// (#415), so the placeholder names the viewed agent and the
+			// way back.
 			m.textarea.Placeholder = m.inspectPlaceholder()
 		} else if m.isAgentBusy() {
 			m.textarea.Placeholder = m.workingPlaceholder
@@ -3680,8 +3680,10 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			// prompt typed here would land in the parent the user
 			// cannot see. Inspect keys (esc, ctrl+], ctrl+x) were
 			// routed earlier by handleInspectKeys; everything else —
-			// typing, paste, submit, @ and / triggers — is swallowed.
-			if m.isInspecting() {
+			// typing, paste, submit, @ and / triggers — is swallowed,
+			// except Tab: moving focus to the chat is the only keyboard
+			// way to scroll the transcript.
+			if m.isInspecting() && !key.Matches(msg, m.keyMap.Tab) {
 				return tea.Batch(cmds...)
 			}
 

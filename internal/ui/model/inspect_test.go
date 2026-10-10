@@ -318,6 +318,24 @@ func TestInspectEditorReadOnly(t *testing.T) {
 		"after leaving inspect mode a submitted prompt runs against the parent session")
 }
 
+// TestInspectTabStillMovesFocus pins the one editor-focus key the
+// read-only swallow (#415) must let through: Tab moves focus to the
+// chat, which is the only keyboard way to scroll the inspect
+// transcript when the drill-in started from the editor.
+func TestInspectTabStillMovesFocus(t *testing.T) {
+	ws := newInspectWorkspace()
+	m := newInspectUI(t, ws)
+	addChild(ws, inspectChildID, inspectParentID, "Dispatched Agent", inspectChildMessages()...)
+
+	require.Equal(t, uiFocusEditor, m.focus)
+	runInspectCmds(m, m.enterInspect(agentBlockRef{sessionID: inspectChildID}))
+	require.True(t, m.isInspecting())
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	require.Equal(t, uiFocusMain, m.focus,
+		"Tab must still move focus to the chat while inspecting")
+}
+
 // TestTaskSessionNeverBecomesActive pins the no-editor-route rule: the
 // picker returning a task session opens the read-only inspect view; the
 // active session is never replaced and never reloaded.
