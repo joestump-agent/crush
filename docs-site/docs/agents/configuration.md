@@ -134,8 +134,9 @@ from a fixed list of worktree-rooted tools (see
   `skills` argument can narrow the definition's list, never widen it, and a
   name that matches no discovered skill fails the call with
   `unknown skills: …`.
-- **`context_paths`.** Replaces `options.context_paths` for that agent. A
-  dispatched agent resolves them inside its worktree.
+- **`context_paths`.** Replaces `options.context_paths` for that agent. For
+  a dispatched agent, relative paths resolve against your checkout, not the
+  worktree ([#561](https://github.com/joestump-agent/crush/issues/561)).
 - **`workspace`.** A `runtime: a2a` agent always runs with `none`. A builtin
   dispatch agent always runs in a `worktree`: `none` is accepted but ignored
   for it.
@@ -357,8 +358,14 @@ executed.
 - Policy (permissions, command allow-lists, LSP servers, skills paths, MCP,
   hooks) is your session's config: global plus the launch directory's project
   config, whether committed or not.
-- Context files (`AGENTS.md`, `CRUSH.md`, …) and skills are resolved inside
-  the worktree.
+- Context files (`AGENTS.md`, `CRUSH.md`, `CLAUDE.md`, …) are read from
+  **your checkout**, the launch directory, exactly as your own agent reads
+  them, uncommitted edits included. They are never read from the worktree:
+  the base revision is the main agent's choice, so an `AGENTS.md` committed
+  there is as untrusted as a `.crushrc` would be
+  ([#561](https://github.com/joestump-agent/crush/issues/561)). The same
+  goes for a dispatch agent's `context_paths` and for relative
+  `global_context_paths`. Skills are resolved inside the worktree.
 - The data directory is shared with your session, so logs and the database
   stay in one place.
 

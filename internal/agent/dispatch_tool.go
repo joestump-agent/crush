@@ -935,10 +935,17 @@ func (c *coordinator) buildDispatchedAgent(ctx context.Context, opts dispatchAge
 
 	// The dispatched prompt renders from the chosen definition (#433):
 	// builtin:dispatch by default, the definition's file: template when
-	// it names one, against the scoped workspace store. The dispatch's
-	// requested skills narrow the definition's set — a dispatch asks
-	// for fewer skills, never more.
-	promptOpts := []prompt.Option{prompt.WithWorkingDir(opts.Toolchain.WorkingDir())}
+	// it names one, against the scoped workspace store. Its context
+	// files (AGENTS.md, CRUSH.md, …) come from the parent's checkout,
+	// never the worktree (#561): the model chooses the base revision, so
+	// a context file committed there is as untrusted as its .crushrc,
+	// and #374 already keeps that out of the dispatched config. The
+	// dispatch's requested skills narrow the definition's set — a
+	// dispatch asks for fewer skills, never more.
+	promptOpts := []prompt.Option{
+		prompt.WithWorkingDir(opts.Toolchain.WorkingDir()),
+		prompt.WithContextRoot(c.cfg.WorkingDir()),
+	}
 	promptOpts = append(promptOpts, agentPromptOptions(agentCfg)...)
 	requestedSkills := opts.Skills
 	if len(agentCfg.Skills) > 0 {
