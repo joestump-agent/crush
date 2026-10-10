@@ -15,11 +15,12 @@ import (
 func TestResolveCwd_RelativeFlagYieldsAbsolutePath(t *testing.T) {
 	original, err := os.Getwd()
 	require.NoError(t, err)
+
+	dir := t.TempDir()
 	t.Cleanup(func() {
 		_ = os.Chdir(original)
 	})
 
-	dir := t.TempDir()
 	require.NoError(t, os.Mkdir(filepath.Join(dir, "sub"), 0o755))
 	require.NoError(t, os.Chdir(dir))
 
@@ -30,5 +31,11 @@ func TestResolveCwd_RelativeFlagYieldsAbsolutePath(t *testing.T) {
 	resolved, err := ResolveCwd(cmd)
 	require.NoError(t, err)
 	require.True(t, filepath.IsAbs(resolved))
-	require.Equal(t, filepath.Join(dir, "sub"), resolved)
+
+	resolvedInfo, err := os.Stat(resolved)
+	require.NoError(t, err)
+	wantInfo, err := os.Stat(filepath.Join(dir, "sub"))
+	require.NoError(t, err)
+	require.True(t, os.SameFile(resolvedInfo, wantInfo),
+		"resolved %q is not the expected directory %q", resolved, filepath.Join(dir, "sub"))
 }
