@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	a2aspec "github.com/a2aproject/a2a-go/v2/a2a"
+
 	"github.com/charmbracelet/crush/internal/config"
 )
 
@@ -81,10 +83,15 @@ func remotePeerFromContext(ctx context.Context) (remotePeer, bool) {
 
 // hostListener is what the shared request middleware needs to know about
 // the listener a request arrived on: which Host headers it answers to,
-// and what it adds to the route's serve context for the auth interceptor.
+// what it adds to the route's serve context for the auth interceptor, and
+// how a route's card reads to a caller on it (#580).
 type hostListener interface {
 	hostAllowed(host string) bool
 	serveContext(routeCtx context.Context, r *http.Request) context.Context
+	// cardFor returns the card to serve for route id to the caller of r,
+	// whose Host passed hostAllowed: the route's card as built, or a
+	// copy whose interfaces name what this listener's callers can dial.
+	cardFor(card *a2aspec.AgentCard, r *http.Request, id string) *a2aspec.AgentCard
 }
 
 // socketListener is the unix socket's side of the middleware (#346): the
@@ -100,6 +107,13 @@ func (socketListener) serveContext(routeCtx context.Context, r *http.Request) co
 		return context.WithValue(routeCtx, peerUIDContextKey{}, uid)
 	}
 	return routeCtx
+}
+
+// cardFor implements [hostListener] (#580): a socket caller gets the card
+// as built — the socket interface first, the TCP listener's second while
+// it runs — the same object the registry entry and the agent index carry.
+func (socketListener) cardFor(card *a2aspec.AgentCard, _ *http.Request, _ string) *a2aspec.AgentCard {
+	return card
 }
 
 // tcpHost is the host's optional TLS-only TCP listener (#358): its own
@@ -306,6 +320,28 @@ func (t *tcpHost) serveContext(routeCtx context.Context, r *http.Request) contex
 		peer.certIdentity = certIdentity(chain)
 	}
 	return context.WithValue(routeCtx, remotePeerContextKey{}, peer)
+}
+
+// cardFor implements [hostListener] (#580): a TCP caller gets a copy of
+// the card with one interface, the route at the origin the caller dialed
+// — https://<Host>/agents/<id>, the Host having passed hostAllowed. The
+// socket interface is dropped: no remote client can dial the crush-a2a
+// label, and an SDK client takes the first interface it supports. The
+// caller's own origin stands in for the advertised address so a card read
+// through another certificate name, or from a listener with no address to
+// advertise, still names a URL its reader can reach; Crush's own
+// external-agent resolver refuses a card whose JSON-RPC service is on
+// another origin than the card's.
+func (t *tcpHost) cardFor(card *a2aspec.AgentCard, r *http.Request, id string) *a2aspec.AgentCard {
+	transport := a2aspec.TransportProtocolJSONRPC
+	if len(card.SupportedInterfaces) > 0 && card.SupportedInterfaces[0] != nil {
+		transport = card.SupportedInterfaces[0].ProtocolBinding
+	}
+	out := *card
+	out.SupportedInterfaces = []*a2aspec.AgentInterface{
+		a2aspec.NewAgentInterface("https://"+r.Host+agentsPathPrefix+id, transport),
+	}
+	return &out
 }
 
 // certIdentity names a verified client certificate "ca-sha256:<ca>/

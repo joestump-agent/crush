@@ -73,10 +73,11 @@ func TestServerRegisterResolveTeardown(t *testing.T) {
 	require.False(t, ok)
 }
 
-// The served surface (#346): the well-known card path is gone
-// (discovery is in-memory), and a JSON-RPC SendMessage on the dispatch's
-// route runs the executor's full task lifecycle — submitted, working,
-// completed with the agent's text.
+// The served surface (#346): the host has no card of its own at the root
+// well-known path (each route serves its card under its own path, #580),
+// and a JSON-RPC SendMessage on the dispatch's route runs the executor's
+// full task lifecycle — submitted, working, completed with the agent's
+// text.
 func TestServerServesTaskLifecycle(t *testing.T) {
 	runner := &fakeRunner{result: textResult("steered answer")}
 	factory := NewServerFactory(t.TempDir())
@@ -93,9 +94,10 @@ func TestServerServesTaskLifecycle(t *testing.T) {
 
 	client := unixDialClient(factory)
 
-	// The card is no longer served over the wire: the well-known path
-	// never reaches the route table (middleware rejects a content-less
-	// GET with 415 first; a JSON POST to it would 404).
+	// The root well-known path names no route, so it never reaches the
+	// route table (middleware rejects a content-less GET with 415 first;
+	// a JSON POST to it would 404). The dispatch's card lives at
+	// /agents/dispatch-1/.well-known/agent-card.json instead (#580).
 	resp, err := httpGet(t, client, "http://"+a2aURLHost+a2asrv.WellKnownAgentCardPath)
 	require.NoError(t, err)
 	_ = resp.Body.Close()

@@ -302,11 +302,13 @@ type ServerFactory struct {
 	indexClient     *http.Client
 }
 
-// route is one dispatch's slice of the host: its JSON-RPC handler and a
+// route is one dispatch's slice of the host: its JSON-RPC handler, the
+// card the host serves at the route's well-known path (#580), and a
 // context that dies with the dispatch, so Stop (or Close) ends any
 // in-flight stream served for it.
 type route struct {
 	handler http.Handler
+	card    *a2aspec.AgentCard
 	ctx     context.Context
 	cancel  context.CancelFunc
 }
@@ -452,11 +454,9 @@ func (f *ServerFactory) StartServer(ctx context.Context, p ServerParams) (*Serve
 		},
 	})))
 	handler := cancelRaceHandler{a2asrv.NewHandler(executor, handlerOpts...)}
-	mux := http.NewServeMux()
-	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
-	mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
-
-	if err := f.register(p.DispatchID, mux); err != nil {
+	// The route carries its card beside the JSON-RPC handler: the host's
+	// router serves it at /agents/<id>/.well-known/agent-card.json (#580).
+	if err := f.register(p.DispatchID, a2asrv.NewJSONRPCHandler(handler), card); err != nil {
 		return nil, err
 	}
 	// The context is bound for exactly the dispatch's lifetime (#350):
@@ -619,10 +619,7 @@ func (f *ServerFactory) PublishAgentDefinition(ctx context.Context, p agent.Agen
 	// the socket it needs no credentials; a call over the TCP listener
 	// must still authenticate before it is rejected (#358).
 	executor := NewExecutor(nil, "")
-	handler := a2asrv.NewHandler(executor, a2asrv.WithCallInterceptors(&hostAuthenticator{factory: f, remoteOnly: true}))
-	mux := http.NewServeMux()
-	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
-	mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
+	handler := a2asrv.NewJSONRPCHandler(a2asrv.NewHandler(executor, a2asrv.WithCallInterceptors(&hostAuthenticator{factory: f, remoteOnly: true})))
 
 	// Claim the route and the card under one lock: a concurrent publish
 	// of the same definition loses cleanly — the first card wins and
@@ -640,7 +637,7 @@ func (f *ServerFactory) PublishAgentDefinition(ctx context.Context, p agent.Agen
 		return nil
 	}
 	routeCtx, cancel := context.WithCancel(context.Background())
-	f.routes[p.ID] = &route{handler: mux, ctx: routeCtx, cancel: cancel}
+	f.routes[p.ID] = &route{handler: handler, card: card, ctx: routeCtx, cancel: cancel}
 	if f.definitions == nil {
 		f.definitions = make(map[string]*a2aspec.AgentCard)
 	}
@@ -972,23 +969,33 @@ func (f *ServerFactory) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // the TCP listener (#346, #358): middleware first, rejecting cross-origin,
 // non-JSON, wrong-host and unsupported-protocol-version requests before any
 // dispatch work runs, then the route table maps /agents/<dispatch id> onto
-// that dispatch's JSON-RPC handler. The middleware exists because a browser
-// page can CSRF a text/plain POST at any loopback port, DNS-rebind its Host,
-// and fold text into a running agent's turn; requests that pass it still
-// have to authenticate (#357): the route's call interceptor demands the
-// host's bearer token — and the socket peer's own uid where the platform
-// reports it, or on TCP a verified client certificate in the token's place
-// — before the executor runs. The listener decides which Host it answers to
-// and what the interceptor learns about the caller. The route context is
-// injected so a Stop or Close cancels the in-flight streams it owns.
+// that dispatch's JSON-RPC handler and /agents/<id>/.well-known/agent-card.json
+// onto its card (#580). The middleware exists because a browser page can
+// CSRF a text/plain POST at any loopback port, DNS-rebind its Host, and
+// fold text into a running agent's turn; requests that pass it still have
+// to authenticate (#357): the route's call interceptor demands the host's
+// bearer token — and the socket peer's own uid where the platform reports
+// it, or on TCP a verified client certificate in the token's place —
+// before the executor runs. The listener decides which Host it answers to,
+// what the interceptor learns about the caller, and which interface the
+// served card names. The route context is injected so a Stop or Close
+// cancels the in-flight streams it owns.
 func (f *ServerFactory) serveRequest(w http.ResponseWriter, r *http.Request, l hostListener) {
 	if r.Header.Get("Origin") != "" {
 		http.Error(w, "a2a: cross-origin requests are not accepted", http.StatusForbidden)
 		return
 	}
-	if ct, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || ct != "application/json" {
-		http.Error(w, "a2a: only application/json requests are accepted", http.StatusUnsupportedMediaType)
-		return
+	id, card := splitRoutePath(r.URL.Path)
+	// A card request carries no body, so there is nothing for the
+	// content-type gate to judge (#580), and A2A clients — the SDK's
+	// resolver, Crush's own external-agent client among them — fetch the
+	// well-known card with a bare GET. Everything else is a JSON-RPC body
+	// and keeps the gate.
+	if !card {
+		if ct, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || ct != "application/json" {
+			http.Error(w, "a2a: only application/json requests are accepted", http.StatusUnsupportedMediaType)
+			return
+		}
 	}
 	if !l.hostAllowed(r.Host) {
 		http.Error(w, "a2a: unexpected Host", http.StatusBadRequest)
@@ -999,8 +1006,7 @@ func (f *ServerFactory) serveRequest(w http.ResponseWriter, r *http.Request, l h
 		return
 	}
 
-	id := strings.TrimPrefix(r.URL.Path, agentsPathPrefix)
-	if id == "" || strings.Contains(id, "/") {
+	if id == "" {
 		http.NotFound(w, r)
 		return
 	}
@@ -1009,11 +1015,58 @@ func (f *ServerFactory) serveRequest(w http.ResponseWriter, r *http.Request, l h
 		http.NotFound(w, r)
 		return
 	}
+	if card {
+		serveAgentCard(w, r, l.cardFor(rt.card, r, id))
+		return
+	}
 	// The route context replaces the request's connection context, so
 	// what the listener knows about the caller — the socket peer's uid
 	// the ConnContext hook read (#357), or the TCP caller and its client
 	// certificate (#358) — is carried across the swap before it serves.
 	rt.handler.ServeHTTP(w, r.WithContext(l.serveContext(rt.ctx, r)))
+}
+
+// splitRoutePath reads a request path as the route table sees it (#346,
+// #580): /agents/<id> is the route's JSON-RPC surface and
+// /agents/<id>/.well-known/agent-card.json its card, with card reporting
+// which. Every other shape — a path off the prefix, an empty id, or an
+// id with a slash in it (any other sub-path of a route, the host's own
+// well-known path included: the host has no card of its own) — returns
+// an empty id, which the router answers 404.
+func splitRoutePath(path string) (id string, card bool) {
+	rest, ok := strings.CutPrefix(path, agentsPathPrefix)
+	if !ok {
+		return "", false
+	}
+	id, card = strings.CutSuffix(rest, a2asrv.WellKnownAgentCardPath)
+	if id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, card
+}
+
+// serveAgentCard answers a route's well-known card path (#580) with the
+// card the listener shaped for the caller. Only GET is served; anything
+// else is 405 with Allow. No credential is checked here: the card is
+// discovery metadata, which the A2A spec has clients fetch with a bare,
+// uncredentialed GET. On the socket the 0600 socket is the reach
+// restriction, as it already is for a definition route's JSON-RPC; on
+// TCP the listener's gate authenticated the caller — client certificate
+// or bearer token — before the router ran. The Origin and Host checks
+// still apply, so a browser page cannot read a card.
+func serveAgentCard(w http.ResponseWriter, r *http.Request, card *a2aspec.AgentCard) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "a2a: the agent card answers GET", http.StatusMethodNotAllowed)
+		return
+	}
+	data, err := json.Marshal(card)
+	if err != nil {
+		http.Error(w, "a2a: encode agent card", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
 }
 
 // writeVersionNotSupported answers a request carrying an A2A-Version the
@@ -1057,8 +1110,9 @@ func writeVersionNotSupported(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(envelope)
 }
 
-// register adds the dispatch's route with a context that dies with it.
-func (f *ServerFactory) register(id string, handler http.Handler) error {
+// register adds the dispatch's route — its JSON-RPC handler and its card
+// (#580) — with a context that dies with it.
+func (f *ServerFactory) register(id string, handler http.Handler, card *a2aspec.AgentCard) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
@@ -1068,7 +1122,7 @@ func (f *ServerFactory) register(id string, handler http.Handler) error {
 		return fmt.Errorf("a2a: dispatch %s is already served", id)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	f.routes[id] = &route{handler: handler, ctx: ctx, cancel: cancel}
+	f.routes[id] = &route{handler: handler, card: card, ctx: ctx, cancel: cancel}
 	return nil
 }
 
