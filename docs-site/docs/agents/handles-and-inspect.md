@@ -114,6 +114,12 @@ way, the tool returns once it's queued, and the reply appears on the agent's
 block. Unknown, finished and external agents are refused. Only the main agent
 has the tool, and only for agents dispatched from its own session.
 
+`message_agent`, `cancel_dispatch`, `apply_dispatch` and `dismiss_dispatch` act
+only on agents dispatched from the calling session: another session's handle,
+dispatch ID or session ID is refused exactly like an unknown one
+([#399](https://github.com/joestump-agent/crush/issues/399),
+[#559](https://github.com/joestump-agent/crush/issues/559)).
+
 ## The agent block
 
 Each `dispatch_agent` call renders as an agent block in the main chat. Its

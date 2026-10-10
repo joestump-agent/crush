@@ -27,6 +27,28 @@ MCP tools use their full name, `mcp_<server>_<tool>`.
 Use this with care — an allowed `edit` means Crush rewrites files without
 asking.
 
+### Read-only bash commands
+
+The `bash` tool runs a small set of read-only commands — `ls`, `pwd`, `which`,
+`git status`, `git log`, `git diff`, and a few more — without prompting, even
+when `bash` is not in the allow list. Crush parses the command rather than
+matching its text, and auto-approves only when the whole command is provably
+inert:
+
+- Every statement must be a plain command: no pipeline, redirection,
+  backgrounding, subshell, loop or function.
+- Every argument must be literal. `$(...)`, backticks, `$VAR`, `$((...))` and
+  `<(...)` are rejected rather than evaluated.
+- A wrapper that runs another program (`env`, `nice`, `nohup`, `timeout`,
+  `time`) is peeled and the inner command is checked on its own, so
+  `timeout 5 ls` runs without a prompt and `timeout 5 rm -rf x` does not.
+- A read-only command that mutates under a flag or operand prompts in that
+  form: `git branch` lists, `git branch -D main` prompts; `git config --get`
+  reads, `git config user.name x` prompts.
+
+Anything the parser cannot prove inert falls back to the normal permission
+prompt. A sequence of read-only statements (`ls; pwd`) is itself read-only.
+
 ## Denying tools
 
 ```bash

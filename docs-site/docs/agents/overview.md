@@ -110,8 +110,10 @@ Stop one dispatched agent yourself: focus its block in the chat (or inspect
 it) and press <kbd>ctrl+x</kbd> — the run ends killed with reason
 `canceled by user`, the card shows **canceled**, and the workspace and branch
 stay for review or a re-dispatch. You can also ask the main agent, which
-cancels by handle through its `cancel_dispatch` tool. The main agent's own
-cancel is unchanged: <kbd>esc</kbd> twice cancels only the parent's turn.
+cancels by handle through its `cancel_dispatch` tool; like steering, it
+reaches only agents dispatched from its own session
+([#559](https://github.com/joestump-agent/crush/issues/559)). The main agent's
+own cancel is unchanged: <kbd>esc</kbd> twice cancels only the parent's turn.
 
 ## What happens to the work
 
@@ -134,7 +136,9 @@ to your permission prompts. Tell it up front if you want to review first. The
 dispatched session's cost is added to the parent session's.
 
 You record your decision with two tools, each of which asks your permission
-before it changes anything:
+before it changes anything. Both act only on dispatches from the calling
+session ([#559](https://github.com/joestump-agent/crush/issues/559)), and the
+permission prompt names the agent's `@handle`, branch and dispatching session:
 
 - **`apply_dispatch`** brings the work into your checkout — `merge` (the
   default, a `--no-ff` merge commit), `squash` (the work lands **staged and
