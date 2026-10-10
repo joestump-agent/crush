@@ -1051,7 +1051,6 @@ func ResolveCwd(cmd *cobra.Command) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to change directory: %v", err)
 		}
-		return cwd, nil
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
