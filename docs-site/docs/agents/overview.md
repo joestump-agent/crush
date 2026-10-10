@@ -44,12 +44,17 @@ a refactor of an unrelated package.
 
 Don't dispatch work that needs your uncommitted changes, because the agent never
 sees your working tree. Don't dispatch read-only searches either; the `agent`
-tool handles those. A dispatched agent reads your context files (`AGENTS.md`,
-`CRUSH.md`, `CLAUDE.md`, and the global ones) from its worktree, and it can
-ask you a question: the question appears in your question prompt labeled with
-its `@handle`, and the agent waits for your answer. Still, write the request
-so it stands on its own — a self-contained prompt finishes faster than one that
-has to ask.
+tool handles those. A dispatched agent can ask you a question: the question
+appears in your question prompt labeled with its `@handle`, and the agent
+waits for your answer. Still, write the request so it stands on its own —
+a self-contained prompt finishes faster than one that has to ask.
+
+Dispatched agents get your context files (`AGENTS.md`, `CRUSH.md`,
+`CLAUDE.md`, and the global ones)
+([#386](https://github.com/joestump-agent/crush/issues/386)), read from your
+checkout rather than from the branch they were dispatched to
+([#561](https://github.com/joestump-agent/crush/issues/561)). A convention
+that lives only on that branch has to go in your request.
 
 ## Requirements
 
