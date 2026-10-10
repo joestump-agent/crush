@@ -39,8 +39,10 @@ You'll steer the agent, ask about it, read its transcript, and apply its work.
 ## Ask for parallel work
 
 Ask for the split in plain language. Name a role, and pass along anything the
-agent should know that is not in your context files — the dispatched agent
-reads `AGENTS.md` and friends from its worktree.
+agent should know that is not in your checkout's context files — the
+dispatched agent reads `AGENTS.md` and friends from your checkout, not from
+the branch it works on
+([#561](https://github.com/joestump-agent/crush/issues/561)).
 
 ```text
 Fix the off-by-one in pkg/x/parse.go yourself. In parallel, dispatch a

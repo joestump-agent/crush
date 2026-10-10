@@ -29,6 +29,7 @@ type Prompt struct {
 	now          func() time.Time
 	platform     string
 	workingDir   string
+	contextRoot  string
 	skillFilter  []string
 	contextPaths []string
 	a2ui         bool
@@ -96,6 +97,22 @@ func WithSkills(names []string) Option {
 func WithContextPaths(paths []string) Option {
 	return func(p *Prompt) {
 		p.contextPaths = paths
+	}
+}
+
+// WithContextRoot sets the directory relative context paths resolve
+// against — the project's and the agent definition's context_paths
+// alike, and any relative global_context_paths. The default (empty) is
+// the store's working directory, which is where every prompt but a
+// dispatched agent's reads its notes. A dispatch renders against a
+// store whose working directory is a worktree cut from a revision the
+// model chose, so its context files must instead come from the
+// parent's checkout, the one the user trusts (#561): the dispatched
+// agent still works inside the worktree, only its project notes are
+// read elsewhere.
+func WithContextRoot(dir string) Option {
+	return func(p *Prompt) {
+		p.contextRoot = dir
 	}
 }
 
@@ -177,9 +194,11 @@ func processFile(filePath string) *ContextFile {
 	}
 }
 
-func processContextPath(p string, store *config.ConfigStore) []ContextFile {
+// processContextPath reads the context file or directory at p, with a
+// relative p resolved against root.
+func processContextPath(p, root string) []ContextFile {
 	var contexts []ContextFile
-	fullPath := filepathext.SmartJoin(store.WorkingDir(), p)
+	fullPath := filepathext.SmartJoin(root, p)
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		return contexts
@@ -218,8 +237,10 @@ func expandPath(path string, store *config.ConfigStore) string {
 	return path
 }
 
-// loadContextFiles loads and deduplicates context files from a list of paths.
-func loadContextFiles(paths []string, store *config.ConfigStore) map[string][]ContextFile {
+// loadContextFiles loads and deduplicates context files from a list of
+// paths. Relative paths resolve against root; the store only expands
+// variables in them.
+func loadContextFiles(paths []string, root string, store *config.ConfigStore) map[string][]ContextFile {
 	files := map[string][]ContextFile{}
 	for _, pth := range paths {
 		expanded := expandPath(pth, store)
@@ -227,7 +248,7 @@ func loadContextFiles(paths []string, store *config.ConfigStore) map[string][]Co
 		if _, ok := files[pathKey]; ok {
 			continue
 		}
-		files[pathKey] = processContextPath(expanded, store)
+		files[pathKey] = processContextPath(expanded, root)
 	}
 	return files
 }
@@ -235,14 +256,17 @@ func loadContextFiles(paths []string, store *config.ConfigStore) map[string][]Co
 func (p *Prompt) promptData(ctx context.Context, provider, model string, store *config.ConfigStore) (PromptDat, error) {
 	workingDir := cmp.Or(p.workingDir, store.WorkingDir())
 	platform := cmp.Or(p.platform, runtime.GOOS)
+	// Context files come from the store's working directory unless the
+	// caller rooted them elsewhere (WithContextRoot, #561).
+	contextRoot := cmp.Or(p.contextRoot, store.WorkingDir())
 
 	cfg := store.Config()
 	contextPaths := cfg.Options.ContextPaths
 	if len(p.contextPaths) > 0 {
 		contextPaths = p.contextPaths
 	}
-	contextFiles := loadContextFiles(contextPaths, store)
-	globalContextFiles := loadContextFiles(cfg.Options.GlobalContextPaths, store)
+	contextFiles := loadContextFiles(contextPaths, contextRoot, store)
+	globalContextFiles := loadContextFiles(cfg.Options.GlobalContextPaths, contextRoot, store)
 
 	// Discover and load skills metadata.
 	var availSkillXML string
