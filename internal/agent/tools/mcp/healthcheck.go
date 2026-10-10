@@ -85,7 +85,7 @@ func checkChannelSessions(ctx context.Context, cfg *config.ConfigStore) {
 			mu.Unlock()
 			continue
 		}
-		err := initClient(ctx, cfg, name, m, currentGen(name), cfg.Resolver())
+		err := initClientWithSessionFactory(ctx, cfg, name, m, currentGen(name), cfg.Resolver(), newSession)
 		mu.Unlock()
 		if err != nil {
 			slog.Warn("MCP channel health check failed to retry session", "name", name, "error", err)
