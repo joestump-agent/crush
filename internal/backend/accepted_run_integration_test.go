@@ -46,7 +46,16 @@ func newRealCoordinator(t *testing.T) (*gatedCoordinator, session.Service, messa
 	t.Helper()
 	conn, err := db.Connect(t.Context(), t.TempDir())
 	require.NoError(t, err)
-	t.Cleanup(func() { conn.Close() })
+	t.Cleanup(func() {
+		require.NoError(t, conn.Close())
+		// Close closes only idle connections. One still checked out
+		// stays open, and keeps the SQLite file open, until whatever
+		// holds it returns it. Windows then refuses to delete crush.db
+		// in TempDir's cleanup. Nothing the run started may still be
+		// reading the store once the run has returned.
+		require.Zero(t, conn.Stats().OpenConnections,
+			"a DB connection was still checked out when the test closed the database")
+	})
 
 	q := db.New(conn)
 	sessions := session.NewService(q, conn)

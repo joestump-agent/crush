@@ -127,7 +127,7 @@ func fantasyMessageText(msg fantasy.Message) string {
 
 func newInjectionSessionAgent(env fakeEnv, model fantasy.LanguageModel, tools []fantasy.AgentTool) *sessionAgent {
 	small := &finishStreamModel{text: "title"}
-	return NewSessionAgent(SessionAgentOptions{
+	sa := NewSessionAgent(SessionAgentOptions{
 		LargeModel: Model{Model: model, CatwalkCfg: catwalk.Model{ContextWindow: 200000, DefaultMaxTokens: 10000}},
 		SmallModel: Model{Model: small, CatwalkCfg: catwalk.Model{ContextWindow: 200000, DefaultMaxTokens: 10000}},
 		IsYolo:     true,
@@ -136,6 +136,8 @@ func newInjectionSessionAgent(env fakeEnv, model fantasy.LanguageModel, tools []
 		Messages:   env.messages,
 		Tools:      tools,
 	}).(*sessionAgent)
+	env.joinTitles(sa)
+	return sa
 }
 
 // TestEnqueueWhenBusyFoldsInjectionIntoRunningTurn is the mid-run

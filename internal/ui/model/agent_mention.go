@@ -3,9 +3,11 @@ package model
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/dispatch"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/ui/chat"
@@ -276,19 +278,23 @@ func (m *UI) routeLeadingAgentHandle(prompt string, attachments []message.Attach
 	return nil, true, true
 }
 
-// agentCompletionValues composes the live-agents source for the @
-// completions (#313): handle, and a "role · status · current todo" detail
-// with a status dot. Live agents only — finished handles never appear.
+// agentCompletionValues composes the agents source for the @
+// completions (#313): live dispatched agents first — handle, and a
+// "role · status · current todo" detail with a status dot; finished
+// handles never appear — then the dispatch agent definitions from the
+// config, so "@go-coder" offers before anything is running. A
+// definition is not a running agent: no injection queue exists to
+// route to, so a leading @<definition> keeps today's fall-through to
+// the normal prompt path, where the coder dispatches it by name.
 func (m *UI) agentCompletionValues() []completions.AgentCompletionValue {
 	tasks := m.com.Workspace.ListAgentTasks(m.currentSessionID())
-	if len(tasks) == 0 {
-		return nil
-	}
 	out := make([]completions.AgentCompletionValue, 0, len(tasks))
+	live := make(map[string]bool, len(tasks))
 	for _, task := range tasks {
 		if task.Handle == "" || task.Terminal() {
 			continue
 		}
+		live[dispatch.HandleSlug(task.Handle)] = true
 		var parts []string
 		if task.Role != "" {
 			parts = append(parts, task.Role)
@@ -300,6 +306,38 @@ func (m *UI) agentCompletionValues() []completions.AgentCompletionValue {
 		out = append(out, completions.AgentCompletionValue{
 			Handle: task.Handle,
 			Detail: strings.Join(parts, " · "),
+		})
+	}
+	out = append(out, m.agentDefinitionCompletionValues(live)...)
+	return out
+}
+
+// agentDefinitionCompletionValues offers the config's dispatch agent
+// definitions in the @ completions. Live handles outrank definitions,
+// so a definition whose id a running dispatch already owns is skipped,
+// and definitions that cannot be dispatched — disabled, or an external
+// agent whose card refused to load — never offer.
+func (m *UI) agentDefinitionCompletionValues(live map[string]bool) []completions.AgentCompletionValue {
+	cfg := m.com.Config()
+	if cfg == nil || len(cfg.Agents) == 0 {
+		return nil
+	}
+	var ids []string
+	for id, agent := range cfg.Agents {
+		if agent.Role != config.AgentRoleDispatch || agent.Disabled || agent.Unusable != "" {
+			continue
+		}
+		if live[dispatch.HandleSlug(id)] {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	out := make([]completions.AgentCompletionValue, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, completions.AgentCompletionValue{
+			Handle: id,
+			Detail: "definition · " + agentOriginTransportLabel(id, cfg.Agents[id]),
 		})
 	}
 	return out

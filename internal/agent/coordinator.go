@@ -717,9 +717,16 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 		MarkRunCompletePublished(ctx)
 	}
 	// A run on this session just ended (#388): dispatch results that
-	// pended while it was busy can deliver now. Detached: the flush
-	// runs its own turn.
-	go c.flushPendingResults(sessionID)
+	// pended while it was busy can deliver now. Inline, not on a
+	// goroutine: the flush reads the parent session from the store, and
+	// that read must finish before run returns. Callers that wait for
+	// the run and then close the database (Workspace.Shutdown's runWG,
+	// a test's cleanup) would otherwise close it with the connection
+	// still checked out, which database/sql leaves open until the read
+	// returns it, and Windows will not delete an open SQLite file. The
+	// delivery turn itself stays detached (startDispatchRun), so this
+	// never waits on a model call.
+	c.flushPendingResults(sessionID)
 	return result, originalErr
 }
 
