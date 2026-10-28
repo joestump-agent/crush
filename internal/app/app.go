@@ -556,10 +556,21 @@ func (app *App) restoreModelFromSession(ctx context.Context, sessionID string) e
 // overrides the model configurations, then rebuilds the agent.
 // Format: "model-name" (searches all providers) or "provider/model-name".
 // Model matching is case-insensitive.
-// If largeModel is provided but smallModel is not, the small model defaults to
-// the provider's default small model.
+// If largeModel is provided but smallModel is not, the small model stays as
+// configured when it is on the large model's provider, and otherwise defaults
+// to the provider's default small model.
 func (app *App) overrideModelsForNonInteractive(ctx context.Context, largeModel, smallModel string) error {
+	if err := app.applyModelOverrides(largeModel, smallModel); err != nil {
+		return err
+	}
+	return app.AgentCoordinator.UpdateModels(ctx)
+}
+
+// applyModelOverrides is overrideModelsForNonInteractive without the agent
+// rebuild: it only rewrites the in-memory model selection.
+func (app *App) applyModelOverrides(largeModel, smallModel string) error {
 	providers := app.config.Config().Providers.Copy()
+	configuredSmall := app.config.Config().Models[config.SelectedModelTypeSmall]
 
 	largeMatches, smallMatches, err := findModels(providers, largeModel, smallModel)
 	if err != nil {
@@ -595,13 +606,16 @@ func (app *App) overrideModelsForNonInteractive(ctx context.Context, largeModel,
 			Model:    found.modelID,
 		})
 
+	case config.KeepConfiguredSmall(configuredSmall, largeProviderID):
+		slog.Info("Keeping configured small model for non-interactive run", "provider", configuredSmall.Provider, "model", configuredSmall.Model)
+
 	case largeModel != "":
 		// No small model specified, but large model was - use provider's default.
 		smallCfg := app.GetDefaultSmallModel(largeProviderID)
 		app.config.OverridePreferredModel(config.SelectedModelTypeSmall, smallCfg)
 	}
 
-	return app.AgentCoordinator.UpdateModels(ctx)
+	return nil
 }
 
 // overrideReasoningEffort validates the requested reasoning effort against

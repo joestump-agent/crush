@@ -63,6 +63,21 @@ const (
 	AgentTask  string = "task"
 )
 
+// KeepConfiguredSmall reports whether overriding the large model with
+// --model should leave the configured small model alone: it is set, and it
+// is on the provider the new large model comes from.
+//
+// Otherwise the small slot is rebuilt from the provider's default, which for
+// a provider catwalk does not know (a LiteLLM gateway, say) is a bare copy
+// of the large model. That drops the small slot's provider_options, and
+// session titles read only those: a reasoning model told to stop thinking
+// for titles spent the whole 40-token title budget thinking instead, so
+// every `crush run --model litellm/X` title hit the length limit twice and
+// the session kept its default name.
+func KeepConfiguredSmall(small SelectedModel, largeProviderID string) bool {
+	return largeProviderID != "" && small.Model != "" && small.Provider == largeProviderID
+}
+
 type SelectedModel struct {
 	// The model id as used by the provider API.
 	// Required.
