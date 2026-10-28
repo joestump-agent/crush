@@ -509,6 +509,7 @@ func overrideModels(
 	}
 
 	providers := cfg.Providers.Copy()
+	configuredSmall := cfg.Models[config.SelectedModelTypeSmall]
 
 	largeMatches, smallMatches := findModelMatches(providers, largeModel, smallModel)
 
@@ -542,6 +543,9 @@ func overrideModels(
 		}); err != nil {
 			return fmt.Errorf("failed to set small model: %w", err)
 		}
+
+	case config.KeepConfiguredSmall(configuredSmall, largeProviderID):
+		slog.Info("Keeping configured small model", "provider", configuredSmall.Provider, "model", configuredSmall.Model)
 
 	case largeModel != "":
 		sm, err := c.GetDefaultSmallModel(ctx, ws.ID, largeProviderID)
