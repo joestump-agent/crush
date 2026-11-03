@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -38,13 +40,21 @@ func (h *HTTPRoundTripLogger) RoundTrip(req *http.Request) (*http.Response, erro
 		)
 		return nil, err
 	}
+	requestBody, err := io.ReadAll(save)
+	if err != nil {
+		return nil, err
+	}
+	var requestOptions struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(requestBody, &requestOptions)
 
 	if slog.Default().Enabled(req.Context(), slog.LevelDebug) {
 		slog.Debug(
 			"HTTP Request",
 			"method", req.Method,
 			"url", req.URL,
-			"body", bodyToString(save),
+			"body", bodyToString(io.NopCloser(bytes.NewReader(requestBody))),
 		)
 	}
 
@@ -60,6 +70,19 @@ func (h *HTTPRoundTripLogger) RoundTrip(req *http.Request) (*http.Response, erro
 			"error", err,
 		)
 		return resp, err
+	}
+
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if mediaType == "text/event-stream" || requestOptions.Stream {
+		if slog.Default().Enabled(req.Context(), slog.LevelDebug) {
+			slog.Debug("HTTP Response", "status_code", resp.StatusCode, "status", resp.Status,
+				"headers", formatHeaders(resp.Header), "content_length", resp.ContentLength,
+				"duration_ms", duration.Milliseconds())
+			if resp.Body != nil && resp.Body != http.NoBody {
+				resp.Body = &loggedStreamBody{ReadCloser: resp.Body}
+			}
+		}
+		return resp, nil
 	}
 
 	save, resp.Body, err = drainBody(resp.Body)
@@ -79,6 +102,47 @@ func (h *HTTPRoundTripLogger) RoundTrip(req *http.Request) (*http.Response, erro
 		)
 	}
 	return resp, nil
+}
+
+const maxLoggedStreamBytes = 64 * 1024
+
+type loggedStreamBody struct {
+	io.ReadCloser
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	truncated bool
+	once      sync.Once
+}
+
+func (b *loggedStreamBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.mu.Lock()
+	remaining := maxLoggedStreamBytes - b.buf.Len()
+	if n > remaining {
+		b.truncated = true
+	}
+	if n > 0 && remaining > 0 {
+		_, _ = b.buf.Write(p[:min(n, remaining)])
+	}
+	b.mu.Unlock()
+	if err != nil {
+		b.log()
+	}
+	return n, err
+}
+
+func (b *loggedStreamBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.log()
+	return err
+}
+
+func (b *loggedStreamBody) log() {
+	b.once.Do(func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		slog.Debug("HTTP Response stream", "body", b.buf.String(), "truncated", b.truncated)
+	})
 }
 
 func bodyToString(body io.ReadCloser) string {
