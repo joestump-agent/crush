@@ -56,8 +56,25 @@ const (
 	// Constants for auto-summarization thresholds
 	largeContextWindowThreshold = 200_000
 	largeContextWindowBuffer    = 20_000
+	largeContextWindowRatio     = 10
 	smallContextWindowRatio     = 0.2
 )
+
+// summarizeThreshold is how much context must remain before the run
+// summarises. A fixed buffer assumes no single turn adds more than the buffer,
+// which one large tool result disproves, so on a large window the headroom is a
+// tenth of the window with the fixed buffer as a floor. An unknown window (0)
+// is the caller's to skip.
+func summarizeThreshold(cw int64) int64 {
+	if cw <= largeContextWindowThreshold {
+		return int64(float64(cw) * smallContextWindowRatio)
+	}
+	proportional := (cw + largeContextWindowRatio - 1) / largeContextWindowRatio
+	if proportional > largeContextWindowBuffer {
+		return proportional
+	}
+	return largeContextWindowBuffer
+}
 
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
 
@@ -1322,13 +1339,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 				}
 				tokens := currentSession.CompletionTokens + currentSession.PromptTokens
 				remaining := cw - tokens
-				var threshold int64
-				if cw > largeContextWindowThreshold {
-					threshold = largeContextWindowBuffer
-				} else {
-					threshold = int64(float64(cw) * smallContextWindowRatio)
-				}
-				if (remaining <= threshold) && !a.disableAutoSummarize {
+				if (remaining <= summarizeThreshold(cw)) && !a.disableAutoSummarize {
 					shouldSummarize = true
 					return true
 				}
