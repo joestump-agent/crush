@@ -1438,6 +1438,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		}
 		var fantasyErr *fantasy.Error
 		var providerErr *fantasy.ProviderError
+		var toolExecutionErr *fantasy.ToolExecutionError
 		var requestTimedOutErr *requestTimeoutError
 		const defaultTitle = "Provider Error"
 		linkStyle := lipgloss.NewStyle().Foreground(charmtone.Guac).Underline(true)
@@ -1447,6 +1448,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			// Checked before the provider branches so a deadline our own
 			// request timeout imposed is never reported as a provider error.
 			currentAssistant.AddFinish(message.FinishReasonError, "Request timed out", requestTimedOutErr.userMessage())
+		} else if errors.As(err, &toolExecutionErr) {
+			// A tool's own failure ends the step but says nothing about the
+			// provider: calling it a provider error makes every monitoring
+			// hook that watches for provider errors fire on a dead URL or a
+			// bad command.
+			currentAssistant.AddFinish(message.FinishReasonError, "Tool Error", toolExecutionErr.Error())
 		} else if isHyper && errors.As(err, &providerErr) && providerErr.StatusCode == http.StatusUnauthorized {
 			currentAssistant.AddFinish(message.FinishReasonError, "Unauthorized", `Please re-authenticate with Hyper. You can also run "crush auth" to re-authenticate.`)
 		} else if errors.As(err, &providerErr) {
